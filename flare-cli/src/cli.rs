@@ -484,6 +484,7 @@ impl OrbitPush {
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
+            scheduler: SchedulerOptions::default(),
             serving: self.serving.clone(),
         }
     }
@@ -572,9 +573,9 @@ pub struct OrbitRun {
     #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
     pub served_model_name: Option<String>,
 
-    /// Favor throughput or output cadence [default: saved group or balanced].
+    /// Favor throughput or output cadence, or bound first-token waits [default: saved group or balanced].
     #[arg(long, value_name = "MODE",
-        value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
+        value_parser = ["balanced", "throughput", "interactive"], help_heading = "Serving options")]
     pub scheduler_policy: Option<String>,
 
     /// Value per terminal retirement in prompt-token units [default: 256].
@@ -588,6 +589,9 @@ pub struct OrbitRun {
     /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub scheduler: SchedulerOptions,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -630,6 +634,7 @@ impl OrbitRun {
         if let Some(price) = self.scheduler_terminal_age_price {
             options.extend(["--scheduler-terminal-age-price".into(), price.to_string()]);
         }
+        options.extend(self.scheduler.options());
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
@@ -661,6 +666,7 @@ impl OrbitRun {
                 .unwrap_or_else(|| "balanced".into()),
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
+            scheduler: self.scheduler.clone(),
             serving: self.serving.clone(),
         }
     }
@@ -790,9 +796,10 @@ pub struct Run {
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
-    /// Favor token throughput or balance it with output cadence; both retain token-service fairness.
+    /// Favor token throughput or balance it with output cadence; all retain token-service fairness.
+    /// Interactive is balanced with a 50 ms first-token target.
     #[arg(long, value_name = "MODE", default_value = "balanced",
-        value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
+        value_parser = ["balanced", "throughput", "interactive"], help_heading = "Serving options")]
     pub scheduler_policy: String,
 
     /// Value per terminal retirement in prompt-token units [default: 256].
@@ -804,7 +811,101 @@ pub struct Run {
     pub scheduler_terminal_age_price: Option<f64>,
 
     #[command(flatten)]
+    pub scheduler: SchedulerOptions,
+
+    #[command(flatten)]
     pub serving: ServingOptions,
+}
+
+/// Scheduler utility coefficients and the first-token guard; omitted values keep the policy's.
+#[derive(Debug, Args, Clone, Default, PartialEq)]
+pub struct SchedulerOptions {
+    /// Value of one output token in prompt-token units [default: 64].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_positive, help_heading = "Scheduler options")]
+    pub scheduler_output_token_value: Option<f64>,
+
+    /// Price of unserved token throughput relative to other requests [default: 16].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_token_fairness: Option<f64>,
+
+    /// Price of unserved output deliveries [default: 4; throughput: 0].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_delivery_fairness: Option<f64>,
+
+    /// Waiting cost of a decoding request per ms of output age [default: 0.1; throughput: 0].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_decode_age_price: Option<f64>,
+
+    /// Time constant of the served-rate estimates in ms [default: 100].
+    #[arg(long, value_name = "MS", value_parser = scheduler_positive, help_heading = "Scheduler options")]
+    pub scheduler_adaptation_ms: Option<f64>,
+
+    /// Force the next round for a prompt still without output this long after arrival; 0 disables
+    /// [default: 0; interactive: 50].
+    #[arg(long, value_name = "MS", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_ttft_target_ms: Option<f64>,
+
+    /// Largest prefill chunk a forced round may use; 0 allows the largest prepared [default: 0].
+    #[arg(long, value_name = "TOKENS", help_heading = "Scheduler options")]
+    pub scheduler_ttft_max_chunk: Option<usize>,
+
+    /// Other rounds allowed between two forced rounds of one prompt [default: 1].
+    #[arg(long, value_name = "N", help_heading = "Scheduler options")]
+    pub scheduler_ttft_decode_interleave: Option<u32>,
+
+    /// Absorb a final message segment of at most chunk/16 tokens (64-512) into the preceding
+    /// prefill chunk instead of running it as its own prefill graph (the prompt-end checkpoint is
+    /// still captured). true: every request except one without tools whose generation prompt
+    /// opens reasoning (a thinking chat's next turn resumes from its last message's checkpoint);
+    /// false; or tools-only: requests with tools [default: tools-only].
+    #[arg(long, value_name = "MODE", value_parser = ["true", "false", "tools-only"],
+        help_heading = "Scheduler options")]
+    pub scheduler_prefill_tail_merge: Option<String>,
+
+    /// Offer message checkpoints to the host prefix cache at capture, even when the prompt
+    /// checkpoint follows within one KV page (upstream PR #227); false defers them until
+    /// exact reuse [default: true].
+    #[arg(long, value_name = "BOOL", help_heading = "Scheduler options")]
+    pub scheduler_eager_message_offers: Option<bool>,
+}
+
+impl SchedulerOptions {
+    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 10] {
+        [
+            ("output_token_value", self.scheduler_output_token_value.map(Into::into)),
+            ("token_fairness", self.scheduler_token_fairness.map(Into::into)),
+            ("delivery_fairness", self.scheduler_delivery_fairness.map(Into::into)),
+            ("decode_age_price", self.scheduler_decode_age_price.map(Into::into)),
+            ("adaptation_ms", self.scheduler_adaptation_ms.map(Into::into)),
+            ("ttft_target_ms", self.scheduler_ttft_target_ms.map(Into::into)),
+            ("ttft_max_chunk", self.scheduler_ttft_max_chunk.map(Into::into)),
+            ("ttft_decode_interleave", self.scheduler_ttft_decode_interleave.map(Into::into)),
+            ("prefill_tail_merge", self.scheduler_prefill_tail_merge.as_deref().map(|mode| match mode {
+                "true" => true.into(),
+                "false" => false.into(),
+                mode => mode.into(),
+            })),
+            ("eager_message_offers", self.scheduler_eager_message_offers.map(Into::into)),
+        ]
+    }
+
+    /// The equivalent command-line flags, for forwarding to rank zero.
+    pub fn options(&self) -> Vec<String> {
+        self.values().into_iter()
+            .filter_map(|(name, value)| value.map(|value| [format!("--scheduler-{}", name.replace('_', "-")),
+                value.as_str().map_or_else(|| value.to_string(), str::to_owned)]))
+            .flatten()
+            .collect()
+    }
+
+    /// Writes the given values as `scheduler_*` server configuration keys.
+    pub fn configure(&self, config: &mut serde_json::Value) {
+        for (name, value) in self.values() {
+            if let Some(value) = value {
+                config[format!("scheduler_{name}")] = value;
+            }
+        }
+    }
 }
 
 /// Options that select a core's trust, loading, speculation and caching; every rank of a
@@ -1022,6 +1123,12 @@ fn scheduler_coefficient(value: &str) -> Result<f64, String> {
         .ok()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| "scheduler coefficient must be finite and nonnegative".into())
+}
+
+fn scheduler_positive(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "scheduler coefficient must be finite and positive".into())
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
@@ -1379,6 +1486,49 @@ mod tests {
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
                 explicit
             );
+        }
+    }
+
+    #[test]
+    fn scheduler_options_parse_forward_and_configure_the_server() {
+        let defaults = run(&["flare", "run", "model"]);
+        assert_eq!(defaults.scheduler, SchedulerOptions::default());
+        let mut config = serde_json::json!({});
+        defaults.scheduler.configure(&mut config);
+        assert_eq!(config, serde_json::json!({}));
+        assert!(Cli::try_parse_from(["flare", "run", "model", "--scheduler-policy", "interactive"]).is_ok());
+        let flags = ["--scheduler-output-token-value", "32", "--scheduler-token-fairness", "0",
+            "--scheduler-delivery-fairness", "2.5", "--scheduler-decode-age-price", "0",
+            "--scheduler-adaptation-ms", "25", "--scheduler-ttft-target-ms", "50",
+            "--scheduler-ttft-max-chunk", "2048", "--scheduler-ttft-decode-interleave", "2",
+            "--scheduler-prefill-tail-merge", "false", "--scheduler-eager-message-offers", "false"];
+        let args = run(&[["flare", "run", "model"].as_slice(), &flags].concat());
+        let mut config = serde_json::json!({});
+        args.scheduler.configure(&mut config);
+        assert_eq!(config, serde_json::json!({"scheduler_output_token_value": 32.0,
+            "scheduler_token_fairness": 0.0, "scheduler_delivery_fairness": 2.5,
+            "scheduler_decode_age_price": 0.0, "scheduler_adaptation_ms": 25.0,
+            "scheduler_ttft_target_ms": 50.0, "scheduler_ttft_max_chunk": 2048,
+            "scheduler_ttft_decode_interleave": 2, "scheduler_prefill_tail_merge": false,
+            "scheduler_eager_message_offers": false}));
+        let forwarded = run(&[["flare", "run", "model"].as_slice(),
+            &args.scheduler.options().iter().map(String::as_str).collect::<Vec<_>>()].concat());
+        assert_eq!(forwarded.scheduler, args.scheduler);
+        let Command::Orbit(orbit) = Cli::try_parse_from([["flare", "orbit", "run", "model"].as_slice(), &flags]
+            .concat()).unwrap().command else { panic!() };
+        let OrbitCommand::Run(orbit) = orbit.command else { panic!() };
+        assert_eq!(orbit.run_args().scheduler, args.scheduler);
+        assert!(orbit.rank_zero_options().ends_with(&args.scheduler.options()));
+        let tools_only = run(&["flare", "run", "model", "--scheduler-prefill-tail-merge", "tools-only"]);
+        let mut config = serde_json::json!({});
+        tools_only.scheduler.configure(&mut config);
+        assert_eq!(config, serde_json::json!({"scheduler_prefill_tail_merge": "tools-only"}));
+        assert_eq!(tools_only.scheduler.options(), ["--scheduler-prefill-tail-merge", "tools-only"]);
+        for (flag, invalid) in [("--scheduler-output-token-value", "0"), ("--scheduler-adaptation-ms", "0"),
+            ("--scheduler-token-fairness", "-1"), ("--scheduler-ttft-target-ms", "NaN"),
+            ("--scheduler-decode-age-price", "inf"), ("--scheduler-ttft-max-chunk", "-1"),
+            ("--scheduler-ttft-decode-interleave", "1.5"), ("--scheduler-prefill-tail-merge", "tools")] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={invalid}")]).is_err(), "{flag}");
         }
     }
 

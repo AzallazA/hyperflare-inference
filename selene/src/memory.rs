@@ -2009,6 +2009,36 @@ mod tests {
     }
 
     #[test]
+    fn pressure_thinning_keeps_a_close_ancestor_row() {
+        // Fork sync check (#227 with #264): a message endpoint whose prompt child lies less
+        // than one page later keeps its row when DRAM retention headroom runs out.
+        let row_slots = 1;
+        let headroom = 2 * row_slots;
+        let layout = Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)]).unwrap();
+        let intake = crate::offload::intake_slots(&layout, 1);
+        // Two page-bearing records plus a page-less close child: one page fewer than three full records.
+        let warm = 2 * (1 + row_slots) + row_slots + headroom;
+        let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
+        let mut core = Core::new(IDENTITY, pool, layout, false);
+        let full = history(192, 1);
+        let checkpoints = [
+            published(&full, 64, None, 0, 1),
+            published(&full, 128, Some(64), 0, 2),
+            published(&full, 160, Some(128), 0, 3),
+        ];
+        for checkpoint in &checkpoints {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        // Thinning ran at its threshold (free retention == headroom), yet the close ancestor kept its row.
+        assert_eq!(core.pool.free_slots(), intake + headroom);
+        assert!(core.index[&checkpoints[1].key].row);
+        assert!(!core.index.row_redundant(&checkpoints[1].key, false));
+        assert_eq!(core.stats.rows_thinned[0], 0);
+        assert_clean_slots(&core);
+    }
+
+    #[test]
     fn pressure_thins_redundant_rows_before_allocating_another_endpoint() {
         for (warm_slots, next_endpoint) in [(7, 256), (9, 384)] {
             let mut core = store_core(warm_slots - 1, 1, false);

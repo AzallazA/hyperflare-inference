@@ -216,6 +216,13 @@ fn named_selection_only_filters_tools_and_none_restores_a_text_turn() {
         assert_eq!(none.rendered_prompt, empty.rendered_prompt);
         assert!(none.output.content.tools.is_empty());
         assert!(none.prompt.grammar.is_none());
+
+        // Only a prompt that renders tool definitions counts as a tool request for the
+        // scheduler's tools-only prefill tail merge.
+        assert!(named.prompt.tools && selected.prompt.tools, "{encoder:?}");
+        assert!(!none.prompt.tools && !empty.prompt.tools, "{encoder:?}");
+        let plain = fixture.prepare(json!({"messages":[{"role":"user","content":"Hi"}]})).unwrap();
+        assert!(!plain.prompt.tools, "{encoder:?}");
     }
 }
 
@@ -707,5 +714,50 @@ fn required_and_named_tools_keep_the_thinking_prompt() {
             assert_eq!(named.output.content.tools[0]["function"]["name"], "lookup");
         }
         assert!(fixture.prepare(json!({"tool_choice":"required","tools":[]})).is_err());
+    }
+}
+
+/// Fork (TP3) prefill tail merge (`PrefillTailMerge::On`): the scheduler runs a chunk past the last
+/// message's checkpoint only when the next turn re-renders the prompt end. DeepSeek V4.1 keeps the
+/// `<think>` header of earlier assistant turns only when the prompt renders tools, so a thinking
+/// turn without tools diverges right after its last message; `reasoning_prompt` marks exactly that
+/// case, and the last message's prefix is shared in every case.
+#[test]
+fn reasoning_prompt_marks_turns_whose_next_turn_rewrites_the_generation_prompt() {
+    let tools = json!([{"type":"function","function":{"name":"lookup","description":"Find a value",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]);
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let fixture = Fixture::new(encoder);
+        // (template kwargs, tools, reasoning_prompt, the next turn extends this whole prompt)
+        for (kwargs, with_tools, reasoning, extends) in [
+            (json!({}), false, true, false),
+            (json!({"enable_thinking": true}), false, true, false),
+            (json!({"enable_thinking": false}), false, false, true),
+            (json!({"enable_thinking": true}), true, true, true),
+            (json!({"enable_thinking": false}), true, false, true),
+        ] {
+            let first_messages = json!([{"role":"system","content":"Policy"},{"role":"user","content":"Hello"}]);
+            let next_messages = json!([{"role":"system","content":"Policy"},{"role":"user","content":"Hello"},
+                {"role":"assistant","content":"Hi there"},{"role":"user","content":"More please"}]);
+            let request = |messages: &Value| {
+                let mut body = json!({"messages": messages, "chat_template_kwargs": kwargs});
+                if with_tools {
+                    body["tools"] = tools.clone();
+                }
+                fixture.prepare(body).unwrap()
+            };
+            let (first, next) = (request(&first_messages), request(&next_messages));
+            let case = format!("{encoder:?} {kwargs} tools={with_tools}");
+            assert_eq!(first.prompt.tools, with_tools, "{case}");
+            assert_eq!(first.prompt.reasoning_prompt, reasoning, "{case}");
+            // DeepSeek V4 drops an absent reasoning block from history even with tools; V4.1 (DS41)
+            // renders it empty, so its tool turns keep the `<think>` header.
+            if encoder == PromptEncoder::DeepseekV41 || !with_tools {
+                assert_eq!(next.prompt.tokens.starts_with(&first.prompt.tokens), extends, "{case}");
+            }
+            let last = *first.prompt.message_boundaries.last().unwrap();
+            assert!(last < first.prompt.tokens.len(), "{case}");
+            assert_eq!(next.prompt.tokens[..last], first.prompt.tokens[..last], "{case}");
+        }
     }
 }

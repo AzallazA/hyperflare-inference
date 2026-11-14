@@ -30,6 +30,10 @@ pub struct Prompt {
     pub tokens: Vec<u32>,
     /// Sorted token counts of exact rendered message prefixes.
     pub message_boundaries: Vec<usize>,
+    /// The rendered chat prompt includes tool definitions (prefill tail merge tools-only rule).
+    pub tools: bool,
+    /// The generation prompt opens a reasoning block (`RequestSpec::reasoning_prompt`).
+    pub reasoning_prompt: bool,
     pub data: crate::model::PromptData,
     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
     pub conditioning: Vec<ConditioningEvent>,
@@ -221,6 +225,8 @@ impl Incoming {
             host_stops: self.prompt.has_host_stops(),
             prompt_logprobs: self.prompt_scored < self.prompt_score_end,
             growable_output: true,
+            tools: self.prompt.tools,
+            reasoning_prompt: self.prompt.reasoning_prompt,
         }
     }
 
@@ -2196,6 +2202,7 @@ impl<'a> Worker<'a> {
         if executor.submit(
             graph,
             &uploads,
+            self.scheduler.cleared_pages(fence)?,
             feedback,
         )? != Some(fence)
         {
@@ -2922,6 +2929,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         };
         let constrained = scheduler.admit(spec(7, true)).unwrap();
         assert_eq!(
@@ -2988,6 +2997,8 @@ mod tests {
             prompt: Prompt {
                 tokens: vec![7],
                 message_boundaries: vec![],
+                tools: false,
+                reasoning_prompt: false,
                 data: PromptData {
                     positions: vec![[0; 3]],
                     vision_token_indices: vec![-1],
@@ -3185,6 +3196,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         }
     }
 
@@ -3698,6 +3711,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         };
         let active = scheduler.admit(spec()).unwrap();
         let rejected = scheduler.admit(spec()).unwrap_err();
