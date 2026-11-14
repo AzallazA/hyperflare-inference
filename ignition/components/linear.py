@@ -13,7 +13,7 @@ import torch
 from b12x.gemm import bf16_gemv, blockscaled
 from b12x.preparation import PreparationSession, PreparedCall
 
-from ignition.components import sm103_projection
+from ignition.components import bf16_bmm, sm103_projection
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.fixtures import bf16_gemv as bf16_fixtures
 from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
@@ -84,20 +84,19 @@ class PreparedProjectionGroup:
 
 
 class BatchedUnquantizedProjection:
-    """Multiply BF16 matrix stacks into caller-owned, possibly strided outputs."""
+    """Multiply BF16 matrix stacks into caller-owned, possibly strided outputs.
+
+    The preparation race selects cuBLAS or a Triton tiled kernel per device
+    (see :mod:`ignition.components.bf16_bmm`); neither uses scratch.
+    """
 
     def __init__(self, source, weight, output, *, major, session, name):
-        del session, name
         if major not in ("n", "k"):
             raise ValueError("batched projections take an n-major or k-major RHS")
         self.weight = weight if major == "n" else weight.transpose(1, 2)
-        if (source.ndim != 3 or output.shape[:2] != source.shape[:2]
-                or self.weight.shape != (source.shape[0], source.shape[2], output.shape[2])
-                or any(value.dtype != torch.bfloat16 or value.device != source.device
-                       for value in (source, weight, output))):
-            raise ValueError("batched BF16 projections require matching matrix stacks and outputs")
         record_numeric_tensor(weight)
         self.output = output
+        self.plan = bf16_bmm.declare_bmm(source, self.weight, output, session=session, name=name)
 
     def functional(self, *, session):
         """Allocate each batched result with the prepared output layout."""
@@ -120,7 +119,7 @@ class BatchedUnquantizedProjection:
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        _bmm_out(source, self.weight, output)
+        bf16_bmm.execute(source, self.weight, output, self.plan.handle)
         return output
 
 
