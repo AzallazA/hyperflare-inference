@@ -9,31 +9,43 @@ import pytest
 from ignition.recipes.deepseek41.tp3_config import (TP3Config, describe_checkpoint, describe_counts_dir,
                                                     format_layers, parse_layers)
 
-# The release export.sh (DeepSeek-V4.1-Flash Flare-tp3-20261107) environment with its defaults expanded
-# (HOT=342, COUNTS=$HERE/expert-order, FLARE_DS41_VISION_HOST=1, FLARE_DS41_VISION_STAGE=1).
-RELEASE_ENV = {
-    "FLARE_DS41_TP3_GRAPH_GIB": "1",
-    "FLARE_DS41_HOST_EXPERT_LAYERS": "20-33",
-    "FLARE_DS41_HOT_EXPERTS": "342",
-    "FLARE_DS41_MERGED_BANK": "1",
-    "FLARE_DS41_TP3_VOCAB_PARALLEL": "1",
-    "FLARE_DS41_EXPERT_COUNTS_DIR": "/release/expert-order",
-    "HF_HUB_OFFLINE": "1",
-    "FLARE_DS41_BRRR_LAYERS": "0-39",
-    "FLARE_DS41_BRRR_CKPT": "/m2-2/flare-ckpt/ds41-1017-engram-mxfp4",
-    "FLARE_DS41_BRRR_PARKED_MAX_ROWS": "12",
-    "FLARE_DS41_EMBED_HOST": "1",
-    "FLARE_DS41_VISION_HOST": "1",
-    "FLARE_DS41_VISION_STAGE": "1",
-    "FLARE_DS41_AR_ROWS": "1024",
-}
+# The release environment as tp3-tools/release/export.sh really exports it with its defaults (HOT=342, COUNTS=
+# $HERE/expert-order, VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1): the script's
+# environment block runs in bash (everything before ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE values are read
+# back, so a change to the script's defaults reaches these tests.
+EXPORT_SH = Path(__file__).resolve().parents[2] / "tp3-tools" / "release" / "export.sh"
+RELEASE_CKPT = "/m2-2/flare-ckpt/ds41-1017-engram-mxfp4"
+
+
+def export_environment(**variables):
+    import os
+    import subprocess
+
+    script = EXPORT_SH.read_text()
+    body = script[:script.index("\nexec ")]
+    dump = '\nfor name in ${!FLARE_DS41_@} HF_HUB_OFFLINE; do printf "%s=%s\\0" "$name" "${!name}"; done'
+    output = subprocess.run(["bash", "-c", body + dump, str(EXPORT_SH)], check=True, capture_output=True,
+                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT, **variables})
+    pairs = (item.split("=", 1) for item in output.stdout.decode().split("\0") if "=" in item)
+    return {key: value for key, value in pairs if key.startswith("FLARE_DS41_") or key == "HF_HUB_OFFLINE"}
+
+
+RELEASE_ENV = export_environment()
 
 RELEASE_CONFIG = TP3Config(
     host_expert_layers=frozenset(range(20, 34)), hot_experts=342, merged_bank=True,
-    expert_counts_dir=Path("/release/expert-order"), embed_host=True, vision_host=True, vision_stage=True,
+    expert_counts_dir=EXPORT_SH.parent / "expert-order", embed_host=True, vision_host=True, vision_stage=True,
     ar_rows=1024, tp3_graph_gib=1.0, tp3_vocab_parallel=True,
-    brrr_layers=frozenset(range(40)), brrr_parked_max_rows=12,
-    brrr_ckpt=Path("/m2-2/flare-ckpt/ds41-1017-engram-mxfp4"))
+    brrr_layers=frozenset(range(40)), brrr_parked_max_rows=12, brrr_ckpt=Path(RELEASE_CKPT),
+    engram_chunk_rows=1024, share_engram_residual=True)
+
+
+def test_export_script_environment_is_parsed_not_copied():
+    assert RELEASE_ENV["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "1024" and RELEASE_ENV["FLARE_DS41_HOT_EXPERTS"] == "342"
+    assert RELEASE_ENV["FLARE_DS41_EXPERT_COUNTS_DIR"] == str(EXPORT_SH.parent / "expert-order")
+    # The script's overrides reach the parsed environment (it is the script, not a copy).
+    overridden = export_environment(HOT="300", FLARE_DS41_ENGRAM_CHUNK_ROWS="0")
+    assert overridden["FLARE_DS41_HOT_EXPERTS"] == "300" and overridden["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "0"
 
 
 def test_release_environment_parses_to_the_expected_config():
@@ -224,7 +236,9 @@ def test_metadata_record_is_json_ready_and_complete():
     record = TP3Config.from_environment(RELEASE_ENV).to_metadata()
     assert set(record) == {item.name for item in fields(TP3Config)}
     assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"
-    assert record["expert_counts_dir"] == "expert-order#missing" and record["tp3_graph_gib"] == 1.0
+    counts, counts_digest = record["expert_counts_dir"].split("#")
+    assert counts == "expert-order" and (counts_digest == "missing" or len(counts_digest) == 12)
+    assert record["tp3_graph_gib"] == 1.0
     # The release view may exist on the build host, so only the shape is fixed: basename#12-hex-or-missing.
     name, digest = record["brrr_ckpt"].split("#")
     assert name == "ds41-1017-engram-mxfp4" and (digest == "missing" or len(digest) == 12)
@@ -246,7 +260,7 @@ def test_config_is_frozen_and_hashable():
 # The 2026-11-14 base port: the release config minus the features the port stages brought back (BRRR = S6, Engram
 # chunk rows and the shared residual = S5, vision staging = S7). The tower stays host-parked (vision_host).
 BASE_PORT_CONFIG = replace(RELEASE_CONFIG, brrr_layers=frozenset(), brrr_parked_max_rows=0, brrr_ckpt=None,
-                           vision_stage=False)
+                           vision_stage=False, engram_chunk_rows=0, share_engram_residual=False)
 
 
 def test_preparation_config_carries_the_tp3_config():
@@ -262,15 +276,16 @@ def test_preparation_config_carries_the_tp3_config():
 def test_every_switch_is_ported_and_the_full_release_environment_prepares():
     from ignition.recipes.deepseek41.bootstrap import PreparationConfig
 
-    # S5 (Engram chunk rows, shared Engram residual), S6 (BRRR) and S7 (vision staging) are ported: the release
+    # S5 (Engram chunk rows, shared Engram residual), S6 (BRRR) and S7 (vision staging) are ported: the real
     # export.sh environment, both S5 switches included, passes require_ported() and builds a PreparationConfig.
-    assert RELEASE_CONFIG.unported() == {} and RELEASE_CONFIG.require_ported() is RELEASE_CONFIG
-    assert BASE_PORT_CONFIG.unported() == {} and BASE_PORT_CONFIG.require_ported() is BASE_PORT_CONFIG
-    env = dict(RELEASE_ENV, FLARE_DS41_ENGRAM_CHUNK_ROWS="1024", FLARE_DS41_SHARE_ENGRAM_RESIDUAL="1")
-    full = TP3Config.from_environment(env)
+    full = TP3Config.from_environment(RELEASE_ENV)
     assert full.engram_chunk_rows == 1024 and full.share_engram_residual is True
     assert full.unported() == {} and full.require_ported() is full
     assert PreparationConfig(max_active=4, tp3=full).tp3 is full
+    assert BASE_PORT_CONFIG.unported() == {} and BASE_PORT_CONFIG.require_ported() is BASE_PORT_CONFIG
+    for off in (dict(FLARE_DS41_ENGRAM_CHUNK_ROWS="0"), dict(FLARE_DS41_SHARE_ENGRAM_RESIDUAL="0")):
+        config = TP3Config.from_environment(export_environment(**off))
+        assert config.require_ported() is config and PreparationConfig(max_active=4, tp3=config).tp3 is config
 
 
 def test_brrr_is_ported_but_refuses_joint_tuning():

@@ -305,6 +305,10 @@ class PreparedEngram:
 
     def __call__(self, source, metadata):
         tokens = source.shape[0]
+        if tokens != self.bounds[-1][1]:
+            # The chunks tile exactly the declared rows: a wider source would leave its extra rows zero, a narrower one
+            # would slice past its end (the one-pass mix used to refuse it by its capacity check).
+            raise ValueError(f"Engram forward got {tokens} rows; it was declared for {self.bounds[-1][1]}")
         mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
         gathered = self.lookup(source, metadata.live_counts[:1])
         output = torch.zeros_like(source)
