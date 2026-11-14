@@ -220,7 +220,13 @@ class PreparedTableRequests:
 
 @dataclass(frozen=True)
 class EngramScratch:
-    """Intermediate lookup and projection storage for serialized Engram layers."""
+    """Declaration operands of serialized Engram layers (the traced forward allocates its own values).
+
+    ``mask`` and ``gathered`` hold every row of the graph. ``local``, ``partial`` and ``projected`` hold one projection
+    chunk: the whole graph by default, ``chunk_rows`` rows when the TP3 fork chunks the projection
+    (tp3.engram_chunk_rows). PreparedEngram derives its chunking from these shapes, so all ranks, given one config,
+    chunk alike.
+    """
 
     mask: torch.Tensor
     gathered: torch.Tensor
@@ -229,13 +235,17 @@ class EngramScratch:
     projected: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, device, *, world=1):
+    def allocate(cls, tokens, device, *, world=1, chunk_rows=0):
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
+        if type(chunk_rows) is not int or chunk_rows < 0:
+            raise ValueError("Engram chunk rows must be a non-negative integer")
+        rows = min(tokens, chunk_rows) if chunk_rows else tokens
         gathered = zeros((tokens, 6144), torch.bfloat16)
-        local = gathered if world == 1 else zeros((tokens, 6144 // world), torch.bfloat16)
-        partial = zeros((tokens, 25600), torch.bfloat16)
-        projected = partial if world == 1 else zeros((tokens, 25600), torch.bfloat16)
+        # Unsharded chunks project row views of ``gathered`` directly (rows are contiguous), so no chunk copy.
+        local = gathered[:rows] if world == 1 else zeros((rows, 6144 // world), torch.bfloat16)
+        partial = zeros((rows, 25600), torch.bfloat16)
+        projected = partial if world == 1 else zeros((rows, 25600), torch.bfloat16)
         return cls(zeros(tokens, torch.bool), gathered, local, partial, projected)
 
 
@@ -244,45 +254,70 @@ class PreparedEngram:
                  runtime=None, coordinator=None, examples=None):
         self.pool = pool
         tokens, device = metadata.token_ids.numel(), source.device
-        self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
-        self.local, self.partial = scratch.local, scratch.partial
+        mask, gathered, projected = scratch.mask, scratch.gathered, scratch.projected
+        local, partial = scratch.local, scratch.partial
         self.columns = tables.columns
         self.sharded = tables.shard.world_size > 1
         if self.sharded and runtime is None:
             raise ValueError("sharded Engram projection requires a collective runtime")
-        for tensor, shape, dtype in ((self.mask, (tokens,), torch.bool),
-                (self.gathered, (tokens, 6144), torch.bfloat16),
-                (self.local, (tokens, 6144 // tables.shard.world_size), torch.bfloat16),
-                (self.partial, (tokens, 25600), torch.bfloat16),
-                (self.projected, (tokens, 25600), torch.bfloat16)):
+        # TP3 fork (tp3.engram_chunk_rows): projection operands narrower than the graph run the projection, its
+        # all-reduce and the mix in row chunks of that height. Each chunk's local/partial/projected values are dead
+        # before the next chunk allocates its own, so Inductor gives every chunk the same pool offsets and the
+        # Engram layer's planned peak holds one chunk of them instead of every row. Default: one pass.
+        chunk = partial.shape[0]
+        if not 0 < chunk <= tokens:
+            raise ValueError("Engram projection scratch must hold between one row and the graph's rows")
+        self.chunked = chunk < tokens
+        self.bounds = tuple((begin, min(begin + chunk, tokens)) for begin in range(0, tokens, chunk))
+        for tensor, shape, dtype in ((mask, (tokens,), torch.bool),
+                (gathered, (tokens, 6144), torch.bfloat16),
+                (local, (chunk, 6144 // tables.shard.world_size), torch.bfloat16),
+                (partial, (chunk, 25600), torch.bfloat16),
+                (projected, (chunk, 25600), torch.bfloat16)):
             if tensor.shape != shape or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous():
                 raise ValueError("Engram scratch must match the contiguous lookup and projection geometry")
-        self.lookup = PreparedEngramLookup(tables.inputs[layer], self.gathered, metadata.live_counts[:1],
+        self.lookup = PreparedEngramLookup(tables.inputs[layer], gathered, metadata.live_counts[:1],
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
             session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
-        self.projection = QuantizedProjection(self.local, weights["projection"], self.partial,
-            session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
-            examples=examples, example_role="engram.projection").functional(session=session)
-        self.reduce = (PreparedChunkedAllReduce(self.partial.view(-1, 5120), self.projected.view(-1, 5120), runtime=runtime,
-            session=session, coordinator=coordinator, name=name + ".reduce").functional(session=session) if self.sharded else None)
+        # One projection and one reduction per distinct chunk height. A shorter tail chunk gets its own pair and its
+        # own declaration role (one backing per role is shared across graph capacities).
+        self.chunk_ops = {}
+        for begin, end in self.bounds:
+            rows = end - begin
+            if rows in self.chunk_ops:
+                continue
+            label = "" if rows == chunk else ".tail"
+            projection = QuantizedProjection(local[:rows], weights["projection"], partial[:rows],
+                session=session, name=name + ".projection" + label, workspace=workspace, activation_mode="auto",
+                examples=examples, example_role="engram.projection" + label).functional(session=session)
+            reduce = (PreparedChunkedAllReduce(partial[:rows].view(-1, 5120), projected[:rows].view(-1, 5120),
+                runtime=runtime, session=session, coordinator=coordinator, name=name + ".reduce" + label
+                ).functional(session=session) if self.sharded else None)
+            self.chunk_ops[rows] = (projection, reduce)
+        self.projection, self.reduce = self.chunk_ops[chunk]
         self.norm_weight = weights["weight"].view(-1)
         self.eps = pool.config.text["rms_norm_eps"]
-        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=tokens, hidden_size=5120),
+        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=chunk, hidden_size=5120),
             invocation={"operation": "engram_mix", "eps": self.eps, "token_mask": True})
-        projected, mask = self.projected, self.mask
         declare(session, (self.mix_plan.request(name=name + ".mix", prepare_call=lambda state: PreparedCall(
-            run=lambda: state.launch(source.view(tokens, -1), projected, self.norm_weight,
-                                      mask, output.view(tokens, -1), eps=self.eps))),))
-        self.mask = self.gathered = self.projected = self.local = self.partial = None
+            run=lambda: state.launch(source.view(tokens, -1)[:chunk], projected, self.norm_weight,
+                                      mask[:chunk], output.view(tokens, -1)[:chunk], eps=self.eps))),))
 
     def __call__(self, source, metadata):
+        tokens = source.shape[0]
         mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
         gathered = self.lookup(source, metadata.live_counts[:1])
-        local = torch.index_select(gathered, 1, self.columns) if self.sharded else gathered
-        projected = self.projection(local)
-        if self.sharded:
-            projected = self.reduce(projected.view(-1, 5120)).view(source.shape[0], 25600)
         output = torch.zeros_like(source)
-        hyperconnection.run_engram_mix(source.view(source.shape[0], -1), projected, self.norm_weight,
-            eps=self.eps, plan=self.mix_plan, out=output.view(source.shape[0], -1), token_mask=mask)
+        state, mixed = source.view(tokens, -1), output.view(tokens, -1)
+        for begin, end in self.bounds:
+            rows = end - begin
+            projection, reduce = self.chunk_ops[rows]
+            local = gathered[begin:end]
+            if self.sharded:
+                local = torch.index_select(local, 1, self.columns)
+            projected = projection(local)
+            if self.sharded:
+                projected = reduce(projected.view(-1, 5120)).view(rows, 25600)
+            hyperconnection.run_engram_mix(state[begin:end], projected, self.norm_weight, eps=self.eps,
+                plan=self.mix_plan, out=mixed[begin:end], token_mask=mask[begin:end])
         return output

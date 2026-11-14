@@ -490,12 +490,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if (weights.config.decoder_start is not None
                 and weights.config.text["candidate_source_layer_id"] >= weights.config.decoder_start):
             candidate_tokens = min(candidate_tokens, 128)
+        # TP3 fork (S5): Engram chunk rows and the shared Engram residual declaration (tp3.engram_chunk_rows,
+        # tp3.share_engram_residual); the defaults declare the base layout.
+        scratch_options = dict(engram_chunk_rows=tp3.engram_chunk_rows, share_engram_residual=tp3.share_engram_residual)
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=candidate_tokens)
+            candidate_tokens=candidate_tokens, **scratch_options)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=config.prefill_chunk_size)
+            candidate_tokens=config.prefill_chunk_size, **scratch_options)
             if config.prompt_logprobs else None)
-        decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
+        decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device,
+            **scratch_options)
         vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))

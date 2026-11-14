@@ -20,11 +20,8 @@ ENV_PREFIX = "FLARE_DS41_"
 
 # Switches whose code is not on the 2026-11-14 upstream port yet: TP3Config still parses and records them (the release
 # environment keeps its meaning), but preparation refuses a non-default value until the named stage lands
-# (``TP3Config.require_ported``), so an export never silently drops a saving or a kernel.
-UNPORTED = {
-    "engram_chunk_rows": "S5 (Engram chunk rows)",
-    "share_engram_residual": "S5 (shared Engram residual; expected to be deleted there, Inductor reuses the storage)",
-}
+# (``TP3Config.require_ported``), so an export never silently drops a saving or a kernel. Empty since S5.
+UNPORTED = {}
 
 # Routed experts per DeepSeek V4.1 MoE layer (hot_experts >= this keeps a parked layer fully resident).
 ROUTED_EXPERTS = 384
@@ -137,10 +134,12 @@ class TP3Config:
     # --- graph scratch (decoder.py Scratch, engram.py; bootstrap.py sizes the pools) ---
     engram_chunk_rows: int = 0
     """Engram projection, its all-reduce and the mix run in row chunks of N inside wider graphs (prefill), so the
-    ``local``/``partial``/``projected`` scratch holds N rows instead of a whole prefill chunk; 0 = one pass (base)."""
+    Engram layer's planned graph pool and its declaration operands hold N rows of ``local``/``partial``/``projected``
+    instead of a whole prefill chunk; 0 = one pass (base)."""
     share_engram_residual: bool = False
-    """``engram_residual`` reuses ``ffn_hc.residual``'s storage (the layer before an Engram layer never defers its
-    mHC post, so the two never hold live values at once); False = separate storage (base)."""
+    """Declare ``engram_residual`` on ``ffn_hc.residual``'s storage (preparation memory only). In the functional
+    forwards the Engram output is a value Inductor already places on dead storage, so serving graphs are the same
+    either way (tp3-main's scratch alias is subsumed); False = separate declaration (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""

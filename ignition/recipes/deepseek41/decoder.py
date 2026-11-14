@@ -115,13 +115,21 @@ class Scratch:
 
     @classmethod
     def allocate(cls, tokens, samples, world, device, *, experts=384, top_k=6,
-                 candidate_tokens=None):
+                 candidate_tokens=None, engram_chunk_rows=0, share_engram_residual=False):
+        """Declaration operands (the traced forwards allocate their own values). TP3 fork switches:
+        ``engram_chunk_rows`` sizes the Engram projection operands to one chunk (PreparedEngram chunks its
+        projection, all-reduce and mix accordingly); ``share_engram_residual`` declares ``engram_residual`` on
+        ``ffn_hc.residual``'s storage. The latter only trims preparation memory: in the functional forwards the
+        Engram output is a value Inductor already places on dead storage (S5 report, 2026-11-14)."""
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
-        residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
+        residual = zeros(tokens, 4, 5120)
         pre_mix, attn_mix = zeros(tokens, 4, dtype=torch.float32), zeros(tokens, 4, dtype=torch.float32)
         attention_hc = MHCScratch.allocate(tokens, 5120, device)
         ffn_hc = MHCScratch.allocate(tokens, 5120, device)
+        # No declared operator takes both (the Engram mix writes engram_residual from residual; the Engram layer's
+        # attention mHC reads it); preparation launches them one at a time, so contents never matter.
+        engram_residual = ffn_hc.residual if share_engram_residual else zeros(tokens, 4, 5120)
         attention = AttentionScratch.allocate(tokens, world, device, candidate_tokens=candidate_tokens)
         attention_output, mlp_output = zeros(tokens, 5120), zeros(tokens, 5120)
         _, vocabulary = TensorParallelShard(0, world).padded_partition(129280, alignment=64)
@@ -129,7 +137,7 @@ class Scratch:
         local_logits = zeros(samples, vocabulary, dtype=cls.logits_dtype)
         logits = zeros(samples, 129280, dtype=cls.logits_dtype)
         embedding = zeros(tokens, 5120)
-        engram = EngramScratch.allocate(tokens, device, world=world)
+        engram = EngramScratch.allocate(tokens, device, world=world, chunk_rows=engram_chunk_rows)
         shared = MLPScratch.allocate(tokens, 5120, 2304 // world, device)
         router_logits = zeros(tokens, experts, dtype=torch.float32)
         router = RouterScratch.allocate(tokens, device, experts=experts, top_k=top_k)
