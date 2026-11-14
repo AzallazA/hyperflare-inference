@@ -628,15 +628,13 @@ def test_export_environment_reaches_the_preparation_config(monkeypatch, world, v
 @pytest.mark.parametrize("overlap", [True, False])
 @pytest.mark.parametrize("tail", [True, False])  # VISION_STAGE=1 (blocks + tail) and VISION_STAGE=blocks
 def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, tail, tmp_path):
-    from functools import partial
-
     from b12x.preparation import PreparationSession
     from transformers.vision_utils import get_vision_position_ids
 
     from ignition.components.weights import DirectWeightLoader
     from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.glm53.vision import PreparedVision, VisionMetadata, VisionScratch
-    from tests.recipes.test_glm53_vision import _input, _module
+    from tests.recipes.test_glm53_vision import VisionForward, _input, _module
     from tests.recipes.test_glm53_vram_options import _PinnedHost
 
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -665,17 +663,19 @@ def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, t
             staging = (VisionStaging(parked, device, stream=arena.auxiliary_stream if overlap else None)
                        if variant == "staged" else None)
             # Workspaces as in the native replay test (none); the arena only supplies the copy stream.
-            prepared = PreparedVision(module, scratch.rows(capacity), metadata, source, session=session,
-                                      staging=staging)
+            rows = scratch.rows(capacity)
+            prepared = PreparedVision(module, rows, metadata, source, session=session, staging=staging)
             prepared.functional(session=session)
             session.freeze()
-            forward = lambda: prepared(pixels.to(torch.bfloat16), metadata)  # noqa: E731
+            # A module-level callable (test_glm53_vision's): the compile worker receives the forward pickled, and a
+            # local lambda becomes a process-local placeholder it cannot trace.
+            forward = VisionForward(prepared, pixels, metadata, rows.output)
             if compiler == "worker":
                 from ignition.preparation.aot import ForwardCache
                 from ignition.preparation.execution import GraphSignature
 
                 cache = ForwardCache(namespace={"vision": "glm53-staged"}, device=device, root=tmp_path / variant)
-                forward = cache.prepare_many({"vision": partial(forward)},
+                forward = cache.prepare_many({"vision": forward},
                                              {"vision": GraphSignature("vision", 1, capacity)})["vision"]
             metadata.position_ids[:count].copy_(get_vision_position_ids(inputs.image_grid_thw, 2))
             metadata.cu_seqlens.copy_(torch.tensor([0, count], dtype=torch.int32))
