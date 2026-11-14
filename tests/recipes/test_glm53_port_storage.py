@@ -13,8 +13,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.recipes.glm53 import bootstrap
-from ignition.recipes.glm53.bootstrap import PreparationConfig
 from ignition.recipes.glm53.mla import MXFP8_BMM_HEADS, decoded_kv_b
 from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.weights import GlmWeightLoader
@@ -40,13 +38,6 @@ def test_mxfp8_kv_b_decodes_exactly_once_per_weight():
     assert decoded_kv_b(packed, heads) is decoded
     other = _packed(heads, generator)
     assert decoded_kv_b(other, heads) is not decoded
-
-
-@pytest.mark.parametrize("name, stage", sorted(bootstrap._UNPORTED.items()))
-def test_unported_switches_raise_before_any_device_work(name, stage):
-    with pytest.raises(ValueError, match=f"not ported .*{stage}"):
-        PreparationConfig(devices=(0, 1, 2), **{name: True})
-    assert getattr(PreparationConfig(devices=(0, 1, 2)), name) is False
 
 
 def _recording_loader(world=3, rank=2):

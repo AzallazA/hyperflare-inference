@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 
 import torch
 from transformers.models.glm5_next.modeling_glm5_next import (
@@ -15,7 +16,15 @@ from transformers.models.glm5_next.modeling_glm5_next import (
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
-from ignition.preparation.persistent import persistent_copy
+from ignition.components.vision_staging import PackedLayout, WeightStaging, pack_tree
+from ignition.preparation.persistent import persistent_copy, persistent_zeros
+from ignition.preparation.tensor_metadata import record_numeric_tensor, unrecorded_numeric_tensors
+
+VISION_BLOCKS = 24
+# Weight staging (fork-only, FLARE_GLM53_VISION_STAGE=1): the 24 blocks (262 MiB) share one geometry and are
+# parked in device-visible host memory and staged through two persistent VRAM slots (22 MiB) per image.
+# The tail (downsample and merger, 109 MiB) and the patch embedding and final norm stay resident: tp3-main
+# aliased the tail's slot onto dead vision scratch, which compiler-owned graph memory no longer exposes.
 
 
 @dataclass(frozen=True)
@@ -72,25 +81,122 @@ class VisionScratch:
 
 
 @dataclass(frozen=True)
+class VisionParking:
+    """Host-parked block weights: one flat region per block, all sharing `block_layout`; `block_tree` gives the
+    geometry the layout binds (keys relative to a block)."""
+    block_layout: PackedLayout
+    block_sources: tuple
+    block_tree: dict
+
+    @property
+    def parked_bytes(self):
+        return sum(flat.nbytes for flat in self.block_sources)
+
+
+def _block_tree(parameters, projections, index):
+    prefix = f"blocks.{index}."
+    return {"parameters": {k.removeprefix(prefix): v for k, v in parameters.items() if k.startswith(prefix)},
+            "projections": {k.removeprefix(prefix): v for k, v in projections.items() if k.startswith(prefix)}}
+
+
+@dataclass(frozen=True)
 class VisionWeights:
     parameters: dict[str, torch.Tensor]
     projections: dict[str, object]
     downsample: torch.Tensor
+    parking: VisionParking | None = None
 
     @classmethod
-    def load(cls, module, loader):
+    def load(cls, module, loader, *, park_blocks=False):
+        """With `park_blocks` the block weights load into temporary device memory: `park` copies them to
+        host memory, and the persistent arena never releases what it holds."""
         parameters, projections = {}, {}
         declarations = loader.quantization
         for path, _ in module.named_parameters():
             prefix = "model.visual." + path.removesuffix(".weight")
+            temporary = park_blocks and path.startswith("blocks.")
             if path.endswith(".weight") and prefix in declarations:
-                projections[path.removesuffix(".weight")] = loader.load_linear(prefix)
+                projections[path.removesuffix(".weight")] = loader.load_linear(prefix, temporary=temporary)
             else:
-                parameters[path] = loader.load_tensor("model.visual." + path)
+                parameters[path] = loader.load_tensor("model.visual." + path, temporary=temporary)
         # Patch rows are ordered [merge_h, merge_w, channel]. Conv2d stores
         # weights as [out, channel, merge_h, merge_w]; transpose once at load.
         downsample = persistent_copy(parameters["downsample.weight"].permute(0, 2, 3, 1).reshape(4096, 4096))
         return cls(parameters, projections, downsample)
+
+    def park(self, allocate):
+        """Move the block weights into ``allocate(name, nbytes)`` flat uint8 regions (device-visible host memory);
+        the returned weights view the parked bytes and keep the resident set (embedding, norm, tail) in place."""
+        trees = tuple(_block_tree(self.parameters, self.projections, i) for i in range(VISION_BLOCKS))
+        layout = PackedLayout(trees[0])
+        if any(PackedLayout(tree).signature != layout.signature for tree in trees):
+            raise ValueError("GLM vision staging requires every block to share one weight layout")
+        blocks = tuple(f"blocks.{i}." for i in range(VISION_BLOCKS))
+        if any(k.startswith("blocks.") and not k.startswith(blocks) for k in (*self.parameters, *self.projections)):
+            raise ValueError("GLM vision weights name a block outside the 24-block tower")
+        parked_parameters, parked_projections, sources, parked_blocks = {}, {}, [], []
+        for index, tree in enumerate(trees):
+            _, flat, parked = pack_tree(tree, lambda n, i=index: allocate(f"model.visual.blocks.{i}", n))
+            sources.append(flat)
+            parked_blocks.append(parked)
+            parked_parameters.update({f"blocks.{index}.{k}": v for k, v in parked["parameters"].items()})
+            parked_projections.update({f"blocks.{index}.{k}": v for k, v in parked["projections"].items()})
+        if (set(parked_parameters) != {k for k in self.parameters if k.startswith("blocks.")}
+                or set(parked_projections) != {k for k in self.projections if k.startswith("blocks.")}):
+            raise ValueError("GLM vision weights must split into blocks and a resident set")
+        # Same keys in the same order, block entries viewing the parked bytes.
+        parameters = {k: parked_parameters.get(k, v) for k, v in self.parameters.items()}
+        projections = {k: parked_projections.get(k, v) for k, v in self.projections.items()}
+        # Geometry trees view the parked bytes, so no reference to the loaded device copies survives.
+        return replace(self, parameters=parameters, projections=projections,
+                       parking=VisionParking(layout, tuple(sources), parked_blocks[0]))
+
+
+class VisionStaging:
+    """Two persistent VRAM slots that every GLM vision graph of one rank stages its block weights through.
+
+    Block ``i`` reads slot ``i % 2`` while block ``i + 1`` lands in the other. The slots and the staging token
+    are persistent (compiler-owned graph memory cannot hold weights that prepared kernels bind), refilled on
+    every replay; graphs replay serially, so all patch capacities share them.
+    """
+
+    def __init__(self, weights, device, *, stream=None, kernel_copy=False):
+        parking = weights.parking
+        if parking is None:
+            raise ValueError("GLM vision staging requires host-parked weights (VisionWeights.park)")
+        self.block_sources = tuple({"block": flat} for flat in parking.block_sources)
+        slots = tuple({"block": persistent_zeros((parking.block_layout.nbytes,), torch.uint8, device)}
+                      for _ in range(2))
+        self.blocks = WeightStaging(self.block_sources[0], storage=slots, stream=stream, kernel_copy=kernel_copy,
+                                    token=persistent_zeros((1,), torch.int32, device))
+        if not all(self.blocks.matches(sources) for sources in self.block_sources):
+            raise ValueError("GLM vision staging requires every block to share one packed size")
+        # The parked bytes are the checkpoint storage the package stores and the slots are filled from.
+        for flat in parking.block_sources:
+            record_numeric_tensor(flat)
+        self.block_trees = tuple(parking.block_layout.bind(parking.block_tree, self.blocks.slot(i)["block"])
+                                 for i in range(2))
+
+    @property
+    def allocated_bytes(self):
+        return self.blocks.nbytes
+
+    def slots(self):
+        """Slot tensors, rewritten on every vision replay (export stores them as zero ranges)."""
+        return tuple(slot["block"] for slot in self.blocks.slots)
+
+    def bound(self, weights):
+        """Parameters and projections with every block's weights read from its slot."""
+        staged_parameters, staged_projections = {}, {}
+        for index in range(VISION_BLOCKS):
+            tree = self.block_trees[index % 2]
+            staged_parameters.update({f"blocks.{index}.{k}": v for k, v in tree["parameters"].items()})
+            staged_projections.update({f"blocks.{index}.{k}": v for k, v in tree["projections"].items()})
+        if (set(staged_parameters) != {k for k in weights.parameters if k.startswith("blocks.")}
+                or set(staged_projections) != {k for k in weights.projections if k.startswith("blocks.")}):
+            raise ValueError("staged GLM vision weights do not cover the parked weights")
+        return ({k: staged_parameters.get(k, v) for k, v in weights.parameters.items()},
+                {k: staged_projections.get(k, v) for k, v in weights.projections.items()})
 
 
 class _Linear(torch.nn.Module):
@@ -137,6 +243,22 @@ class _Attention(torch.nn.Module):
         return self.proj(attended.view(hidden_states.shape[0], 1024))
 
 
+def staged_blocks(blocks, hidden, run, staging):
+    """Run ``hidden = run(block, hidden)`` over the tower, staging block ``i + 1`` while block ``i`` runs.
+
+    Block ``i`` reads slot ``i % 2``. Its join follows the previous block's output (``hidden``); the next block's
+    copies fork only after that join, when the slot's previous reader (block ``i - 1``) has been enqueued."""
+    if staging is not None:
+        staging.blocks.stage(0, staging.block_sources[0])
+    for index, block in enumerate(blocks):
+        if staging is not None:
+            staging.blocks.join(index, hidden)
+            if index + 1 < len(blocks):
+                staging.blocks.stage(index + 1, staging.block_sources[index + 1])
+        hidden = run(block, hidden)
+    return hidden
+
+
 class PreparedVision:
     """Encode packed patches with a fixed capacity and device-resident lengths.
 
@@ -147,7 +269,7 @@ class PreparedVision:
     """
 
     def __init__(self, module, scratch, metadata, weights, *, session, name="vision",
-                 projection_workspace=None, attention_workspace=None):
+                 projection_workspace=None, attention_workspace=None, staging=None):
         config = module.config
         expected = dict(hidden_size=1024, num_heads=16, intermediate_size=4096, depth=24,
                         out_hidden_size=4096, projection_intermediate_size=10240,
@@ -159,29 +281,34 @@ class PreparedVision:
             raise ValueError("GLM vision metadata and scratch capacities differ")
         if metadata.num_patches.item() or bool(metadata.cu_seqlens.any().item()):
             raise ValueError("GLM vision preparation requires inactive metadata")
-        self.module, self.scratch, self.metadata = module, scratch, metadata
-        for path, tensor in weights.parameters.items():
+        self.module, self.scratch, self.metadata, self.staging = module, scratch, metadata, staging
+        parameters, projections = ((weights.parameters, weights.projections) if staging is None
+                                   else staging.bound(weights))
+        for path, tensor in parameters.items():
             parent, _, attribute = path.rpartition(".")
             setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(tensor, requires_grad=False))
         self.patch_embed = _Linear(UnquantizedProjection(scratch.patches,
             module.patch_embed.proj.weight.flatten(1), scratch.hidden,
             session=session, name=f"{name}.patch_embed"), module.patch_embed.proj.bias)
         module.rotary_pos_emb = Glm5NextVisionRotaryEmbedding(config).to(device)
-        for index, block in enumerate(module.blocks):
-            prefix = f"blocks.{index}"
-            block.attn = _Attention(block.attn, scratch, metadata,
-                {key: weights.projections[f"{prefix}.attn.{key}"] for key in ("qkv", "proj")},
-                session=session, name=f"{name}.{prefix}.attn",
-                shared=module.blocks[0].attn if index else None,
-                projection_workspace=projection_workspace, attention_workspace=attention_workspace)
-            for key, source, output in (("gate_proj", scratch.hidden, scratch.gate),
-                                       ("up_proj", scratch.hidden, scratch.up),
-                                       ("down_proj", scratch.gate, scratch.projected)):
-                original = getattr(block.mlp, key)
-                setattr(block.mlp, key, _Linear(QuantizedProjection(source,
-                    weights.projections[f"{prefix}.mlp.{key}"], output,
-                    session=session, name=f"{name}.{prefix}.mlp.{key}",
-                    activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
+        # Staged block kernels read slot tensors, rewritten on every replay rather than checkpoint storage, so they
+        # are not recorded as numeric storage (VisionStaging recorded the parked sources).
+        with unrecorded_numeric_tensors() if staging is not None else nullcontext():
+            for index, block in enumerate(module.blocks):
+                prefix = f"blocks.{index}"
+                block.attn = _Attention(block.attn, scratch, metadata,
+                    {key: projections[f"{prefix}.attn.{key}"] for key in ("qkv", "proj")},
+                    session=session, name=f"{name}.{prefix}.attn",
+                    shared=module.blocks[0].attn if index else None,
+                    projection_workspace=projection_workspace, attention_workspace=attention_workspace)
+                for key, source, output in (("gate_proj", scratch.hidden, scratch.gate),
+                                           ("up_proj", scratch.hidden, scratch.up),
+                                           ("down_proj", scratch.gate, scratch.projected)):
+                    original = getattr(block.mlp, key)
+                    setattr(block.mlp, key, _Linear(QuantizedProjection(source,
+                        projections[f"{prefix}.mlp.{key}"], output,
+                        session=session, name=f"{name}.{prefix}.mlp.{key}",
+                        activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
         self.downsample = _Linear(UnquantizedProjection(scratch.hidden.view(-1, 4096),
             weights.downsample, scratch.merged, session=session, name=f"{name}.downsample"), module.downsample.bias)
         for key, source, output in (("proj", scratch.merged, scratch.output),
@@ -190,7 +317,7 @@ class PreparedVision:
                                    ("down_proj", scratch.merger_gate, scratch.output)):
             original = getattr(module.merger, key)
             setattr(module.merger, key, _Linear(QuantizedProjection(source,
-                weights.projections[f"merger.{key}"], output,
+                projections[f"merger.{key}"], output,
                 session=session, name=f"{name}.merger.{key}",
                 activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
         self.capacity = capacity
@@ -211,8 +338,8 @@ class PreparedVision:
         module = self.module
         hidden = self.patch_embed(pixels)
         rope = module.rotary_pos_emb(hidden, metadata.position_ids)
-        for block in module.blocks:
-            hidden = block(hidden, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope)
+        hidden = staged_blocks(module.blocks, hidden, lambda block, value: block(
+            value, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope), self.staging)
         hidden = module.post_layernorm(hidden)
         hidden = self.downsample(hidden.view(-1, 4096))
         output = module.merger(hidden)

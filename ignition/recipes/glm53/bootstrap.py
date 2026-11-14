@@ -32,6 +32,7 @@ from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.deferred import deferred_mode
+from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
@@ -67,8 +68,6 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 
 _COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "vision", "init", "restore", "snapshot")
-# Fork-only switches whose tp3-main form wrote into the removed scratch pool; each raises until its port stage lands.
-_UNPORTED = {"vision_stage": "S10"}
 # Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
 _DMA_PREFILL_TOKENS = 1024
 # Allocator granularity and fragmentation slack beyond the headroom kept after the final KV allocation.
@@ -184,9 +183,6 @@ class PreparationConfig:
             if (three.heads, three.padded_heads) != (24, 72):
                 raise ValueError("GLM decode context parallelism over three ranks requires 24 heads per rank "
                                  f"(72 exchanged), not {three.heads} ({three.padded_heads})")
-        for name, stage in _UNPORTED.items():
-            if getattr(self, name):
-                raise ValueError(f"GLM {name} is not ported to compiler-owned storage yet (port stage {stage})")
         for name in ("context", "prefill_chunk_size", "max_active", "snapshot_budget_bytes", "headroom_bytes",
                      "compile_headroom_bytes"):
             if type(getattr(self, name)) is not int:
@@ -357,10 +353,16 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                 expert_columns=config.expert_columns, draft_head=config.draft_head,
                                 draft_eh_proj=config.draft_eh_proj,
                                 host_allocator=core_storage.host_allocate
-                                if config.embed_host and core_storage is not None else None)
+                                if config.embed_host and core_storage is not None else None,
+                                vision_host_allocator=core_storage.host_allocate
+                                if config.vision_stage and core_storage is not None else None)
     if config.embed_host:
         report("token embedding in device-visible host memory (FLARE_GLM53_EMBED_HOST=1)" if core_storage is not None
                else "FLARE_GLM53_EMBED_HOST ignored: in-process preparation has no host mappings; embedding resident")
+    if config.vision_stage and not config.language_model_only:
+        report("vision blocks parked in device-visible host memory and staged per image (FLARE_GLM53_VISION_STAGE=1)"
+               if weights.vision is not None and weights.vision.parking is not None
+               else "FLARE_GLM53_VISION_STAGE ignored: in-process preparation has no host mappings; vision resident")
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -469,7 +471,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity, sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
-        vision_state = vision_inputs = vision_prefill = vision_storage = None
+        vision_state = vision_inputs = vision_prefill = vision_storage = vision_staging = None
         vision_owners = []
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device)
@@ -540,6 +542,15 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         if vision_state is not None:
             from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel
 
+            if weights.vision.parking is not None:
+                from .vision import VisionStaging
+
+                # One pair of persistent slots for every capacity: vision graphs replay serially.
+                vision_staging = VisionStaging(weights.vision, device,
+                    stream=arena.auxiliary_stream if config.stream_overlap else None)
+                vision_owners.append(vision_staging)
+                memory(f"vision staging slots {vision_staging.allocated_bytes >> 20} MiB "
+                       f"(parked {weights.vision.parking.parked_bytes >> 20} MiB)")
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
                 storage = vision_storage.rows(capacity)
@@ -548,7 +559,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     module = Glm5NextVisionModel(weights.tree.config.vision_config)
                 module.eval().requires_grad_(False)
                 encoder = PreparedVision(module, storage, vision_metadata, weights.vision,
-                    session=session, name=name, projection_workspace=arena, attention_workspace=arena)
+                    session=session, name=name, projection_workspace=arena, attention_workspace=arena,
+                    staging=vision_staging)
                 encoder.functional(session=session)
                 forward = PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion, frame, sequence)
                 add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
@@ -774,7 +786,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     }), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, resources=resources, session=session,
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},
-        export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges()),
+        export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges(),
+                            # Block staging slots are refilled on every vision replay.
+                            *(() if vision_staging is None else storage_ranges(vision_staging.slots()))),
         close_resources=(*((scoring,) if scoring is not None else ()),
                          *(() if context is None else (context.heads, context.candidates)), *shared_pages,
                          *(() if virtual_pages is None else (virtual_pages,)),
