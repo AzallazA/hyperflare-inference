@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.ring_commit import PreparedRingCommit
@@ -167,7 +167,9 @@ class PreparedLayer:
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
             window_metadata=window_metadata, examples=examples)
-        self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
+        # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
+        # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
+        self.attention_reduce = PreparedChunkedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
             _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
@@ -191,7 +193,7 @@ class PreparedLayer:
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
+        self.mlp_reduce = PreparedChunkedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")

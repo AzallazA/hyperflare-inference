@@ -87,6 +87,15 @@ def _can_race_contextual_plans(config, signatures, device):
     return True
 
 
+def _sampling_defaults(config):
+    """Vocabulary-parallel sampling has no top-p filter: declare top_p fixed at 1 so requests clamp instead of failing."""
+    defaults = RECIPE.sampling_defaults.as_dict()
+    if config.vocabulary_parallel_sampling:
+        defaults["top_p"] = 1.
+        defaults.setdefault("ranges", {})["top_p"] = {"min": 1., "max": 1.}
+    return defaults
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
@@ -268,6 +277,11 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         buffers["speculative_prefix_limits"] = prefix_limits
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
         packed_inputs += ("speculative_prefix_limits",)
+        # Copied history proposals for `flare run --history-drafts`: consumed only by the TP3 vocabulary-parallel
+        # draft path, so only that path advertises the inputs (upstream rejects --history-drafts without them).
+        if config.vocabulary_parallel_sampling:
+            buffers.update(speculation.copy_buffers())
+            packed_inputs += speculation.COPY_INPUTS
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
@@ -324,9 +338,22 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
-    prefill = create_dma_all_reduce_runtime(group, device,
-        max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
+    # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world size to
+    # divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between decode and
+    # prefill: graph capture enters only the main collective's capture() context, so a second runtime's reductions
+    # would be captured outside the protocol b12x requires (and could desynchronize).
+    if 5120 % len(config.devices):
+        # tp3.ar_rows = N sizes the shared runtime for N rows instead of a whole prefill chunk; the decoder's chunked
+        # reductions split prefill rows to fit (786 MiB/GPU at 4096 rows vs 190 MiB at 1024).
+        ar_rows = config.tp3.ar_rows or config.prefill_chunk_size
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=max(config.all_reduce_tokens, min(config.prefill_chunk_size, ar_rows)), hidden_size=5120, ipc=ipc)
+        prefill = collective
+    else:
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+        prefill = create_dma_all_reduce_runtime(group, device,
+            max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
@@ -624,7 +651,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(metadata_path, eos_token_ids=[1], prompt_encoder=PromptEncoder.DEEPSEEK_V41,
             image_profile="deepseek_row_major" if vision_state is not None else None),
-        "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
+        "sampling_defaults": _sampling_defaults(config), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}
