@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
@@ -16,15 +17,20 @@ from transformers.models.glm5_next.modeling_glm5_next import (
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
-from ignition.components.vision_staging import PackedLayout, WeightStaging, pack_tree
+from ignition.components.vision_staging import PackedLayout, WeightStaging, pack_tree, stage_copies
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor, unrecorded_numeric_tensors
+from ignition.preparation.tuning import register_finalizer
 
 VISION_BLOCKS = 24
-# Weight staging (fork-only, FLARE_GLM53_VISION_STAGE=1): the 24 blocks (262 MiB) share one geometry and are
-# parked in device-visible host memory and staged through two persistent VRAM slots (22 MiB) per image.
-# The tail (downsample and merger, 109 MiB) and the patch embedding and final norm stay resident: tp3-main
-# aliased the tail's slot onto dead vision scratch, which compiler-owned graph memory no longer exposes.
+# Weight staging (fork-only, FLARE_GLM53_VISION_STAGE=1|blocks): the 24 blocks (262 MiB) share one geometry and
+# are parked in device-visible host memory and staged through two persistent VRAM slots (22 MiB) per image.
+# With the tail (VISION_STAGE=1, the default mode) the downsample and merger projection weights (109 MiB) are
+# parked too and copied once per image, after the last block, into forward-local tensors the compiler places in
+# the vision graph's pool (tp3-main aliased a tail slot onto dead vision scratch by hand). The patch embedding,
+# the final norm and the small tail parameters (biases, merger norm) stay resident.
+MERGER_PROJECTIONS = ("proj", "gate_proj", "up_proj", "down_proj")
+TAIL_PROJECTIONS = tuple(f"merger.{key}" for key in MERGER_PROJECTIONS)
 
 
 @dataclass(frozen=True)
@@ -83,14 +89,19 @@ class VisionScratch:
 @dataclass(frozen=True)
 class VisionParking:
     """Host-parked block weights: one flat region per block, all sharing `block_layout`; `block_tree` gives the
-    geometry the layout binds (keys relative to a block)."""
+    geometry the layout binds (keys relative to a block). With the tail parked, `tail_source` holds the downsample
+    weight and merger projections, bound by `tail_layout` to `tail_tree`'s geometry."""
     block_layout: PackedLayout
     block_sources: tuple
     block_tree: dict
+    tail_layout: PackedLayout | None = None
+    tail_source: torch.Tensor | None = None
+    tail_tree: dict | None = None
 
     @property
     def parked_bytes(self):
-        return sum(flat.nbytes for flat in self.block_sources)
+        return sum(flat.nbytes for flat in self.block_sources) + (
+            0 if self.tail_source is None else self.tail_source.nbytes)
 
 
 def _block_tree(parameters, projections, index):
@@ -107,15 +118,16 @@ class VisionWeights:
     parking: VisionParking | None = None
 
     @classmethod
-    def load(cls, module, loader, *, park_blocks=False):
-        """With `park_blocks` the block weights load into temporary device memory: `park` copies them to
-        host memory, and the persistent arena never releases what it holds."""
+    def load(cls, module, loader, *, park_blocks=False, park_tail=False):
+        """With `park_blocks` (`park_tail`) the block (tail projection) weights load into temporary device memory:
+        `park` copies them to host memory, and the persistent arena never releases what it holds."""
         parameters, projections = {}, {}
         declarations = loader.quantization
         for path, _ in module.named_parameters():
             prefix = "model.visual." + path.removesuffix(".weight")
             # The convolution-layout downsample weight is read once, below, so it never needs persistent storage.
-            temporary = park_blocks and path.startswith("blocks.") or path == "downsample.weight"
+            temporary = (park_blocks and path.startswith("blocks.") or path == "downsample.weight"
+                         or park_tail and path.removesuffix(".weight") in TAIL_PROJECTIONS)
             if path.endswith(".weight") and prefix in declarations:
                 projections[path.removesuffix(".weight")] = loader.load_linear(prefix, temporary=temporary)
             else:
@@ -123,12 +135,14 @@ class VisionWeights:
         # Patch rows are ordered [merge_h, merge_w, channel]. Conv2d stores
         # weights as [out, channel, merge_h, merge_w]; transpose once at load and drop the convolution layout
         # (only the transposed copy is read; tp3-main's parking dropped it too).
-        downsample = persistent_copy(parameters.pop("downsample.weight").permute(0, 2, 3, 1).reshape(4096, 4096))
+        transposed = parameters.pop("downsample.weight").permute(0, 2, 3, 1).reshape(4096, 4096)
+        downsample = transposed.contiguous() if park_tail else persistent_copy(transposed)
         return cls(parameters, projections, downsample)
 
-    def park(self, allocate):
+    def park(self, allocate, *, tail=False):
         """Move the block weights into ``allocate(name, nbytes)`` flat uint8 regions (device-visible host memory);
-        the returned weights view the parked bytes and keep the resident set (embedding, norm, tail) in place."""
+        with `tail` also the downsample weight and merger projections (one region). The returned weights view the
+        parked bytes and keep the resident set (embedding, norms, biases) in place."""
         trees = tuple(_block_tree(self.parameters, self.projections, i) for i in range(VISION_BLOCKS))
         layout = PackedLayout(trees[0])
         if any(PackedLayout(tree).signature != layout.signature for tree in trees):
@@ -146,20 +160,30 @@ class VisionWeights:
         if (set(parked_parameters) != {k for k in self.parameters if k.startswith("blocks.")}
                 or set(parked_projections) != {k for k in self.projections if k.startswith("blocks.")}):
             raise ValueError("GLM vision weights must split into blocks and a resident set")
-        # Same keys in the same order, block entries viewing the parked bytes.
+        downsample, tail_parking = self.downsample, {}
+        if tail:
+            tree = {"projections": {key: self.projections[key] for key in TAIL_PROJECTIONS},
+                    "downsample": self.downsample}
+            tail_layout, tail_source, tail_tree = pack_tree(tree, lambda n: allocate("model.visual.tail", n))
+            parked_projections.update(tail_tree["projections"])
+            downsample = tail_tree["downsample"]
+            tail_parking = dict(tail_layout=tail_layout, tail_source=tail_source, tail_tree=tail_tree)
+        # Same keys in the same order, parked entries viewing the parked bytes.
         parameters = {k: parked_parameters.get(k, v) for k, v in self.parameters.items()}
         projections = {k: parked_projections.get(k, v) for k, v in self.projections.items()}
         # Geometry trees view the parked bytes, so no reference to the loaded device copies survives.
-        return replace(self, parameters=parameters, projections=projections,
-                       parking=VisionParking(layout, tuple(sources), parked_blocks[0]))
+        return replace(self, parameters=parameters, projections=projections, downsample=downsample,
+                       parking=VisionParking(layout, tuple(sources), parked_blocks[0], **tail_parking))
 
 
 class VisionStaging:
-    """Two persistent VRAM slots that every GLM vision graph of one rank stages its block weights through.
+    """Two persistent VRAM slots that every GLM vision graph of one rank stages its block weights through, and
+    (parked tail) the forward-local tail copy.
 
     Block ``i`` reads slot ``i % 2`` while block ``i + 1`` lands in the other. The slots and the staging token
-    are persistent (compiler-owned graph memory cannot hold weights that prepared kernels bind), refilled on
-    every replay; graphs replay serially, so all patch capacities share them.
+    are persistent, refilled on every replay; graphs replay serially, so all patch capacities share them.
+    The tail kernels are declared and tuned on one VRAM declaration example of the packed tail (shared by every
+    capacity, released after tuning) and rebound per forward to `stage_tail`'s copy.
     """
 
     def __init__(self, weights, device, *, stream=None, kernel_copy=False):
@@ -178,17 +202,48 @@ class VisionStaging:
             record_numeric_tensor(flat)
         self.block_trees = tuple(parking.block_layout.bind(parking.block_tree, self.blocks.slot(i)["block"])
                                  for i in range(2))
+        self.kernel_copy, self.device = bool(kernel_copy), device
+        self.tail_layout, self.tail_source, self.tail_tree = parking.tail_layout, parking.tail_source, parking.tail_tree
+        self.tail_example = None
+        if self.tail_source is not None:
+            # The parked bytes remain the checkpoint storage the package stores and the graph copies from.
+            record_numeric_tensor(self.tail_source)
+
+    @property
+    def staged_tail(self):
+        return self.tail_source is not None
 
     @property
     def allocated_bytes(self):
+        """Persistent VRAM the staging holds: the two block slots (the tail copy is forward-local)."""
         return self.blocks.nbytes
+
+    @property
+    def tail_bytes(self):
+        return 0 if self.tail_source is None else self.tail_source.nbytes
+
+    def stage_tail(self, token):
+        """The tail weights copied into a forward-local tensor after ``token`` (the last block's output) exists."""
+        copied = stage_copies(token, {"tail": self.tail_source}, kernel_copy=self.kernel_copy)["tail"]
+        return self.tail_layout.bind(self.tail_tree, copied)
+
+    def tail_example_tree(self):
+        """The tail geometry bound to one VRAM declaration example, shared by every vision graph prepared before
+        tuning (`release_tail_example` drops it; a later graph declares on a fresh one)."""
+        if self.tail_example is None:
+            self.tail_example = torch.zeros((self.tail_layout.nbytes,), dtype=torch.uint8, device=self.device)
+        return self.tail_layout.bind(self.tail_tree, self.tail_example)
+
+    def release_tail_example(self):
+        self.tail_example = None
 
     def slots(self):
         """Slot tensors, rewritten on every vision replay (export stores them as zero ranges)."""
         return tuple(slot["block"] for slot in self.blocks.slots)
 
     def bound(self, weights):
-        """Parameters and projections with every block's weights read from its slot."""
+        """Parameters, projections and downsample weight with every block's weights read from its slot and the
+        tail's from the declaration example."""
         staged_parameters, staged_projections = {}, {}
         for index in range(VISION_BLOCKS):
             tree = self.block_trees[index % 2]
@@ -197,8 +252,44 @@ class VisionStaging:
         if (set(staged_parameters) != {k for k in weights.parameters if k.startswith("blocks.")}
                 or set(staged_projections) != {k for k in weights.projections if k.startswith("blocks.")}):
             raise ValueError("staged GLM vision weights do not cover the parked weights")
+        downsample = weights.downsample
+        if self.staged_tail:
+            example = self.tail_example_tree()
+            staged_projections.update(example["projections"])
+            downsample = example["downsample"]
         return ({k: staged_parameters.get(k, v) for k, v in weights.parameters.items()},
-                {k: staged_projections.get(k, v) for k, v in weights.projections.items()})
+                {k: staged_projections.get(k, v) for k, v in weights.projections.items()}, downsample)
+
+
+def rebound(projection, weight):
+    """A prepared projection reading ``weight`` (same geometry as declared) in this forward.
+
+    UnquantizedProjection and the plain QuantizedProjection path read ``weight`` at call time; the parts the
+    SM103 and MXFP8-encoded paths cache are re-derived from it the way QuantizedProjection.__init__ does."""
+    result = copy.copy(projection)
+    result.weight = weight
+    if isinstance(projection, QuantizedProjection):
+        result.activation_scale = getattr(weight, "activation_global_scale", None)
+        if projection.encoded is not None or projection.encoded_layout is not None:
+            from b12x.quantization import mxfp8
+
+            packed = weight.weight
+            result.parts = packed.values, mxfp8.dense_scale_storage(packed.scale_mma), None
+        else:
+            from b12x.gemm.blockscaled._a16 import _weight_parts
+
+            values, scales, gain, _ = _weight_parts(weight)
+            if projection.sm103 and scales.dtype == torch.float8_e8m0fnu:
+                scales = scales.view(torch.uint8)
+            result.parts = values, scales, gain
+    return result
+
+
+def _with_children(module, children):
+    """A shallow copy of ``module`` whose submodules ``children`` replace the named ones (the original keeps its)."""
+    clone = copy.copy(module)
+    clone._modules = {**module._modules, **children}
+    return clone
 
 
 class _Linear(torch.nn.Module):
@@ -284,8 +375,9 @@ class PreparedVision:
         if metadata.num_patches.item() or bool(metadata.cu_seqlens.any().item()):
             raise ValueError("GLM vision preparation requires inactive metadata")
         self.module, self.scratch, self.metadata, self.staging = module, scratch, metadata, staging
-        parameters, projections = ((weights.parameters, weights.projections) if staging is None
-                                   else staging.bound(weights))
+        parameters, projections, downsample = ((weights.parameters, weights.projections, weights.downsample)
+                                               if staging is None else staging.bound(weights))
+        self.staged_tail = staging is not None and staging.staged_tail
         for path, tensor in parameters.items():
             parent, _, attribute = path.rpartition(".")
             setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(tensor, requires_grad=False))
@@ -311,18 +403,42 @@ class PreparedVision:
                         projections[f"{prefix}.mlp.{key}"], output,
                         session=session, name=f"{name}.{prefix}.mlp.{key}",
                         activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
-        self.downsample = _Linear(UnquantizedProjection(scratch.hidden.view(-1, 4096),
-            weights.downsample, scratch.merged, session=session, name=f"{name}.downsample"), module.downsample.bias)
-        for key, source, output in (("proj", scratch.merged, scratch.output),
-                                   ("gate_proj", scratch.output, scratch.merger_gate),
-                                   ("up_proj", scratch.output, scratch.merger_up),
-                                   ("down_proj", scratch.merger_gate, scratch.output)):
-            original = getattr(module.merger, key)
-            setattr(module.merger, key, _Linear(QuantizedProjection(source,
-                projections[f"merger.{key}"], output,
-                session=session, name=f"{name}.merger.{key}",
-                activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
+        # Staged tail kernels are declared on the tail's declaration example and rebound to the forward's copy.
+        with unrecorded_numeric_tensors() if self.staged_tail else nullcontext():
+            self.downsample = _Linear(UnquantizedProjection(scratch.hidden.view(-1, 4096),
+                downsample, scratch.merged, session=session, name=f"{name}.downsample"), module.downsample.bias)
+            for key, source, output in (("proj", scratch.merged, scratch.output),
+                                       ("gate_proj", scratch.output, scratch.merger_gate),
+                                       ("up_proj", scratch.output, scratch.merger_up),
+                                       ("down_proj", scratch.merger_gate, scratch.output)):
+                original = getattr(module.merger, key)
+                setattr(module.merger, key, _Linear(QuantizedProjection(source,
+                    projections[f"merger.{key}"], output,
+                    session=session, name=f"{name}.merger.{key}",
+                    activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
+        if self.staged_tail:
+            register_finalizer(session, self._release_tail_examples)
         self.capacity = capacity
+
+    def _release_tail_examples(self):
+        """After tuning: drop every reference to the tail's declaration example (each forward rebinds the tail)."""
+        tail = (self.downsample, *(getattr(self.module.merger, key) for key in MERGER_PROJECTIONS))
+        for linear in tail:
+            linear.projection.weight = None
+            if hasattr(linear.projection, "parts"):
+                linear.projection.parts = None
+        self.staging.release_tail_example()
+
+    def tail(self, normed):
+        """Downsample and merge the final-normed patch rows; a staged tail first copies its weights (after
+        ``normed`` exists) and runs the prepared kernels on that copy."""
+        downsample, merger = self.downsample, self.module.merger
+        if self.staged_tail:
+            weights = self.staging.stage_tail(normed)
+            downsample = _Linear(rebound(downsample.projection, weights["downsample"]), downsample.bias)
+            merger = _with_children(merger, {key: _Linear(rebound(getattr(merger, key).projection,
+                weights["projections"][f"merger.{key}"]), getattr(merger, key).bias) for key in MERGER_PROJECTIONS})
+        return merger(downsample(normed.view(-1, 4096)))
 
     def functional(self, *, session):
         self.patch_embed.projection.functional(session=session)
@@ -342,8 +458,6 @@ class PreparedVision:
         rope = module.rotary_pos_emb(hidden, metadata.position_ids)
         hidden = staged_blocks(module.blocks, hidden, lambda block, value: block(
             value, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope), self.staging)
-        hidden = module.post_layernorm(hidden)
-        hidden = self.downsample(hidden.view(-1, 4096))
-        output = module.merger(hidden)
+        output = self.tail(module.post_layernorm(hidden))
         output.masked_fill_((torch.arange(self.capacity // 4, device=pixels.device) >= metadata.num_patches // 4)[:, None], 0)
         return output

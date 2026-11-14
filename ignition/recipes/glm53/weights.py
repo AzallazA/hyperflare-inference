@@ -73,11 +73,13 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
              expand_expert_scales=False, language_model_only=False, expert_columns=None,
-             draft_head="target", draft_eh_proj="bf16", host_allocator=None, vision_host_allocator=None):
+             draft_head="target", draft_eh_proj="bf16", host_allocator=None, vision_host_allocator=None,
+             vision_stage_tail=True):
         """`host_allocator` (fork-only FLARE_GLM53_EMBED_HOST, package exports) moves the replicated token
         embedding into device-visible host memory after loading (`park_embedding`). `vision_host_allocator`
-        (fork-only FLARE_GLM53_VISION_STAGE) parks the vision tower's block weights the same way
-        (`VisionWeights.park`); bootstrap then stages them through VRAM slots per image."""
+        (fork-only FLARE_GLM53_VISION_STAGE) parks the vision tower's block weights, and with `vision_stage_tail`
+        its downsample and merger weights, the same way (`VisionWeights.park`); bootstrap then stages them into
+        VRAM per image."""
         import torch
 
         from .model import create_model_tree
@@ -140,12 +142,14 @@ class ModelWeights:
             with DirectWeightLoader(manifest, device, prefixes=("model.visual.",),
                                     progress=progress if shard.rank == 0 else None,
                                     progress_label="Load vision weights") as loader:
-                vision = VisionWeights.load(tree.model.visual, loader, park_blocks=vision_host_allocator is not None)
+                vision = VisionWeights.load(tree.model.visual, loader, park_blocks=vision_host_allocator is not None,
+                                            park_tail=vision_host_allocator is not None and vision_stage_tail)
             if vision_host_allocator is not None:
                 # The loader's direct transfers have finished once it closes; the temporary device copies are
                 # released once the parked weights replace them.
                 torch.cuda.synchronize(device)
-                vision = vision.park(lambda name, nbytes: vision_host_allocator(name, (nbytes,), torch.uint8).device_view)
+                vision = vision.park(lambda name, nbytes: vision_host_allocator(name, (nbytes,), torch.uint8).device_view,
+                                     tail=vision_stage_tail)
                 torch.cuda.synchronize(device)
         torch.cuda.synchronize(device)
         return cls(tree, shard, tuple(layers), scales, allocated_tensor_bytes(device) - before, head, draft, vision)

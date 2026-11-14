@@ -1,14 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fork-only GLM vision weight staging (FLARE_GLM53_VISION_STAGE=1), DeepSeek's TP3 `vision_stage` for GLM.
+"""Fork-only GLM vision weight staging (FLARE_GLM53_VISION_STAGE=1|blocks), DeepSeek's TP3 `vision_stage` for GLM.
 
-Port 2026-11-14 (compiler-owned storage): only the 24 blocks are parked and staged, through two persistent slots;
-the tail (downsample and merger) stays resident, because graph-local memory can no longer back a weight slot.
+Port 2026-11-14 (compiler-owned storage): the 24 blocks are parked and staged through two persistent slots; in the
+default mode (VISION_STAGE=1) the tail (downsample and merger projections) is parked too and copied per image into
+forward-local tensors (`stage_copies`, DeepSeek's S7 scheme) that the compiler places in the vision graph's pool;
+VISION_STAGE=blocks keeps the tail resident.
 
 CPU checks cover the packed byte layout (bytes, geometry and aliasing survive packing and binding), the split of
-the tower into parked blocks and resident weights at the checkpoint's real geometry, slot binding (block ``i``
-reads slot ``i % 2``), the staging schedule, and the export switch's plumbing. They run without a GPU:
+the tower into parked blocks, a parked tail and resident weights at the checkpoint's real geometry, slot binding
+(block ``i`` reads slot ``i % 2``), the staging schedule, the staged tail (bit-equal to the resident tail with stub
+kernels, negative controls, the copy ordered after the final norm and before every tail GEMM, each GEMM reading
+its own part of the copy, the MXFP8/NVFP4/SM103 parts rebinding), and the export switch's plumbing. They run
+without a GPU:
 
     CUDA_VISIBLE_DEVICES= .venv/bin/python -m pytest -q tests/recipes/test_glm53_vision_staging.py
 
@@ -31,6 +36,7 @@ import torch
 from ignition.components.vision_staging import PackedLayout, map_tensors, pack_tree, tensor_leaves
 from ignition.recipes.glm53 import recipe as glm_recipe
 from ignition.recipes.glm53.bootstrap import PreparationConfig
+from ignition.recipes.glm53 import vision as glm_vision
 from ignition.recipes.glm53.vision import VISION_BLOCKS, VisionStaging, VisionWeights, staged_blocks
 
 _CUDA = os.environ.get("FLARE_RUN_CUDA_TESTS") == "1"
@@ -177,19 +183,22 @@ class _RecordingLoader:
         return torch.zeros(self.shapes[name], dtype=torch.bfloat16)
 
 
-@pytest.mark.parametrize("park_blocks", [False, True])
-def test_load_keeps_only_the_transposed_downsample_weight(park_blocks):
+@pytest.mark.parametrize("park_blocks, park_tail", [(False, False), (True, False), (True, True)])
+def test_load_keeps_only_the_transposed_downsample_weight(park_blocks, park_tail):
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel
 
     with torch.device("meta"):
         module = Glm5NextVisionModel(Glm5NextVisionConfig(**VISION_CONFIG))
     loader = _RecordingLoader(module)
-    weights = VisionWeights.load(module, loader, park_blocks=park_blocks)
+    weights = VisionWeights.load(module, loader, park_blocks=park_blocks, park_tail=park_tail)
     # The convolution-layout weight (32 MiB) loads into temporary memory and is dropped after the transpose.
     assert loader.temporary.pop("model.visual.downsample.weight") is True
     assert "downsample.weight" not in weights.parameters and weights.downsample.shape == (4096, 4096)
-    assert all(flag is (park_blocks and name.startswith("model.visual.blocks.")) for name, flag in loader.temporary.items())
+    assert weights.downsample.is_contiguous()
+    tail = {f"model.visual.{key}.weight" for key in glm_vision.TAIL_PROJECTIONS}
+    assert all(flag is (park_blocks and name.startswith("model.visual.blocks.") or park_tail and name in tail)
+               for name, flag in loader.temporary.items())
 
 
 class _Host:
@@ -247,8 +256,10 @@ def test_staging_binds_blocks_to_two_alternating_persistent_slots(checkpoint):
     staging = VisionStaging(parked, "cpu")
     assert staging.allocated_bytes == 2 * parked.parking.block_sources[0].nbytes
     assert len(staging.slots()) == 2 and all(slot.dtype == torch.uint8 for slot in staging.slots())
-    parameters, projections = staging.bound(parked)
+    assert not staging.staged_tail and staging.tail_bytes == 0
+    parameters, projections, downsample = staging.bound(parked)
     assert set(parameters) == set(parked.parameters) and set(projections) == set(parked.projections)
+    assert downsample is parked.downsample
 
     def within(tensor, flat):
         return flat.data_ptr() <= tensor.data_ptr() < flat.data_ptr() + flat.nbytes
@@ -307,21 +318,289 @@ def test_block_schedule_overlaps_the_next_copy_with_the_current_block():
     assert staged_blocks([1, 2, 3], 0, lambda block, hidden: hidden + block, None) == 6
 
 
+# Staged tail ---------------------------------------------------------------------------------------------------
+
+def _tail_weights():
+    """Checkpoint-geometry weights with random tail bytes (NVFP4 merger values/scales, BF16 downsample)."""
+    weights = _checkpoint_weights()
+    generator = torch.Generator().manual_seed(1114)
+    for key in glm_vision.TAIL_PROJECTIONS:
+        for leaf in tensor_leaves(weights.projections[key]):
+            if leaf.dtype == torch.uint8:
+                leaf.copy_(torch.randint(0, 256, leaf.shape, dtype=torch.uint8, generator=generator))
+    return weights
+
+
+@pytest.fixture(scope="module")
+def tail_checkpoint():
+    weights = _tail_weights()
+    host = _Host()
+    return weights, weights.park(host, tail=True), host
+
+
+def test_parking_with_the_tail_moves_downsample_and_merger_projections(tail_checkpoint):
+    weights, parked, host = tail_checkpoint
+    parking = parked.parking
+    assert list(host.regions) == [*(f"model.visual.blocks.{i}" for i in range(VISION_BLOCKS)), "model.visual.tail"]
+    tail = host.regions["model.visual.tail"]
+    assert parking.tail_source is tail and 108 << 20 < tail.nbytes < 110 << 20  # 32 MiB downsample + 76.5 merger
+    assert parking.parked_bytes == VISION_BLOCKS * parking.block_sources[0].nbytes + tail.nbytes
+
+    def within(value):
+        return tail.data_ptr() <= value.data_ptr() < tail.data_ptr() + tail.nbytes
+
+    assert within(parked.downsample) and torch.equal(_bytes(parked.downsample), _bytes(weights.downsample))
+    for key in glm_vision.TAIL_PROJECTIONS:
+        assert all(map(within, tensor_leaves(parked.projections[key])))
+        assert _same_bytes(parked.projections[key], weights.projections[key])
+    # Biases and the merger norm stay resident (the loaded tensors themselves).
+    assert all(parked.parameters[k] is v for k, v in weights.parameters.items() if not k.startswith("blocks."))
+    assert not any(map(within, tensor_leaves(parking.block_tree)))
+
+
+class _Stub:
+    """A prepared projection stand-in: reads ``self.weight`` at call time (as UnquantizedProjection and the plain
+    NVFP4 path of QuantizedProjection do) and logs which bytes it read."""
+
+    def __init__(self, name, weight, log):
+        self.name, self.weight, self.log = name, weight, log
+
+    def __call__(self, source):
+        if self.log is not None:  # eager runs only (traced tensors have no addresses)
+            self.log.append((self.name, tuple(t.data_ptr() for t in tensor_leaves(self.weight))))
+        if isinstance(self.weight, torch.Tensor):  # downsample, BF16 [out, in]
+            return torch.mm(source.float(), self.weight.float().t()).to(torch.bfloat16)
+        values, scales = self.weight.values, self.weight.scale_mma  # NVFP4 [out, in / 2] bytes
+        product = torch.mm(source.float()[:, :values.shape[1]], values.float().t() / 256)
+        return (product + scales.float().mean() / 256).to(torch.bfloat16)
+
+
+class _Merger(torch.nn.Module):
+    """Glm5NextVisionPatchMerger's projection order (proj -> gate/up -> down) with stub children."""
+
+    def forward(self, hidden):
+        hidden = self.proj(hidden)
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+
+
+def _tail_encoder(projections, downsample, *, staging=None, log=None):
+    """PreparedVision's tail state as __init__ builds it, over stub kernels declared on the given weights."""
+    log = [] if log is None else log
+    encoder = glm_vision.PreparedVision.__new__(glm_vision.PreparedVision)
+    encoder.staging = staging
+    encoder.staged_tail = staging is not None and staging.staged_tail
+    encoder.downsample = glm_vision._Linear(_Stub("downsample", downsample, log), torch.ones(4096).bfloat16())
+    merger = _Merger()
+    for key in glm_vision.MERGER_PROJECTIONS:
+        setattr(merger, key, glm_vision._Linear(_Stub(key, projections[f"merger.{key}"], log)))
+    encoder.module = SimpleNamespace(merger=merger)
+    return encoder, log
+
+
+def _normed(rows=4):
+    return torch.randn((rows * 4, 1024), generator=torch.Generator().manual_seed(7)).to(torch.bfloat16)
+
+
+def _resident_tail(weights):
+    encoder, _ = _tail_encoder(weights.projections, weights.downsample)
+    return encoder.tail(_normed())
+
+
+@pytest.mark.parametrize("kernel_copy", [False, True])
+def test_staged_tail_matches_the_resident_tail_and_reads_its_own_copy(tail_checkpoint, kernel_copy):
+    weights, parked, _ = tail_checkpoint
+    staging = VisionStaging(parked, "cpu", kernel_copy=kernel_copy)
+    assert staging.staged_tail and staging.tail_bytes == parked.parking.tail_source.nbytes
+    # The slots stay the block pair: the tail copy is forward-local.
+    assert staging.allocated_bytes == 2 * parked.parking.block_sources[0].nbytes
+    _, projections, downsample = staging.bound(parked)
+    example = staging.tail_example
+    assert example is not None and example.device.type == "cpu" and example.nbytes == staging.tail_layout.nbytes
+    declared = [downsample, *(projections[key] for key in glm_vision.TAIL_PROJECTIONS)]
+    assert all(example.data_ptr() <= t.data_ptr() < example.data_ptr() + example.nbytes
+               for t in tensor_leaves(declared))
+    encoder, log = _tail_encoder(projections, downsample, staging=staging)
+    expected = _resident_tail(weights)
+
+    staged = encoder.tail(_normed())
+    assert torch.equal(_bytes(staged), _bytes(expected))
+    # One forward-local copy (neither the declaration example nor the parked bytes) feeds the five GEMMs; each
+    # reads its own part of it, at the place the packed layout gives that weight.
+    copies = []
+    original = glm_vision.stage_copies
+
+    def recording(token, sources, **kwargs):
+        copies.append(original(token, sources, **kwargs)["tail"])
+        return {"tail": copies[-1]}
+
+    log.clear()
+    glm_vision.stage_copies, previous = recording, glm_vision.stage_copies
+    try:
+        again = encoder.tail(_normed())
+    finally:
+        glm_vision.stage_copies = previous
+    assert torch.equal(_bytes(again), _bytes(expected)) and len(copies) == 1
+    copy = copies[0]
+    assert copy.data_ptr() not in (example.data_ptr(), parked.parking.tail_source.data_ptr())
+    bound = staging.tail_layout.bind(staging.tail_tree, copy)
+    want = {"downsample": tuple(t.data_ptr() for t in tensor_leaves(bound["downsample"]))}
+    want.update({key: tuple(t.data_ptr() for t in tensor_leaves(bound["projections"][f"merger.{key}"]))
+                 for key in glm_vision.MERGER_PROJECTIONS})
+    assert sorted(log) == sorted(want.items()) and len({ptrs for _, ptrs in log}) == 5
+    # The prepared kernels keep their declaration weights; the forward rebinds copies of them.
+    assert encoder.downsample.projection.weight is downsample
+    # After tuning the examples are dropped; later forwards still rebind every tail kernel to the copy.
+    encoder._release_tail_examples()
+    assert staging.tail_example is None and encoder.downsample.projection.weight is None
+    assert all(getattr(encoder.module.merger, key).projection.weight is None for key in glm_vision.MERGER_PROJECTIONS)
+    assert torch.equal(_bytes(encoder.tail(_normed())), _bytes(expected))
+
+
+def test_staged_tail_negative_controls(tail_checkpoint, monkeypatch):
+    weights, parked, _ = tail_checkpoint
+    expected = _resident_tail(weights)
+    staging = VisionStaging(parked, "cpu")
+    _, projections, downsample = staging.bound(parked)
+    encoder, _ = _tail_encoder(projections, downsample, staging=staging)
+    # Kernels left on the (zero) declaration example: the result differs.
+    monkeypatch.setattr(glm_vision, "rebound", lambda projection, weight: projection)
+    assert not torch.equal(_bytes(encoder.tail(_normed())), _bytes(expected))
+    monkeypatch.undo()
+    # A copy that skips the merger's bytes: the result differs.
+    monkeypatch.setattr(glm_vision, "stage_copies", lambda token, sources, **kwargs: {
+        "tail": torch.cat((sources["tail"][:32 << 20], torch.zeros_like(sources["tail"][32 << 20:])))})
+    assert not torch.equal(_bytes(encoder.tail(_normed())), _bytes(expected))
+
+
+def _ancestors(node):
+    seen, stack = set(), [node]
+    while stack:
+        for parent in stack.pop().all_input_nodes:
+            if parent not in seen:
+                seen.add(parent)
+                stack.append(parent)
+    return seen
+
+
+def test_functionalized_tail_copies_after_the_final_norm_and_before_every_tail_gemm(tail_checkpoint):
+    """The graph AOTAutograd hands Inductor: one functionalized copy into a graph-local empty whose token is the
+    final norm's output, ordered before all five tail GEMMs, each GEMM's weight a view of that copy."""
+    from torch._functorch.aot_autograd import aot_function
+
+    _, parked, _ = tail_checkpoint
+    staging = VisionStaging(parked, "cpu")
+    _, projections, downsample = staging.bound(parked)
+    encoder, _ = _tail_encoder(projections, downsample, staging=staging)
+    encoder._release_tail_examples()
+    for linear in (encoder.downsample, *encoder.module.merger.children()):
+        linear.projection.log = None
+    captured = []
+
+    class Captured(Exception):
+        pass
+
+    def compiler(graph, inputs):
+        captured.append(graph)
+        raise Captured
+
+    def forward(hidden, source, bias):
+        # Constants enter as graph inputs (fake mode refuses real constants).
+        staging.tail_source, encoder.downsample.bias = source, bias
+        return encoder.tail(torch.nn.functional.rms_norm(hidden, (1024,)))
+
+    source = staging.tail_source
+    try:
+        with pytest.raises(Captured):
+            aot_function(forward, fw_compiler=compiler)(_normed(), source, encoder.downsample.bias)
+    finally:
+        staging.tail_source = source
+    graph = captured[0].graph
+    stage = torch.ops.flare.stage_parked_weights.default
+    copies = [node for node in graph.nodes if node.op == "call_function"
+              and "auto_functionalized" in str(node.target) and node.args[0] is stage]
+    assert len(copies) == 1
+    (node,) = copies
+    assert node.kwargs["stream"] == 0
+    assert all(str(base.target).startswith("aten.empty") for base in node.kwargs["_all_bases"])
+    # The copy follows the final norm's output (computed from the hidden input), not a graph input it could be
+    # hoisted to; the downsample GEMM consumes that same tensor.
+    token = node.kwargs["token"]
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    assert token.op == "call_function" and placeholders[0] in _ancestors(token)
+    mms = [n for n in graph.nodes if n.op == "call_function" and str(n.target).startswith("aten.mm")]
+    assert len(mms) == 5
+    order = list(graph.nodes)
+    assert all(order.index(node) < order.index(mm) and node in _ancestors(mm.args[1]) for mm in mms)
+    assert token is mms[0].args[0] or token in _ancestors(mms[0].args[0])
+    # No GEMM reads the parked bytes directly.
+    assert not any(placeholders[1] in _ancestors(mm.args[1]) - _ancestors(node) for mm in mms)
+
+
+def _quantized(weight, *, encoded=False, sm103=False):
+    from ignition.components.linear import QuantizedProjection
+
+    projection = QuantizedProjection.__new__(QuantizedProjection)
+    projection.weight, projection.sm103, projection.activation_scale = weight, sm103, None
+    projection.encoded, projection.encoded_layout = None, (((4, 64), torch.float8_e4m3fn),) if encoded else None
+    projection.parts = ("declared",)
+    projection.plan = "selected"
+    return projection
+
+
+def test_rebound_rederives_the_parts_quantized_projection_caches(monkeypatch):
+    from b12x.gemm.blockscaled._a16 import _weight_parts
+    from b12x.quantization import mxfp8
+
+    declared = _nvfp4(64, 128)
+    staged = dataclasses.replace(_nvfp4(64, 128), activation_global_scale=torch.full((1,), 2.0))
+    for sm103 in (False, True):
+        projection = _quantized(declared, sm103=sm103)
+        result = glm_vision.rebound(projection, staged)
+        values, scales, gain, _ = _weight_parts(staged)
+        if sm103 and scales.dtype == torch.float8_e8m0fnu:
+            scales = scales.view(torch.uint8)
+        assert result.weight is staged and result.plan == "selected"
+        assert [t.data_ptr() if t is not None else None for t in result.parts] == [
+            t.data_ptr() if t is not None else None for t in (values, scales, gain)]
+        assert result.activation_scale is staged.activation_global_scale
+        assert projection.weight is declared and projection.parts == ("declared",)
+    # MXFP8 pre-encoded projections (`encoded=` / functional `encoded_layout`) cache the packed values and MMA scales.
+    # (dense_scale_storage needs CUDA tensors; on CPU it is checked to receive the staged weight's MMA scales.)
+    monkeypatch.setattr(mxfp8, "dense_scale_storage", lambda scale_mma: ("storage", scale_mma))
+    declared, staged = _mxfp8(64, 128), _mxfp8(64, 128)
+    for encoded in (True, False):  # functional (`encoded_layout`) and eager (`encoded`) pre-encoded projections
+        projection = _quantized(declared, encoded=encoded)
+        if not encoded:
+            projection.encoded = "eager rows"
+        result = glm_vision.rebound(projection, staged)
+        assert result.parts[0] is staged.weight.values and result.parts[2] is None
+        assert result.parts[1] == ("storage", staged.weight.scale_mma) and projection.parts == ("declared",)
+    # Unquantized projections read `weight` at call time; only it changes.
+    plain = SimpleNamespace(weight=torch.zeros(2), bias=None, plan="selected")
+    swapped = glm_vision.rebound(plain, torch.ones(2))
+    assert torch.equal(swapped.weight, torch.ones(2)) and torch.equal(plain.weight, torch.zeros(2))
+
+
 # Export switch ------------------------------------------------------------------------------------------------
 
 def test_vision_stage_defaults_off_and_is_validated(monkeypatch):
     assert PreparationConfig(devices=(0, 1)).vision_stage is False
+    # Staging the tail is the default mode once staging is on.
+    assert PreparationConfig(devices=(0, 1)).vision_stage_tail is True
     assert PreparationConfig(devices=(0, 1), vision_stage=True).vision_stage is True
     with pytest.raises(TypeError, match="vision_stage"):
         PreparationConfig(devices=(0, 1), vision_stage=1)
+    with pytest.raises(TypeError, match="vision_stage_tail"):
+        PreparationConfig(devices=(0, 1), vision_stage_tail="blocks")
     monkeypatch.setenv("FLARE_GLM53_VISION_STAGE", "yes")
     with pytest.raises(ValueError, match="VISION_STAGE"):
-        glm_recipe._tp3_override("VISION_STAGE", ("1", "0"), "0")
+        glm_recipe._tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0")
 
 
 @pytest.mark.parametrize("world", [2, 3])
-@pytest.mark.parametrize("value, expected", [(None, False), ("0", False), ("1", True)])
-def test_export_environment_reaches_the_preparation_config(monkeypatch, world, value, expected):
+@pytest.mark.parametrize("value, expected, tail", [(None, False, True), ("0", False, True), ("1", True, True),
+                                                   ("blocks", True, False)])
+def test_export_environment_reaches_the_preparation_config(monkeypatch, world, value, expected, tail):
     import ignition.preparation.rank_group as rank_group
     from tests.recipes.test_glm53_vram_options import _plan
 
@@ -337,7 +616,7 @@ def test_export_environment_reaches_the_preparation_config(monkeypatch, world, v
     plan.language_model_only = False
     glm_recipe.prepare("/nonexistent", plan, compile_forwards=False, kernel_cache=None, progress=None)
     config = seen["config"]
-    assert config.vision_stage is expected
+    assert config.vision_stage is expected and config.vision_stage_tail is tail
     assert (config.embed_host, config.kda_side_chain, config.language_model_only) == (False, False, False)
 
 
@@ -347,7 +626,8 @@ def test_export_environment_reaches_the_preparation_config(monkeypatch, world, v
 @torch.no_grad()
 @pytest.mark.parametrize("compiler", ["none", "worker"])
 @pytest.mark.parametrize("overlap", [True, False])
-def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, tmp_path):
+@pytest.mark.parametrize("tail", [True, False])  # VISION_STAGE=1 (blocks + tail) and VISION_STAGE=blocks
+def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, tail, tmp_path):
     from functools import partial
 
     from b12x.preparation import PreparationSession
@@ -366,9 +646,10 @@ def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, t
     with DirectWeightLoader(manifest, device, prefixes=("model.visual.",)) as loader:
         weights = VisionWeights.load(_module(manifest), loader)
     with DirectWeightLoader(manifest, device, prefixes=("model.visual.",)) as loader:
-        temporary = VisionWeights.load(_module(manifest), loader, park_blocks=True)
+        temporary = VisionWeights.load(_module(manifest), loader, park_blocks=True, park_tail=tail)
     host = _PinnedHost(device)
-    parked = temporary.park(lambda name, nbytes: host(name, (nbytes,), torch.uint8).device_view)
+    parked = temporary.park(lambda name, nbytes: host(name, (nbytes,), torch.uint8).device_view, tail=tail)
+    assert (parked.parking.tail_source is not None) is tail
     del temporary
     capacity = 4096
     inputs = _input([(14 * 56, 14 * 56)], 0)

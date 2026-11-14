@@ -117,9 +117,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         # (1210 MiB per rank at every rank count) in device-visible host memory; KV pages take the VRAM.
         embed_host=_tp3_override("EMBED_HOST", ("1", "0"), "0") == "1",
         # Fork-only VRAM switch (2026-11-12, DeepSeek's TP3 vision weight staging): VISION_STAGE=1 parks the
-        # replicated vision tower in device-visible host memory and stages it through VRAM slots per image.
+        # replicated vision tower's blocks and tail (downsample + merger) in device-visible host memory and
+        # stages them into VRAM per image; VISION_STAGE=blocks keeps the tail resident (109 MiB per rank).
         # Only meaningful with images (export without --language-model-only).
-        vision_stage=_tp3_override("VISION_STAGE", ("1", "0"), "0") == "1",
+        vision_stage=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "0",
+        vision_stage_tail=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "blocks",
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)

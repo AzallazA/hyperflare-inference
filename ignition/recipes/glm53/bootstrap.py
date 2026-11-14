@@ -125,10 +125,12 @@ class PreparationConfig:
     # mappings and keeps it resident.
     embed_host: bool = False
     # Fork-only VRAM switch (recipe.py `_tp3_override("VISION_STAGE")`, DeepSeek's TP3 `vision_stage`): package
-    # exports park the replicated vision tower's block and tail weights (~0.36 GiB per rank) in device-visible
-    # host memory and stage them through VRAM slots per image (two block slots; the tail aliases dead vision
-    # scratch). In-process preparation has no host mappings and keeps the tower resident.
+    # exports park the replicated vision tower's block weights (262 MiB per rank) in device-visible host memory
+    # and stage them through two persistent VRAM slots per image; with `vision_stage_tail` (the default mode)
+    # the downsample and merger weights (109 MiB) are parked too and copied per image into forward-local
+    # tensors in the vision graph's pool. In-process preparation has no host mappings and keeps the tower resident.
     vision_stage: bool = False
+    vision_stage_tail: bool = True
     # Run shared experts, KDA gate projections, and decode query chains on an auxiliary stream;
     # without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -169,8 +171,8 @@ class PreparationConfig:
             raise TypeError("kda_side_chain must be a boolean")
         if type(self.embed_host) is not bool:
             raise TypeError("embed_host must be a boolean")
-        if type(self.vision_stage) is not bool:
-            raise TypeError("vision_stage must be a boolean")
+        if type(self.vision_stage) is not bool or type(self.vision_stage_tail) is not bool:
+            raise TypeError("vision_stage and vision_stage_tail must be booleans")
         if self.draft_head not in ("target", "nvfp4") or self.draft_eh_proj not in ("bf16", "mxfp8"):
             raise ValueError("GLM draft head must be target or nvfp4 and draft eh_proj bf16 or mxfp8")
         if self.expert_columns is not None and type(self.expert_columns) is not int:
@@ -355,12 +357,15 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                 host_allocator=core_storage.host_allocate
                                 if config.embed_host and core_storage is not None else None,
                                 vision_host_allocator=core_storage.host_allocate
-                                if config.vision_stage and core_storage is not None else None)
+                                if config.vision_stage and core_storage is not None else None,
+                                vision_stage_tail=config.vision_stage_tail)
     if config.embed_host:
         report("token embedding in device-visible host memory (FLARE_GLM53_EMBED_HOST=1)" if core_storage is not None
                else "FLARE_GLM53_EMBED_HOST ignored: in-process preparation has no host mappings; embedding resident")
     if config.vision_stage and not config.language_model_only:
-        report("vision blocks parked in device-visible host memory and staged per image (FLARE_GLM53_VISION_STAGE=1)"
+        report(("vision blocks and tail" if config.vision_stage_tail else "vision blocks")
+               + " parked in device-visible host memory and staged per image (FLARE_GLM53_VISION_STAGE="
+               + ("1)" if config.vision_stage_tail else "blocks)")
                if weights.vision is not None and weights.vision.parking is not None
                else "FLARE_GLM53_VISION_STAGE ignored: in-process preparation has no host mappings; vision resident")
     if torch.cuda.get_device_properties(device).is_integrated:
@@ -550,7 +555,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     stream=arena.auxiliary_stream if config.stream_overlap else None)
                 vision_owners.append(vision_staging)
                 memory(f"vision staging slots {vision_staging.allocated_bytes >> 20} MiB "
-                       f"(parked {weights.vision.parking.parked_bytes >> 20} MiB)")
+                       f"(parked {weights.vision.parking.parked_bytes >> 20} MiB, "
+                       f"tail copied per image {vision_staging.tail_bytes >> 20} MiB)")
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
                 storage = vision_storage.rows(capacity)
