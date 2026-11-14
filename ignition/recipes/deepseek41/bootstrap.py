@@ -96,6 +96,31 @@ def _sampling_defaults(config):
     return defaults
 
 
+def _expert_selection_summary(tuning):
+    """TP3 fork diagnostic: the routed-expert implementations tuning selected, per graph family and token count.
+
+    FlashInfer aa6c4221 lets DeepSeek's 1-4 token W4A8 MoE calls run tiny_decode (the w4a8_mx "micro" backend) with
+    its SwiGLU limit; the fork's patch that excluded it is gone, so the export log names where it was chosen."""
+    import re
+    from collections import Counter
+
+    counts, micro = Counter(), Counter()
+    for item in tuning.get("selections", ()):
+        name = item.get("name", "")
+        if not name.endswith(".experts"):
+            continue
+        config = item.get("config") or {}
+        choice = next((str(config[key]) for key in ("implementation", "backend") if key in config), None)
+        if choice is None:
+            choice = "micro" if "micro" in json.dumps(config, sort_keys=True, default=str) else "other"
+        counts[choice] += 1
+        if "micro" in choice or "tiny" in choice:
+            micro[re.sub(r"\.layer\d+\.experts$", "", name)] += 1
+    summary = ", ".join(f"{choice} x{count}" for choice, count in counts.most_common()) or "none"
+    graphs = ", ".join(f"{graph} x{count}" for graph, count in sorted(micro.items())) or "none"
+    return f"Routed-expert selections: {summary}; micro/tiny_decode in: {graphs}"
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
@@ -611,6 +636,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
             tuning = session.tune(show_progress=progress is not None and rank == 0,
                                   console=stage.console, contextual=contextual)
+        if progress is not None:
+            progress(_expert_selection_summary(tuning))
         if contextual is not None and progress is not None:
             from .contextual_selection import contextual_summary
 

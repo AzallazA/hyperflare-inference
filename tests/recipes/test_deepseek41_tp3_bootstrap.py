@@ -98,3 +98,17 @@ def test_history_draft_inputs_only_under_vocabulary_parallel_sampling(monkeypatc
     assert all(not set(SpeculativePreparation.COPY_INPUTS) & set(fields)
                for name, fields in records if not name.startswith("packed-speculative"))
     assert (set(copies) <= set(buffers)) == parallel
+
+
+def test_expert_selection_summary_names_micro_graphs():
+    tuning = {"selections": [
+        {"name": "decode1.layer3.experts", "config": {"implementation": "micro"}},
+        {"name": "decode1.layer4.experts", "config": {"implementation": "micro"}},
+        {"name": "prefill4096.layer3.experts", "config": {"implementation": "dynamic"}},
+        {"name": "verification8x6-tokens48.layer3.experts", "config": {"tile": 64, "mode": "static_micro"}},
+        {"name": "decode1.layer3.router", "config": {"implementation": "micro"}},
+    ]}
+    line = bootstrap._expert_selection_summary(tuning)
+    assert line == ("Routed-expert selections: micro x3, dynamic x1; "
+                    "micro/tiny_decode in: decode1 x2, verification8x6-tokens48 x1")
+    assert bootstrap._expert_selection_summary({}).endswith("none; micro/tiny_decode in: none")
