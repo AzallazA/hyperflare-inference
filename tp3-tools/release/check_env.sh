@@ -69,9 +69,12 @@ if [ -x "$VENV/bin/python" ]; then
   if [ ! -f "$IMPL" ]; then
     fail "FlashInfer is not installed in .venv (uv sync --locked --extra prepare --extra test)"
   else
-    # The swiglu patch adds a guard to the tiny_decode selection in _impl.py; without it replies corrupt mid-way at TP3.
-    if grep -q 'tiny_decode implements plain SiLU-GLU only' "$IMPL"; then pass "tiny_decode honors swiglu_limit (flashinfer-tiny-decode-swiglu.patch content present)"
-    else fail "flashinfer-tiny-decode-swiglu.patch content missing in $IMPL (replies corrupt at TP3 without it)"; fi
+    # tiny_decode must honor swiglu_limit, or replies corrupt mid-way at TP3 (flare#193). FlashInfer aa6c4221 (pinned
+    # since upstream #291) clamps inside the kernel (_tiny_decode_swiglu_supported); older pins needed the fork's
+    # flashinfer-tiny-decode-swiglu.patch, which excluded tiny_decode whenever a limit was set (dropped 2026-11-14).
+    if grep -q '_tiny_decode_swiglu_supported' "$IMPL"; then pass "tiny_decode honors swiglu_limit (FlashInfer applies the clamp in the kernel)"
+    elif grep -q 'tiny_decode implements plain SiLU-GLU only' "$IMPL"; then pass "tiny_decode honors swiglu_limit (flashinfer-tiny-decode-swiglu.patch content present)"
+    else fail "tiny_decode ignores swiglu_limit in $IMPL (replies corrupt at TP3): FlashInfer predates aa6c4221 and the old swiglu patch is not applied"; fi
     # The release folder carries its own tp3-patches/; run from the fork (tp3-tools/release/), check the fork's.
     PATCHES=$HERE/tp3-patches; [ -d "$PATCHES" ] || PATCHES=$FORK/tp3-patches
     for p in "$PATCHES"/*.patch; do
