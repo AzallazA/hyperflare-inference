@@ -215,12 +215,25 @@ def test_flare_layer_issues_no_launch(stubs):
     ("verify", 13, True, False, True),     # negative control: wider than the gate on a parked layer
 ])
 def test_decision_rule_and_records(stubs, mode, rows, parked, expect, gated):
-    tp3 = _tp3(host_expert_layers=frozenset({PARKED_LAYER}), brrr_parked_max_rows=12)
+    tp3 = _tp3(host_expert_layers=frozenset({PARKED_LAYER}), brrr_parked_max_rows=12, hot_experts=342,
+               merged_bank=True, expert_counts_dir="/counts")
     index = PARKED_LAYER if parked else LAYER
     hot_map = torch.arange(384, dtype=torch.int32) if parked else None
     layer = _layer(index, tp3, rows=rows, mode=mode, hot_map=hot_map)
     assert (layer.brrr is not None) == expect
     assert decoder._BRRR_DECISIONS == [(f"{mode}{rows}.layer{index}", index, mode, rows, expect, gated)]
+
+
+@pytest.mark.parametrize("mode", ["decode", "verify"])
+def test_graph_wider_than_the_kernel_fails_at_construction(stubs, mode):
+    assert _layer(LAYER, _tp3(), rows=brrr.MAX_ROWS, mode=mode).brrr is not None
+    with pytest.raises(ValueError, match=f"has {brrr.MAX_ROWS + 1} rows, the fused kernel takes at most 128"):
+        _layer(LAYER, _tp3(), rows=brrr.MAX_ROWS + 1, mode=mode)
+    # A parked layer the row gate keeps on Flare's path is not refused (it never reaches the kernel).
+    gated = _tp3(host_expert_layers=frozenset({PARKED_LAYER}), brrr_parked_max_rows=12, hot_experts=342,
+                 merged_bank=True, expert_counts_dir="/counts")
+    layer = _layer(PARKED_LAYER, gated, rows=brrr.MAX_ROWS + 1, mode=mode, hot_map=torch.arange(384, dtype=torch.int32))
+    assert layer.brrr is None and decoder._BRRR_DECISIONS[-1][-2:] == (False, True)
 
 
 def test_no_decisions_without_brrr_layers(stubs):
@@ -360,17 +373,29 @@ def test_register_packs_checkpoint_copies_and_keeps_weight_views(monkeypatch, cs
     for name, source in (("woa", "wo_a"), ("wob", "wo_b"), ("gate", "router"), ("sh13", "gate_up"), ("sh2", "down")):
         assert kwargs[name] is dense[source]
     assert kwargs["w13"] is rep.w13_rp and kwargs["w2"] is rep.w2_rp
-    # Everything built from checkpoint reads (and the int32 hot map) went through persistent_copy.
-    copied = {"woa_s", "wob_s", "gate_b", "sh13_s", "sh2_s", "fn", "hc_scale", "hc_base", "norm", "hot_map"}
+    # Everything built from checkpoint reads went through persistent_copy; the hot map is already a persistent
+    # int32 forward constant and is passed as is (no second copy).
+    assert kwargs["hot_map"] is weights.experts.hot_map
+    copied = {"woa_s", "wob_s", "gate_b", "sh13_s", "sh2_s", "fn", "hc_scale", "hc_base", "norm"}
     if csf:
         copied |= {"csf13_gdesc", "csf2_gdesc"}
     assert len(copies) == len(copied) and {id(kwargs[name]) for name in copied} == {id(t) for t in copies}
     if csf:  # the kernel reads the payload; b12x's expanded planes are not held
         assert kwargs["s13"] is engine.unused_scales and kwargs["s2"] is engine.unused_scales
+        # ... in particular not the loader's shared scale scratch b12x's planes view (rep.w13_sfb / w2_sfb).
+        assert all(kwargs[name].data_ptr() != plane.data_ptr()
+                   for name in ("s13", "s2") for plane in (rep.w13_sfb, rep.w2_sfb))
         assert kwargs["csf13_storage"] is weights.experts.experts._impl.nvfp4_csf.first.scales
     else:
         assert kwargs["s13"] is rep.w13_sfb and kwargs["s2"] is rep.w2_sfb
     assert engine.keep == [kwargs]
+
+
+def test_register_refuses_a_hot_map_that_is_not_int32(monkeypatch):
+    engine, weights, _, _, _ = _engine(monkeypatch, csf=True)
+    weights.experts.hot_map = torch.arange(384, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="hot_map must be contiguous int32"):
+        engine.register(LAYER, weights)
 
 
 def test_register_refuses_a_foreign_expert_plane(monkeypatch):
@@ -381,15 +406,23 @@ def test_register_refuses_a_foreign_expert_plane(monkeypatch):
     assert engine.ext.layers == []
 
 
-def test_brrr_launch_functionalizes_once_per_layer(stubs):
-    """What AOTAutograd hands Inductor (aot_function, the functionalized inference graph): the launch as one
-    auto_functionalized node per layer and no copy-back into graph inputs (its outputs are graph-local)."""
+@torch.library.custom_op("flare_test::brrr_layer_tail_old_schema",
+                         mutates_args=("attn_post", "attn_comb", "attn_pre", "y", "resid1", "post1", "comb1", "pre1"))
+def _old_schema(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
+                resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
+                y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,
+                pre1: torch.Tensor) -> None:
+    raise AssertionError("never run")
+
+
+@_old_schema.register_fake
+def _(*args):
+    pass
+
+
+def _functionalized(first, second):
     from torch._functorch.aot_autograd import aot_function
 
-    first, second = _layer(LAYER, _tp3()), _layer(PARKED_LAYER, _tp3(), carry=True)
-    for layer in (first, second):
-        _forbid(layer)
-        _drive(layer)
     captured = []
 
     class Captured(Exception):
@@ -406,11 +439,40 @@ def test_brrr_launch_functionalizes_once_per_layer(stubs):
 
     with pytest.raises(Captured):
         aot_function(forward, fw_compiler=compiler)(*_inputs(6), torch.ones(32))
-    graph = captured[0].graph
+    return captured[0].graph
+
+
+def _two_layers():
+    first, second = _layer(LAYER, _tp3()), _layer(PARKED_LAYER, _tp3(), carry=True)
+    for layer in (first, second):
+        _forbid(layer)
+        _drive(layer)
+    return first, second
+
+
+def test_brrr_launch_functionalizes_once_per_layer(stubs):
+    """What AOTAutograd hands Inductor (aot_function, the functionalized inference graph): the launch as one
+    auto_functionalized node per layer whose only mutated bases are the five graph-local outputs. The attention mHC
+    inputs (post, comb, attn_mix) are read-only arguments, so nothing clones or copies them around the launch."""
+    schema = {argument.name: argument for argument in OP._schema.arguments}
+    assert [name for name, argument in schema.items() if argument.alias_info is not None
+            and argument.alias_info.is_write] == ["y", "resid1", "post1", "comb1", "pre1"]
+    graph = _functionalized(*_two_layers())
     functional = [node for node in graph.nodes if node.op == "call_function"
                   and "auto_functionalized" in str(node.target)]
     assert len(functional) == 2 and all(node.args[0] is OP for node in functional), \
         [str(node.target) for node in graph.nodes if node.op == "call_function"]
-    placeholders = {node for node in graph.nodes if node.op == "placeholder"}
+    for node in functional:
+        bases = node.kwargs["_all_bases"]
+        assert len(bases) == 5 and all(str(base.target).startswith("aten.empty") for base in bases)
+        assert all(node.kwargs[name] not in bases for name in ("attn_post", "attn_comb", "attn_pre"))
     assert not [node for node in graph.nodes if node.op == "call_function"
-                and str(node.target).startswith("aten.copy_") and node.args[0] in placeholders]
+                and any(word in str(node.target) for word in ("clone", "copy"))]
+
+
+def test_negative_control_old_schema_makes_the_attention_inputs_mutated_bases(stubs, monkeypatch):
+    monkeypatch.setattr(brrr, "brrr_layer_tail", _old_schema)
+    graph = _functionalized(*_two_layers())
+    functional = [node for node in graph.nodes if node.op == "call_function"
+                  and "auto_functionalized" in str(node.target)]
+    assert len(functional) == 2 and all(len(node.kwargs["_all_bases"]) == 8 for node in functional)

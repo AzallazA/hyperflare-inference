@@ -55,6 +55,7 @@ from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
 from .tp3_config import TP3Config
+from .config import ModelConfig
 from .weights import ModelWeights, vision_host_parked
 
 
@@ -411,6 +412,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
+    # TP3: layer sets must name layers of this checkpoint (or its mini view); checked before any weight is loaded.
+    tp3.check_layers(ModelConfig.load(metadata_path, mini=tp3.mini).layers)
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,

@@ -159,6 +159,8 @@ class Engine:
             raise ValueError("TP3 config: BRRR needs brrr_ckpt (the checkpoint view it reads dense copies from)")
         self.ext = ext = extension(kernel_defines(tp3))
         check_switches(ext, tp3)
+        if ext.MAXM != MAX_ROWS:
+            raise RuntimeError(f"BRRR kernel MAXM {ext.MAXM} differs from brrr.MAX_ROWS {MAX_ROWS}")
         self.group, self.device, self.ipc, self.tp3 = group, device, ipc, tp3
         self.rank, world = dist.get_rank(group=group), dist.get_world_size(group=group)
         if world != ext.RANKS:
@@ -248,7 +250,8 @@ class Engine:
             norm=self.raw(f"{p}.ffn_norm.weight").contiguous(),
             image_lo=0, dense_native=False,
             # Merged hot/cold bank: experts are stored hot-first; the kernel routes by global ID and reads the slot.
-            hot_map=None if weights.experts.hot_map is None else weights.experts.hot_map.to(torch.int32).contiguous(),
+            # Already a persistent int32 forward constant (weights.py); passed as is, never copied.
+            hot_map=weights.experts.hot_map,
             # Cold-first job ordering: slots >= hot_rows are host-RAM experts. Default EXPERTS (all resident) keeps
             # the arrival order; a merged bank without a known hot count also stays unordered (safe).
             hot_rows=ext.EXPERTS if weights.experts.hot_map is None or weights.experts.hot_rows is None
@@ -292,6 +295,9 @@ class Engine:
                     torch.cuda.synchronize(self.device)
                     print(f"[brrr] rank {r} layer {index} {tag} CSF self-check: {int((got != want).sum())} of "
                           f"{want.numel()} words differ", flush=True)
+        hot_map = kwargs["hot_map"]
+        if hot_map is not None and (hot_map.dtype != torch.int32 or not hot_map.is_contiguous()):
+            raise RuntimeError(f"BRRR layer {index}: the merged bank's hot_map must be contiguous int32")
         planes = ("w13", "w2") if decoder is not None else ("w13", "s13", "w2", "s2")
         for name in planes:
             if kwargs[name].data_ptr() != getattr(rep, {"w13": "w13_rp", "s13": "w13_sfb", "w2": "w2_rp", "s2": "w2_sfb"}[name]).data_ptr():
@@ -315,7 +321,7 @@ class Engine:
 
 # add_layer tensors built by register() from checkpoint reads (copies, not views of Flare's weights or b12x's planes).
 NATIVE_DENSE = ("woa", "wob", "gate", "sh13", "sh2")
-PERSISTENT_COPIES = ("woa_s", "wob_s", "gate_b", "sh13_s", "sh2_s", "fn", "hc_scale", "hc_base", "norm", "hot_map",
+PERSISTENT_COPIES = ("woa_s", "wob_s", "gate_b", "sh13_s", "sh2_s", "fn", "hc_scale", "hc_base", "norm",
                      "csf13_gdesc", "csf2_gdesc", *NATIVE_DENSE)
 
 
@@ -364,8 +370,14 @@ def engine():
     return _ENGINE[0] if _ENGINE else None
 
 
-@torch.library.custom_op("flare::brrr_layer_tail",
-                         mutates_args=("attn_post", "attn_comb", "attn_pre", "y", "resid1", "post1", "comb1", "pre1"))
+# Rows one launch accepts (decoder.cu MAXM, checked against the built extension in Engine.__init__): PreparedLayer
+# refuses a BRRR layer in a wider graph at construction, before tuning, instead of at the first launch.
+MAX_ROWS = 128
+
+
+# Writes only the five FFN-side outputs; attn_post/attn_comb/attn_pre are read (__ldg in the kernel's residual mix), so
+# they are not declared mutated: the compiler then needs no copies of them around the launch (40 per decode step).
+@torch.library.custom_op("flare::brrr_layer_tail", mutates_args=("y", "resid1", "post1", "comb1", "pre1"))
 def brrr_layer_tail(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
                     resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
                     y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,

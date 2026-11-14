@@ -258,13 +258,19 @@ class PreparedLayer:
         # BRRR-26 level). Flare's tail operators above are still declared and tuned (as on tp3-main); _run skips them.
         if tp3.brrr_layers:
             rows = metadata.positions.numel()
-            # A layer counts as parked only if it has a host tail (HOT >= 384 loads it fully resident, no hot_map).
+            # A layer counts as parked only if it has a merged bank with a host tail (hot_map). TP3Config refuses
+            # brrr_parked_max_rows unless parked BRRR layers have one (0 < hot_experts < 384), so the gate is never
+            # a silent no-op; without the gate a fully host-parked bank (hot_experts=0) is simply not gated.
             parked = index in tp3.host_expert_layers and self.hot_map is not None
             gated = bool(tp3.brrr_parked_max_rows) and parked and rows > tp3.brrr_parked_max_rows
             if index in tp3.brrr_layers and mode in ("decode", "verify") and not gated:
                 if self.image_mask is not None or boundary is not None or self.attention.owns_window_metadata:
                     raise ValueError(f"BRRR layer {index} needs a decode/verify layer with shared window indices")
-                from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
+                from ignition.recipes.deepseek41.brrr import MAX_ROWS, PreparedBRRRTail
+                if rows > MAX_ROWS:
+                    raise ValueError(f"BRRR layer {index} in {name}: the graph has {rows} rows, the fused kernel "
+                                     f"takes at most {MAX_ROWS}: lower the speculative widths or concurrency, or leave the layer "
+                                     "out of brrr_layers")
                 self.attention.external_tail = True
                 self.brrr = PreparedBRRRTail(index, weights, metadata.positions.dtype,
                                              rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)

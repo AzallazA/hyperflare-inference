@@ -259,3 +259,46 @@ def test_vision_host_parked_needs_every_tower_tensor_in_a_mapped_region():
     assert not vision_host_parked(tower, spans[1:])            # negative control: one tensor outside
     assert not vision_host_parked(tower, [SimpleNamespace(**{**vars(s), "closed": True}) for s in spans])
     assert not vision_host_parked({"image_start": torch.zeros(2)}, spans)
+
+
+def test_rebinding_reaches_the_real_components_low_level_calls(monkeypatch):
+    """The staging rebinds (vision._projection_with / _mlp_with / dataclasses.replace) against the real component
+    classes: the weight a functional UnquantizedProjection, PreparedMLP and RMSNorm hand their kernel is the rebound
+    one, and the prepared object keeps its own (the stubs above cannot show this)."""
+    from dataclasses import replace
+
+    from ignition.components import linear, mlp as mlp_module
+    from ignition.components.rms_norm import _FunctionalRMSNorm
+
+    seen = []
+    monkeypatch.setattr(linear.bf16_gemv, "mm", lambda source, weight, *, out, plan, bias: seen.append((weight, bias)) or out)
+    monkeypatch.setattr(mlp_module.hyperconnection, "run_swiglu", lambda gate_up, *, limit, round_silu, out, plan: out)
+    monkeypatch.setattr(torch.ops.b12x, "hyperconnection_grouped_rmsnorm",
+                        lambda source, weight, output, eps, handle, zero_centered: seen.append((weight, None)),
+                        raising=False)
+
+    def projection(columns, weight, bias):
+        prepared = object.__new__(linear.UnquantizedProjection)
+        prepared.dense, prepared.output, prepared.plan = False, None, object()
+        prepared.output_layout = ((4, columns), (columns, 1), torch.bfloat16)
+        prepared.weight, prepared.bias = weight, bias
+        return prepared
+
+    declared, staged = (torch.zeros(8, 8), torch.zeros(8)), (torch.ones(8, 8), torch.ones(8))
+    prepared = projection(8, *declared)
+    vision._projection_with(prepared, *staged)(torch.zeros(4, 8))
+    assert seen.pop() == staged and (prepared.weight, prepared.bias) == declared
+
+    mlp = object.__new__(mlp_module.PreparedMLP)
+    mlp.swiglu_limit, mlp.round_silu, mlp.activation_plan = 10., True, object()
+    mlp._functional_layout = (None, None, None, (4, 8), (8, 1), torch.bfloat16, None, None, None)
+    mlp.up_projection, mlp.down_projection = projection(16, torch.zeros(16, 8), None), projection(8, torch.zeros(8, 8), None)
+    up, down = torch.ones(16, 8), torch.ones(8, 8)
+    vision._mlp_with(mlp, up, down)(torch.zeros(4, 8))
+    assert [weight for weight, _ in seen] == [up, down] and mlp.up_projection.weight is not up
+    seen.clear()
+
+    norm = _FunctionalRMSNorm(torch.zeros(8), SimpleNamespace(handle=0), 1e-6, False, False, False)
+    weight = torch.ones(8)
+    replace(norm, weight=weight)(torch.zeros(4, 8))
+    assert seen == [(weight, None)] and norm.weight is not weight

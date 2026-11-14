@@ -342,3 +342,25 @@ def test_planner_helpers_read_the_environment_through_the_config(monkeypatch, tm
     for key, value in RELEASE_ENV.items():
         monkeypatch.setenv(key, value)
     assert _graph_bytes(3) == 1 << 30 and _parked_bytes(3) == _parked_bytes(3, RELEASE_CONFIG)
+
+
+@pytest.mark.parametrize("changes", [
+    dict(host_expert_layers=frozenset()),                                            # no parked layer at all
+    dict(brrr_layers=frozenset(range(20))),                                           # no BRRR layer is parked
+    dict(hot_experts=0, merged_bank=False),                                           # whole bank in host memory: no hot_map
+    dict(hot_experts=384),                                                            # fully resident: nothing parked
+])
+def test_parked_row_gate_is_refused_where_it_would_gate_nothing(changes):
+    assert RELEASE_CONFIG.brrr_parked_max_rows == 12  # the release config (BRRR 0-39, H342 merged) keeps the gate
+    with pytest.raises(ValueError, match="brrr_parked_max_rows gates BRRR layers parked with a merged bank"):
+        replace(RELEASE_CONFIG, **changes)
+    replace(RELEASE_CONFIG, brrr_parked_max_rows=0, **changes)  # ungated: accepted
+
+
+def test_layer_sets_are_checked_against_the_model():
+    assert RELEASE_CONFIG.check_layers(40) is RELEASE_CONFIG
+    with pytest.raises(ValueError, match="brrr_layers names layers 8-39 but the model has 8 layers"):
+        RELEASE_CONFIG.check_layers(8)  # e.g. the release BRRR set on a mini8 view
+    replace(RELEASE_CONFIG, brrr_layers=frozenset(range(8)), host_expert_layers=frozenset({3}),
+            brrr_parked_max_rows=12).check_layers(8)
+    TP3Config().check_layers(6)

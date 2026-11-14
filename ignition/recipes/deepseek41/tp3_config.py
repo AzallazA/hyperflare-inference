@@ -26,6 +26,9 @@ UNPORTED = {
     "share_engram_residual": "S5 (shared Engram residual; expected to be deleted there, Inductor reuses the storage)",
 }
 
+# Routed experts per DeepSeek V4.1 MoE layer (hot_experts >= this keeps a parked layer fully resident).
+ROUTED_EXPERTS = 384
+
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
 
@@ -203,6 +206,14 @@ class TP3Config:
             raise ValueError("TP3 config: hot_experts needs merged_bank (separate hot + cold banks were not ported)")
         if self.brrr_parked_max_rows and not self.brrr_layers:
             raise ValueError("TP3 config: brrr_parked_max_rows needs brrr_layers")
+        if self.brrr_parked_max_rows and not (self.brrr_layers & self.host_expert_layers
+                                              and self.merged_bank and 0 < self.hot_experts < ROUTED_EXPERTS):
+            # The gate applies to layers with a merged VRAM/host bank (decoder.PreparedLayer: hot_map). With no BRRR
+            # layer parked, or hot_experts 0 (whole bank in host memory, no hot_map) or >= 384 (fully resident), it
+            # would gate nothing.
+            raise ValueError("TP3 config: brrr_parked_max_rows gates BRRR layers parked with a merged bank; it needs "
+                             "a layer in both brrr_layers and host_expert_layers, merged_bank and "
+                             f"0 < hot_experts < {ROUTED_EXPERTS}")
         if self.brrr_layers and self.brrr_ckpt is None:
             raise ValueError("TP3 config: brrr_layers needs brrr_ckpt (the checkpoint view BRRR reads its dense copies from)")
         for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap"):
@@ -308,6 +319,15 @@ class TP3Config:
             raise ValueError("TP3 config: " + "; ".join(
                 f"{name}={format_layers(value) if isinstance(value, frozenset) else value!r} is not ported yet "
                 f"(stage {pending[name]})" for name, value in ((name, getattr(self, name)) for name in pending)))
+        return self
+
+    def check_layers(self, layers: int):
+        """Raise when a layer set names a layer the model (or its mini view) does not have; preparation calls it
+        with the checkpoint's layer count before loading weights."""
+        beyond = sorted(layer for layer in self.brrr_layers if layer >= layers)
+        if beyond:
+            raise ValueError(f"TP3 config: brrr_layers names layers {format_layers(beyond)} but the model has "
+                             f"{layers} layers (0-{layers - 1})")
         return self
 
     def shared_engram_tables(self, world: int) -> bool:
