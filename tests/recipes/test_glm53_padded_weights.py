@@ -421,6 +421,84 @@ def test_three_ranks_zero_fill_the_padded_tails(loader_factory, checkpoint, rank
         assert mla["q_b_proj"].values[-1].view(torch.uint8).count_nonzero()
 
 
+@pytest.mark.parametrize("temporary", [False, True])
+def test_padded_dense_groups_land_in_persistent_storage(loader_factory, checkpoint, monkeypatch, temporary):
+    """TP3 rank 2's zero-padded BF16/block-FP8 groups (MLA q_b/kv_b/o, shared expert gate_up/down) are final
+    weights: they come from the persistent allocators (core storage's never-freed arena during an export), not
+    the caching allocator; the per-prefix pieces of a concatenated group load temporary. `temporary` loads stay
+    out of persistent storage. (DS41 has no caller: its loader overrides load_linear_group, see
+    BlockFP8WeightLoader.)"""
+    import ignition.components.weights as weights_module
+    import ignition.preparation.persistent as persistent
+
+    persistent_storages, temporary_requests = set(), []
+    original = persistent.persistent_empty
+
+    def recording(*args, **kwargs):
+        tensor = original(*args, **kwargs)
+        persistent_storages.add(tensor.untyped_storage().data_ptr())
+        return tensor
+
+    monkeypatch.setattr(persistent, "persistent_empty", recording)
+    monkeypatch.setattr(weights_module, "persistent_empty", recording)
+    padded_groups = []
+    group = weights_module.DirectWeightLoader._load_padded_dense_group
+
+    def spy(self, prefixes, *args, **kwargs):
+        padded_groups.append((tuple(p.rsplit(".", 1)[-1] for p in prefixes), kwargs.get("temporary")))
+        return group(self, prefixes, *args, **kwargs)
+
+    monkeypatch.setattr(weights_module.DirectWeightLoader, "_load_padded_dense_group", spy)
+    queue = weights_module.DirectWeightLoader._queue_tensor
+
+    def queued(self, name, **kwargs):
+        temporary_requests.append((name.rsplit(".", 2)[-2], kwargs.get("temporary")))
+        return queue(self, name, **kwargs)
+
+    monkeypatch.setattr(weights_module.DirectWeightLoader, "_queue_tensor", queued)
+    block = weights_module.DirectWeightLoader._load_padded_block
+
+    def padded_block(self, name, *args, **kwargs):
+        temporary_requests.append((name.rsplit(".", 2)[-2], kwargs.get("temporary")))
+        return block(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(weights_module.DirectWeightLoader, "_load_padded_block", padded_block)
+    loader, _ = loader_factory(2, 3)
+    shards = Shards.of(3)
+    with loader:
+        loaded = {
+            "q_b": loader.load_linear_group([f"{MLA}.q_b_proj"], row_ranges=[shards.head_channels(2, 256)],
+                                            pad=True, temporary=temporary),
+            "kv_b": loader.load_linear_group([f"{MLA}.kv_b_proj"], row_ranges=[shards.head_channels(2, 512)],
+                                             pad=True, temporary=temporary),
+            "o": loader.load_linear_group([f"{MLA}.o_proj"], column_range=shards.head_channels(2, 256),
+                                          pad=True, temporary=temporary),
+            "gate_up": loader.load_linear_group([f"{MOE}.shared_experts.gate_proj", f"{MOE}.shared_experts.up_proj"],
+                                                row_ranges=[(1536, 2304)] * 2, pad=True, temporary=temporary),
+        }
+    # Every load took the padded path (rank 2 holds heads 48..63 + 8 zero heads, expert columns 1536..2303).
+    assert [names for names, _ in padded_groups] == [("q_b_proj",), ("kv_b_proj",), ("o_proj",),
+                                                      ("gate_proj", "up_proj")]
+    assert all(flag is temporary for _, flag in padded_groups)
+    tensors = {}
+    for name, value in loaded.items():
+        if isinstance(value, BlockFP8Weight):
+            tensors[name + ".values"], tensors[name + ".scales"] = value.values, value.scales
+        else:
+            tensors[name] = value
+    in_persistent = {name: t.untyped_storage().data_ptr() in persistent_storages for name, t in tensors.items()}
+    assert in_persistent == dict.fromkeys(tensors, not temporary)
+    # The concatenated group's per-prefix pieces were temporary (only the packed result is persistent).
+    pieces = [flag for name, flag in temporary_requests if name in ("gate_proj", "up_proj")]
+    assert len(pieces) == 4 and all(pieces)  # values and scales of both prefixes
+    # The bytes are unchanged by where they live.
+    _, tensors_on_disk = checkpoint
+    _same(loaded["kv_b"], _padded(tensors_on_disk[f"{MLA}.kv_b_proj.weight"], shards.head_channels(2, 512)))
+    _same(loaded["gate_up"].values, torch.cat([_padded(tensors_on_disk[f"{MOE}.shared_experts.{n}.weight"], (1536, 2304))
+                                               for n in ("gate_proj", "up_proj")]))
+    assert provenance.lookup(loaded["gate_up"].values) is not None
+
+
 @pytest.mark.parametrize("rank", [0, 1, 2])
 def test_three_ranks_narrow_routed_experts_to_704_columns(loader_factory, checkpoint, rank):
     """FLARE_GLM53_EXPERT_COLUMNS=704: routed columns 0..703, 704..1407 exact, 1408..2047 + 64 zero; the shared

@@ -18,7 +18,7 @@ from time import monotonic
 from typing import TYPE_CHECKING
 
 from ignition.preparation.checkpoint import IndexedCheckpoint
-from ignition.preparation.persistent import persistent_empty, persistent_zeros, persistent_copy
+from ignition.preparation.persistent import persistent_cat, persistent_empty, persistent_zeros, persistent_copy
 from ignition.preparation.rebuild_manifest import declare_container_fields
 from ignition.progress import phase
 from ignition.preparation.quantization import linear_format, projection_group_format, quantized_layers
@@ -1049,7 +1049,7 @@ class DirectWeightLoader:
         self._session.flush()
         return targets
 
-    def _load_padded_block(self, name, source, rows, columns):
+    def _load_padded_block(self, name, source, rows, columns, *, temporary=False):
         """Zero block for a row/column range past `source`, with the covered rectangle copied in.
 
         Provenance records the covered rectangle as one affine byte piece; the zero remainder has no
@@ -1061,7 +1061,8 @@ class DirectWeightLoader:
         from ignition.preparation import provenance
 
         (r0, r1), (c0, c1) = rows, columns
-        target = torch.zeros((r1 - r0, c1 - c0), dtype=source.dtype, device=self.device)
+        zeros = torch.zeros if temporary else persistent_zeros
+        target = zeros((r1 - r0, c1 - c0), dtype=source.dtype, device=self.device)
         nr, nc = max(0, min(r1, source.shape[0]) - r0), max(0, min(c1, source.shape[1]) - c0)
         if nr and nc:
             self._copy(target[:nr, :nc], source[r0:r0 + nr, c0:c0 + nc])
@@ -1122,14 +1123,18 @@ class DirectWeightLoader:
                 return True
         return False
 
-    def _load_padded_dense_group(self, prefixes, row_ranges, column_range, fmt, dtype, alignment):
+    def _load_padded_dense_group(self, prefixes, row_ranges, column_range, fmt, dtype, alignment, *,
+                                 temporary=False):
         """TP3 zero-padded BF16/FP32/block-FP8 group: the fork's per-prefix path from before upstream's packed
         single-destination loader (2026-11 sync). Covered blocks keep their bytes and provenance; zero tails
-        have no source; block-FP8 tails get zero scales."""
+        have no source; block-FP8 tails get zero scales. The returned tensors are persistent unless `temporary`;
+        pieces that are concatenated load temporary."""
         import torch
         from ignition.components.block_fp8 import BlockFP8Weight
 
         values, scales = [], []
+        pieces = temporary or len(prefixes) > 1
+        cat = torch.cat if temporary else persistent_cat
         for prefix, rows in zip(prefixes, row_ranges, strict=True):
             source = self._sources[prefix + ".weight"]
             if source.ndim != 2 or source.dtype != dtype:
@@ -1140,9 +1145,11 @@ class DirectWeightLoader:
             covered_rows, covered_columns = min(r1, n) - r0, min(c1, k) - c0
             padded = (covered_rows, covered_columns) != (r1 - r0, c1 - c0)
             if padded:
-                values.append(self._load_padded_block(prefix + ".weight", source, (r0, r1), (c0, c1)))
+                values.append(self._load_padded_block(prefix + ".weight", source, (r0, r1), (c0, c1),
+                                                      temporary=pieces))
             else:
-                values.append(self.load_tensor(prefix + ".weight", extent=(slice(r0, r1), slice(c0, c1))))
+                values.append(self.load_tensor(prefix + ".weight", extent=(slice(r0, r1), slice(c0, c1)),
+                                               temporary=pieces))
             if fmt == "block_fp8":
                 scale = self._sources[prefix + ".weight_scale"]
                 if scale.dtype != torch.float32 or scale.shape not in (
@@ -1151,12 +1158,13 @@ class DirectWeightLoader:
                 if padded:
                     # Zero scales for the zero tail; the covered blocks keep their checkpoint values.
                     scales.append(self._load_padded_block(prefix + ".weight_scale",
-                        scale.reshape(n // 128, k // 128), (r0 // 128, r1 // 128), (c0 // 128, c1 // 128)))
+                        scale.reshape(n // 128, k // 128), (r0 // 128, r1 // 128), (c0 // 128, c1 // 128),
+                        temporary=pieces))
                     continue
                 extent = ((slice(r0 // 128, r1 // 128), slice(c0 // 128, c1 // 128))
                           if scale.ndim == 2 else
                           (slice(r0 // 128, r1 // 128), slice(None), slice(c0 // 128, c1 // 128), slice(None)))
-                scales.append(self.load_tensor(prefix + ".weight_scale", extent=extent).view(
+                scales.append(self.load_tensor(prefix + ".weight_scale", extent=extent, temporary=pieces).view(
                     (r1 - r0) // 128, (c1 - c0) // 128))
         if any(value.shape[1] != values[0].shape[1] for value in values):
             raise ValueError("packed projections must share input width")
@@ -1165,7 +1173,7 @@ class DirectWeightLoader:
             from ignition.preparation import provenance
 
             parts = [provenance.lookup(value) for value in values]
-            combined = torch.cat(values)
+            combined = cat(values)
             if all(parts):
                 provenance.record_sources(
                     combined,
@@ -1175,7 +1183,7 @@ class DirectWeightLoader:
             values = combined
         else:
             values = values[0]
-        return values if not scales else BlockFP8Weight(values, torch.cat(scales) if len(scales) > 1 else scales[0])
+        return values if not scales else BlockFP8Weight(values, cat(scales) if len(scales) > 1 else scales[0])
 
     def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, scale_name="weight_scale",
                           pad=False, temporary=False):
@@ -1208,7 +1216,8 @@ class DirectWeightLoader:
             alignment = 128 if fmt == "block_fp8" else 1
             if pad and self._dense_group_padded(prefixes, row_ranges, column_range, dtype, alignment):
                 # TP3 zero padding (GLM): per-prefix blocks with a zero tail, concatenated (not packed storage).
-                return self._load_padded_dense_group(prefixes, row_ranges, column_range, fmt, dtype, alignment)
+                return self._load_padded_dense_group(prefixes, row_ranges, column_range, fmt, dtype, alignment,
+                                                     temporary=temporary)
             for prefix, rows in zip(prefixes, row_ranges, strict=True):
                 source = self._sources[prefix + ".weight"]
                 if source.ndim != 2 or source.dtype != dtype:
