@@ -46,7 +46,7 @@ from ignition.progress import phase
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import RECIPE
 from .attention import INDEXER_QUERY_ROWS
-from .decoder import PreparedDecoder, Scratch, DraftScratch
+from .decoder import PreparedDecoder, Scratch, DraftScratch, check_brrr_decisions
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -176,6 +176,10 @@ class PreparationConfig:
         elif not isinstance(self.tp3, TP3Config):
             raise TypeError("tp3 must be a TP3Config")
         self.tp3.require_ported()
+        if self.tp3.brrr_layers and self.joint_tuning:
+            # Joint tuning observes Flare's layer tail (attention output, router ids) in every decode graph, which a
+            # BRRR layer does not run; tp3-main never combined the two (export.sh does not use --joint-tuning).
+            raise ValueError("TP3 config: brrr_layers cannot be combined with --joint-tuning")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -363,6 +367,8 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
+    from ignition.recipes.deepseek41.brrr import create_engine
+    create_engine(group, device, ipc, config.tp3)  # TP3 BRRR: no-op unless tp3.brrr_layers is set
     # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world size to
     # divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between decode and
     # prefill: graph capture enters only the main collective's capture() context, so a second runtime's reductions
@@ -615,6 +621,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     transient.close()
+    # TP3 BRRR: ranks must agree on every layer's fused-kernel decision before any of them can enter the kernel
+    # (its all-reduce would deadlock); plain construction code, before tuning and capture.
+    check_brrr_decisions(group)
     release_unused()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
@@ -661,6 +670,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         prefill_storage = decoder_storage = scored_storage = storage = decoder = batch = None
         arena.release_preparation()
         release_unused()
+        check_brrr_decisions(group)  # anything constructed since the catalog (tuning)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,

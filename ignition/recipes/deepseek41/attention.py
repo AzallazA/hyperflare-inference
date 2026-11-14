@@ -284,6 +284,10 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 
 
 class PreparedAttention:
+    # TP3 BRRR (decoder.PreparedLayer sets it for BRRR layers): the fused layer kernel applies inverse RoPE and the
+    # o-projection itself, so _run returns the attention output as the kernel reads it.
+    external_tail = False
+
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None):
@@ -531,6 +535,12 @@ class PreparedAttention:
             indexed_indices=selected if self.ratio else None,
             indexed_lengths=geometry.index_lengths if self.ratio else None,
             page_table=m.token_page_table if self.ratio else None, window=window_cache)
+        if self.external_tail:
+            # TP3 BRRR: decode/verify only (no prefill commit); the kernel rotates and projects ``attended`` itself.
+            observations = dict(projected=projected, query_low=query_low, query=query,
+                                window_values=window_values, qkv_encoded_bases=qkv_encoded_bases,
+                                query_encoded_bases=encoded_bases, selected=selected, attended=attended)
+            return attended, (window_cache, records), (selected, candidates, candidate_counts), observations
         self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
         output = self.output_projection(attended.view(source.shape[0], -1, 4096))
         record = window_cache, records

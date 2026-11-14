@@ -28,6 +28,55 @@ from .probe import Probe
 from .tp3_config import TP3Config
 
 
+# TP3 BRRR: each rank decides per layer and graph whether the fused tail runs, from its own TP3Config (brrr_layers,
+# brrr_parked_max_rows, host_expert_layers, hot_experts, ...) and the graph's row count. The kernel's in-kernel
+# all-reduce needs every rank to make the same decision: a rank that runs Flare's path while a peer waits in the kernel
+# deadlocks. PreparedLayer records its decisions here and the bootstrap compares them across ranks
+# (check_brrr_decisions) in plain construction code, before any capture.
+_BRRR_DECISIONS = []
+_BRRR_CHECKED = 0
+_BRRR_DECISION_FIELDS = ("graph", "layer", "mode", "rows", "brrr", "gated")
+
+
+def record_brrr_decision(name, index, mode, rows, uses_brrr, gated=False):
+    _BRRR_DECISIONS.append((str(name), int(index), str(mode), int(rows), bool(uses_brrr), bool(gated)))
+
+
+def check_brrr_decisions(group):
+    """All-gather the BRRR decisions recorded since the previous check and raise when ranks disagree.
+
+    Collective over ``group`` (the Gloo group create_engine used): every rank must call it at the same point, from plain
+    construction code, never inside a traced or captured forward. No-op without a BRRR engine (no engine, no kernel to
+    deadlock) or without a group. Returns the number of decisions compared.
+    """
+    global _BRRR_CHECKED
+    from ignition.recipes.deepseek41.brrr import engine
+
+    if group is None or engine() is None:
+        return 0
+    import torch.distributed as dist
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("check_brrr_decisions must run outside CUDA graph capture")
+    pending, _BRRR_CHECKED = list(_BRRR_DECISIONS[_BRRR_CHECKED:]), len(_BRRR_DECISIONS)
+    gathered = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, pending, group=group)
+    root = gathered[0]
+    for rank, other in enumerate(gathered[1:], 1):
+        if other == root:
+            continue
+        if len(other) != len(root):
+            detail = f"rank 0 recorded {len(root)} layer decisions, rank {rank} recorded {len(other)}"
+        else:
+            at = next(i for i, (a, b) in enumerate(zip(root, other)) if a != b)
+            detail = (f"rank 0 decided {dict(zip(_BRRR_DECISION_FIELDS, root[at]))}, "
+                      f"rank {rank} decided {dict(zip(_BRRR_DECISION_FIELDS, other[at]))}")
+        raise RuntimeError("BRRR layer decisions differ between ranks (the fused kernel's all-reduce would deadlock): "
+                           f"{detail}. Every rank must receive the same TP3Config (brrr_*, host_expert_layers, "
+                           "hot_experts) and graph catalog.")
+    return len(pending)
+
+
 @dataclass(frozen=True)
 class Scratch:
     """BF16 decoder activations and FP32 target vocabulary logits."""
@@ -131,6 +180,7 @@ class PreparedDecoderBoundary:
 class PreparedLayer:
     # TP3 fork attributes; class defaults keep the upstream behaviour (one router-ID-ordered bank, no debug hooks).
     hot_map = None
+    brrr = None
     no_engram = False
     probe, probe_index, probe_mode = Probe(), None, None
 
@@ -202,6 +252,23 @@ class PreparedLayer:
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
+        # TP3 BRRR: one fused kernel from the attention output to the MLP all-reduce in decode/verify graphs
+        # (TP3Config.brrr_layers). tp3.brrr_parked_max_rows = N: parked (host-expert) layers use it only in graphs of at
+        # most N rows; wide verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300,
+        # BRRR-26 level). Flare's tail operators above are still declared and tuned (as on tp3-main); _run skips them.
+        if tp3.brrr_layers:
+            rows = metadata.positions.numel()
+            # A layer counts as parked only if it has a host tail (HOT >= 384 loads it fully resident, no hot_map).
+            parked = index in tp3.host_expert_layers and self.hot_map is not None
+            gated = bool(tp3.brrr_parked_max_rows) and parked and rows > tp3.brrr_parked_max_rows
+            if index in tp3.brrr_layers and mode in ("decode", "verify") and not gated:
+                if self.image_mask is not None or boundary is not None or self.attention.owns_window_metadata:
+                    raise ValueError(f"BRRR layer {index} needs a decode/verify layer with shared window indices")
+                from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
+                self.attention.external_tail = True
+                self.brrr = PreparedBRRRTail(index, weights, metadata.positions.dtype,
+                                             rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
+            record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
 
         if self.attention_hc is not None:
             self.attention_hc.functional()
@@ -246,6 +313,16 @@ class PreparedLayer:
         attention_normalized = normalized
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
             indices=indices, window_cache=window_cache)
+        if self.brrr is not None:
+            # TP3 BRRR: ``attended`` is the attention output before inverse RoPE (attention.external_tail); the kernel
+            # runs inverse RoPE .. MLP all-reduce and returns what Flare's path below would.
+            output, (residual, post, comb), next_mix = self.brrr(attended, residual, post, comb, attn_mix,
+                                                                 indices.position)
+            incoming = ((self.post(output, residual, post, comb),) if self.post is not None
+                        else (output, residual, post, comb))
+            observations = {"attention." + key: value for key, value in observations.items()}
+            observations.update({"attention_hc.normalized": attention_normalized, "output": incoming[0]})
+            return incoming, next_mix, records, selection, observations
         attention_output = self.attention_reduce(attended)
         probe.record(attention_output, layer, 1, mode)
         next_mix = torch.zeros_like(attn_mix)

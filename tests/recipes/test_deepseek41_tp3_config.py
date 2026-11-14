@@ -243,7 +243,7 @@ def test_config_is_frozen_and_hashable():
     assert hash(config) == hash(TP3Config.from_environment(dict(RELEASE_ENV)))
 
 
-# The 2026-11-14 base port: the release config minus the features later port stages bring back (BRRR = S6, Engram
+# The 2026-11-14 base port: the release config minus the features the port stages bring back (BRRR = S6, Engram
 # chunk rows and the shared residual = S5, vision staging = S7). The tower stays host-parked (vision_host).
 BASE_PORT_CONFIG = replace(RELEASE_CONFIG, brrr_layers=frozenset(), brrr_parked_max_rows=0, brrr_ckpt=None,
                            vision_stage=False)
@@ -260,7 +260,6 @@ def test_preparation_config_carries_the_tp3_config():
 
 
 @pytest.mark.parametrize("changes,stage", [
-    (dict(brrr_layers=frozenset({0, 1}), brrr_ckpt=Path("/c")), "stage S6"),
     (dict(engram_chunk_rows=1024), "stage S5"),
     (dict(share_engram_residual=True), "stage S5"),
     (dict(vision_stage=True), "stage S7"),
@@ -277,15 +276,25 @@ def test_unported_switches_fail_at_config_time_with_their_stage(changes, stage):
 
 
 def test_release_config_names_every_unported_switch_and_the_base_port_none():
-    assert set(RELEASE_CONFIG.unported()) == {"brrr_layers", "vision_stage"}
+    assert set(RELEASE_CONFIG.unported()) == {"vision_stage"}
     assert BASE_PORT_CONFIG.unported() == {} and BASE_PORT_CONFIG.require_ported() is BASE_PORT_CONFIG
-    with pytest.raises(ValueError, match="brrr_layers='0-39' is not ported yet") as error:
+    with pytest.raises(ValueError, match="vision_stage=True is not ported yet \\(stage S7"):
         RELEASE_CONFIG.require_ported()
-    assert "vision_stage=True is not ported yet (stage S7" in str(error.value)
     # The release export.sh environment still parses (the switches keep their meaning for the later stages).
     env = dict(RELEASE_ENV, FLARE_DS41_ENGRAM_CHUNK_ROWS="1024", FLARE_DS41_SHARE_ENGRAM_RESIDUAL="1")
     assert set(TP3Config.from_environment(env).unported()) == {
-        "brrr_layers", "vision_stage", "engram_chunk_rows", "share_engram_residual"}
+        "vision_stage", "engram_chunk_rows", "share_engram_residual"}
+
+
+def test_brrr_is_ported_but_refuses_joint_tuning():
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    brrr = replace(BASE_PORT_CONFIG, brrr_layers=frozenset(range(40)), brrr_parked_max_rows=12, brrr_ckpt=Path("/c"))
+    assert brrr.unported() == {}
+    assert PreparationConfig(max_active=4, tp3=brrr).tp3 is brrr
+    with pytest.raises(ValueError, match="brrr_layers cannot be combined with --joint-tuning"):
+        PreparationConfig(max_active=4, tp3=brrr, joint_tuning=True)
+    assert PreparationConfig(max_active=4, tp3=BASE_PORT_CONFIG, joint_tuning=True).joint_tuning
 
 
 def test_engram_table_layout_switch():

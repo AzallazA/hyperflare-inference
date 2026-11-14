@@ -22,7 +22,6 @@ ENV_PREFIX = "FLARE_DS41_"
 # environment keeps its meaning), but preparation refuses a non-default value until the named stage lands
 # (``TP3Config.require_ported``), so an export never silently drops a saving or a kernel.
 UNPORTED = {
-    "brrr_layers": "S6 (BRRR fused layer tail)",
     "engram_chunk_rows": "S5 (Engram chunk rows)",
     "share_engram_residual": "S5 (shared Engram residual; expected to be deleted there, Inductor reuses the storage)",
     "vision_stage": "S7 (vision weight staging)",
