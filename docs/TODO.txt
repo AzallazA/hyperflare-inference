@@ -1,3 +1,24 @@
+[ ] Compare Inkling 2 effort-zero generation with the canonical target using
+    the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and
+    violates exact-output prompts; the TML prompt matches tml-renderers 0.4.1.
+    Preserve the failing zero-effort cases in tests/server/test_inkling2.py.
+
+[ ] Qualify Inkling 2 numerical agreement at long contexts and on fully
+    populated large vision graphs. Canonical vision comparisons cover at most
+    256 live patches.
+
+[ ] Fix native TP4 shutdown reporting "free(): double free detected in tcache 2"
+    after server drain with Inkling 2 cores. Reproduces with compiled and
+    uncompiled graphs; preserve the successful request drain and GPU release.
+
+[ ] Update the FlashInfer dependency pin after the Inkling 2 b12x relative-bias,
+    private attention-tail and explicit expert activation-mode changes are
+    published. Preparation currently requires the patched local checkout.
+
+[ ] Make test_explicit_worker_budget_compiles_and_replays_a_catalog account for
+    host memory admission. Its nine-worker assertion requires 296 GiB available
+    under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.
