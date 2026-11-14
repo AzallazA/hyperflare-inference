@@ -23,6 +23,8 @@ from ignition.preparation.tuning import register_finalizer
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .probe import Probe
+from .tp3_config import TP3Config
 
 
 @dataclass(frozen=True)
@@ -126,12 +128,23 @@ class PreparedDecoderBoundary:
 
 
 class PreparedLayer:
+    # TP3 fork attributes; class defaults keep the upstream behaviour (no debug hooks).
+    no_engram = False
+    probe, probe_index, probe_mode = Probe(), None, None
+
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
-                 window_metadata=None, examples=None):
+                 window_metadata=None, examples=None, tp3=None, probe=None):
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches; the decoder shares one instance per graph
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
+        # Debug (TP3Config.probe / no_engram, flare#193): per-layer residual probes; Engram handshake kept but its
+        # contribution to the residual discarded.
+        self.probe = Probe(tp3.probe) if probe is None else probe
+        self.probe_index, self.probe_mode = index, mode
+        self.probe.allocate(s.residual.device)  # eager, outside traced forwards (no-op unless enabled)
+        self.no_engram = tp3.no_engram
         self.metadata = metadata
         self.image_mask = (torch.zeros(metadata.token_ids.shape, dtype=torch.bool, device=metadata.token_ids.device)
                            if mode == "prefill" and weights.experts.vision_correction is not None else None)
@@ -211,8 +224,13 @@ class PreparedLayer:
         return incoming, next_mix, records, selection
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
-        if self.engram is not None:
+        probe, layer, mode = self.probe, self.probe_index, self.probe_mode
+        if self.engram is not None and self.no_engram:
+            self.engram(incoming[0], metadata)  # debug A/B: readiness wait and lookup run, the result is dropped
+        elif self.engram is not None:
             incoming = (self.engram(incoming[0], metadata),)
+        if len(incoming) == 1:
+            probe.record(incoming[0], layer, 0, mode)
         if boundary is None:
             attn_mix = torch.zeros_like(pre_mix)
             residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
@@ -222,6 +240,7 @@ class PreparedLayer:
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
             indices=indices, window_cache=window_cache)
         attention_output = self.attention_reduce(attended)
+        probe.record(attention_output, layer, 1, mode)
         next_mix = torch.zeros_like(attn_mix)
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
@@ -229,11 +248,20 @@ class PreparedLayer:
         image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
         router_logits = self.router_projection(normalized)
         route = self.router(router_logits, image_mask=image_mask)
-        routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
+        probe.router(route.ids, route.weights, layer, mode)
+        probe.full(normalized, layer, "in", mode)
+        ids = route.ids
+        routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
+        probe.full(routed, layer, "out", mode)
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
-        output = self.mlp_reduce(routed + shared)
+        probe.record(routed, layer, 3, mode)
+        probe.record(shared, layer, 4, mode)
+        partial = routed + shared
+        probe.record(partial, layer, 5, mode)
+        output = self.mlp_reduce(partial)
+        probe.record(output, layer, 2, mode)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
         observations = {"attention." + key: value for key, value in observations.items()}
@@ -245,9 +273,12 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None):
+                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
+                 tp3=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
+        self.probe = Probe(tp3.probe)
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
@@ -313,7 +344,7 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples))
+                examples=examples, tp3=tp3, probe=self.probe))
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
@@ -352,6 +383,8 @@ class PreparedDecoder:
 
     def __call__(self, metadata):
         source_metadata = metadata
+        self.probe.step(metadata.positions.device, self.mode)
+        self.probe.positions(metadata.positions, self.mode)
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
                   if self.vision is not None else metadata.token_ids)

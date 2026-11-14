@@ -18,6 +18,19 @@ from pathlib import Path
 
 ENV_PREFIX = "FLARE_DS41_"
 
+# Switches whose code is not on the 2026-11-14 upstream port yet: TP3Config still parses and records them (the release
+# environment keeps its meaning), but preparation refuses a non-default value until the named stage lands
+# (``TP3Config.require_ported``), so an export never silently drops a saving or a kernel.
+UNPORTED = {
+    "brrr_layers": "S6 (BRRR fused layer tail)",
+    "engram_chunk_rows": "S5 (Engram chunk rows)",
+    "share_engram_residual": "S5 (shared Engram residual; expected to be deleted there, Inductor reuses the storage)",
+    "vision_stage": "S7 (vision weight staging)",
+}
+
+# Engram table layouts at export (``engram_tables``).
+ENGRAM_TABLES = ("auto", "shared", "partitioned")
+
 # Switches whose code paths or names were removed (2026-11-08); the full construction (from_environment) rejects
 # them so a stale setting fails loudly instead of being ignored.
 REMOVED = {
@@ -114,6 +127,11 @@ class TP3Config:
     """Override of the per-rank captured-graph estimate for world size 3 (GiB); None = the 8 GiB default."""
     tp3_vocab_parallel: bool = False
     """Admit vocabulary-parallel sampling at TP3 (b12x gathers enabled for world 3)."""
+    # --- Engram tables (engram.py Tables) ---
+    engram_tables: str = "auto"
+    """Engram table layout in the package: ``shared`` = every rank reads the whole tables (the layout of every TP3
+    package so far; the fast-restart private-table reader was validated on it), ``partitioned`` = upstream #220's
+    per-rank head partitions, ``auto`` = shared at world 3, partitioned at other multi-rank worlds (upstream)."""
     # --- graph scratch (decoder.py Scratch, engram.py; bootstrap.py sizes the pools) ---
     engram_chunk_rows: int = 0
     """Engram projection, its all-reduce and the mix run in row chunks of N inside wider graphs (prefill), so the
@@ -171,6 +189,9 @@ class TP3Config:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
+        if self.engram_tables not in ENGRAM_TABLES:
+            raise ValueError(f"TP3 config: engram_tables must be one of {', '.join(ENGRAM_TABLES)}, "
+                             f"not {self.engram_tables!r}")
         if self.vision_stage_copy not in ("memcpy", "kernel"):
             raise ValueError(f"TP3 config: vision_stage_copy must be 'memcpy' or 'kernel', not {self.vision_stage_copy!r}")
         if self.vision_stage and not self.vision_host:
@@ -257,6 +278,7 @@ class TP3Config:
             ar_rows=integer("AR_ROWS"),
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
+            engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
@@ -273,6 +295,27 @@ class TP3Config:
             no_engram=truthy("NO_ENGRAM"),
             probe=truthy("PROBE"),
         )
+
+    def unported(self) -> dict:
+        """Switches set to a non-default value whose code has not been ported yet: {field: stage}."""
+        defaults = {item.name: item.default_factory() if item.default is MISSING else item.default
+                    for item in fields(self)}
+        return {name: stage for name, stage in UNPORTED.items() if getattr(self, name) != defaults[name]}
+
+    def require_ported(self):
+        """Raise when a switch asks for code that is not on this port yet (preparation calls it at config time)."""
+        pending = self.unported()
+        if pending:
+            raise ValueError("TP3 config: " + "; ".join(
+                f"{name}={format_layers(value) if isinstance(value, frozenset) else value!r} is not ported yet "
+                f"(stage {pending[name]})" for name, value in ((name, getattr(self, name)) for name in pending)))
+        return self
+
+    def shared_engram_tables(self, world: int) -> bool:
+        """Whether a ``world``-rank export keeps whole Engram tables on every rank (see ``engram_tables``)."""
+        if world == 1 or self.engram_tables == "shared":
+            return True
+        return self.engram_tables == "auto" and world == 3
 
     def to_metadata(self) -> dict:
         """JSON-ready record of every switch: layer sets as ``"20-33"`` strings; the two paths as basename plus a

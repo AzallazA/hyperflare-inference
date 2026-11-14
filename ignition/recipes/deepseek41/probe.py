@@ -25,21 +25,23 @@ _STATE = {}
 def _state(device):
     key = torch.device(device).index
     if key not in _STATE:
+        # Persistent storage: the probe state must outlive the transient pools that preparation constructs in.
+        from ignition.preparation.persistent import persistent_zeros as zeros
         state = {
-            "ring": torch.zeros((RING, LAYERS, STAGES, 4), dtype=torch.float32, device=device),
-            "counter": torch.zeros((1,), dtype=torch.int64, device=device),
-            "prefill": torch.zeros((PREFILL_ROWS, LAYERS, STAGES, 4), dtype=torch.float32, device=device),
-            "prefill_rows": torch.zeros((1,), dtype=torch.int64, device=device),
-            "ring_pos": torch.full((RING,), -1, dtype=torch.int64, device=device),
-            "prefill_pos": torch.full((PREFILL_ROWS,), -1, dtype=torch.int64, device=device),
-            "ring_ids": torch.full((RING, LAYERS, 6), -1, dtype=torch.int32, device=device),
-            "ring_w": torch.zeros((RING, LAYERS, 6), dtype=torch.float32, device=device),
-            "prefill_ids": torch.full((PREFILL_ROWS, LAYERS, 6), -1, dtype=torch.int32, device=device),
-            "prefill_w": torch.zeros((PREFILL_ROWS, LAYERS, 6), dtype=torch.float32, device=device),
-            "ring_in": torch.zeros((RING, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
-            "ring_out": torch.zeros((RING, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
-            "prefill_in": torch.zeros((PREFILL_ROWS, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
-            "prefill_out": torch.zeros((PREFILL_ROWS, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
+            "ring": zeros((RING, LAYERS, STAGES, 4), dtype=torch.float32, device=device),
+            "counter": zeros((1,), dtype=torch.int64, device=device),
+            "prefill": zeros((PREFILL_ROWS, LAYERS, STAGES, 4), dtype=torch.float32, device=device),
+            "prefill_rows": zeros((1,), dtype=torch.int64, device=device),
+            "ring_pos": zeros((RING,), torch.int64, device).fill_(-1),
+            "prefill_pos": zeros((PREFILL_ROWS,), torch.int64, device).fill_(-1),
+            "ring_ids": zeros((RING, LAYERS, 6), torch.int32, device).fill_(-1),
+            "ring_w": zeros((RING, LAYERS, 6), dtype=torch.float32, device=device),
+            "prefill_ids": zeros((PREFILL_ROWS, LAYERS, 6), torch.int32, device).fill_(-1),
+            "prefill_w": zeros((PREFILL_ROWS, LAYERS, 6), dtype=torch.float32, device=device),
+            "ring_in": zeros((RING, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
+            "ring_out": zeros((RING, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
+            "prefill_in": zeros((PREFILL_ROWS, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
+            "prefill_out": zeros((PREFILL_ROWS, len(FULL_LAYERS), 5120), dtype=torch.bfloat16, device=device),
         }
         _STATE[key] = state
         if key == 0:

@@ -54,10 +54,8 @@ from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
+from .tp3_config import TP3Config
 from .weights import ModelWeights
-
-
-_CONTEXT = partial(PreparedContext, compact_prefill=True)
 
 
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
@@ -67,9 +65,9 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None):
-    """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
+                       draft_vocabulary_runtime=None, examples=None, tp3=None):
+    """Bind attention arithmetic, the proposal head's BF16 gather channel and the TP3 fork switches."""
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples, tp3=tp3),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -133,9 +131,17 @@ class PreparationConfig:
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
+    # TP3 fork switches (expert parking, host embedding/vision, chunked all-reduce, Engram tables, ...):
+    # recipe.prepare builds it from the environment once; None means the bare upstream behaviour (TP3Config defaults).
+    tp3: TP3Config | None = None
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.tp3 is None:
+            object.__setattr__(self, "tp3", TP3Config())
+        elif not isinstance(self.tp3, TP3Config):
+            raise TypeError("tp3 must be a TP3Config")
+        self.tp3.require_ported()
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -339,6 +345,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
+    tp3 = config.tp3  # TP3 fork switches: one instance, threaded through weights, Engram tables and the decoder
+    if progress is not None:
+        progress(tp3.describe())
+    # Truncated mini views (tp3.mini, test tooling) have no ratio-1 decoder suffix to compact prefill feedback.
+    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini)
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
@@ -436,7 +447,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
+            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples, tp3=tp3)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -457,7 +468,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
-                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
+                forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -512,7 +523,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         )
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
+                        context_factory=PreparedContext if kind == "scored_prefill" else context_factory)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
@@ -605,7 +616,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    assets = {role: {"path": str(path)}
+    assets = {role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name,
@@ -638,7 +649,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "indexer_query_rows": INDEXER_QUERY_ROWS,
         "free_device_bytes": free, "total_device_bytes": total, "headroom_bytes": config.headroom_bytes,
         "allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),
-        "tuning": tuning, "compiled_decoder": config.compile_decoder}
+        "tuning": tuning, "compiled_decoder": config.compile_decoder,
+        # TP3 fork: the switches this rank was prepared with (also written beside the package as tp3-config.json).
+        "tp3_config": tp3.to_metadata()}
     if scoring is not None:
         memory.update(scoring.memory_report())
     memory["draft_prefix_selection"] = config.draft_prefix_selection
@@ -673,4 +686,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
+    if rank == 0:
+        # Recorded by export_package as a JSON sidecar next to the package's model file: the package index has no
+        # free-form field (the native exporter types every serving key), so the config travels beside it.
+        model.package_sidecars = {"tp3-config.json": tp3.to_metadata()}
+        if progress is not None:
+            progress("TP3 config record: " + json.dumps(tp3.to_metadata(), sort_keys=True))
     return model
