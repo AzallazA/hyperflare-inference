@@ -152,8 +152,44 @@ def _checkpoint_weights():
             projections[prefix] = _projection(prefix, tuple(parameter.shape))
         else:
             parameters[path] = torch.randn(parameter.shape).to(torch.bfloat16)
-    downsample = parameters["downsample.weight"].permute(0, 2, 3, 1).reshape(4096, 4096).contiguous()
+    # VisionWeights.load drops the convolution-layout weight after transposing it.
+    downsample = parameters.pop("downsample.weight").permute(0, 2, 3, 1).reshape(4096, 4096).contiguous()
     return VisionWeights(parameters, projections, downsample)
+
+
+class _RecordingLoader:
+    """VisionWeights.load's loader interface on CPU: records each load's `temporary` flag."""
+
+    def __init__(self, module):
+        self.shapes = {"model.visual." + path: tuple(p.shape) for path, p in module.named_parameters()}
+        quantized = {f"blocks.{i}.{p}" for i in range(24) for p in
+                     ("attn.qkv", "attn.proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")}
+        quantized |= {f"merger.{p}" for p in ("proj", "gate_proj", "up_proj", "down_proj")}
+        self.quantization = {"model.visual." + name for name in quantized}
+        self.temporary = {}
+
+    def load_linear(self, prefix, *, temporary=False):
+        self.temporary[prefix + ".weight"] = temporary
+        return _nvfp4(*self.shapes[prefix + ".weight"])
+
+    def load_tensor(self, name, *, temporary=False):
+        self.temporary[name] = temporary
+        return torch.zeros(self.shapes[name], dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("park_blocks", [False, True])
+def test_load_keeps_only_the_transposed_downsample_weight(park_blocks):
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel
+
+    with torch.device("meta"):
+        module = Glm5NextVisionModel(Glm5NextVisionConfig(**VISION_CONFIG))
+    loader = _RecordingLoader(module)
+    weights = VisionWeights.load(module, loader, park_blocks=park_blocks)
+    # The convolution-layout weight (32 MiB) loads into temporary memory and is dropped after the transpose.
+    assert loader.temporary.pop("model.visual.downsample.weight") is True
+    assert "downsample.weight" not in weights.parameters and weights.downsample.shape == (4096, 4096)
+    assert all(flag is (park_blocks and name.startswith("model.visual.blocks.")) for name, flag in loader.temporary.items())
 
 
 class _Host:

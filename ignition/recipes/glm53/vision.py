@@ -114,14 +114,16 @@ class VisionWeights:
         declarations = loader.quantization
         for path, _ in module.named_parameters():
             prefix = "model.visual." + path.removesuffix(".weight")
-            temporary = park_blocks and path.startswith("blocks.")
+            # The convolution-layout downsample weight is read once, below, so it never needs persistent storage.
+            temporary = park_blocks and path.startswith("blocks.") or path == "downsample.weight"
             if path.endswith(".weight") and prefix in declarations:
                 projections[path.removesuffix(".weight")] = loader.load_linear(prefix, temporary=temporary)
             else:
                 parameters[path] = loader.load_tensor("model.visual." + path, temporary=temporary)
         # Patch rows are ordered [merge_h, merge_w, channel]. Conv2d stores
-        # weights as [out, channel, merge_h, merge_w]; transpose once at load.
-        downsample = persistent_copy(parameters["downsample.weight"].permute(0, 2, 3, 1).reshape(4096, 4096))
+        # weights as [out, channel, merge_h, merge_w]; transpose once at load and drop the convolution layout
+        # (only the transposed copy is read; tp3-main's parking dropped it too).
+        downsample = persistent_copy(parameters.pop("downsample.weight").permute(0, 2, 3, 1).reshape(4096, 4096))
         return cls(parameters, projections, downsample)
 
     def park(self, allocate):
