@@ -478,6 +478,8 @@ impl OrbitPush {
             controller_key: None,
             transfer_streams: self.transfer_streams,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: None,
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
@@ -650,6 +652,8 @@ impl OrbitRun {
             controller_key: None,
             transfer_streams: self.transfer_streams,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: self.api_key_file.clone(),
             scheduler_policy: self
                 .scheduler_policy
@@ -760,6 +764,27 @@ pub struct Run {
     /// Distribute and verify rank cores, then exit before GPU initialization.
     #[arg(long, help_heading = "Multi-host options")]
     pub stage_only: bool,
+
+    /// Print the memory plan and KV capacity this configuration would get on the selected GPUs,
+    /// then exit without creating a CUDA context, allocating GPU memory, or reading weights.
+    #[arg(
+        long,
+        conflicts_with_all = ["hosts", "rank", "rendezvous", "stage_only"],
+        help_heading = "Planning options"
+    )]
+    pub dry_run: bool,
+
+    /// Free GPU memory the dry run assumes before loading: one size for every GPU or one per
+    /// selected GPU [default: each GPU's CUDA driver total minus 606 MiB].
+    #[arg(
+        long,
+        value_name = "SIZE[,SIZE...]",
+        value_delimiter = ',',
+        value_parser = parse_size,
+        requires = "dry_run",
+        help_heading = "Planning options"
+    )]
+    pub dry_run_free_memory: Vec<u64>,
 
     /// File containing the serving API key; overrides [server].api_key, including with an empty file.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
@@ -903,6 +928,10 @@ pub struct ServingOptions {
         help_heading = "Speculation options"
     )]
     pub no_history_drafts: bool,
+
+    /// Serve prompts and decoding in separate rounds even when the package captured mixed graphs.
+    #[arg(long, help_heading = "Speculation options")]
+    pub no_mixed_prefill: bool,
 
     /// Advanced: fix the total verification-row budget, including pending inputs, using
     /// one exact captured packed graph per batch [default: adaptive within captured capacities].
@@ -1068,6 +1097,9 @@ impl ServingOptions {
         if self.no_history_drafts {
             options.push("--no-history-drafts".into());
         }
+        if self.no_mixed_prefill {
+            options.push("--no-mixed-prefill".into());
+        }
         if let Some(n) = self.mtp_verification_token_budget {
             options.extend(["--mtp-verification-token-budget".into(), n.to_string()]);
         }
@@ -1152,6 +1184,8 @@ impl ServingOptions {
             kv_cache_limit: self.kv_cache_limit,
             memory_limit: self.memory_limit,
             embedding_table_storage: self.embedding_table_storage,
+            // Per-table storage has no CLI flag yet; Helios applies the legacy env shim at load.
+            embedding_table_storage_per_table: None,
             embedding_table_cache_bytes: self.embedding_table_cache_size,
             embedding_table_resident_scales: if self.embedding_table_resident_scales {
                 Some(true)
@@ -1163,6 +1197,7 @@ impl ServingOptions {
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
+            no_mixed_prefill: self.no_mixed_prefill,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {
@@ -1464,6 +1499,10 @@ mod tests {
         assert_eq!(options.memory_limit, None);
         assert_eq!(options.mtp_draft_tokens, None);
         assert_eq!(options.history_drafts, None);
+        assert!(!options.no_mixed_prefill);
+        assert!(run(&["flare", "run", "model.safetensors", "--no-mixed-prefill"]).load_options().no_mixed_prefill);
+        assert!(run(&["flare", "run", "model.safetensors", "--no-mixed-prefill"]).rank_options()
+            .contains(&"--no-mixed-prefill".to_owned()));
         assert_eq!(options.mtp_verification_token_budget, None);
         assert_eq!(options.mtp_max_verification_token_budget, None);
         assert_eq!(options.adaptive_verification, None);
@@ -1550,6 +1589,29 @@ mod tests {
         assert_eq!(head.transfer_streams, Some(16));
         assert!(head.stage_only);
         assert!(Cli::try_parse_from(["flare", "run"]).is_err());
+        let planned = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--gpus",
+            "0,1",
+            "--dry-run",
+            "--dry-run-free-memory",
+            "90G,91GiB",
+        ]);
+        assert!(planned.dry_run);
+        assert_eq!(planned.dry_run_free_memory, [90 << 30, 91 << 30]);
+        assert!(!run(&["flare", "run", "model.safetensors"]).dry_run);
+        for conflicting in [
+            vec!["--dry-run", "--stage-only"],
+            vec!["--dry-run", "--rank", "1", "--rendezvous", "host:1"],
+            vec!["--dry-run", "--hosts", "peer1"],
+            vec!["--dry-run-free-memory", "90G"],
+        ] {
+            let mut arguments = vec!["flare", "run", "model.safetensors"];
+            arguments.extend(conflicting);
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
         assert!(
             Cli::try_parse_from([
                 "flare",

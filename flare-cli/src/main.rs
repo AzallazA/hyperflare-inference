@@ -14,6 +14,7 @@ mod cli;
 mod cluster;
 mod config;
 use flare::download_cache;
+mod dry_run;
 #[cfg(unix)]
 mod core_cache;
 #[cfg(unix)]
@@ -182,7 +183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| error.to_string())?;
         configure_core_devices(&mut args, &authorized, &mut progress)?;
         _lease = lease;
-        if flare_helios::runtime_core::core_cluster(&authorized).is_some() && !args.stage_only {
+        if flare_helios::runtime_core::core_cluster(&authorized).is_some()
+            && !args.stage_only
+            && !args.dry_run
+        {
             cluster::require_transport()?;
         }
         if !args.hosts.is_empty() {
@@ -237,6 +241,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             peers.finish().map_err(|e| e.to_string())?;
         }
         return Ok(());
+    }
+    if args.dry_run {
+        progress.finish_animation();
+        return dry_run::run(&args, authorized);
     }
     if membership.is_some() {
         cluster::require_transport()?;
