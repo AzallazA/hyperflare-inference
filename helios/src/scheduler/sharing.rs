@@ -33,15 +33,10 @@ impl RequestScheduler {
         self.track_evictions = true;
     }
 
-    /// Retire cache entries for mandatory execution resources and queue notices
-    /// when tracking is enabled.
+    /// Retires cache entries under pressure, queueing a notice for each when
+    /// tracking is enabled. Every eviction in the scheduler goes through here.
     pub(super) fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let report = self.cache.evict(target);
-        self.record_evictions(&report);
-        report
-    }
-
-    pub(super) fn record_evictions(&mut self, report: &EvictionReport) {
         for retired in &report.retired {
             self.offered_publications.remove(&retired.checkpoint);
         }
@@ -86,6 +81,7 @@ impl RequestScheduler {
                 });
             }
         }
+        report
     }
 
     /// Evictions since tracking was enabled or the previous call, oldest first.
@@ -157,7 +153,7 @@ impl RequestScheduler {
         })
     }
 
-    pub(super) fn decode_growth_pages(&self) -> usize {
+    fn decode_growth_pages(&self) -> usize {
         self.slots
             .iter()
             .filter_map(|slot| slot.request.as_ref())

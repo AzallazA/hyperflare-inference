@@ -158,10 +158,6 @@ impl Fixture {
                             request.reserved_pages.clone(),
                             request.terminal_snapshot,
                             request.prompt_snapshot,
-                            request.anchor_guard,
-                            request.checkpoint_capture,
-                            request.checkpoint_copy_ns,
-                            request.checkpoint_accounting(),
                             request.prefix,
                             request.admission_order,
                         ),
@@ -245,12 +241,10 @@ impl Fixture {
                     );
                 }
                 for snapshot in [
-                    request.anchor_guard,
                     request.terminal_snapshot,
                     request.message_snapshot,
                     request.prompt_snapshot,
                     request.window_snapshot,
-                    request.checkpoint_capture.map(|capture| capture.snapshot),
                 ]
                 .into_iter()
                 .flatten()
@@ -403,7 +397,6 @@ impl Fixture {
                     request.message_snapshot,
                     request.prompt_snapshot,
                     request.window_snapshot,
-                    request.checkpoint_capture.map(|capture| capture.snapshot),
                 ];
                 s.cancel(handle).unwrap();
                 if through > s.completed {
@@ -466,8 +459,6 @@ impl Fixture {
                             request.message_snapshot,
                             request.prompt_snapshot,
                             request.window_snapshot,
-                            request.checkpoint_capture.map(|capture| capture.snapshot),
-                            request.anchor_guard,
                         ]
                         .into_iter()
                         .flatten(),
