@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import gc
+import warnings
 from collections import Counter
 from collections.abc import Hashable
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -23,6 +24,7 @@ from b12x.preparation.session import _declaration_key, _plans_of
 from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
+from .scratch_preference import from_environment as scratch_preference_from_environment
 from .host_memory import COMPILE_HEADROOM_BYTES, candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
 
 
@@ -126,6 +128,16 @@ class RecordedPreparationSession(PreparationSession):
         if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
             raise ValueError("compile_headroom_bytes must be a nonnegative byte count")
         self.compile_headroom_bytes = compile_headroom_bytes
+        # Near-equal race candidates resolve to the smaller workspace (tp3 b12x patch).
+        self.scratch_preference = scratch_preference_from_environment()
+        if self.scratch_preference is not None:
+            configure = getattr(self, "configure_scratch_preference", None)
+            if configure is None:
+                warnings.warn("FLARE_TUNE_SCRATCH_TOLERANCE needs tp3-patches/flashinfer-tuning-scratch-preference"
+                              ".patch; tuning keeps the fastest candidates", RuntimeWarning, stacklevel=2)
+                self.scratch_preference = None
+            else:
+                configure(self.scratch_preference)
         cpu_workers(compile_workers)
         self.requested_compile_workers = compile_workers
         self.tuning_replica = tuning_replica
@@ -617,6 +629,7 @@ class RecordedPreparationSession(PreparationSession):
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,
                 "compile_headroom_bytes": self.compile_headroom_bytes,
+                "scratch_preference": None if self.scratch_preference is None else self.scratch_preference.identity,
                 "cache_hits": sum(result.cache_hits for result in results),
                 "benchmarked_candidates": sum(result.benchmarked_candidates for result in results),
                 "restored_candidates": sum(result.restored_candidates for result in results),
