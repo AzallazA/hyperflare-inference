@@ -107,6 +107,10 @@ class SpeculativePreparation:
         self.draft_tables = torch.full_like(inputs.page_tables, -1)
         self.draft_generation = torch.zeros_like(requests.generation)
         self.draft_offset = torch.zeros_like(requests.generation)
+        # A checkpoint declaring index_share_for_mtp_iteration attends every draft pass of a round through
+        # its first pass's sparse selection.
+        self.share_draft_selection = bool(getattr(weights.tree.config.text_config,
+                                                  "index_share_for_mtp_iteration", False))
         # Verification records every KDA layer's tokens, so each request keeps one recurrent row.
         layers = delta_layers(pool)
         recurrent = pool.decoder.layers[layers[0]].recurrent
@@ -132,6 +136,23 @@ class SpeculativePreparation:
         return PreparedMTP(self.weights, self.pool.draft, metadata, mode=mode,
             session=self.session, name=name, workspace=self.workspace, cache_only=cache_only,
             max_cache_pages=self.max_cache_pages, scratch=scratch, context=self.context, **self.collectives)
+
+
+def retain_selection(selection, rows):
+    """Each request's first-pass selection, taken from its draft output row.
+
+    Requests that propose a later draft proposed the first one; other requests' copies are never read.
+    """
+    physical, lengths = selection
+    return physical.index_select(0, rows), lengths.index_select(0, rows)
+
+
+def reuse_selection(retained, metadata):
+    """Each packed draft row's request selection from `retain_selection`; idle rows select nothing."""
+    physical, lengths = retained
+    requests = metadata.requests.long()
+    return (physical.index_select(0, requests),
+            torch.where(metadata.positions >= 0, lengths.index_select(0, requests), 0))
 
 
 class PreparedPrefill:
@@ -184,9 +205,14 @@ class PreparedRound:
             self.sampling_layouts["proposal"] = PreparedDraftDistribution.scratch_layout(b, 1, o.requests.vocab_size)
         self.sampling_scratch = self._sampling_scratch(device)
         self.convolution_regions = o.convolution
+        # Width one carries no drafts to roll back, so its KDA layers decode in place through one state column.
+        self.recorded = w > 1
+        self.state_columns = 8 if self.recorded else 1
+        # Draft passes after the first attend through the first pass's sparse selection.
+        self.share_selection = o.share_draft_selection and w > 2
         self.metadata = DecoderMetadata.allocate(b * w, b, blocks, device)
         self.metadata = DecoderMetadata(self.metadata.token_ids, torch.arange(b * w, device=device),
-            DeltaMetadata.allocate(b, device, verification_columns=8), self.metadata.indexed)
+            DeltaMetadata.allocate(b, device, verification_columns=self.state_columns), self.metadata.indexed)
         self.validator = PreparedBatch(o.inputs, o.requests, DecoderMetadata.allocate(b, b, blocks, device),
             mode="decode", shard=o.weights.shard, pages=o.pool.memory_capacity[1:], shards=o.shards)
         validation = torch.empty((1, max(8, 2 * o.requests.capacity)), dtype=torch.bfloat16, device=device)
@@ -196,11 +222,13 @@ class PreparedRound:
         self.decoder = PreparedDecoder(o.weights, o.scratch.rows(b * w, "decode", sample_rows=b * w),
             o.pool.decoder, self.metadata, mode="decode", session=o.session, name=f"{name}.target",
             workspace=o.workspace, max_cache_pages=o.max_cache_pages, context=o.context,
-            kda_records=o.kda_records, **o.collectives)
-        first = self.decoder.layers[o.kda_records.layers[0]].attention
-        self.kda_commit = PreparedKDACommit(o.pool, o.kda_records, first.recurrent_plan,
-            self.metadata.recurrent.state_indices[:, 0], self.metadata.recurrent.num_seqs,
-            session=o.session, workspace=o.workspace)
+            kda_records=o.kda_records if self.recorded else None, **o.collectives)
+        self.kda_commit = None
+        if self.recorded:
+            first = self.decoder.layers[o.kda_records.layers[0]].attention
+            self.kda_commit = PreparedKDACommit(o.pool, o.kda_records, first.recurrent_plan,
+                self.metadata.recurrent.state_indices[:, 0], self.metadata.recurrent.num_seqs,
+                session=o.session, workspace=o.workspace)
         self.draft_metadata = DraftMetadata(b, b, blocks, device, shards=o.shards)
         self.draft = o.draft(self.draft_metadata, f"{name}.draft") if w > 1 else None
         self.draft_logits = (torch.zeros(self.draft.logits.shape, dtype=self.draft.logits.dtype, device=device)
@@ -278,7 +306,7 @@ class PreparedRound:
         o, b, w = self.owner, self.batch, self.width
         device = slots.device
         m = DecoderMetadata.allocate(b * w, b, o.inputs.page_tables.shape[1], device,
-                                     samples=b * w, verification_columns=8)
+                                     samples=b * w, verification_columns=self.state_columns)
         g, index = m.recurrent, m.indexed
         lengths = torch.where(active, limits, 0)
         ends = lengths.cumsum(0)
@@ -287,8 +315,10 @@ class PreparedRound:
         states = o.inputs.request_state_rows[slots.clamp(0, o.requests.capacity - 1)]
         g.convolution_slots.copy_(torch.where(active, states[:, 0], -1))
         g.accepted_tokens.fill_(1)
-        state_columns = torch.arange(8, device=device)
-        states = torch.where(state_columns < 1, states, 0)
+        # Verification reads each request's live row in column zero and records its tokens; width one
+        # advances that row in place.
+        state_columns = torch.arange(self.state_columns, device=device)
+        states = torch.where(state_columns < 1, states[:, :self.state_columns], 0)
         g.state_indices.copy_(torch.where(active[:, None], states, 0))
         g.num_seqs.copy_(o.inputs.live_rows.clamp(0, b))
         g.num_tokens.copy_(ends[-1:])
@@ -310,20 +340,25 @@ class PreparedRound:
         return m
 
     def commit_state(self, slots, counts, records, metadata, hidden):
-        """Replay accepted KDA records, shift convolution history, and retain endpoint feedback."""
+        """Replay accepted KDA records, shift convolution history, and retain endpoint feedback.
+
+        Width one has already advanced each live KDA row, and its single token leaves the convolution
+        history in place, so it saves only the target output.
+        """
         o, w = self.owner, self.width
         states = o.inputs.request_state_rows[slots.clamp(0, o.requests.capacity - 1)]
         live = torch.where(counts > 0, states[:, 0], 0).long()
-        self.kda_commit(counts, records, metadata)
-        backing = o.pool.backing
-        halves, channels, columns = self.convolution_regions
-        args = (backing.view(torch.bfloat16), slots, counts, o.inputs.request_state_rows, halves,
-                backing.shape[1] // 2, channels, columns, 128)
-        grid = (halves.numel(), self.batch, triton.cdiv(channels, 128))
-        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
-            torch.library.wrap_triton(_shift_convolution)[grid](*args, num_warps=4)
-        else:
-            _shift_convolution[grid](*args, num_warps=4)
+        if self.kda_commit is not None:
+            self.kda_commit(counts, records, metadata)
+            backing = o.pool.backing
+            halves, channels, columns = self.convolution_regions
+            args = (backing.view(torch.bfloat16), slots, counts, o.inputs.request_state_rows, halves,
+                    backing.shape[1] // 2, channels, columns, 128)
+            grid = (halves.numel(), self.batch, triton.cdiv(channels, 128))
+            if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+                torch.library.wrap_triton(_shift_convolution)[grid](*args, num_warps=4)
+            else:
+                _shift_convolution[grid](*args, num_warps=4)
         rows = torch.arange(self.batch, device=slots.device)
         selected_hidden = hidden.view(self.batch, w, 4096)[rows, (counts - 1).clamp_min(0).long()]
         save_hidden(selected_hidden, o.pool.last_hidden, live, (counts > 0).int())
@@ -352,9 +387,12 @@ class PreparedRound:
         before = o.requests.consumed_tokens[safe]
         pending = o.requests.pending_token[safe]
         previous = torch.empty((b, 4096), dtype=torch.bfloat16, device=device)
-        tail_backup = torch.empty_like(o.pool.draft.index.tail[:b])
         gather_rows(o.pool.last_hidden, o.inputs.request_state_rows[safe, 0], previous)
-        gather_rows(o.pool.draft.index.tail, o.inputs.request_state_rows[safe, 0], tail_backup)
+        # Draft passes advance the draft C4 tail ring, which is restored before absorbing the accepted tokens.
+        tail_backup = None
+        if self.draft is not None:
+            tail_backup = torch.empty_like(o.pool.draft.index.tail[:b])
+            gather_rows(o.pool.draft.index.tail, o.inputs.request_state_rows[safe, 0], tail_backup)
         base_offset = torch.where(o.draft_generation[safe] == o.requests.generation[safe], o.draft_offset[safe], 0)
         seed = o.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN
         drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
@@ -362,13 +400,21 @@ class PreparedRound:
         valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
         sampled = torch.zeros_like(before)
         draft_hidden = previous
+        retained = None
         for i, proposal in enumerate(proposals):
             token = pending if i == 0 else drafts[:, i - 1]
             proposing = active & (i < limits - 1)
             draft_metadata = DraftMetadata.pack(slots, proposing.long(), before - 1 + i,
                 token, draft_hidden, o.draft_tables, state_rows=o.inputs.request_state_rows,
                 capacity=1, shards=o.shards)
-            hidden, logits = self.draft(draft_metadata)
+            if not self.share_selection:
+                hidden, logits = self.draft(draft_metadata)
+            elif i == 0:
+                hidden, logits, selection = self.draft.forward(draft_metadata, retain=True)
+                retained = retain_selection(selection, draft_metadata.output_indices)
+            else:
+                hidden, logits = self.draft.forward(draft_metadata,
+                                                    selection=reuse_selection(retained, draft_metadata.indexed))
             draft_hidden = hidden[draft_metadata.output_indices]
             draft_logits = logits[draft_metadata.output_indices].view(b, 1, -1)
             proposal.run(scratch['proposal'], draft_logits, candidates=drafts,
@@ -383,7 +429,7 @@ class PreparedRound:
         o.draft_generation.copy_(torch.where(matched, o.requests.generation, o.draft_generation))
         candidates = torch.cat((pending[:, None], drafts), dim=1)
         metadata = self.target_metadata(slots, limits, active, before, candidates)
-        records = o.records()
+        records = o.records() if self.recorded else None
         hidden, logits, _, _ = self.decoder(metadata, records=records)
         logits = logits.view(b, w, -1)
         target.run(scratch['target'], logits, candidates=drafts)
@@ -391,9 +437,10 @@ class PreparedRound:
             scratch['target']['valid'], drafts=drafts, draft_valid=valid)
         committed = commit(logits, acceptance=acceptance, inputs=candidates)
         self.commit_state(slots, committed.emitted_count, records, metadata.recurrent, hidden)
-        tail = o.pool.draft.index.tail
-        save_hidden(tail_backup.view(b, -1), tail.view(tail.shape[0], -1),
-                    o.inputs.request_state_rows[safe, 0], active)
+        if tail_backup is not None:
+            tail = o.pool.draft.index.tail
+            save_hidden(tail_backup.view(b, -1), tail.view(tail.shape[0], -1),
+                        o.inputs.request_state_rows[safe, 0], active)
         context = torch.cat((previous[:, None], hidden.view(b, w, 4096)[:, :-1]), dim=1)
         absorb_metadata = DraftMetadata.pack(slots, committed.emitted_count.long(), before - 1,
             candidates, context, o.draft_tables, state_rows=o.inputs.request_state_rows, capacity=w,

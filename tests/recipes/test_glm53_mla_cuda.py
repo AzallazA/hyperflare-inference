@@ -18,7 +18,7 @@ from cuda.bindings import driver as cuda
 
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.linear import BatchedQuantizedProjection, BatchedUnquantizedProjection
-from ignition.components.sparse_mla import PreparedSparseMLA
+from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
@@ -27,6 +27,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.glm53.indexer import IndexMetadata
 from ignition.recipes.glm53.mla import MLAScratch, MLAState, PreparedGlmMLA
 from ignition.recipes.glm53.model import create_model_tree
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.weights import TEXT_PREFIX, GlmWeightLoader
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -100,14 +101,18 @@ def assert_selection(actual, expected, indexer, scratch):
         assert torch.all(logits[row][changed] == cutoff)
 
 
-@pytest.fixture(scope="module", params=[1, 2, 4])
+# (world, rank): the last rank of each size, and every rank of three (24/24/16 checkpoint heads, 24 each).
+@pytest.fixture(scope="module", params=[(1, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 3)],
+                ids=lambda value: f"{value[0]}.{value[1]}")
 def model_weights(request):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
+    if not snapshot.is_dir():
+        pytest.skip("GLM 5.3 Flash checkpoint is not available")
     tree = create_model_tree(snapshot)
     manifest = inspect_indexed_checkpoint(snapshot)
-    world = request.param
-    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(world - 1, world),
+    world, rank = request.param
+    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(rank, world),
             prefixes=(f"{TEXT_PREFIX}.layers.3.self_attn.",)) as loader:
         weights = loader.load_attention(3)
     return tree.model.language_model.layers[3].self_attn, weights, world
@@ -122,7 +127,8 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
     capacity = 1 << (rows - 1).bit_length()
     sequences = rows if mode == "decode" else 1
     source = torch.zeros((capacity, 4096), dtype=torch.bfloat16, device=device)
-    scratch = MLAScratch.allocate(capacity, 64 // world, 64, mode, device)
+    # The last rank of three holds heads 48..63 and 8 zero-weight padding heads (24 per rank).
+    scratch = MLAScratch.allocate(capacity, Shards.of(world).heads, 64, mode, device)
     state = MLAState.allocate(128, 4, device)
     metadata = IndexMetadata.allocate(capacity, sequences, 64, device)
     arena = ScratchArena(device, overlap=overlap)
@@ -259,14 +265,88 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
             graph.reset()
 
 
-@pytest.mark.parametrize("model_weights", [2], indirect=True)
+@pytest.mark.parametrize("overlap", [True, False])
+@torch.no_grad()
+def test_reused_selection_attends_only_to_the_first_pass_records(model_weights, overlap):
+    """Fork #218 on the functional forward: a draft pass that reuses the first pass's selection excludes its own
+    and later records, and leaves the C4 index state unchanged."""
+    module, weights, world = model_weights
+    if world == 1:
+        pytest.skip("GLM prepares draft graphs for TP2, TP3 and TP4")
+    device = torch.device("cuda:0")
+    source = torch.zeros((2, 4096), dtype=torch.bfloat16, device=device)
+    scratch = MLAScratch.allocate(2, Shards.of(world).heads, 64, "decode", device)
+    state = MLAState.allocate(128, 4, device)
+    metadata = IndexMetadata.allocate(2, 2, 64, device)
+    history = torch.zeros((256, 512), dtype=torch.bfloat16, device=device)
+    history_slots = torch.zeros(256, dtype=torch.int64, device=device)
+    arena = ScratchArena(device, overlap=overlap)
+    with RecordedPreparationSession(device=device, checkpoint="GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
+            workload_schema="glm-mla-shared-selection-v1", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        attention = PreparedGlmMLA(module, weights, source, scratch, state, metadata,
+            mode="decode", session=session, name="mla", workspace=arena)
+        writer = PreparedLatentCacheWriter(history, state.cache, history_slots, session=session, name="history")
+        attention.functional(session=session)
+        session.tune()
+        arena.release_preparation()
+        state.cache.zero_()
+        state.index.cache.zero_()
+        state.index.tail.zero_()
+        generator = torch.Generator(device=device).manual_seed(173)
+        metadata.block_table.copy_(torch.randperm(128, device=device, generator=generator, dtype=torch.int32)
+                                   .reshape(2, 64))
+        # Request zero is live in state slot 2; request one is idle.
+        metadata.state_slots.copy_(torch.tensor([2, -1], device=device))
+        metadata.query_start_loc.copy_(torch.tensor([0, 1, 1], dtype=torch.int32, device=device))
+        metadata.requests.zero_()
+        page = metadata.block_table[0, 0].long()
+        # Latent records of positions 0 through 255 precede the first draft pass at position 256. With fewer
+        # than 512 complete C4 pools every pool is selected, so the selection does not depend on the query.
+        history.normal_(generator=generator)
+        history_slots.copy_(page * 256 + torch.arange(256, device=device))
+        writer()
+
+        def run(position, *, selection=None, write=True):
+            slot = metadata.block_table[0, position // 256].long() * 256 + position % 256
+            metadata.positions.copy_(torch.tensor([position, -1], device=device))
+            metadata.token_slots.copy_(torch.where(torch.tensor([write, False], device=device), slot, -1))
+            output, local = attention.forward(source, metadata, selection=selection)
+            return output.clone(), (local.index.physical.clone(), local.index.selected_lengths.clone())
+
+        source[0].normal_(std=.1, generator=generator)
+        _, (physical, lengths) = run(256)
+        # Sixty-four complete pools and the tail token at position 256.
+        assert lengths.tolist() == [257, 0]
+        index_cache, index_tail = state.index.cache.clone(), state.index.tail.clone()
+        source[0].normal_(std=.1, generator=generator)
+        reused, (reused_physical, reused_lengths) = run(257, selection=(physical, lengths))
+        # The pass writes its latent record and leaves the selection and C4 state unchanged.
+        assert torch.equal(reused_physical, physical) and torch.equal(reused_lengths, lengths)
+        assert torch.equal(state.index.cache, index_cache) and torch.equal(state.index.tail, index_tail)
+        own = (metadata.block_table[0, 1].long() * 256 + 1).item()
+        assert state.cache.view(-1, 528)[own].count_nonzero()
+        assert not reused[1].count_nonzero()
+        # Selecting at the preceding position with the same query attends to the same records.
+        preceding, (selected, _) = run(256, write=False)
+        assert torch.equal(selected[0, :257].sort().values, physical[0, :257].sort().values)
+        assert ((preceding.float() - reused.float()).norm() / reused.float().norm()).item() < 1e-3
+        # Selecting at the pass's own position also attends to its record.
+        state.index.cache.copy_(index_cache)
+        state.index.tail.copy_(index_tail)
+        current, (_, current_lengths) = run(257, write=False)
+        assert current_lengths.tolist() == [258, 0]
+        assert ((current.float() - reused.float()).norm() / reused.float().norm()).item() > 2e-2
+
+
+@pytest.mark.parametrize("model_weights", [(2, 1)], indirect=True)
 @torch.no_grad()
 def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weights):
     from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
     from ignition.recipes.glm53.dcp import ContextShards, PREFILL_SLICE_ROWS
 
     module, weights, world = model_weights
-    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, 64 // world
+    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, Shards.of(world).heads
     torch.manual_seed(53)
     caches = [pack_mla_kv_cache_reference(torch.randn(blocks * 256, 512, device=device)).view(-1, 64, 528)
               for _ in range(world)]

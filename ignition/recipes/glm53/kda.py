@@ -23,6 +23,24 @@ from ignition.components.recurrent import (
     run_short_conv,
 )
 
+from .shards import HEAD_COUNTS
+
+# Fork-only TP3 decode-speed switch (PreparationConfig.kda_side_chain, set once per rank by bootstrap.prepare_rank
+# before any declaration example is allocated). Off keeps the upstream layout and schedule.
+_SIDE_CHAIN = False
+
+
+def configure(*, side_chain):
+    """Select the KDA projection schedule for examples allocated and layers prepared afterwards."""
+    global _SIDE_CHAIN
+    if type(side_chain) is not bool:
+        raise TypeError("KDA side chain must be a boolean")
+    _SIDE_CHAIN = side_chain
+
+
+def side_chain_enabled():
+    return _SIDE_CHAIN
+
 
 @dataclass(frozen=True)
 class KDAScratch:
@@ -38,13 +56,24 @@ class KDAScratch:
     gated: torch.Tensor
     output: torch.Tensor
 
+    @property
+    def split(self):
+        """Side-chain layout: q/k/v, beta and the forget input each own contiguous rows, so the q/k/v GEMM
+        returns its output whole (no staging copy) and f_b reads f_a's rows directly (no copy)."""
+        return self.projected_input.shape[-1] == self.projected_qkv.shape[-1]
+
     @classmethod
-    def allocate(cls, tokens, heads, device):
-        if type(tokens) is not int or tokens <= 0 or heads not in (16, 32, 64):
-            raise ValueError("GLM KDA scratch requires positive capacity and TP1/TP2/TP4 head counts")
+    def allocate(cls, tokens, heads, device, *, split=None):
+        if type(tokens) is not int or tokens <= 0 or heads not in HEAD_COUNTS:
+            raise ValueError("GLM KDA scratch requires positive capacity and a supported rank-count head partition")
+        split = _SIDE_CHAIN if split is None else split
         width = heads * 128
         def buffer(channels):
             return torch.zeros((tokens, channels), dtype=torch.bfloat16, device=device)
+        if split:
+            qkv = buffer(3 * width)
+            return cls(qkv, qkv, buffer(3 * width), buffer(128), buffer(128), buffer(width), buffer(heads),
+                       buffer(width), buffer(width), buffer(width), buffer(4096))
         projected = buffer(3 * width + heads + 128)
         qkv, beta, forget = projected.split((3 * width, heads, 128), dim=-1)
         if tokens > 1:
@@ -56,7 +85,7 @@ class KDAScratch:
         if type(tokens) is not int or not 0 < tokens <= self.output.shape[0]:
             raise ValueError("KDA rows exceed scratch capacity")
         views = {field.name: getattr(self, field.name)[:tokens] for field in fields(self)}
-        if tokens == 1:
+        if tokens == 1 and not self.split:
             views["forget_input"] = views["projected_input"][:, -128:]
         return KDAScratch(**views)
 
@@ -87,9 +116,9 @@ class PreparedGlmKDA:
         self.sequences = metadata.query_start_loc.numel() - 1
         self.columns = metadata.state_indices.shape[1]
         self.drafts = state.convolution.shape[-1] - 3
-        if (self.heads not in (16, 32, 64) or state.recurrent.shape[2:] != (128, 128)
+        if (self.heads not in HEAD_COUNTS or state.recurrent.shape[2:] != (128, 128)
                 or state.convolution.shape[:2] != (state.recurrent.shape[0], 3 * self.width)):
-            raise ValueError("GLM KDA state must match one TP1/TP2/TP4 head partition")
+            raise ValueError("GLM KDA state must match one supported rank-count head partition")
         if metadata.num_tokens.item() or metadata.num_seqs.item():
             raise ValueError("KDA preparation requires zero live counts")
         if mode == "decode" and (self.tokens > self.sequences * self.columns or self.columns > self.drafts + 1):
@@ -103,6 +132,54 @@ class PreparedGlmKDA:
         self.state, self.metadata, self.mode = state, metadata, mode
         module.o_norm.weight = torch.nn.Parameter(weights["o_norm.weight"], requires_grad=False)
         self.projections = {}
+        self.side_chain = scratch.split
+        self.side_chains = ()
+        self.gate_overlap = None
+        if self.side_chain:
+            self._prepare_side_chain(weights, source, scratch, session=session, name=name, workspace=workspace)
+        else:
+            self._prepare_projections(weights, source, scratch, session=session, name=name, workspace=workspace)
+        self._prepare_recurrence(module, weights, scratch, state, metadata, records,
+                                 mode=mode, session=session, name=name, workspace=workspace,
+                                 checkpoint_export=checkpoint_export)
+
+    def _prepare_side_chain(self, weights, source, scratch, *, session, name, workspace):
+        """q/k/v alone on the main stream; f_a -> f_b, b and g_a -> g_b on the auxiliary stream beside it.
+
+        The checkpoint group keeps its stored parts (MXFP8 q/k/v, BF16 b + f_a); the BF16 part is split by rows
+        (contiguous views of the same storage), so the weights and every dot product are unchanged.
+        """
+        from ignition.components.weights import GroupedLinearWeights
+
+        group = weights["input_proj"]
+        width = 3 * self.width
+        if (not isinstance(group, GroupedLinearWeights) or len(group.parts) != 2
+                or tuple(group.widths) != (width, self.heads + 128)
+                or not isinstance(group.parts[1], torch.Tensor)):
+            raise ValueError("KDA side chain requires the q/k/v group followed by one BF16 b + f_a part")
+        qkv_weight, gates = group.parts
+        def project(key, weight, input, output):
+            self.projections[key] = prepare_projection(input, weight, output, session=session,
+                name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
+        project("input_proj", qkv_weight, source, scratch.projected_qkv)
+        project("b_proj", gates[:self.heads], source, scratch.raw_beta)
+        project("f_a_proj", gates[self.heads:], source, scratch.forget_input)
+        project("f_b_proj", weights["f_b_proj"], scratch.forget_input, scratch.raw_g)
+        project("g_a_proj", weights["g_a_proj"], source, scratch.gate_input)
+        project("g_b_proj", weights["g_b_proj"], scratch.gate_input, scratch.z)
+        project("o_proj", weights["o_proj"], scratch.gated, scratch.output)
+        if workspace.overlap:
+            main = self.projections["input_proj"]
+            parallel = tuple(main.plans) if hasattr(main, "plans") else (main.plan,)
+            # Chain outputs are invocation-local; each join follows the q/k/v launch and orders the chain's
+            # outputs (and workspace) for their main-stream readers (ConcurrentProjectionChain.finish).
+            self.side_chains = tuple(ConcurrentProjectionChain(tuple(self.projections[key] for key in keys),
+                    parallel_plans=parallel, session=session, workspace=workspace)
+                for keys in (("g_a_proj", "g_b_proj"), ("f_a_proj", "f_b_proj"), ("b_proj",)))
+            # Tests and callers read gate_overlap as "the output-gate chain overlaps the input projection".
+            self.gate_overlap = self.side_chains[0]
+
+    def _prepare_projections(self, weights, source, scratch, *, session, name, workspace):
         for key, input, output in (
             ("input_proj", source, scratch.projected_input),
             ("f_b_proj", scratch.forget_input, scratch.raw_g),
@@ -115,7 +192,6 @@ class PreparedGlmKDA:
                 # Convolution consumes the projected rows after this staging has been copied out.
                 staging=scratch.convolved_qkv if key == "input_proj" else None)
         # The output-gate chain runs beside the input projections, or after them on the main stream.
-        self.gate_overlap = None
         if workspace.overlap:
             self.gate_overlap = ConcurrentProjectionChain(
                 (self.projections["g_a_proj"], self.projections["g_b_proj"]),
@@ -123,6 +199,9 @@ class PreparedGlmKDA:
                     if hasattr(self.projections["input_proj"], "plans") else
                     (self.projections["input_proj"].plan, self.projections["f_b_proj"].plan),
                 session=session, workspace=workspace)
+
+    def _prepare_recurrence(self, module, weights, scratch, state, metadata, records, *,
+                            mode, session, name, workspace, checkpoint_export):
         conv_args = {
             "x": scratch.projected_qkv, "conv_weight": weights["conv1d.weight"],
             "query_start_loc": metadata.query_start_loc, "state_slot_ids": metadata.convolution_slots,
@@ -200,6 +279,9 @@ class PreparedGlmKDA:
                 eps=module.o_norm.variance_epsilon)
 
     def functional(self, *, session):
+        for chain in self.side_chains:
+            if chain is not self.gate_overlap:
+                chain.functional(session=session)
         if self.gate_overlap is not None:
             self.gate_overlap.functional(session=session)
         for projection in self.projections.values():
@@ -220,20 +302,24 @@ class PreparedGlmKDA:
         if self.recording and records is None:
             raise ValueError("recording KDA execution requires invocation-local records")
         tokens = source.shape[0]
-        scratch = KDAScratch.allocate(tokens, self.heads, source.device)
-        pending = None if self.gate_overlap is None else self.gate_overlap.start(source)
-        projected = self.projections["input_proj"](source)
-        projected_qkv = projected[:, :3 * self.width]
-        forget_input = projected[:, -128:]
-        if tokens > 1:
-            scratch.forget_input.copy_(forget_input)
-            forget_input = scratch.forget_input
-        raw_g = self.projections["f_b_proj"](forget_input)
-        if self.gate_overlap is None:
-            gate_input = self.projections["g_a_proj"](source)
-            z = self.projections["g_b_proj"](gate_input)
+        scratch = KDAScratch.allocate(tokens, self.heads, source.device, split=self.side_chain)
+        if self.side_chain:
+            projected_qkv, raw_g, raw_beta, z = self._side_chain_projections(source)
         else:
-            z = self.gate_overlap.finish(pending, raw_g)
+            pending = None if self.gate_overlap is None else self.gate_overlap.start(source)
+            projected = self.projections["input_proj"](source)
+            projected_qkv = projected[:, :3 * self.width]
+            forget_input = projected[:, -128:]
+            if tokens > 1:
+                scratch.forget_input.copy_(forget_input)
+                forget_input = scratch.forget_input
+            raw_g = self.projections["f_b_proj"](forget_input)
+            if self.gate_overlap is None:
+                gate_input = self.projections["g_a_proj"](source)
+                z = self.projections["g_b_proj"](gate_input)
+            else:
+                z = self.gate_overlap.finish(pending, raw_g)
+            raw_beta = projected[:, 3 * self.width:3 * self.width + self.heads]
         conv_args = dict(x=projected_qkv, conv_weight=self.weights["conv1d.weight"],
             query_start_loc=metadata.query_start_loc, state_slot_ids=metadata.convolution_slots,
             state_is_fresh=metadata.fresh, num_accepted_tokens=metadata.accepted_tokens,
@@ -244,7 +330,6 @@ class PreparedGlmKDA:
         run_short_conv(self.conv_plan, scratch=conv_scratch, **conv_args)
         raw_g = raw_g.view(tokens, self.heads, 128)
         z = z.view(tokens, self.heads, 128)
-        raw_beta = projected[:, 3 * self.width:3 * self.width + self.heads]
         gated = scratch.gated.view(tokens, self.heads, 128)
         if self.verification is not None:
             recurrence = scratch.recurrence.view(tokens, self.heads, 128)
@@ -279,6 +364,22 @@ class PreparedGlmKDA:
                 self.recurrent_plan.handle, -5.0, None, 1e-6, None, None)
             gated = self.output_norm(recurrence, z, live=metadata.num_tokens)
         return self.projections["o_proj"](gated.reshape(tokens, -1))
+
+    def _side_chain_projections(self, source):
+        """Side-chain schedule: (q/k/v, raw g, raw beta, z), each a whole invocation-local projection output."""
+        p = self.projections
+        if self.side_chains:
+            pending = tuple(chain.start(source) for chain in self.side_chains)
+            projected_qkv = p["input_proj"](source)
+            # Joins follow the q/k/v launch on the main stream; each orders its chain's outputs for the readers.
+            z, raw_g, raw_beta = (chain.finish(started, projected_qkv)
+                                  for chain, started in zip(self.side_chains, pending, strict=True))
+            return projected_qkv, raw_g, raw_beta, z
+        projected_qkv = p["input_proj"](source)
+        raw_beta = p["b_proj"](source)
+        raw_g = p["f_b_proj"](p["f_a_proj"](source))
+        z = p["g_b_proj"](p["g_a_proj"](source))
+        return projected_qkv, raw_g, raw_beta, z
 
     def run_recorded(self, reads, recurrent_state, output, corrections, keys_gates, scratch):
         (mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, query_start_loc,

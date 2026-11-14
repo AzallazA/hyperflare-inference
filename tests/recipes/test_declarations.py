@@ -134,7 +134,7 @@ def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
     assert sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_glm_state_rows_and_pages_match_the_continuation_pool(world_size):
     from ignition.recipes.glm53.pool import continuation_layout
 
@@ -149,8 +149,16 @@ def test_glm_state_rows_and_pages_match_the_continuation_pool(world_size):
         assert costs.state_row_bytes == continuation_layout(
             layer_types, world_size, mtp=speculation is not None).row_bytes
         assert costs.page_bytes == layers * (4 * 64 * 528 + 64 * 132)
-        # Context parallelism places 256 records of each page on every rank.
-        assert costs.page_tokens == 256 * world_size
+        # Context parallelism places 256 records of each page on every rank; three ranks only with the
+        # fork's opt-in FLARE_GLM53_DCP3=1 (768-token pages), so by default the planner keeps it off there.
+        if world_size == 3:
+            from ignition.recipes.glm53.recipe import _costs
+
+            dcp3 = _costs(costs.state_row_bytes, costs.graph_bytes, ranks=3, speculating=speculation is not None,
+                          context_parallel_three=True)
+            assert dcp3.page_tokens == 768 and dcp3.page_bytes == costs.page_bytes
+        else:
+            assert costs.page_tokens == 256 * world_size
 
 
 @pytest.mark.parametrize("model", [QWEN, GLM])
@@ -343,6 +351,44 @@ def test_checkpoint_costs_stay_within_the_recipe_sizes():
         replace(recipe, checkpoints=(replace(checkpoint, plain_ranks={2: RankCosts(1, 1, 1)}),))
     with pytest.raises(ValueError, match="with and without speculation for different sizes"):
         replace(recipe, checkpoints=(replace(checkpoint, ranks=None),))
+
+
+def _glm_with_three_rank_context_parallelism():
+    """GLM as declared under FLARE_GLM53_DCP3=1: three ranks carry 768-token context-parallel pages."""
+    from dataclasses import replace
+    from types import MappingProxyType
+
+    from ignition.recipes import ResolvedModel
+
+    recipe = GLM.recipe
+    ranks = MappingProxyType({**recipe.ranks, 3: replace(recipe.ranks[3], page_tokens=768)})
+    plain = MappingProxyType({**recipe.plain_ranks, 3: replace(recipe.plain_ranks[3], page_tokens=768)})
+    return ResolvedModel(replace(recipe, ranks=ranks, plain_ranks=plain), GLM.checkpoint)
+
+
+def test_glm_three_rank_context_parallelism_plans_ceil_pages_and_a_full_context(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
+                        lambda snapshot, config, prepare, *, progress, core_storage=None, ranks=None, checkpoint=None:
+                        seen.append(config) or "group")
+    # Default declaration: three ranks keep whole 256-token pages and no context parallelism.
+    plan = fitted(GLM, 3)
+    assert (plan.context_parallel, plan.page_tokens) == (False, 256)
+    model = _glm_with_three_rank_context_parallelism()
+    plan = fitted(model, 3)
+    assert (plan.context_parallel, plan.page_tokens) == (True, 768)
+    # 2^20 is 1365.33 pages of 768: every count rounds up, so a full-context request allocates all of it.
+    assert plan.demand_pages == plan.concurrency * 1366 and plan.minimum_pages == plan.concurrency * 11
+    assert plan.minimum_pages * 768 >= plan.concurrency * 8192
+    assert model.recipe.prepare(tmp_path, plan, compile_forwards=False, kernel_cache=tmp_path, progress=None) == "group"
+    config = seen.pop()
+    assert config.devices == (0, 1, 2) and config.context_parallel and config.context == 1048576
+    assert config.page_tokens == plan.page_tokens == 768 and config.blocks == 1366
+    assert config.page_capacity == plan.minimum_pages
+    # Pages hold three times the tokens at the same bytes per rank as the plan without context parallelism.
+    whole = fitted(model, 3, context_parallel=False)
+    assert whole.page_tokens == 256 and whole.costs.page_bytes == plan.costs.page_bytes
+    assert plan.pages == whole.pages and plan.tokens == 3 * whole.tokens
 
 
 def test_recipes_declare_whether_they_overlap_branches():
