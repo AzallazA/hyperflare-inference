@@ -53,6 +53,13 @@ class Gpu:
         return self.capability in SUPPORTED_CAPABILITIES
 
 
+def _tp3_vocabulary_parallel() -> bool:
+    """ds41-tp3-v2: TP3Config.tp3_vocab_parallel (FLARE_DS41_TP3_VOCAB_PARALLEL=1) admits vocabulary-parallel sampling
+    at TP3 (b12x gathers enabled for world 3); experimental until validated end to end."""
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
+    return TP3Config.vocab_parallel_from_environment()  # one variable, no validation: generic planner code
+
+
 def discover_gpus() -> tuple[Gpu, ...]:
     """Enumerate NVML devices and include the shared CUDA budget on Windows iGPUs."""
     try:
@@ -312,7 +319,8 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        # Ceil: a context-parallel page (768 positions at three ranks) need not divide the context.
+        return self.concurrency * -(-self.recipe.context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -322,7 +330,7 @@ class Plan:
 
     @property
     def minimum_pages(self) -> int:
-        return self.concurrency * (MINIMUM_REQUEST_TOKENS // self.page_tokens)
+        return self.concurrency * -(-MINIMUM_REQUEST_TOKENS // self.page_tokens)
 
     @property
     def free_bytes(self) -> int:
@@ -464,7 +472,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 or {"top_p", "top_k", "min_p"} & sampling.ranges.keys()):
             raise UsageError("--vocabulary-parallel-sampling requires a sampling policy without"
                              " top-k, top-p, or min-p filtering")
-        if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
+        if speculation.vocabulary_parallel_sampling and len(gpus) == 3 and not _tp3_vocabulary_parallel():
             raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
         for head in ("draft", "markov"):
             value = getattr(speculation, f"{head}_head_quantization")
@@ -602,7 +610,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
-        world_sizes = tuple(size for size in world_sizes if size != 3)
+        if not _tp3_vocabulary_parallel():
+            world_sizes = tuple(size for size in world_sizes if size != 3)
     sizes = " or ".join(map(str, world_sizes))
     supported = [gpu for gpu in gpus if gpu.supported]
     chosen = None
@@ -611,7 +620,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
             raise UsageError(f"--gpus {format_gpus(selected)} names a GPU this host does not have;"
                              f" it has {len(gpus)}")
         chosen = tuple(gpus[index] for index in selected)
-        if speculation is not None and speculation.vocabulary_parallel_sampling and len(chosen) == 3:
+        if speculation is not None and speculation.vocabulary_parallel_sampling and len(chosen) == 3 and not _tp3_vocabulary_parallel():
             raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
         if len(chosen) not in world_sizes:
             size = min(world_sizes, key=lambda size: (size < len(chosen), size))
@@ -643,10 +652,14 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                              key=lambda gpu: gpu.index)
         return fitted(tuple(fitting[:world_size]), **settings)
 
+    def selectable(size):
+        """Automatic selection skips rank counts the recipe reserves for hosts with exactly that many GPUs."""
+        return size <= len(supported) and (size not in recipe.exact_rank_counts or size == len(supported))
+
     def candidates(**settings):
         if chosen is not None:
             return [fitted(chosen, **settings)]
-        return [automatic(size, **settings) for size in world_sizes if size <= len(supported)]
+        return [automatic(size, **settings) for size in world_sizes if selectable(size)]
 
     def attempt(**settings):
         return next((candidate for candidate in candidates(**settings) if candidate.fits), None)
@@ -674,7 +687,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         options.append("--no-mtp")
     if chosen is not None:
         for size in world_sizes:
-            if len(chosen) < size <= len(supported) and (larger := automatic(size)).fits:
+            if len(chosen) < size and selectable(size) and (larger := automatic(size)).fits:
                 options.append(f"--gpus {format_gpus(gpu.index for gpu in larger.gpus)}")
                 break
     scope = "this host" if chosen is None else f"GPU {format_gpus(gpu.index for gpu in chosen)}"
