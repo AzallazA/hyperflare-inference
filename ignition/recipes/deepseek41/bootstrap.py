@@ -398,7 +398,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     tables = Tables.prepare(manifest, weights.config, tokens=max(config.prefill_chunk_size, config.decode_tokens),
-        device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress, shard=shard)
+        device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress, shard=shard,
+        shared=tp3.shared_engram_tables(shard.world_size))
     with phase(progress, "Allocate model state and collectives"):
         layout = continuation_layout(weights.config, dspark=config.dspark)
         snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
@@ -666,8 +667,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
         "target_logits_dtype": "float32",
         "draft_logits_dtype": "bfloat16" if config.dspark else None,
-        "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264
-                               for ordinal in range(len(tables.sources))),
+        "offloaded_bytes": tables.rank_bytes(shard.rank),
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
         "preparation_state_bytes": int(pool.memory_capacity[0].item()) * layout.row_bytes,

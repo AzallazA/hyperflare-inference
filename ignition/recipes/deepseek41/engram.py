@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""File-backed FP8 n-gram tables, compact GPU inputs, and residual injection."""
+"""File-backed FP8 or MXFP4 n-gram tables, compact GPU inputs, and residual injection."""
 
 from dataclasses import dataclass
 from functools import cached_property
@@ -36,13 +36,21 @@ class Tables:
     row_mapping: dict
     columns: torch.Tensor
     readiness_runtime: object = None
+    # TP3 fork: packed MXFP4 E2M1 rows (128 bytes + 8 scale bytes per row) instead of FP8 E4M3 rows (256 + 8).
+    packed_fp4: bool = False
+    # TP3 fork: every rank keeps the whole tables (TP3Config.engram_tables); False = upstream #220's per-rank head
+    # partitions. Each rank projects only its own heads' columns either way.
+    shared: bool = False
 
     @classmethod
-    def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None, shard=None):
+    def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None, shard=None,
+                shared=None):
+        """``shared`` keeps whole tables on every rank (None: only a single rank does, as upstream)."""
         from transformers import PreTrainedTokenizerFast
         from ignition.components.parallel import TensorParallelShard
 
         shard = shard or TensorParallelShard(0, 1)
+        shared = shard.world_size == 1 if shared is None else bool(shared)
 
         tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(manifest.metadata_path / "tokenizer.json"))
         token_map, size = engram.build_compressed_token_map(tokenizer)
@@ -54,28 +62,45 @@ class Tables:
         if geometry.num_embeddings != tuple(text["engram_num_embeddings"]):
             raise ValueError("Engram hash geometry differs from checkpoint tables")
         sources, inputs, mailboxes, row_mapping = {}, {}, {}, {}
+        packed_fp4 = None
         timings = ReadinessTimings.allocate(frame, len(geometry.layer_ids))
         with phase(progress, "Prepare embedding tables") as stage:
             for index, layer in enumerate(geometry.layer_ids):
                 rows = geometry.num_embeddings[index]
                 pair = []
-                for suffix, columns, dtype in (("weight", 256, "F8_E4M3"), ("scale", 8, "F8_E8M0")):
+                # FP8 E4M3 rows (stock checkpoint) or packed MXFP4 E2M1 rows (engram-nvidia checkpoint).
+                weight = manifest.tensors[f"layers.{layer}.engram.embed.weight"]
+                packed = weight.dtype == "U8" and weight.shape == (rows, 128)
+                if packed_fp4 is None:
+                    packed_fp4 = packed
+                elif packed_fp4 != packed:
+                    raise ValueError("Engram tables mix FP8 and MXFP4 rows")
+                for suffix, columns, dtype in (("weight", 128 if packed else 256, "U8" if packed else "F8_E4M3"),
+                                               ("scale", 8, "F8_E8M0")):
                     name = f"layers.{layer}.engram.embed.{suffix}"
                     metadata = manifest.tensors[name]
                     if metadata.shape != (rows, columns) or metadata.dtype != dtype:
                         raise ValueError(f"{name}: invalid Engram table geometry or dtype")
                     pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * columns))
                 sources[layer] = tuple(pair)
-                partition = EmbeddingHeadPartition.for_rank(geometry.offsets[index], rows,
-                                                            shard.rank, shard.world_size)
-                row_mapping[layer] = torch.tensor(partition.row_mapping, dtype=torch.int64, device=device)
-                inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index)
+                # Shared tables keep canonical rows: no request remapping (the pre-#220 request path).
+                row_mapping[layer] = None if shared else torch.tensor(EmbeddingHeadPartition.for_rank(
+                    geometry.offsets[index], rows, shard.rank, shard.world_size).row_mapping,
+                    dtype=torch.int64, device=device)
+                inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index,
+                                                      packed_fp4=packed)
                 mailboxes[layer] = host_allocator(f"engram_{layer}_requests", (tokens * 24 + 1,), torch.int64)
                 mailboxes[layer].host_view.zero_()
             stage.update(f"{sum(source.nbytes for pair in sources.values() for source in pair) / (1 << 30):.1f} GiB in checkpoint spans")
         columns = persistent_copy(torch.tensor([head * 256 + column for head in range(shard.rank, 24, shard.world_size)
                                 for column in range(256)], dtype=torch.int64, device=device))
-        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns)
+        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns,
+                   packed_fp4=bool(packed_fp4), shared=shared)
+
+    @property
+    def row_bytes(self):
+        """Bytes of one stored row in the weight and scale planes."""
+        return (128 if self.packed_fp4 else 256), 8
 
     @cached_property
     def device_token_map(self):
@@ -96,8 +121,8 @@ class Tables:
             {"planes": [{"segments": [
                             {"path": str(source.path), "offset": source.offset + first * row_bytes,
                              "nbytes": (last - first) * row_bytes}
-                            for first, last in partition.source_rows], "row_bytes": row_bytes}
-                        for source, row_bytes in zip(self.sources[layer], (256, 8), strict=True)],
+                            for first, last in self.source_rows(ordinal, self.shard.rank)], "row_bytes": row_bytes}
+                        for source, row_bytes in zip(self.sources[layer], self.row_bytes, strict=True)],
              "heads": 24, "weights": f"engram_{layer}_weights", "scales": f"engram_{layer}_scales",
              "hashes": f"engram_{layer}_hashes", "event": f"engram_{layer}_ready",
              "request": f"engram_{layer}_requests"}
@@ -105,31 +130,46 @@ class Tables:
             for partition in (self.partition(ordinal, self.shard.rank),)]}
 
     def partition(self, ordinal, rank):
+        """The rows ``rank`` stores for table ``ordinal``: its heads' rows, or every row with shared tables."""
+        if self.shared:
+            return EmbeddingHeadPartition.for_rank(self.geometry.offsets[ordinal],
+                self.geometry.num_embeddings[ordinal], 0, 1)
         return EmbeddingHeadPartition.for_rank(self.geometry.offsets[ordinal],
             self.geometry.num_embeddings[ordinal], rank, self.shard.world_size)
+
+    def source_rows(self, ordinal, rank):
+        """Checkpoint row ranges ``rank`` stores; shared tables are one whole-table span (the pre-#220 layout)."""
+        if self.shared:
+            return ((0, self.geometry.num_embeddings[ordinal]),)
+        return self.partition(ordinal, rank).source_rows
+
+    def rank_bytes(self, rank):
+        """Host bytes of the table rows ``rank`` stores (weight and scale planes)."""
+        return sum(self.partition(ordinal, rank).rows * sum(self.row_bytes) for ordinal in range(len(self.sources)))
 
     def export_metadata(self):
         """Describe table geometry and checkpoint spans for native publication."""
         tables = []
         for ordinal, layer in enumerate(self.geometry.layer_ids):
             table = dict(layer=layer, rows=self.geometry.num_embeddings[ordinal],
-                embedding_width=256, scale_block=32, encoding="FP8_E4M3_E8M0",
+                embedding_width=256, scale_block=32,
+                encoding="MXFP4_E2M1_E8M0" if self.packed_fp4 else "FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
                 request_buffer=f"engram_{layer}_requests")
             offsets = [0] * 24
             first = 0
             shards = []
-            for rank in range(self.shard.world_size):
+            for rank in range(1 if self.shared else self.shard.world_size):
                 partition = self.partition(ordinal, rank)
                 for head in partition.heads:
                     offsets[head] = first + partition.row_mapping[head][2]
                 planes = dict(rank=rank, first_row=first, rows=partition.rows)
-                for name, source, width in zip(("weights", "scales"), self.sources[layer], (256, 8), strict=True):
+                for name, source, width in zip(("weights", "scales"), self.sources[layer], self.row_bytes, strict=True):
                     planes[name] = [dict(path=str(source.path), offset=source.offset + start * width,
                                          nbytes=(end - start) * width)
-                                    for start, end in partition.source_rows]
-                if self.shard.world_size == 1:
+                                    for start, end in self.source_rows(ordinal, rank)]
+                if self.shared or self.shard.world_size == 1:
                     table.update(weights=planes["weights"], scales=planes["scales"])
                 else:
                     shards.append(planes)
