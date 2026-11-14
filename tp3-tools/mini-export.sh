@@ -9,6 +9,8 @@
 #   GPUS    default 0,1,2; PORT is fixed at 15015 (consistency.py's URL)
 #   FLARE_BIN  server binary (default: this checkout's flare-cli/target/release/flare; worktrees without a Rust build
 #              point it at the serving checkout's binary)
+#   CONFIG  Flare config file for the export (e.g. a port config dir with its own kernel cache; copy the default
+#           signing key and publisher there first, handbook D.2.14); default: ignition's default config
 # Further FLARE_DS41_* settings pass through from the environment (e.g. FLARE_DS41_AR_ROWS=1024). Run from any
 # worktree: the export imports this checkout (PYTHONPATH), and the log records which ignition it imported.
 # The GPUs must be idle: stop any server first; this script refuses to start next to one and starts none afterwards.
@@ -29,7 +31,7 @@ export PATH="$CUDA_HOME/bin:$PATH"
 start=$(date +%s)
 rc=0; timeout 3600 .venv/bin/ignition export "$SNAP" --gpus "${GPUS:-0,1,2}" --max-concurrency 8 \
   --prefill-chunk-size 4096 --mtp-draft-tokens 5 --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
-  --vocabulary-parallel-sampling --verbose >> "$OUT/export.log" 2>&1 || rc=$?
+  --vocabulary-parallel-sampling --verbose ${CONFIG:+--config "$CONFIG"} >> "$OUT/export.log" 2>&1 || rc=$?
 echo "export exit $rc after $(( ($(date +%s) - start) / 60 )) min" | tee "$OUT/SUMMARY.txt"
 if [ "$rc" != 0 ]; then
   tr '\r' '\n' < "$OUT/export.log" | grep -E "Error|Traceback" | grep -v "^b12x" | tail -4 | cut -c1-300 | tee -a "$OUT/SUMMARY.txt"

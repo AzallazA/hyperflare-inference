@@ -37,6 +37,31 @@ def _capture_order(names, compiled, coordinator):
     return tuple(sorted(names, key=priority, reverse=True))
 
 
+def pool_request_report(compiled):
+    """One line: every compiled forward's Inductor graph-pool requests (``capture_allocation_sizes``), largest first.
+
+    TP3 fork diagnostic for the Inductor-planned memory scheme: all serving graphs allocate their combined pools from
+    one shared graph pool, so the largest request bounds the "Graph capture pool" and the KV that remains."""
+    rows = []
+    for name, forward in compiled.items():
+        try:
+            sizes = tuple(forward.capture_allocation_sizes)
+        except AttributeError:  # an eager or guarded forward without an Inductor memory plan
+            continue
+        rows.append((max(sizes, default=0), sum(sizes), name, sizes))
+    if not rows:
+        return "Graph pool requests: no compiled forward reports a memory plan"
+    rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+
+    def mib(value):
+        return f"{value / (1 << 20):.1f}"
+
+    entries = ", ".join(f"{name} {mib(total)}" + ("" if len(sizes) <= 1 else f" ({'+'.join(mib(s) for s in sizes)})")
+                        for _, total, name, sizes in rows)
+    return (f"Graph pool requests (MiB, {len(rows)} compiled forwards, largest first; max {mib(rows[0][0])} "
+            f"in {rows[0][2]}): {entries}")
+
+
 @_defer_full_collection()
 def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
@@ -169,6 +194,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             stream.synchronize()
             stage.update(advance=1)
     ordered_names = _capture_order(names, compiled, coordinator)
+    if progress is not None and compiled:
+        progress(pool_request_report({name: compiled[name] for name in ordered_names if name in compiled}))
     with phase(progress, label, total=len(names)) as stage:
         for name in ordered_names:
             function = compiled.get(name, functions[name])
