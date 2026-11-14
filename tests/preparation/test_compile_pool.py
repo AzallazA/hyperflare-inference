@@ -42,7 +42,7 @@ def test_forward_compiler_uses_explicit_host_budget_without_eight_worker_cap(mon
 
 
 @pytest.mark.parametrize("available,compile_headroom,workers", [
-    (12038 << 20, None, 0), (12038 << 20, 6 << 30, 1), (40 << 30, None, 1), (40 << 30, 4 << 30, 2)])
+    (12038 << 20, None, 0), (12038 << 20, 6 << 30, 1), (40 << 30, None, 1), (72 << 30, 4 << 30, 2)])
 def test_forward_compilers_leave_the_compile_headroom_free(monkeypatch, available, compile_headroom, workers):
     from ignition.preparation import compile_pool, host_memory
 
