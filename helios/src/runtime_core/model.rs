@@ -1100,10 +1100,29 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
+        // `FLARE_SHUTDOWN_TIMING=1` reports how long each part of the release takes (stderr).
+        let timing = matches!(
+            std::env::var("FLARE_SHUTDOWN_TIMING").ok().as_deref().map(str::trim),
+            Some("1" | "true" | "on" | "yes")
+        );
+        let mut parts = Vec::new();
+        let mut begin = std::time::Instant::now();
+        let mut lap = |label: String, parts: &mut Vec<String>| {
+            parts.push(format!("{label} {:.2}s", begin.elapsed().as_secs_f64()));
+            begin = std::time::Instant::now();
+        };
         self.offload.reset();
+        lap("host prefix store".into(), &mut parts);
         self.engram.clear();
+        lap("embedding tables".into(), &mut parts);
         // Rank zero owns the shared reservations and releases them after every peer.
-        while self.ranks.pop().is_some() {}
+        while let Some(rank) = self.ranks.pop() {
+            drop(rank);
+            lap(format!("rank {}", self.ranks.len()), &mut parts);
+        }
+        if timing {
+            eprintln!("Model release: {}", parts.join(" · "));
+        }
     }
 }
 

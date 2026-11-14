@@ -187,7 +187,12 @@ impl PreparedTables {
     pub fn descriptors(&self) -> Vec<i32> {
         self.data
             .iter()
-            .flat_map(|planes| planes.iter().map(|plane| plane.descriptor()))
+            // Prepared planes come from `load_segments`/`from_shared`, which are always memfd-backed.
+            .flat_map(|planes| {
+                planes
+                    .iter()
+                    .map(|plane| plane.descriptor().expect("prepared embedding planes are shareable"))
+            })
             .collect()
     }
 

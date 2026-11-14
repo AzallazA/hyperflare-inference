@@ -30,6 +30,47 @@ const CHUNK: usize = 64 << 10;
 const DEPTH: usize = 128;
 const LOAD_CHUNK: usize = 4 << 20;
 const LOAD_READERS: usize = 4;
+const MAX_LOAD_READERS: usize = 64;
+
+/// Threads that read one RAM-resident plane at startup: `FLARE_ENGRAM_LOAD_READERS` (1..=64), default 4.
+/// The reads are disjoint 4 MiB ranges, so the count only changes startup speed.
+fn load_readers() -> usize {
+    static READERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *READERS.get_or_init(|| parse_load_readers(std::env::var("FLARE_ENGRAM_LOAD_READERS").ok().as_deref()))
+}
+
+fn parse_load_readers(value: Option<&str>) -> usize {
+    match value.map(str::trim) {
+        None | Some("") => LOAD_READERS,
+        Some(text) => match text.parse::<usize>() {
+            Ok(count) if (1..=MAX_LOAD_READERS).contains(&count) => count,
+            _ => {
+                eprintln!(
+                    "FLARE_ENGRAM_LOAD_READERS={text:?} is not 1..={MAX_LOAD_READERS}; using {LOAD_READERS}"
+                );
+                LOAD_READERS
+            }
+        },
+    }
+}
+
+/// `FLARE_ENGRAM_PRIVATE_TABLES=1`: RAM-resident planes that `Reader::from_files` loads live in
+/// anonymous, process-private memory (read-only after loading) instead of a sealed memfd.
+/// Anonymous memory makes the load disk-bound: DS41 "Prepare embedding tables" 25.7 s -> 11.4 s on
+/// 4 KiB pages (`MADV_NOHUGEPAGE`, see `ResidentMapping::anonymous`). Release is not faster without
+/// huge pages (8.4 s), so pair it with `FLARE_FAST_EXIT`.
+/// Private planes have no descriptor to share, so the prepared multi-process tables
+/// (`PreparedTables`, `Resident::load_segments`) keep the memfd. Default off (unchanged behaviour).
+#[cfg(unix)]
+fn private_tables() -> bool {
+    static PRIVATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRIVATE.get_or_init(|| {
+        matches!(
+            std::env::var("FLARE_ENGRAM_PRIVATE_TABLES").ok().as_deref().map(str::trim),
+            Some("1" | "true" | "on" | "yes")
+        )
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Plane {
@@ -88,8 +129,9 @@ pub(crate) struct Resident {
     storage: ResidentMapping,
     #[cfg(windows)]
     storage: Aligned,
+    /// The sealed memfd behind a shareable plane; `None` for a process-private plane.
     #[cfg(unix)]
-    file: File,
+    file: Option<File>,
     skip: usize,
     nbytes: usize,
 }
@@ -136,6 +178,55 @@ impl ResidentMapping {
 }
 
 #[cfg(unix)]
+impl ResidentMapping {
+    /// Process-private anonymous memory of `nbytes` on 4 KiB pages. `MADV_NOHUGEPAGE`: with THP
+    /// "always" a fragmented host backed ~60% of the DS41 tables with huge pages and the rest with
+    /// 4 KiB pages, and decode gathers paid for it (11-14 A/B, 32K c4: 640 vs 749 tok/s, dTLB load
+    /// misses x2.6). Without huge pages c4 matches the memfd tables and the load stays as fast
+    /// (11.4 s vs 25.7 s); the slower release is skipped by `FLARE_FAST_EXIT`.
+    fn anonymous(nbytes: usize) -> Result<Self> {
+        let nbytes = nbytes.next_multiple_of(crate::os::page_size());
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                nbytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(format!(
+                "map private embedding table: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        let mapping = Self { address: address as usize, nbytes };
+        if unsafe { libc::madvise(address, nbytes, libc::MADV_NOHUGEPAGE) } != 0 {
+            return Err(format!(
+                "disable huge pages for private embedding table: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        Ok(mapping)
+    }
+
+    fn make_read_only(&self) -> Result<()> {
+        if unsafe { libc::mprotect(self.address as *mut libc::c_void, self.nbytes, libc::PROT_READ) } != 0 {
+            return Err(format!(
+                "protect private embedding table: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl Drop for ResidentMapping {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.address as *mut libc::c_void, self.nbytes) };
@@ -167,17 +258,53 @@ fn seal_resident(file: &File) -> Result<()> {
 impl Resident {
     pub(super) fn load(file: &File, plane: Plane) -> Result<Self> {
         Self::initialize(plane, |address, extent, required| {
+            Self::read_plane(file, plane, address, extent, required, load_readers())
+        })
+    }
+
+    /// Load `plane` into process-private anonymous memory (see `private_tables`).
+    #[cfg(unix)]
+    pub(super) fn load_private(file: &File, plane: Plane) -> Result<Self> {
+        let skip = (plane.offset % BLOCK as u64) as usize;
+        let required = skip
+            .checked_add(plane.nbytes)
+            .ok_or("resident Engram plane exceeds host range")?;
+        let extent = plane.resident_bytes()?;
+        let storage = ResidentMapping::anonymous(extent)?;
+        Self::read_plane(file, plane, storage.address, extent, required, load_readers())?;
+        // Readers joined; nothing writes the plane after this point.
+        storage.make_read_only()?;
+        Ok(Self {
+            storage,
+            file: None,
+            skip,
+            nbytes: plane.nbytes,
+        })
+    }
+
+    /// Fill `extent` bytes at `address` from the block-aligned start of `plane` with `readers`
+    /// threads reading disjoint `LOAD_CHUNK` ranges. The first `required` bytes must be present.
+    fn read_plane(
+        file: &File,
+        plane: Plane,
+        address: usize,
+        extent: usize,
+        required: usize,
+        readers: usize,
+    ) -> Result<()> {
+        {
             let skip = (plane.offset % BLOCK as u64) as usize;
             let offset = plane.offset - skip as u64;
+            let readers = readers.clamp(1, MAX_LOAD_READERS);
             std::thread::scope(|scope| -> Result<()> {
                 let mut workers = Vec::new();
-                for reader in 0..LOAD_READERS.min(extent.div_ceil(LOAD_CHUNK)) {
+                for reader in 0..readers.min(extent.div_ceil(LOAD_CHUNK)) {
                     workers.push(
                         std::thread::Builder::new()
                             .name(format!("flare-table-loader-{reader}"))
                             .spawn_scoped(scope, move || -> Result<()> {
                                 for begin in (reader * LOAD_CHUNK..extent)
-                                    .step_by(LOAD_READERS * LOAD_CHUNK)
+                                    .step_by(readers * LOAD_CHUNK)
                                 {
                                     let nbytes = LOAD_CHUNK.min(extent - begin);
                                     let source = offset
@@ -205,7 +332,7 @@ impl Resident {
                 }
                 Ok(())
             })
-        })
+        }
     }
 
     #[cfg(unix)]
@@ -324,15 +451,16 @@ impl Resident {
         }
         Ok(Self {
             storage: ResidentMapping::new(&file, extent, false)?,
-            file,
+            file: Some(file),
             skip,
             nbytes: plane.nbytes,
         })
     }
 
+    /// The shareable memfd of this plane; `None` for a process-private plane.
     #[cfg(unix)]
-    pub(super) fn descriptor(&self) -> i32 {
-        self.file.as_raw_fd()
+    pub(super) fn descriptor(&self) -> Option<i32> {
+        self.file.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -727,6 +855,16 @@ enum Data {
 const GATHER_BYTES_PER_THREAD: usize = 128 << 10;
 
 /// Default cap on CPU threads one RAM-resident gather fans out across.
+/// A RAM-resident plane for one process's readers: process-private when `private` (Unix only).
+fn load_resident(file: &File, plane: Plane, private: bool) -> Result<Resident> {
+    #[cfg(unix)]
+    if private {
+        return Resident::load_private(file, plane);
+    }
+    let _ = private;
+    Resident::load(file, plane)
+}
+
 pub fn default_gather_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get()).min(16)
 }
@@ -810,9 +948,13 @@ impl Reader {
             return Err("embedding plane references an unknown file".into());
         }
         let data = if resident {
+            #[cfg(unix)]
+            let private = private_tables();
+            #[cfg(not(unix))]
+            let private = false;
             Data::Ram([
-                Arc::new(Resident::load(&files[planes[0].file], planes[0])?),
-                Arc::new(Resident::load(&files[planes[1].file], planes[1])?),
+                Arc::new(load_resident(&files[planes[0].file], planes[0], private)?),
+                Arc::new(load_resident(&files[planes[1].file], planes[1], private)?),
             ])
         } else {
             let mut disk = DiskReader::from_files(files, stats.clone(), workers)?;
@@ -1085,7 +1227,7 @@ mod tests {
         let original = planes.map(|plane| Arc::new(Resident::load(&file, plane).unwrap()));
         let shared = std::array::from_fn(|i| {
             Arc::new(
-                Resident::from_shared(original[i].file.try_clone().unwrap(), planes[i]).unwrap(),
+                Resident::from_shared(original[i].file.as_ref().unwrap().try_clone().unwrap(), planes[i]).unwrap(),
             )
         });
         std::fs::remove_file(path).unwrap();
@@ -1137,23 +1279,23 @@ mod tests {
             row_bytes: 128,
         };
         let original = Resident::load(&open_file(&path).unwrap(), plane).unwrap();
-        let peer = Resident::from_shared(original.file.try_clone().unwrap(), plane).unwrap();
+        let peer = Resident::from_shared(original.file.as_ref().unwrap().try_clone().unwrap(), plane).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
-            original.file.metadata().unwrap().ino(),
-            peer.file.metadata().unwrap().ino()
+            original.file.as_ref().unwrap().metadata().unwrap().ino(),
+            peer.file.as_ref().unwrap().metadata().unwrap().ino()
         );
-        assert!(original.file.set_len(1).is_err());
+        assert!(original.file.as_ref().unwrap().set_len(1).is_err());
         let value = 255u8;
         assert_eq!(
-            unsafe { libc::pwrite(original.descriptor(), (&value as *const u8).cast(), 1, 97) },
+            unsafe { libc::pwrite(original.descriptor().unwrap(), (&value as *const u8).cast(), 1, 97) },
             -1
         );
         let wrong = Plane {
             nbytes: plane.nbytes + BLOCK,
             ..plane
         };
-        assert!(Resident::from_shared(original.file.try_clone().unwrap(), wrong).is_err());
+        assert!(Resident::from_shared(original.file.as_ref().unwrap().try_clone().unwrap(), wrong).is_err());
         std::fs::remove_file(path).unwrap();
         drop(original);
         assert_eq!(peer.bytes(), &bytes[97..97 + 8192]);
@@ -1203,6 +1345,102 @@ mod tests {
                 .to_string()
                 .contains("requires")
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_planes_match_shared_planes_and_are_read_only() {
+        let path =
+            std::env::temp_dir().join(format!("helios-engram-private-{}.bin", std::process::id()));
+        let rows = LOAD_CHUNK * 3 / 96 + 5;
+        let first = 4096 + 77;
+        let second = first + rows * 96 + 13;
+        let bytes: Vec<_> = (0..second + rows * 12)
+            .map(|i| (i * 31 + i / 101) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane { file: 0, offset: first as u64, nbytes: rows * 96, row_bytes: 96 },
+            Plane { file: 0, offset: second as u64, nbytes: rows * 12, row_bytes: 12 },
+        ];
+        let file = open_file(&path).unwrap();
+        let shared = planes.map(|plane| Arc::new(load_resident(&file, plane, false).unwrap()));
+        let private = planes.map(|plane| Arc::new(load_resident(&file, plane, true).unwrap()));
+        for (plane, (shared, private)) in planes.iter().zip(shared.iter().zip(&private)) {
+            let begin = plane.offset as usize;
+            assert_eq!(private.bytes(), &bytes[begin..begin + plane.nbytes]);
+            assert_eq!(private.bytes(), shared.bytes());
+            assert!(shared.descriptor().is_some());
+            assert!(private.descriptor().is_none());
+            // Read-only private mapping without huge pages (VmFlags `nh`).
+            let start = private.storage.address;
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut lines = smaps.lines().skip_while(|line| {
+                let range = line.split_whitespace().next().unwrap_or("");
+                let Some((low, high)) = range.split_once('-') else { return true };
+                match (usize::from_str_radix(low, 16), usize::from_str_radix(high, 16)) {
+                    (Ok(low), Ok(high)) => !(low <= start && start < high),
+                    _ => true,
+                }
+            });
+            let header = lines.next().expect("private plane mapping");
+            assert_eq!(header.split_whitespace().nth(1).unwrap(), "r--p", "{header}");
+            let flags = lines.find(|line| line.starts_with("VmFlags:")).unwrap();
+            assert!(flags.split_whitespace().any(|flag| flag == "nh"), "{flags}");
+        }
+        // Gathers over private planes return the same rows as over shared planes.
+        let ids: Vec<_> = (0..300).map(|i| ((i * 7919 + 3) % rows) as i64).chain([-1]).collect();
+        let row = 96 + 12;
+        let mut expected = vec![0; ids.len() * row];
+        let mut actual = vec![0xA5; ids.len() * row];
+        Reader::resident(shared, Arc::default()).gather(&planes, &ids, &mut expected).unwrap();
+        Reader::resident(private, Arc::default()).gather(&planes, &ids, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        // A truncated source fails the private load as it fails the shared one.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((first + LOAD_CHUNK + 17) as u64)
+            .unwrap();
+        assert!(
+            load_resident(&file, planes[0], true)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires")
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_reader_count_parses_and_falls_back() {
+        assert_eq!(parse_load_readers(None), LOAD_READERS);
+        assert_eq!(parse_load_readers(Some("")), LOAD_READERS);
+        assert_eq!(parse_load_readers(Some(" 16 ")), 16);
+        assert_eq!(parse_load_readers(Some("64")), 64);
+        for bad in ["0", "65", "-1", "eight"] {
+            assert_eq!(parse_load_readers(Some(bad)), LOAD_READERS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn plane_reads_are_identical_for_any_reader_count() {
+        let path =
+            std::env::temp_dir().join(format!("helios-engram-readers-{}.bin", std::process::id()));
+        let bytes: Vec<_> = (0..LOAD_CHUNK * 9 + 4321).map(|i| (i * 7 + i / 4099) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let plane = Plane { file: 0, offset: 513, nbytes: LOAD_CHUNK * 9, row_bytes: 64 };
+        let file = open_file(&path).unwrap();
+        let extent = plane.resident_bytes().unwrap();
+        let required = 513 + plane.nbytes;
+        for readers in [1, 3, 4, 16, 64] {
+            let buffer = Aligned::new(extent).unwrap();
+            Resident::read_plane(&file, plane, buffer.0, extent, required, readers).unwrap();
+            let view = unsafe { std::slice::from_raw_parts((buffer.0 + 513) as *const u8, plane.nbytes) };
+            assert_eq!(view, &bytes[513..513 + plane.nbytes], "{readers} readers");
+        }
         std::fs::remove_file(&path).unwrap();
     }
 

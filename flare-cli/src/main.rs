@@ -53,6 +53,32 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// `FLARE_FAST_EXIT=1`: once a signalled shutdown has confirmed the drain (HTTP joined, every
+/// request failed or finished, replay streams synchronized, host prefix store closed), end the
+/// process with `_exit(0)` instead of releasing the model object by object. The kernel and the
+/// GPU driver reclaim host mappings, pinned/registered memory, VMM allocations and contexts at
+/// process exit. Nothing on disk depends on the skipped destructors: the prefix store is closed
+/// (durable records flushed) before the drain is reported. Unconfirmed drains, errors and
+/// unexpected stops keep the normal path. Default off (orderly release).
+#[cfg(unix)]
+fn fast_exit_requested() -> bool {
+    env_switch(std::env::var("FLARE_FAST_EXIT").ok().as_deref())
+}
+
+fn env_switch(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+#[cfg(unix)]
+fn fast_exit() -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: Terminates the process without running destructors or atexit handlers; the caller
+    // has confirmed that no GPU work, host transfer or durable write is outstanding.
+    unsafe { libc::_exit(0) }
+}
+
 #[cfg(all(feature = "roce", not(target_os = "linux")))]
 compile_error!("the roce feature requires Linux");
 
@@ -659,7 +685,9 @@ fn serve_local(
     server.stop_dashboard();
     std::thread::sleep(Duration::from_millis(50));
     let phase = progress.phase("Shut down server", None);
+    let begin = std::time::Instant::now();
     let shutdown = session.close();
+    let drained_in = begin.elapsed().as_secs_f64();
     if !shutdown.drained {
         return Err(shutdown
             .error
@@ -672,8 +700,18 @@ fn serve_local(
     if !STOP.load(Ordering::Relaxed) {
         return Err("native server stopped unexpectedly".into());
     }
+    #[cfg(unix)]
+    if fast_exit_requested() {
+        phase.finish(format!("drain {drained_in:.1}s · fast exit"));
+        drop(progress);
+        fast_exit();
+    }
+    let release = std::time::Instant::now();
     drop(session);
-    phase.finish("");
+    phase.finish(format!(
+        "drain {drained_in:.1}s · release {:.1}s",
+        release.elapsed().as_secs_f64()
+    ));
     Ok(())
 }
 
@@ -690,6 +728,17 @@ unsafe extern "system" fn stop_console(event: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fast_exit_switch_is_off_unless_set_on() {
+        assert!(!super::env_switch(None));
+        for off in ["", "0", "false", "off", "no", "2"] {
+            assert!(!super::env_switch(Some(off)), "{off}");
+        }
+        for on in ["1", "true", "on", "yes", " 1 "] {
+            assert!(super::env_switch(Some(on)), "{on}");
+        }
+    }
+
     use std::path::Path;
 
     use clap::Parser as _;
