@@ -697,3 +697,26 @@ def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, t
             outputs[variant] = results
     for result in (*outputs["resident"], *outputs["staged"]):
         torch.testing.assert_close(result, outputs["resident"][0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("language_model_only, value, warned", [
+    (True, "1", True), (True, "blocks", True), (True, "0", False), (False, "1", False)])
+def test_vision_stage_without_a_vision_tower_warns(monkeypatch, language_model_only, value, warned):
+    import warnings
+
+    import ignition.preparation.rank_group as rank_group
+    from tests.recipes.test_glm53_vram_options import _plan
+
+    for name in ("EXPERT_ACTIVATION", "EXPAND_SCALES", "EXPERT_COLUMNS", "KDA_SIDE_CHAIN", "DRAFT_HEAD",
+                 "DRAFT_EH_PROJ", "EMBED_HOST"):
+        monkeypatch.delenv(f"FLARE_GLM53_{name}", raising=False)
+    monkeypatch.setenv("FLARE_GLM53_VISION_STAGE", value)
+    monkeypatch.setattr(rank_group, "prepare_group", lambda snapshot, config, function, **kwargs: config)
+    plan = _plan(3)
+    plan.language_model_only = language_model_only
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        glm_recipe.prepare("/nonexistent", plan, compile_forwards=False, kernel_cache=None, progress=None)
+    messages = [str(w.message) for w in caught if "VISION_STAGE" in str(w.message)]
+    assert messages == (["FLARE_GLM53_VISION_STAGE ignored: a language-model-only export has no vision tower"]
+                        if warned else [])

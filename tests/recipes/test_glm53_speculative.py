@@ -174,3 +174,63 @@ def records_only_cpu_commit(monkeypatch):
     # These state-machine tests run without CUDA; reduction and graph ordering
     # have independent CUDA coverage.
     monkeypatch.setattr("ignition.components.speculation.PreparedLogprobs", RecordOnlyLogprobs)
+
+
+class _Recorder:
+    """Stand-in for a prepared component: records its constructor's keyword arguments."""
+
+    def __init__(self, *args, **kwargs):
+        self.args, self.kwargs = args, kwargs
+
+    @staticmethod
+    def allocate(*args, **kwargs):
+        return SimpleNamespace(args=args, kwargs=kwargs, token_ids=None, indexed=None,
+                               state_indices=torch.zeros((2, 8)), num_seqs=torch.zeros(1))
+
+    @staticmethod
+    def scratch_layout(*args):
+        return args
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 6])
+@pytest.mark.parametrize("share", [False, True])
+def test_round_constructor_sets_width_one_in_place_and_shared_selection(monkeypatch, width, share):
+    """PreparedRound.__init__ itself (not an injected field) chooses #217's in-place width one and #218's selection
+    sharing: width one keeps one state column, no KDA records, no commit and no draft; wider rounds record eight
+    columns; draft passes share the first selection only from width three when the checkpoint asks for it."""
+    import ignition.recipes.glm53.speculative as speculative
+
+    for name in ("PreparedSpeculativeDistributions", "PreparedStochasticVerification", "PreparedDraftDistribution",
+                 "PreparedBatch", "PreparedAllReduce", "PreparedDecoder", "PreparedKDACommit"):
+        monkeypatch.setattr(speculative, name, _Recorder)
+    class Metadata(_Recorder):
+        def __init__(self, token_ids, rows, recurrent, indexed):
+            self.token_ids, self.rows, self.recurrent, self.indexed = token_ids, rows, recurrent, indexed
+
+    monkeypatch.setattr(speculative, "DecoderMetadata", Metadata)
+    monkeypatch.setattr(speculative, "DeltaMetadata", _Recorder)
+    monkeypatch.setattr(speculative, "DraftMetadata", _Recorder)
+    monkeypatch.setattr(PreparedRound, "_sampling_scratch", lambda self, device: {})
+    drafts = []
+    kda_records = SimpleNamespace(layers=(0,))
+    backing = SimpleNamespace(device=torch.device("cpu"))
+    owner = SimpleNamespace(
+        pool=SimpleNamespace(backing=backing, decoder=None, memory_capacity=(0, 1),
+                             draft=SimpleNamespace(index=SimpleNamespace(tail=torch.zeros((4, 3))))),
+        inputs=SimpleNamespace(page_tables=torch.zeros((2, 5))), requests=SimpleNamespace(vocab_size=32, capacity=2),
+        convolution=None, share_draft_selection=share, weights=SimpleNamespace(shard=None), shards=None,
+        collectives={"runtime": None, "coordinator": None}, session=None, scratch=SimpleNamespace(
+            rows=lambda *args, **kwargs: None), workspace=None, max_cache_pages=None, context=None,
+        kda_records=kda_records, draft=lambda metadata, name, **kwargs: drafts.append((name, kwargs)) or SimpleNamespace(
+            logits=torch.zeros((2, 32))))
+    monkeypatch.setattr(speculative.PreparedDecoder, "layers", {0: SimpleNamespace(
+        attention=SimpleNamespace(recurrent_plan=None))}, raising=False)
+    round_ = PreparedRound(owner, 2, width, "round")
+    assert round_.recorded is (width > 1)
+    assert round_.state_columns == (8 if width > 1 else 1)
+    assert round_.metadata.recurrent.kwargs == {"verification_columns": round_.state_columns}
+    assert round_.decoder.kwargs["kda_records"] is (kda_records if width > 1 else None)
+    assert (round_.kda_commit is not None) is (width > 1)
+    assert round_.share_selection is (share and width > 2)
+    assert (round_.draft is not None) is (width > 1)
+    assert [name for name, _ in drafts] == ([] if width == 1 else ["round.draft"]) + ["round.absorb"]

@@ -5,6 +5,7 @@
 """Qualified checkpoint, serving range, and memory costs of the GLM 5.3 recipe."""
 
 import os
+import warnings
 from types import MappingProxyType
 
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
@@ -59,6 +60,16 @@ def _context_parallel_three_ranks():
     Read at import, like the other export overrides; export with `DCP=1 tp3-tools/glm53-export-tp3.sh`.
     """
     return _tp3_override("DCP3", ("1", "0"), "0") == "1"
+
+
+def _warn_ignored_overrides(config):
+    """Fork-only overrides an export cannot apply are reported rather than silently dropped (review 2026-11-14)."""
+    if not config.mtp and (config.draft_head, config.draft_eh_proj) != ("target", "bf16"):
+        warnings.warn("FLARE_GLM53_DRAFT_HEAD / FLARE_GLM53_DRAFT_EH_PROJ ignored: this export has no MTP drafting",
+                      stacklevel=3)
+    if config.vision_stage and config.language_model_only:
+        warnings.warn("FLARE_GLM53_VISION_STAGE ignored: a language-model-only export has no vision tower",
+                      stacklevel=3)
 
 
 def _costs(state_row_bytes, graph_bytes, *, ranks, speculating, context_parallel_three=None):
@@ -123,6 +134,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         vision_stage=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "0",
         vision_stage_tail=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "blocks",
         mtp=speculation is not None, **drafting)
+    _warn_ignored_overrides(config)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,

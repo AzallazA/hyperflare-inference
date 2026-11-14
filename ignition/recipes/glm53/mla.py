@@ -125,16 +125,24 @@ MXFP8_BMM_HEADS = frozenset((8, 16, 32))
 _DECODED_KV_B = {}
 
 
-def decoded_kv_b(packed, heads):
-    """Exact BF16 [heads, 512, 512] values of an MXFP8 kv_b_proj: E4M3 x E8M0 fits BF16's mantissa and exponent."""
-    cached = _DECODED_KV_B.get(id(packed.values))
-    if cached is not None and cached[0] is packed.values:
-        return cached[1]
+def decode_kv_b(packed, heads):
+    """Exact BF16 [heads, 512, 512] values of an MXFP8 kv_b_proj: E4M3 x E8M0 fits BF16's mantissa and exponent.
+
+    The weight loader decodes the draft layer's kv_b this way at three ranks and keeps only the BF16 copy
+    (weights.py load_attention), so the MXFP8 bytes load into temporary memory."""
     stored = packed.values.view(heads * 512, 512)
     exponents = packed.scale_rows.view(torch.uint8).view(heads * 512, 16).int() - 127
     decoded = stored.float().view(heads * 512, 16, 32) * torch.ldexp(
         torch.ones_like(exponents, dtype=torch.float32), exponents)[..., None]
-    values = persistent_copy(decoded.view(heads, 512, 512).to(torch.bfloat16))
+    return persistent_copy(decoded.view(heads, 512, 512).to(torch.bfloat16))
+
+
+def decoded_kv_b(packed, heads):
+    """`decode_kv_b` once per MXFP8 weight handed to PreparedMLA directly (shared by its prepared passes)."""
+    cached = _DECODED_KV_B.get(id(packed.values))
+    if cached is not None and cached[0] is packed.values:
+        return cached[1]
+    values = decode_kv_b(packed, heads)
     _DECODED_KV_B[id(packed.values)] = (packed.values, values)
     return values
 

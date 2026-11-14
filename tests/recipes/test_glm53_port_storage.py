@@ -77,3 +77,54 @@ def test_padded_rows_forward_the_temporary_flag():
     loader._load_rows("long", (0, 24))
     assert loader.calls == [("padded", "short", (48, 72), True), ("tensor", "long", slice(48, 72), True),
                             ("tensor", "long", slice(0, 24), False)]
+
+
+def _attention_loader(world, rank, kv_b_format, generator):
+    """GlmWeightLoader.load_attention over stubs: records each kv_b load's `temporary` flag."""
+    loader = object.__new__(GlmWeightLoader)
+    loader.shard = SimpleNamespace(world_size=world, rank=rank)
+    loader.kv_b_loads = []
+    loader._layer = lambda layer: f"layers.{layer}"
+    loader._projection = lambda name, **kwargs: name
+    loader.load_mixed_linear_group = lambda prefixes, **kwargs: prefixes
+    loader.load_tensor = lambda name, **kwargs: name
+    loader.linear_format = lambda prefix: kv_b_format if prefix.endswith("kv_b_proj") else "mxfp8"
+
+    def load_linear_group(prefixes, *, row_ranges=None, pad=False, temporary=False):
+        (rows,) = row_ranges
+        heads = (rows[1] - rows[0]) // 512
+        loader.kv_b_loads.append((prefixes, rows, pad, temporary))
+        if kv_b_format == "bfloat16":
+            return torch.zeros((heads * 512, 512), dtype=torch.bfloat16)
+        return SimpleNamespace(weight=_packed(heads, generator))
+
+    loader.load_linear_group = load_linear_group
+    return loader
+
+
+@pytest.mark.parametrize("world, rank", [(3, 0), (3, 2), (2, 1), (4, 3)])
+@pytest.mark.parametrize("kv_b_format", ["mxfp8", "bfloat16"])
+def test_unqualified_mxfp8_kv_b_keeps_only_its_bf16_decoding(world, rank, kv_b_format):
+    """At three ranks (24 heads, outside b12x's BF16 x MXFP8 BMM) the draft layer's MXFP8 kv_b is decoded at load and
+    only the BF16 copy is kept, so the MXFP8 load is temporary; qualified head counts and BF16 kv_b are unchanged."""
+    loader = _attention_loader(world, rank, kv_b_format, torch.Generator().manual_seed(world * 10 + rank))
+    weights = loader.load_attention(45)
+    ((prefixes, rows, pad, temporary),) = loader.kv_b_loads
+    heads = Shards.of(world).heads
+    assert prefixes == ("layers.45.self_attn.kv_b_proj",) and pad and rows[1] - rows[0] == heads * 512
+    decoded = kv_b_format == "mxfp8" and heads not in MXFP8_BMM_HEADS
+    # 16 and 32 heads qualify; BF16 never decodes.
+    assert temporary is decoded and decoded is (kv_b_format == "mxfp8" and world == 3)
+    kv_b = weights["kv_b_proj"]
+    if decoded:
+        assert isinstance(kv_b, torch.Tensor) and kv_b.dtype == torch.bfloat16 and kv_b.shape == (heads * 512, 512)
+    elif kv_b_format == "mxfp8":
+        assert isinstance(kv_b, SimpleNamespace)  # the packed MXFP8 weight PreparedMLA's MXFP8 BMM reads
+
+
+def test_load_time_decoding_equals_the_prepared_decoding():
+    from ignition.recipes.glm53.mla import decode_kv_b
+
+    heads = Shards.of(3).heads
+    packed = _packed(heads, torch.Generator().manual_seed(11))
+    assert torch.equal(decode_kv_b(packed, heads), decoded_kv_b(packed, heads))

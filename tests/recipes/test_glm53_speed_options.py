@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from ignition.recipes.glm53 import kda
+from ignition.recipes.glm53 import recipe as glm_recipe
 from ignition.recipes.glm53.bootstrap import PreparationConfig
 from ignition.recipes.glm53.kda import KDAScratch
 from ignition.recipes.glm53.recipe import _tp3_override
@@ -157,3 +158,76 @@ def test_side_chain_forward_starts_every_chain_before_qkv_and_joins_after(overla
     else:
         assert events == ["input_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"]
         assert (raw_g, raw_beta, z) == ("f_b_proj(f_a_proj(x))", "b_proj(x)", "g_b_proj(g_a_proj(x))")
+
+
+def test_side_chain_construction_order_matches_the_forward_unpacking(monkeypatch):
+    """_prepare_side_chain builds its chains in the order _side_chain_projections unpacks them (z, raw g, raw
+    beta): with chains that run their own projections, the overlapped forward returns what the serial one does,
+    output for output."""
+    from ignition.components.weights import GroupedLinearWeights
+
+    class Projection:
+        plan = "plan"
+
+        def __init__(self, key):
+            self.key = key
+
+        def __call__(self, source):
+            return f"{self.key}({source})"
+
+    def prepare_projection(input, weight, output, *, name, **kwargs):
+        return Projection(name.rsplit(".", 1)[-1])
+
+    class Chain:
+        def __init__(self, projections, **kwargs):
+            self.projections = projections
+
+        def start(self, source):
+            return source
+
+        def finish(self, started, dependency):
+            for projection in self.projections:
+                started = projection(started)
+            return started
+
+    monkeypatch.setattr(kda, "prepare_projection", prepare_projection)
+    monkeypatch.setattr(kda, "ConcurrentProjectionChain", Chain)
+    layer = object.__new__(kda.PreparedGlmKDA)
+    layer.width, layer.heads, layer.projections = 4, 2, {}
+    group = GroupedLinearWeights((torch.zeros(12, 8), torch.zeros(130, 8)), (12, 130))
+    weights = {"input_proj": group, "f_b_proj": None, "g_a_proj": None, "g_b_proj": None, "o_proj": None}
+    scratch = SimpleNamespace(projected_qkv=None, raw_beta=None, forget_input=None, raw_g=None, gate_input=None,
+                              z=None, gated=None, output=None)
+    layer._prepare_side_chain(weights, "x", scratch, session=None, name="layer",
+                              workspace=SimpleNamespace(overlap=True))
+    assert len(layer.side_chains) == 3 and layer.gate_overlap is layer.side_chains[0]
+    overlapped = layer._side_chain_projections("x")
+    layer.side_chains = ()
+    serial = layer._side_chain_projections("x")
+    assert overlapped == serial == ("input_proj(x)", "f_b_proj(f_a_proj(x))", "b_proj(x)", "g_b_proj(g_a_proj(x))")
+
+
+@pytest.mark.parametrize("speculating", [True, False])
+@pytest.mark.parametrize("head, eh_proj", [("nvfp4", None), (None, "mxfp8"), (None, None), ("target", "bf16")])
+def test_draft_options_without_mtp_warn(monkeypatch, speculating, head, eh_proj):
+    import warnings
+
+    import ignition.preparation.rank_group as rank_group
+    from tests.recipes.test_glm53_vram_options import _plan
+
+    for name in ("EXPERT_ACTIVATION", "EXPAND_SCALES", "EXPERT_COLUMNS", "KDA_SIDE_CHAIN", "DRAFT_HEAD",
+                 "DRAFT_EH_PROJ", "EMBED_HOST", "VISION_STAGE"):
+        monkeypatch.delenv(f"FLARE_GLM53_{name}", raising=False)
+    for name, value in (("DRAFT_HEAD", head), ("DRAFT_EH_PROJ", eh_proj)):
+        if value is not None:
+            monkeypatch.setenv(f"FLARE_GLM53_{name}", value)
+    monkeypatch.setattr(rank_group, "prepare_group", lambda snapshot, config, function, **kwargs: config)
+    plan = _plan(3)
+    if not speculating:
+        plan.speculation = None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        glm_recipe.prepare("/nonexistent", plan, compile_forwards=False, kernel_cache=None, progress=None)
+    messages = [str(w.message) for w in caught if "DRAFT" in str(w.message)]
+    changed = head == "nvfp4" or eh_proj == "mxfp8"
+    assert len(messages) == int(changed and not speculating)

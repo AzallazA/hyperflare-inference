@@ -250,11 +250,18 @@ class GlmWeightLoader(DirectWeightLoader):
         result["qkv_a_proj"] = self.load_mixed_linear_group(
             tuple(f"{prefix}.{name}" for name in ("q_a_proj", "kv_a_proj_with_mqa", "indexer.wk", "indexer.weights_proj")))
         result["q_b_proj"] = self._projection(f"{prefix}.q_b_proj", rows=head_channels, pad=True)
-        if self.linear_format(f"{prefix}.kv_b_proj") not in ("mxfp8", "bfloat16"):
+        fmt = self.linear_format(f"{prefix}.kv_b_proj")
+        if fmt not in ("mxfp8", "bfloat16"):
             raise ValueError(f"{prefix}.kv_b_proj: MLA absorption requires BF16 or MXFP8 weights")
-        result["kv_b_proj"] = self.load_linear_group(
-            (f"{prefix}.kv_b_proj",), row_ranges=(Shards.of(self.shard.world_size).head_channels(self.shard.rank, 512),),
-            pad=True)
+        from .mla import MXFP8_BMM_HEADS, decode_kv_b
+
+        kv_rows = Shards.of(self.shard.world_size).head_channels(self.shard.rank, 512)
+        heads = (kv_rows[1] - kv_rows[0]) // 512
+        # Head counts b12x's BF16 x MXFP8 BMM does not qualify (24 per rank at three ranks) run the MXFP8 kv_b
+        # (the draft layer's) as its exact BF16 decoding; only that copy is kept, so the MXFP8 bytes are temporary.
+        decode = fmt == "mxfp8" and heads not in MXFP8_BMM_HEADS
+        kv_b = self.load_linear_group((f"{prefix}.kv_b_proj",), row_ranges=(kv_rows,), pad=True, temporary=decode)
+        result["kv_b_proj"] = decode_kv_b(kv_b.weight, heads).view(heads * 512, 512) if decode else kv_b
         result["o_proj"] = self._projection(f"{prefix}.o_proj", columns=head_channels, pad=True)
         for name in ("q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.k_norm.weight",
                      "indexer.k_norm.bias", "indexer.index_kpool_compress_ape", "indexer.index_kpool_compress_gate"):

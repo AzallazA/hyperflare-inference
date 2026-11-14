@@ -560,10 +560,12 @@ def test_uncovered_partitions_fail_with_the_tensor_name(loader_factory):
             loader.load_linear(f"{KDA}.q_proj", rows=(8192, 11008), pad=True)
         with pytest.raises(ValueError, match=r"q_proj\.weight: partition \(6144, 9216\) exceeds its 8192"):
             loader.load_linear(f"{KDA}.q_proj", rows=(6144, 9216))
-        # Upstream's dense block loader (#273) reports these unpadded overruns without the tensor name.
-        with pytest.raises(ValueError, match=r"partition"):
+        # Upstream's dense loader (#273, weights.py _aligned_range) reports these unpadded overruns without the
+        # tensor name.
+        unnamed = r"^weight partition must be aligned, nonempty and in range$"
+        with pytest.raises(ValueError, match=unnamed):
             loader.load_linear(f"{MLA}.q_b_proj", rows=(12288, 18432))
-        with pytest.raises(ValueError, match=r"partition"):
+        with pytest.raises(ValueError, match=unnamed):
             loader.load_linear_group((f"{MLA}.kv_b_proj",), row_ranges=((24576, 36864),))
         with pytest.raises(ValueError, match=r"up_proj\.weight: partition \(1536, 2304\) exceeds its 2048"):
             loader.load_nvfp4_experts((f"{MOE}.experts.0",), hidden_size=EXPERT_HIDDEN, intermediate_size=2048,
