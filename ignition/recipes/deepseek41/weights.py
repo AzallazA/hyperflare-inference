@@ -4,6 +4,7 @@
 
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -12,7 +13,7 @@ from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
-from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
+from ignition.preparation.persistent import active_core_storage, persistent_copy, allocated_tensor_bytes
 
 from .config import ModelConfig
 from .tp3_config import TP3Config
@@ -101,8 +102,9 @@ class ModelWeights:
                 # tokens' rows (<= 48 in decode, one prefill chunk otherwise); read it from device-visible host
                 # memory and give the VRAM to hot experts / KV.
                 from ignition.components.weights import _park_on_host
-                embedding = _park_on_host(host_allocator, "embed.weight",
-                                          loader.load_tensor("embed.weight", temporary=True))
+                with _parking_pool():
+                    embedding = _park_on_host(host_allocator, "embed.weight",
+                                              loader.load_tensor("embed.weight", temporary=True))
                 norm = loader.load_tensor("norm.weight")
             else:
                 embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
@@ -120,17 +122,30 @@ class ModelWeights:
                     draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
                 elif markov_head_quantization == "fp8":
                     draft = replace(draft, markov_head=fp8_markov_head(draft.markov_head))
-            vision = ({name: loader.load_tensor(name, temporary=park_vision) for name in loader._sources
-                       if name.startswith(("vision.", "aligner.", "image_"))}
-                      if config.vision is not None else None)
-            if vision and park_vision:
-                # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections consume
-                # these tensors as-is, so read them from device-visible host memory and give the VRAM to KV
-                # (images ~3 s slower each; staging them through VRAM slots is stage S7 of the port).
-                from ignition.components.weights import _park_on_host
-                vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
+            with _parking_pool() if park_vision else nullcontext():
+                vision = ({name: loader.load_tensor(name, temporary=park_vision) for name in loader._sources
+                           if name.startswith(("vision.", "aligner.", "image_"))}
+                          if config.vision is not None else None)
+                if vision and park_vision:
+                    # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections
+                    # consume these tensors as-is, so read them from device-visible host memory and give the VRAM to
+                    # KV (images ~3 s slower each; staging them through VRAM slots is stage S7 of the port).
+                    from ignition.components.weights import _park_on_host
+                    vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
         return cls(config, shard, embedding, norm, head, layers, draft,
                    allocated_tensor_bytes(device) - before, vision)
+
+
+def _parking_pool():
+    """TP3: a pool of its own for device copies that are parked on the host right after loading.
+
+    The load pool stays active for the whole load, and ``torch.cuda.empty_cache`` does not release an active
+    pool's cached segments. A freed parked copy (the 1.23 GiB embedding) therefore stayed cached there, a long-lived
+    allocation (the routed experts' scale scratch) was carved from it, and the whole segment stayed mapped through
+    tuning (G1 2026-11-14: 1.06 GiB/rank, graph catalog out of memory). This pool is destroyed on exit, so its
+    segments return to the device; the parked tensors must be dropped inside it."""
+    storage = active_core_storage()
+    return nullcontext() if storage is None else storage.transient()
 
 
 def hot_expert_ids(layer: int, experts: int, tp3: TP3Config) -> list | None:

@@ -18,6 +18,7 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.parallel import TensorParallelShard
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
@@ -299,8 +300,16 @@ class PreparedDecoder:
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
             self.packing = PreparedDecoderSuffix(metadata)
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
-        self.output_scratch = scratch if self.packing is None else Scratch.allocate(
-            128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
+        self.output_scratch = scratch
+        if self.packing is not None:
+            # TP3: suffix scratch is declaration-only, so the prefill graphs share one (released with the examples),
+            # as tp3-main's suffix_scratch did; per graph it was ~0.4 GiB/rank of catalog operands (G1 2026-11-14).
+            key = ("decoder.suffix_scratch", scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
+            self.output_scratch = None if examples is None else examples.get(key)
+            if self.output_scratch is None:
+                self.output_scratch = Scratch.allocate(128, *key[1:])
+                if examples is not None:
+                    examples[key] = self.output_scratch
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
@@ -312,11 +321,17 @@ class PreparedDecoder:
         self.rotary = Rotary(weights.config, scratch.embedding.device)
         self.window_commit = None
         if mode == "verify":
+            # TP3: the staging is only a declaration example (each call allocates its own), so every verification
+            # graph shares one by role, as tp3-main's window_staging did; per graph it was 0.9 GiB/rank over the
+            # 68 TP3 speculative graphs (G1 2026-11-14, graph catalog out of memory).
+            staging = None if examples is None else declaration_tensor(examples, "verification.window_staging",
+                (len(weights.layers), metadata.state_rows.numel(), (128 + metadata.max_query_tokens) * 528),
+                torch.uint8, metadata.positions.device)
             self.window_commit = PreparedRingCommit(pool.reserved_backing,
                 [pool.layout.region(f"layer{index}.window").offset for index in range(len(weights.layers))],
                 metadata.state_rows, metadata.starts,
                 token_capacity=metadata.max_query_tokens,
-                window_tokens=128, record_bytes=528)
+                window_tokens=128, record_bytes=528, staging=staging)
         ratios = weights.config.text["compress_ratios"][:len(weights.layers)]
         prefix_ratios = ratios if self.packing is None else ratios[:decoder_start + 1]
         self.window_metadata = AttentionIndices(metadata, mode=mode,

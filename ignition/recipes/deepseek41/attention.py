@@ -23,6 +23,7 @@ from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from ignition.components.window_indices import PreparedWindowIndices, WindowIndices
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.scratch import ScratchArena
 
@@ -138,7 +139,7 @@ class AttentionScratch:
 
 
 class PreparedCompressor:
-    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name, deferred=False):
+    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name, deferred=False, examples=None):
         self.pool, self.layer = pool, layer
         self.weight = weights["norm"]
         self.deferred = deferred
@@ -146,24 +147,26 @@ class PreparedCompressor:
         self.ratio = ratio
         tokens, rows = source.shape[0], metadata.starts.numel()
         device = source.device
-        def zeros(shape, dtype):
-            return torch.zeros(shape, device=device, dtype=dtype)
-        self.values = zeros((tokens, 512), torch.float32 if ratio == 2 else torch.bfloat16)
+        # TP3: declaration examples shared by role across layers and graphs (tuning binds fresh copies); per layer
+        # and graph they were 0.33 GiB/rank of catalog operands (G1 2026-11-14).
+        def zeros(shape, dtype, role):
+            return declaration_tensor(examples, "compressor." + role, shape, dtype, device)
+        self.values = zeros((tokens, 512), torch.float32 if ratio == 2 else torch.bfloat16, "values")
         self.project_values = UnquantizedProjection(source, weights["values"], self.values,
             session=session, name=f"{name}.values").functional(session=session)
-        self.output = zeros((tokens, 512), torch.bfloat16)
-        self.emitted = zeros(tokens, torch.bool)
-        self.slots = zeros(tokens, torch.int64).fill_(-1)
+        self.output = zeros((tokens, 512), torch.bfloat16, "output")
+        self.emitted = zeros(tokens, torch.bool, "emitted")
+        self.slots = zeros(tokens, torch.int64, "slots").fill_(-1)
         self.state_ids = torch.arange(rows, dtype=torch.int64, device=device)
         self.arguments = dict(values=self.values, weight=weights["norm"], query_start_loc=metadata.query_start_loc,
             positions=metadata.starts, state_ids=self.state_ids, destination_slots=slots,
             live_counts=metadata.live_counts, out=self.output, emitted=self.emitted, emitted_slots=self.slots)
         if ratio == 2:
-            self.gates = zeros(self.values.shape, self.values.dtype)
+            self.gates = zeros(self.values.shape, self.values.dtype, "gates")
             self.project_gates = UnquantizedProjection(source, weights["gates"], self.gates,
                 session=session, name=f"{name}.gates").functional(session=session)
             self.pending = {key: zeros((rows, 512) if key != "pending_position" else (rows,),
-                torch.float32 if key != "pending_position" else torch.int64)
+                torch.float32 if key != "pending_position" else torch.int64, key)
                 for key in ("pending_values", "pending_gates", "pending_position")}
             self.arguments.update(gates=self.gates, **self.pending)
         self.plan = mla_compress.plan(mla_compress.Caps(device=device, max_tokens=tokens,
@@ -239,14 +242,14 @@ class PreparedGlobalKV:
     """Project and store every source row before decoder queries are packed."""
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *,
-                 session, name, indices, deferred=False):
+                 session, name, indices, deferred=False, examples=None):
         self.rotary = rotary
         self.ratio = pool.config.text["compress_ratios"][layer]
         if indices.metadata is not metadata or indices.position.shape != (source.shape[0],):
             raise ValueError("global KV indices must describe every source row")
         slots = indices.compressed(self.ratio).slots
         self.compressor = PreparedCompressor(layer, weights["compressor"], source, metadata,
-            pool, slots, session=session, name=f"{name}.compress", deferred=deferred)
+            pool, slots, session=session, name=f"{name}.compress", deferred=deferred, examples=examples)
         self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"], scratch.index_keys,
             session=session, name=f"{name}.index_key").functional(session=session)
         self.index_norm = PreparedRMSNorm(scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
@@ -305,8 +308,10 @@ class PreparedAttention:
                 raise ValueError("verification window staging must match the contiguous cache geometry")
             self.window_cache = window_staging
         else:
-            self.window_cache = self.window if mode == "decode" else zeros(
-                (rows, self.window_page_size * 528), torch.uint8)
+            # TP3: a declaration example (each call allocates its own), shared by role across layers and graphs as
+            # tp3-main's cursors did; per layer and graph it was 0.23 GiB/rank of catalog operands (G1 2026-11-14).
+            self.window_cache = self.window if mode == "decode" else declaration_tensor(examples,
+                "attention.window_cache", (rows, self.window_page_size * 528), torch.uint8, device)
         window_width = self.window_page_size if draft else 128
         self.owns_window_metadata = window_metadata is None
         if window_metadata is None:
@@ -367,7 +372,7 @@ class PreparedAttention:
         self.selectors = []
         if "compressor" in weights:
             self.global_kv = PreparedGlobalKV(layer, weights, source, scratch, metadata, pool, rotary,
-                session=session, name=name, indices=window_metadata, deferred=mode == "verify")
+                session=session, name=name, indices=window_metadata, deferred=mode == "verify", examples=examples)
         if "index_q" in weights:
             self.index_query = QuantizedProjection(scratch.query_low, weights["index_q"],
                 scratch.index_query.view(tokens, -1), session=session, name=f"{name}.index_query",

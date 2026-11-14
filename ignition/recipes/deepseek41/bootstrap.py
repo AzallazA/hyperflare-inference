@@ -584,9 +584,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
+            # TP3: the encoder scratch is a declaration example (calls own no scratch), and vision graphs run one at
+            # a time, so the smaller capacities take row prefixes of the largest one, as tp3-main's cursors did
+            # (0.4 GiB/rank of catalog operands, G1 2026-11-14). vision_storage stays the only owner.
+            largest = max(PATCH_CAPACITIES)
+            vision_storage[largest] = VisionScratch.allocate(largest, device, hidden=5120)
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120)
+                vision_storage[capacity] = vision_storage[largest].rows(capacity)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
                     session=session, workspace=arena, name=name)
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence),
