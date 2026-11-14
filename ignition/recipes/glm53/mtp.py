@@ -15,12 +15,13 @@ from flashinfer.triton.norm import rms_norm, rms_norm_add_residual
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .indexer import IndexMetadata
 from .mla import MLAScratch, PreparedGlmMLA
 from .moe import MoeScratch, PreparedGlmMoe
+from .shards import Shards
 
 
 @dataclass(frozen=True)
@@ -42,8 +43,8 @@ class MTPScratch:
         def buffer(width):
             return torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
         return cls(buffer(4096), buffer(8192), buffer(4096), buffer(4096), buffer(4096), buffer(4096), buffer(4096),
-                   MLAScratch.allocate(tokens, 64 // world_size, blocks, mode, device, context_ranks=context_ranks,
-                                       remote=remote),
+                   MLAScratch.allocate(tokens, Shards.of(world_size).heads, blocks, mode, device,
+                                       context_ranks=context_ranks, remote=remote),
                    MoeScratch.allocate(tokens, world_size, device) if moe else None)
 
     @classmethod
@@ -236,8 +237,12 @@ class PreparedMTP:
         self.hidden = scratch.hidden
         self.embedding = PreparedEmbedding(weights.tree.model.language_model.embed_tokens.weight,
             metadata.token_ids, self.embedded, num_rows=metadata.num_tokens, session=session, name=f"{name}.embedding")
-        self.projection = UnquantizedProjection(self.joined, weights.mtp.tensors["eh_proj"], self.residual,
-            session=session, name=f"{name}.eh_proj")
+        eh_proj = weights.mtp.tensors["eh_proj"]
+        # A packed eh_proj (fork-only TP3 option draft_eh_proj="mxfp8") runs as a b12x MXFP8 projection.
+        self.projection = (UnquantizedProjection(self.joined, eh_proj, self.residual,
+            session=session, name=f"{name}.eh_proj") if isinstance(eh_proj, torch.Tensor) else
+            QuantizedProjection(self.joined, eh_proj, self.residual, session=session, name=f"{name}.eh_proj",
+                                activation_mode="auto", workspace=workspace))
         self.attention = PreparedGlmMLA(attention, weights.mtp.attention, self.normalized, scratch.attention,
             state, metadata.indexed, mode=mode, session=session, name=f"{name}.mla", workspace=workspace,
             max_cache_pages=max_cache_pages, context=context)
@@ -248,7 +253,7 @@ class PreparedMTP:
                 scratch.moe, session=session, name=f"{name}.moe", workspace=workspace)
             self.mlp_reduce = PreparedAllReduce(self.moe.output, self.mlp_output,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce")
-            self.local_logits = buffer(rows, 154880 // weights.shard.world_size)
+            self.local_logits = buffer(rows, Shards.of(weights.shard.world_size).vocabulary)
             self.logits = buffer(rows, 154880)
             head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.head
             self.head = PreparedVocabularyProjection(self.hidden, head,

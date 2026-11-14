@@ -27,6 +27,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
+from .shards import WORLDS, Shards
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_core_pb2 as contract_proto
@@ -66,6 +67,8 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 
 _COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "vision", "init", "restore", "snapshot")
+# Fork-only switches whose tp3-main form wrote into the removed scratch pool; each raises until its port stage lands.
+_UNPORTED = {"kda_side_chain": "S9", "vision_stage": "S10"}
 # Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
 _DMA_PREFILL_TOKENS = 1024
 # Allocator granularity and fragmentation slack beyond the headroom kept after the final KV allocation.
@@ -108,6 +111,25 @@ class PreparationConfig:
     context_parallel: bool = False
     # Expand routed experts' CSF block scales once at load instead of before every expert launch.
     expand_expert_scales: bool = False
+    # Routed expert intermediate columns per rank (shards.py `routed_expert_columns`); None keeps the shared
+    # expert's 128-aligned shard (768 at three ranks). 704 at three ranks is the fork-only TP3 experiment.
+    expert_columns: int | None = None
+    # Fork-only TP3 decode-speed experiments (recipe.py `_tp3_override`): run the small KDA projections on the
+    # auxiliary stream beside q/k/v; propose with an NVFP4 copy of the head ("nvfp4") instead of the target head
+    # ("target"); run the draft layer's eh_proj as MXFP8 ("mxfp8") instead of BF16 ("bf16"). The draft options
+    # change the proposal distribution only; verification keeps the target head and layers.
+    kda_side_chain: bool = False
+    draft_head: str = "target"
+    draft_eh_proj: str = "bf16"
+    # Fork-only VRAM switch (recipe.py `_tp3_override("EMBED_HOST")`): package exports keep the replicated BF16
+    # token embedding (1210 MiB per rank) in device-visible host memory; in-process preparation has no host
+    # mappings and keeps it resident.
+    embed_host: bool = False
+    # Fork-only VRAM switch (recipe.py `_tp3_override("VISION_STAGE")`, DeepSeek's TP3 `vision_stage`): package
+    # exports park the replicated vision tower's block and tail weights (~0.36 GiB per rank) in device-visible
+    # host memory and stage them through VRAM slots per image (two block slots; the tail aliases dead vision
+    # scratch). In-process preparation has no host mappings and keeps the tower resident.
+    vision_stage: bool = False
     # Run shared experts, KDA gate projections, and decode query chains on an auxiliary stream;
     # without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -139,17 +161,40 @@ class PreparationConfig:
         if type(self.compile_decoder) is not bool or type(self.stream_overlap) is not bool:
             raise TypeError("compile_decoder and stream_overlap must be booleans")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2, 4)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in WORLDS
                 or len(set(placements)) != len(self.devices)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("GLM requires one, two or four distinct CUDA devices")
+            raise ValueError("GLM requires one, two, three or four distinct CUDA devices")
+        if type(self.kda_side_chain) is not bool:
+            raise TypeError("kda_side_chain must be a boolean")
+        if type(self.embed_host) is not bool:
+            raise TypeError("embed_host must be a boolean")
+        if type(self.vision_stage) is not bool:
+            raise TypeError("vision_stage must be a boolean")
+        if self.draft_head not in ("target", "nvfp4") or self.draft_eh_proj not in ("bf16", "mxfp8"):
+            raise ValueError("GLM draft head must be target or nvfp4 and draft eh_proj bf16 or mxfp8")
+        if self.expert_columns is not None and type(self.expert_columns) is not int:
+            raise TypeError("expert_columns must be an integer or None")
+        Shards.of(len(self.devices), expert_columns=self.expert_columns)
+        if self.context_parallel and len(self.devices) == 3:
+            # DCP3 exchanges 24 query heads per rank (72 with rank 2's 8 zero heads; b12x splits head exchanges
+            # into equal shards) and merges 3 x 512 candidates through a masked 2048-key sort (dcp.py).
+            three = Shards.of(3, expert_columns=self.expert_columns)
+            if (three.heads, three.padded_heads) != (24, 72):
+                raise ValueError("GLM decode context parallelism over three ranks requires 24 heads per rank "
+                                 f"(72 exchanged), not {three.heads} ({three.padded_heads})")
+        for name, stage in _UNPORTED.items():
+            if getattr(self, name):
+                raise ValueError(f"GLM {name} is not ported to compiler-owned storage yet (port stage {stage})")
         for name in ("context", "prefill_chunk_size", "max_active", "snapshot_budget_bytes", "headroom_bytes",
                      "compile_headroom_bytes"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"{name} must be an integer")
-        if not self.page_tokens <= self.context <= 1048576 or self.context % self.page_tokens:
-            raise ValueError(f"GLM context must be {self.page_tokens}-aligned in [{self.page_tokens},1048576]")
+        # Context-parallel pages hold 256 * ranks positions; 768 (three ranks) does not divide 2^20, so the
+        # page tables round up (`blocks`) and the context needs alignment to 256 local records only.
+        if not self.page_tokens <= self.context <= 1048576 or self.context % 256:
+            raise ValueError(f"GLM context must be 256-aligned in [{self.page_tokens},1048576]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         request_capacity(self.max_active)
@@ -195,12 +240,18 @@ class PreparationConfig:
         """Fixed KV pages, or the context of every active request when memory does not size them."""
         if self.pages is not None:
             return self.pages
-        return self.minimum_pages or (self.context // self.page_tokens + int(self.mtp)) * self.max_active
+        return self.minimum_pages or (self.blocks + int(self.mtp)) * self.max_active
 
     @property
     def page_tokens(self):
         """Global positions per KV page: 256 local records on each rank that shares the context."""
         return 256 * (len(self.devices) if self.context_parallel else 1)
+
+    @property
+    def blocks(self):
+        """Page-table columns of one request: enough pages for the whole context, the last one partial when
+        the page size does not divide it (768-token pages at three context ranks)."""
+        return -(-self.context // self.page_tokens)
 
     @property
     def preparation_pages(self):
@@ -276,6 +327,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
 
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
+    shards = Shards.of(shard.world_size, expert_columns=config.expert_columns)
     if (shard.world_size > 1) != (group is not None):
         raise ValueError("a GLM rank group exists exactly when more than one rank prepares")
     device = torch.device("cuda", config.devices[rank])
@@ -297,7 +349,14 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp,
                                 expert_activation=expert_activation,
-                                expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only)
+                                expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only,
+                                expert_columns=config.expert_columns, draft_head=config.draft_head,
+                                draft_eh_proj=config.draft_eh_proj,
+                                host_allocator=core_storage.host_allocate
+                                if config.embed_host and core_storage is not None else None)
+    if config.embed_host:
+        report("token embedding in device-visible host memory (FLARE_GLM53_EMBED_HOST=1)" if core_storage is not None
+               else "FLARE_GLM53_EMBED_HOST ignored: in-process preparation has no host mappings; embedding resident")
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -311,7 +370,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         snapshots = 1 if core_storage is not None else layout.snapshot_capacity(config.snapshot_budget_bytes)
         if snapshots < 1:
             raise ValueError("GLM snapshot budget must hold at least one continuation row")
-        pages, blocks = config.preparation_pages, config.context // config.page_tokens
+        pages, blocks = config.preparation_pages, config.blocks
         slots = config.request_capacity
         # Speculative verification records its tokens and commits into the live row: one row per request.
         state_rows = snapshots + slots
@@ -346,7 +405,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             # carries decode context parallelism's exchanges.
             # Decode rows reduce one-shot; prefill chunks through the pipelined two-shot path.
             decode_tokens = max(config.request_capacity, sample_rows)
-            gather_bytes = sample_rows * (154880 // shard.world_size) * 2
+            gather_bytes = sample_rows * shards.vocabulary * 2
             if config.context_parallel:
                 from ignition.components.head_exchange import pack_width
 
@@ -355,8 +414,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 # Per-rank contributions: query heads and the merge's head shards for one exchange
                 # slice, and index candidates for one slice of rows.
                 exchange = min(SLICE_ROWS, decode_tokens)
-                gather_bytes = max(gather_bytes, exchange * (64 // shard.world_size) * 512 * 2,
-                                   exchange * pack_width(shard.world_size, 64, 512) * 2,
+                gather_bytes = max(gather_bytes, exchange * shards.heads * 512 * 2,
+                                   exchange * pack_width(shard.world_size, shards.padded_heads, 512) * 2,
                                    min(config.token_capacity, SLICE_ROWS) * 2048 * 2)
             varlen_bytes = 0
             if config.context_parallel:
@@ -367,13 +426,25 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             collective = prefill_collective = vocabulary_collective = create_roce_runtime(
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
+        elif group is not None and 4096 % shard.world_size:
+            # The DMA all-reduce reduce-scatters each 4096-wide row over the ranks (b12x _dma_preparation.py
+            # requires numel % (world * 128) == 0), which three ranks cannot divide for power-of-two prefill
+            # capacities. As in deepseek41/bootstrap.py (`if 5120 % len(config.devices)`: one PCIe runtime shared
+            # by decode and prefill so capture enters a single collective's protocol), size one PCIe all-reduce
+            # for the whole prefill chunk. DeepSeek's `ar_rows` chunked prefill reductions are not ported yet:
+            # a 4096-row chunk reduces 32 MiB per layer call.
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+                max_tokens=max(config.token_capacity, config.prefill_chunk_size), hidden_size=4096, ipc=ipc)
+            prefill_collective = collective
+            vocabulary_collective = create_all_gather_runtime(group, device,
+                max_rows=sample_rows, columns=shards.padded_vocabulary, ipc=ipc)
         elif group is not None:
             collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)
             vocabulary_collective = create_all_gather_runtime(group, device,
-                max_rows=sample_rows, columns=154880, ipc=ipc)
+                max_rows=sample_rows, columns=shards.padded_vocabulary, ipc=ipc)
         identity = hashlib.sha256(json.dumps({"config": json.loads((snapshot / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
@@ -418,12 +489,12 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 exchange_rows = min(SLICE_ROWS, max(config.request_capacity,
                     max((b * w for b, w in config.speculative_shapes), default=1) if config.mtp else 1))
                 context = ContextParallel(owned,
-                    heads=create_head_exchange(group, device, max_rows=exchange_rows, heads=64, head_dim=512,
-                                               ipc=ipc),
+                    heads=create_head_exchange(group, device, max_rows=exchange_rows, heads=shards.padded_heads,
+                                               head_dim=512, ipc=ipc),
                     candidates=create_all_gather_runtime(group, device,
                         max_rows=min(config.token_capacity, SLICE_ROWS), columns=2048 * shard.world_size, ipc=ipc),
                     coordinator=coordinator)
-        shards = None if context is None else context.shards
+        context_shards = None if context is None else context.shards
         remote = context is not None and context.remote
         prefill_storage = DecoderScratch.allocate(config.prefill_chunk_size, blocks, "prefill", device,
             shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote)
@@ -500,7 +571,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                         session=session, name=name, workspace=arena, feedback=feedback,
                         max_cache_pages=max_cache_pages, context=context, vision=vision_state)
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard,
-                                          pages=pool.memory_capacity[1:], shards=shards,
+                                          pages=pool.memory_capacity[1:], shards=context_shards,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None)
                     forward = PreparedGeneration(decoders[name], batch, completion, frame, sequence,
                         pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation")

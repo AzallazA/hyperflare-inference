@@ -27,6 +27,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.glm53.indexer import IndexMetadata
 from ignition.recipes.glm53.mla import MLAScratch, MLAState, PreparedGlmMLA
 from ignition.recipes.glm53.model import create_model_tree
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.weights import TEXT_PREFIX, GlmWeightLoader
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -100,14 +101,18 @@ def assert_selection(actual, expected, indexer, scratch):
         assert torch.all(logits[row][changed] == cutoff)
 
 
-@pytest.fixture(scope="module", params=[1, 2, 4])
+# (world, rank): the last rank of each size, and every rank of three (24/24/16 checkpoint heads, 24 each).
+@pytest.fixture(scope="module", params=[(1, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 3)],
+                ids=lambda value: f"{value[0]}.{value[1]}")
 def model_weights(request):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
+    if not snapshot.is_dir():
+        pytest.skip("GLM 5.3 Flash checkpoint is not available")
     tree = create_model_tree(snapshot)
     manifest = inspect_indexed_checkpoint(snapshot)
-    world = request.param
-    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(world - 1, world),
+    world, rank = request.param
+    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(rank, world),
             prefixes=(f"{TEXT_PREFIX}.layers.3.self_attn.",)) as loader:
         weights = loader.load_attention(3)
     return tree.model.language_model.layers[3].self_attn, weights, world
@@ -122,7 +127,8 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
     capacity = 1 << (rows - 1).bit_length()
     sequences = rows if mode == "decode" else 1
     source = torch.zeros((capacity, 4096), dtype=torch.bfloat16, device=device)
-    scratch = MLAScratch.allocate(capacity, 64 // world, 64, mode, device)
+    # The last rank of three holds heads 48..63 and 8 zero-weight padding heads (24 per rank).
+    scratch = MLAScratch.allocate(capacity, Shards.of(world).heads, 64, mode, device)
     state = MLAState.allocate(128, 4, device)
     metadata = IndexMetadata.allocate(capacity, sequences, 64, device)
     arena = ScratchArena(device, overlap=overlap)
@@ -259,14 +265,14 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
             graph.reset()
 
 
-@pytest.mark.parametrize("model_weights", [2], indirect=True)
+@pytest.mark.parametrize("model_weights", [(2, 1)], indirect=True)
 @torch.no_grad()
 def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weights):
     from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
     from ignition.recipes.glm53.dcp import ContextShards, PREFILL_SLICE_ROWS
 
     module, weights, world = model_weights
-    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, 64 // world
+    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, Shards.of(world).heads
     torch.manual_seed(53)
     caches = [pack_mla_kv_cache_reference(torch.randn(blocks * 256, 512, device=device)).view(-1, 64, 528)
               for _ in range(world)]

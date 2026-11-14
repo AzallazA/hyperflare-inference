@@ -20,9 +20,11 @@ from ignition.components import sm103
 from ignition.components.block_fp8 import BlockFP8Projection, _workspace_bytes
 from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.components.sparse_mla_sm103 import Sm103PrefillSparseMLA, Sm103SparseMLA
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import register_finalizer
 
 from .indexer import IndexMetadata, IndexScratch, IndexState, PreparedGlmIndexer
+from .shards import HEAD_COUNTS
 
 
 @dataclass(frozen=True)
@@ -68,8 +70,8 @@ class MLAScratch:
 
     @classmethod
     def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False):
-        if heads not in (16, 32, 64):
-            raise ValueError("GLM MLA scratch requires TP1, TP2 or TP4 head partitions")
+        if heads not in HEAD_COUNTS:
+            raise ValueError("GLM MLA scratch requires a supported rank-count head partition")
         from .dcp import PREFILL_SLICE_ROWS, SLICE_ROWS
 
         index = IndexScratch.allocate(tokens, blocks, mode, device, context_ranks=context_ranks)
@@ -116,6 +118,25 @@ class MLAScratch:
 
 _CHAINS = weakref.WeakValueDictionary()
 _CHAIN_HANDLES = itertools.count()
+# Head counts per rank that b12x's BF16 x MXFP8 batched GEMM qualifies (mxfp8_bmm._QUALIFIED_BATCHES).
+MXFP8_BMM_HEADS = frozenset((8, 16, 32))
+# BF16 decodings of MXFP8 kv_b_proj weights by the packed values' identity: every prepared draft pass of one
+# layer shares one persistent copy (the persistent arena never frees, so a copy per pass would accumulate).
+_DECODED_KV_B = {}
+
+
+def decoded_kv_b(packed, heads):
+    """Exact BF16 [heads, 512, 512] values of an MXFP8 kv_b_proj: E4M3 x E8M0 fits BF16's mantissa and exponent."""
+    cached = _DECODED_KV_B.get(id(packed.values))
+    if cached is not None and cached[0] is packed.values:
+        return cached[1]
+    stored = packed.values.view(heads * 512, 512)
+    exponents = packed.scale_rows.view(torch.uint8).view(heads * 512, 16).int() - 127
+    decoded = stored.float().view(heads * 512, 16, 32) * torch.ldexp(
+        torch.ones_like(exponents, dtype=torch.float32), exponents)[..., None]
+    values = persistent_copy(decoded.view(heads, 512, 512).to(torch.bfloat16))
+    _DECODED_KV_B[id(packed.values)] = (packed.values, values)
+    return values
 
 
 @torch.library.custom_op("flare::start_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace", "encoded"))
@@ -290,8 +311,8 @@ class PreparedGlmMLA:
         if (module.num_heads, module.q_lora_rank, module.kv_lora_rank, module.qk_nope_head_dim,
                 module.qk_rope_head_dim, module.v_head_dim) != (64, 1536, 512, 256, 0, 256):
             raise ValueError("canonical MLA geometry differs from GLM 5.3 Flash")
-        if module.indexer is None or module.skip_topk or heads not in (16, 32, 64):
-            raise ValueError("GLM MLA requires a full indexer and TP1, TP2 or TP4 head partitions")
+        if module.indexer is None or module.skip_topk or heads not in HEAD_COUNTS:
+            raise ValueError("GLM MLA requires a full indexer and a supported rank-count head partition")
         if (state.cache.shape != (state.index.cache.shape[0] * 4, 64, 528)
                 or weights["q_b_proj"].out_features != heads * 256
                 or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
@@ -312,6 +333,14 @@ class PreparedGlmMLA:
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
         if isinstance(weights["kv_b_proj"], torch.Tensor):
             values = weights["kv_b_proj"].view(heads, 512, 512)
+            self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]
+            batched_projection = BatchedUnquantizedProjection
+        elif heads not in MXFP8_BMM_HEADS:
+            # b12x qualifies its BF16 x MXFP8 BMM for 8, 16 and 32 groups only, and three ranks hold 24 heads
+            # (shards.py). The MXFP8 kv_b_proj (the draft layer's in the FP4-Local checkpoint; target layers
+            # store BF16) decodes exactly into BF16, so the BF16 BMM computes the same products for 2x the bytes
+            # of a 12.6 MiB per-layer weight.
+            values = decoded_kv_b(weights["kv_b_proj"].weight, heads)
             self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]
             batched_projection = BatchedUnquantizedProjection
         else:
