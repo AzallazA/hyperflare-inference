@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 from transformers.models.glm5_next.modeling_glm5_next import (
@@ -17,7 +18,7 @@ from transformers.models.glm5_next.modeling_glm5_next import (
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
-from ignition.components.vision_staging import PackedLayout, WeightStaging, pack_tree, stage_copies
+from ignition.components.vision_staging import PackedLayout, WeightStaging, map_tensors, pack_tree, stage_copies
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor, unrecorded_numeric_tensors
 from ignition.preparation.tuning import register_finalizer
@@ -225,7 +226,7 @@ class VisionStaging:
     def stage_tail(self, token):
         """The tail weights copied into a forward-local tensor after ``token`` (the last block's output) exists."""
         copied = stage_copies(token, {"tail": self.tail_source}, kernel_copy=self.kernel_copy)["tail"]
-        return self.tail_layout.bind(self.tail_tree, copied)
+        return _bind_local(self.tail_layout, self.tail_tree, copied)
 
     def tail_example_tree(self):
         """The tail geometry bound to one VRAM declaration example, shared by every vision graph prepared before
@@ -261,6 +262,23 @@ class VisionStaging:
                 {k: staged_projections.get(k, v) for k, v in weights.projections.items()}, downsample)
 
 
+def _bind_local(layout, tree, flat):
+    """`PackedLayout.bind` for a fresh forward-local buffer, traceable by Dynamo.
+
+    `bind` reads the buffer's storage offset and checks addresses, which a compiled forward cannot do with a
+    graph-local tensor; `stage_copies` returns a new contiguous tensor (storage offset zero), so every leaf is a
+    dtype view of it at the layout's byte offset, as `bind` computes it."""
+    entries, typed = iter(layout.entries), {}
+
+    def view(tensor):
+        index, dtype, shape, stride, offset = next(entries)
+        if dtype not in typed:
+            typed[dtype] = flat.view(dtype)
+        return typed[dtype].as_strided(shape, stride, (layout.offsets[index] + offset) // dtype.itemsize)
+
+    return map_tensors(tree, view)
+
+
 def rebound(projection, weight):
     """A prepared projection reading ``weight`` (same geometry as declared) in this forward.
 
@@ -285,11 +303,34 @@ def rebound(projection, weight):
     return result
 
 
-def _with_children(module, children):
-    """A shallow copy of ``module`` whose submodules ``children`` replace the named ones (the original keeps its)."""
-    clone = copy.copy(module)
-    clone._modules = {**module._modules, **children}
-    return clone
+class _Bound:
+    """A projection call with its bias, as `_Linear` runs it, built inside a forward (plain object, no module)."""
+
+    def __init__(self, projection, bias):
+        self.projection, self.bias = projection, bias
+
+    def __call__(self, source):
+        result = self.projection(source)
+        if self.bias is not None:
+            result.add_(self.bias)
+        return result
+
+
+def _forward_with(module, children):
+    """``module``'s own forward over its attributes with ``children`` in place of the named submodules.
+
+    The forward runs on a plain namespace rather than a copy of the module: compiled forwards cannot copy or
+    construct modules, and the prepared module keeps its own children."""
+    view = _View({**{k: v for k, v in vars(module).items() if not k.startswith("_")}, **module._modules, **children})
+    return partial(type(module).forward, view)
+
+
+class _View:
+    """Plain attribute holder (Dynamo traces user classes, not SimpleNamespace construction)."""
+
+    def __init__(self, attributes):
+        for name, value in attributes.items():
+            setattr(self, name, value)
 
 
 class _Linear(torch.nn.Module):
@@ -435,8 +476,8 @@ class PreparedVision:
         downsample, merger = self.downsample, self.module.merger
         if self.staged_tail:
             weights = self.staging.stage_tail(normed)
-            downsample = _Linear(rebound(downsample.projection, weights["downsample"]), downsample.bias)
-            merger = _with_children(merger, {key: _Linear(rebound(getattr(merger, key).projection,
+            downsample = _Bound(rebound(downsample.projection, weights["downsample"]), downsample.bias)
+            merger = _forward_with(merger, {key: _Bound(rebound(getattr(merger, key).projection,
                 weights["projections"][f"merger.{key}"]), getattr(merger, key).bias) for key in MERGER_PROJECTIONS})
         return merger(downsample(normed.view(-1, 4096)))
 

@@ -147,8 +147,10 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
 
             def forward():
                 _, local = attention.forward(source, metadata)
+                # The forward keeps the attention result local since upstream 4a24d78a (only `expanded` and
+                # `output` leave it), so the returned scratch's `attended` stage is never written.
                 for name in ("query_input", "query_residual", "latent_input", "latent", "query",
-                             "absorbed_query", "attended", "expanded", "output", "visible"):
+                             "absorbed_query", "expanded", "output", "visible"):
                     getattr(scratch, name).copy_(getattr(local, name))
                 for field in fields(scratch.index):
                     getattr(scratch.index, field.name).copy_(getattr(local.index, field.name))
@@ -180,7 +182,7 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                 metadata.requests.copy_(torch.arange(rows, dtype=torch.int32, device=device))
             stages = {key: getattr(scratch, key) for key in (
                 "query_input", "query_residual", "latent_input", "latent", "query", "absorbed_query",
-                "attended", "expanded", "output")}
+                "expanded", "output")}
             persistent = (state.cache, state.index.cache, state.index.tail)
             mismatches = []
             for step in range(3):
@@ -237,7 +239,8 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                 scratch.attended.copy_(attended)
                 scratch.expanded.copy_(attention.value_expansion(attended.transpose(0, 1)).transpose(0, 1))
                 scratch.output.copy_(attention.projections["o_proj"](scratch.expanded.view(capacity, -1)))
-                for key in ("attended", "expanded", "output"):
+                # The recomputed attention reaches the comparison through `expanded` and `output`.
+                for key in ("expanded", "output"):
                     expected[key] = stages[key].clone()
                 assert_selection(actual_pools, expected_pools, attention.indexer, scratch.index)
                 scratch.index.pools.copy_(actual_pools)

@@ -536,6 +536,23 @@ def test_functionalized_tail_copies_after_the_final_norm_and_before_every_tail_g
     assert not any(placeholders[1] in _ancestors(mm.args[1]) - _ancestors(node) for mm in mms)
 
 
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_staged_tail_traces_under_dynamo_and_matches_the_resident_tail(tail_checkpoint, backend):
+    """Compiled vision forwards run the tail under Dynamo (fullgraph, as aot_forward does): binding the
+    forward-local copy, rebinding the projections and running the merger must trace without graph breaks (no
+    storage offsets, no module copies) and give the resident result. G3 found the first version breaking here."""
+    weights, parked, _ = tail_checkpoint
+    staging = VisionStaging(parked, "cpu")
+    _, projections, downsample = staging.bound(parked)
+    encoder, _ = _tail_encoder(projections, downsample, staging=staging)
+    encoder._release_tail_examples()
+    for linear in (encoder.downsample, *encoder.module.merger.children()):
+        linear.projection.log = None
+    torch._dynamo.reset()
+    compiled = torch.compile(encoder.tail, fullgraph=True, backend=backend)
+    assert torch.equal(_bytes(compiled(_normed())), _bytes(_resident_tail(weights)))
+
+
 def _quantized(weight, *, encoded=False, sm103=False):
     from ignition.components.linear import QuantizedProjection
 
@@ -628,15 +645,13 @@ def test_export_environment_reaches_the_preparation_config(monkeypatch, world, v
 @pytest.mark.parametrize("overlap", [True, False])
 @pytest.mark.parametrize("tail", [True, False])  # VISION_STAGE=1 (blocks + tail) and VISION_STAGE=blocks
 def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, tail, tmp_path):
-    from functools import partial
-
     from b12x.preparation import PreparationSession
     from transformers.vision_utils import get_vision_position_ids
 
     from ignition.components.weights import DirectWeightLoader
     from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.glm53.vision import PreparedVision, VisionMetadata, VisionScratch
-    from tests.recipes.test_glm53_vision import _input, _module
+    from tests.recipes.test_glm53_vision import VisionForward, _input, _module
     from tests.recipes.test_glm53_vram_options import _PinnedHost
 
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -665,17 +680,19 @@ def test_staged_replay_matches_the_resident_tower(manifest, compiler, overlap, t
             staging = (VisionStaging(parked, device, stream=arena.auxiliary_stream if overlap else None)
                        if variant == "staged" else None)
             # Workspaces as in the native replay test (none); the arena only supplies the copy stream.
-            prepared = PreparedVision(module, scratch.rows(capacity), metadata, source, session=session,
-                                      staging=staging)
+            rows = scratch.rows(capacity)
+            prepared = PreparedVision(module, rows, metadata, source, session=session, staging=staging)
             prepared.functional(session=session)
             session.freeze()
-            forward = lambda: prepared(pixels.to(torch.bfloat16), metadata)  # noqa: E731
+            # A module-level callable (test_glm53_vision's): the compile worker receives the forward pickled, and a
+            # local lambda becomes a process-local placeholder it cannot trace.
+            forward = VisionForward(prepared, pixels, metadata, rows.output)
             if compiler == "worker":
                 from ignition.preparation.aot import ForwardCache
                 from ignition.preparation.execution import GraphSignature
 
                 cache = ForwardCache(namespace={"vision": "glm53-staged"}, device=device, root=tmp_path / variant)
-                forward = cache.prepare_many({"vision": partial(forward)},
+                forward = cache.prepare_many({"vision": forward},
                                              {"vision": GraphSignature("vision", 1, capacity)})["vision"]
             metadata.position_ids[:count].copy_(get_vision_position_ids(inputs.image_grid_thw, 2))
             metadata.cu_seqlens.copy_(torch.tensor([0, count], dtype=torch.int32))
