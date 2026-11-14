@@ -26,6 +26,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.examples import declaration_summary
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
@@ -322,11 +323,10 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
                 proposal_only=True)
             source.prepare()
             proposals[batch] = source
-    for batch, _ in reversed(config.speculative_shapes):
-        name = f"speculative{batch}x1"
-        forward = PreparedParallelDraftRound(speculation, batch, 1, name)
-        forward.prepare()
-        add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
+    # TP3: the packed verification graphs are built before the width-1 rounds (their verify staging and window
+    # declarations are the larger ones of their roles; declaration_tensor would otherwise allocate the x1 size first
+    # and keep it alive, superseded, until tuning ends: ~21 MiB/rank). Graphs are still added in the catalog order.
+    packed = []
     for batch, packed_tokens in sorted(config.packed_speculative_shapes,
             key=lambda shape: (shape[1], shape[0]), reverse=True):
         logical_width = max(config.speculative_widths)
@@ -337,6 +337,13 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         name = f"packed-speculative{batch}x{logical_width}-drafts{config.draft_tokens}-tokens{packed_tokens}"
         forward = PreparedPackedSpeculativeRound(proposals[batch], target, prefix_limits, confidence.device_view,
             name=name)
+        packed.append((name, forward, batch, logical_width, packed_tokens))
+    for batch, _ in reversed(config.speculative_shapes):
+        name = f"speculative{batch}x1"
+        forward = PreparedParallelDraftRound(speculation, batch, 1, name)
+        forward.prepare()
+        add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
+    for name, forward, batch, logical_width, packed_tokens in packed:
         add(name, forward, "speculative", batch, logical_width, packed_inputs,
             enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
     return confidence
@@ -649,12 +656,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     # TP3 BRRR: ranks must agree on every layer's fused-kernel decision before any of them can enter the kernel
     # (its all-reduce would deadlock); plain construction code, before tuning and capture.
     check_brrr_decisions(group)
+    from ignition.recipes.deepseek41.brrr import engine as brrr_engine, placement_line
+    if brrr_engine() is not None:
+        print(placement_line(brrr_engine()), flush=True)  # every rank; the GPU chain greps "[brrr] placement rank"
     release_unused()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
                  f"{torch.cuda.memory_reserved(device) >> 20} MiB reserved, "
                  f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB free")
         progress(f"Graph operand allocation by operation: {catalog_bytes}")
+        shared = declaration_summary(examples)
+        progress(f"Shared declaration examples: {shared['roles']} roles, {shared['allocated'] >> 20} MiB allocated, "
+                 f"{shared['largest'] >> 20} MiB largest per role, {shared['superseded'] >> 20} MiB superseded"
+                 + (f" (grown: {', '.join(f'{role} {size >> 20} MiB' for role, size in sorted(shared['grown'].items()))})"
+                    if shared["grown"] else ""))
     def materialize():
         if feature_pool is not None:
             feature_pool.materialize()

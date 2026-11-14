@@ -128,7 +128,9 @@ class Scratch:
         attention_hc = MHCScratch.allocate(tokens, 5120, device)
         ffn_hc = MHCScratch.allocate(tokens, 5120, device)
         # No declared operator takes both (the Engram mix writes engram_residual from residual; the Engram layer's
-        # attention mHC reads it); preparation launches them one at a time, so contents never matter.
+        # attention mHC reads it), but tuning calls may clobber each other's contents through the alias. That is
+        # harmless only because no kernel touching this storage is data-dependent in its control flow: a future
+        # data-dependent consumer of ffn_hc.residual or engram_residual must re-check this alias.
         engram_residual = ffn_hc.residual if share_engram_residual else zeros(tokens, 4, 5120)
         attention = AttentionScratch.allocate(tokens, world, device, candidate_tokens=candidate_tokens)
         attention_output, mlp_output = zeros(tokens, 5120), zeros(tokens, 5120)

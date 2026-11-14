@@ -199,6 +199,10 @@ def _engram(monkeypatch, tokens, chunk_rows, world):
 @pytest.mark.parametrize("tokens,chunk_rows,parts", [
     (12, 4, 3), (10, 4, 3), (8, 8, 1), (8, 16, 1), (1300, 512, 3), (1024, 384, 3), (640, 128, 5)])
 def test_chunked_engram_is_bit_identical_to_one_pass(monkeypatch, world, tokens, chunk_rows, parts):
+    """PLUMBING ONLY. The stand-in kernels are row-independent CPU functions, so this proves the chunk orchestration
+    (bounds, row slices of source/mask/output, column selection, one op pair per height, tail naming) and nothing
+    about the real kernels: a b12x projection or mix that misbehaves at a row offset or a tail height would pass
+    here. GPU numerics need the chunked-vs-one-pass export A/B (consistency.py, lavd; S5-REVIEW risk 1)."""
     whole, metadata, source, declared_whole = _engram(monkeypatch, tokens, 0, world)
     reference = whole(source, metadata)
     assert not whole.chunked and [p.name for p in _Projection.created] == ["prefill.layer1.engram.projection"]
@@ -233,6 +237,20 @@ def test_masked_rows_and_row_order_reach_every_chunk(monkeypatch):
     assert not torch.equal(prepared(source, swapped), good)  # mask rows are taken per chunk
     prepared.bounds = ((0, 4), (0, 4), (8, 10))  # broken bounds
     assert not torch.equal(prepared(source, metadata), good)
+
+
+@pytest.mark.parametrize("chunk_rows", [0, 4])
+def test_engram_forward_refuses_rows_other_than_declared(monkeypatch, chunk_rows):
+    prepared, metadata, source, _ = _engram(monkeypatch, 10, chunk_rows, 3)
+    prepared(source, metadata)
+    wider = torch.cat((source, source[:2]))
+    wide_metadata = SimpleNamespace(token_ids=torch.arange(12), positions=torch.arange(12),
+                                    live_counts=torch.tensor([12]))
+    with pytest.raises(ValueError, match="Engram forward got 12 rows; it was declared for 10"):
+        prepared(wider, wide_metadata)
+    with pytest.raises(ValueError, match="got 8 rows"):
+        prepared(source[:8], SimpleNamespace(token_ids=metadata.token_ids[:8], positions=metadata.positions[:8],
+                                             live_counts=torch.tensor([8])))
 
 
 def test_engram_rejects_inconsistent_chunk_scratch(monkeypatch):

@@ -36,7 +36,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ignition.preparation.persistent import persistent_copy, persistent_zeros
+from ignition.preparation.persistent import active_core_storage, persistent_copy, persistent_zeros
 
 from .tp3_config import TP3Config
 
@@ -321,22 +321,57 @@ class Engine:
         flare_owned = dict(fn=weights.residual["hc_ffn_fn"], hc_scale=weights.residual["hc_ffn_scale"],
                            hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"],
                            gate_b=weights.experts.correction)
+        placement = self.__dict__.setdefault("placement", {"layers": 0, "in_place": {}, "copied": {}, "bytes": 0})
         for name, owned in flare_owned.items():
             if (isinstance(owned, torch.Tensor) and owned.is_contiguous() and owned.dtype == kwargs[name].dtype
                     and owned.shape == kwargs[name].shape and torch.equal(owned, kwargs[name])):
+                _require_persistent(owned, f"BRRR layer {index}: Flare's {name}")
                 kwargs[name] = owned
+                placement["in_place"][name] = placement["in_place"].get(name, 0) + 1
         # The kernel holds raw pointers to these tensors: the copies made here are forward constants, packed into the
         # persistent arena with the final weights (registration runs inside the catalog's transient pool).
         for name in PERSISTENT_COPIES:
             if (kwargs.get(name) is not None and not (tp3.brrr_dense_native and name in NATIVE_DENSE)
                     and not any(kwargs[name] is owned for owned in flare_owned.values())):
                 kwargs[name] = persistent_copy(kwargs[name])
+                placement["copied"][name] = placement["copied"].get(name, 0) + 1
+                placement["bytes"] += kwargs[name].nbytes
+        placement["layers"] += 1
         self.keep.append(kwargs)
         self.slots[index] = ext.add_layer(self.local_handle, **kwargs)
         if tp3.brrr_log:
             print(f"[brrr] rank {r} layer {index} -> slot {self.slots[index]} (w13 {tuple(rep.w13_rp.shape)}, "
                   f"sfb {tuple(rep.w13_sfb.shape)}, layout {rep.w13_layout})", flush=True)
         return self.slots[index]
+
+
+def _require_persistent(tensor, what):
+    """A tensor the kernel reads in place must outlive preparation: inside the core's persistent arena. No-op without
+    core storage (unit tests, eager runs)."""
+    storage = active_core_storage()
+    if storage is None or tensor.device.type != "cuda":
+        return
+    arena = getattr(storage, "_persistent_arena", None)
+    start = tensor.data_ptr()
+    if (arena is None or arena.closed or not (arena.region.address <= start
+                                               and start + tensor.nbytes <= arena.region.address + arena.used)):
+        raise RuntimeError(f"{what} is not in the persistent arena; BRRR would keep a pointer to temporary memory")
+
+
+PLACEMENT_PREFIX = "[brrr] placement"
+
+
+def placement_line(engine_):
+    """One stable line per rank for the GPU chain: registered layers, Flare tensors read in place and register()
+    copies (counts over all layers, per name) and the copied bytes."""
+    placement = getattr(engine_, "placement", None) or {"layers": 0, "in_place": {}, "copied": {}, "bytes": 0}
+
+    def names(counts):
+        return " ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "-"
+    return (f"{PLACEMENT_PREFIX} rank {engine_.rank}: layers={placement['layers']} "
+            f"in_place={sum(placement['in_place'].values())} [{names(placement['in_place'])}] "
+            f"copied={sum(placement['copied'].values())} [{names(placement['copied'])}] "
+            f"copied_bytes={placement['bytes']}")
 
 
 # add_layer tensors built by register() from checkpoint reads (copies, not views of Flare's weights or b12x's planes).
