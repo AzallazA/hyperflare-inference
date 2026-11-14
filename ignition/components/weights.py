@@ -376,12 +376,15 @@ def _source_stride(source, axis):
 def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projection_names,
                                         weight_name, scale_name, first, last, hidden_size,
                                         local, group, format, scale_compression=None,
-                                        w13_layout=None):
+                                        w13_layout=None, covered=None):
     """Record affine byte maps for retained native FP4 expert owners.
 
     Only unchanged bytes are mapped. Padded or re-blocked scale owners remain
     unprovenanced rather than claiming a copy that did not happen. FC1 half
     order follows the retained storage after any b12x w31 normalization.
+    `covered` (default `local`) is the count of checkpoint columns the owner holds; a
+    zero-padded owner maps only those columns, and only in the native layout, since a
+    source without pieces would claim the whole view.
     """
     import torch
     from ignition.preparation import provenance
@@ -399,6 +402,9 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
     count = len(prefixes)
     half = hidden_size // 2
     local_half = local // 2
+    covered = local if covered is None else covered
+    padded = covered != local
+    end = first + covered
     scale_columns = hidden_size // group
     local_scale_columns = local // group
     first_name, second_name, down_name = projection_names
@@ -465,15 +471,18 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
                 source = sources[f'{prefix}.{projection}.{weight_name}']
                 rows = offset * local
                 entry = dict(tensor=f'{prefix}.{projection}.{weight_name}',
-                             ranges=((first, last), (0, half)))
+                             ranges=((first, end), (0, half)))
                 if (w13_native and _source_element_size(source) == 1
                         and _source_stride(source, 1) == 1):
                     entry['pieces'] = (dict(
                         source_offset=first * _source_stride(source, 0),
                         destination_offset=index * w13.stride(0) + rows * w13.stride(1),
                         contiguous_bytes=half,
-                        extents=(local,), source_strides=(_source_stride(source, 0),),
+                        extents=(covered,), source_strides=(_source_stride(source, 0),),
                         destination_strides=(w13.stride(1),)),)
+                elif padded:
+                    # A tiled owner interleaves padded and covered columns; it stays unprovenanced.
+                    continue
                 elif w4a16_tiles:
                     full_ntiles = _source_shape(source)[0] // 64
                     n_tiles = local // 64
@@ -504,13 +513,16 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
         if w2 is not None:
             source = sources[f'{prefix}.{down_name}.{weight_name}']
             entry = dict(tensor=f'{prefix}.{down_name}.{weight_name}',
-                         ranges=((0, hidden_size), (first // 2, last // 2)))
+                         ranges=((0, hidden_size), (first // 2, end // 2)))
+            if padded and not (w2_native and _source_element_size(source) == 1
+                               and _source_stride(source, 1) == 1):
+                continue
             if (w2_native and _source_element_size(source) == 1
                     and _source_stride(source, 1) == 1):
                 entry['pieces'] = (dict(
                     source_offset=first // 2,
                     destination_offset=index * w2.stride(0),
-                    contiguous_bytes=local_half,
+                    contiguous_bytes=covered // 2,
                     extents=(hidden_size,),
                     source_strides=(_source_stride(source, 0),),
                     destination_strides=(w2.stride(1),)),)
@@ -554,7 +566,9 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
                                   statistics_domain='tensor',
                                   packing_parameters=w2_parameters)
 
-    if scale_compression is not None:
+    if scale_compression is not None or padded:
+        # Swizzled scale owners tile 128 rows x 4 columns; a padded owner's tiles mix covered and zero
+        # entries, so they stay unprovenanced (a source without pieces would claim the whole view).
         return
     s13_sources = []
     s2_sources = []
@@ -704,6 +718,13 @@ def _release_unused_contexts(device):
             driver.cuDevicePrimaryCtxReset_v2(handle)
 
 
+def _park_on_host(host_allocator, name, tensor):
+    """Copy a loaded device tensor into device-visible host memory (TP3 expert parking)."""
+    region = host_allocator(name, tuple(tensor.shape), tensor.dtype).device_view
+    region.copy_(tensor)
+    return region
+
+
 class DirectWeightLoader:
     """Own b12x tensor views until direct transfers finish.
 
@@ -735,10 +756,16 @@ class DirectWeightLoader:
     def quantization(self):
         return quantized_layers(json.loads((self.manifest.metadata_path / "config.json").read_text()))
 
-    def load_linear(self, prefix, *, rows=None, columns=None, temporary=False):
-        """Load one projection using its checkpoint quantization declaration."""
+    def load_linear(self, prefix, *, rows=None, columns=None, pad=False, temporary=False):
+        """Load one projection using its checkpoint quantization declaration.
+
+        With ``pad``, a row or column range may extend past the checkpoint extent; the tail is
+        zero weights with neutral scales, so the stored bytes of the covered range are unchanged.
+        """
         self._require_open()
+        # `pad` and `temporary` travel only when requested, so existing callers' keyword sets are unchanged.
         return self.load_linear_group((prefix,), row_ranges=(rows,), column_range=columns,
+                                      **({"pad": True} if pad else {}),
                                       **({"temporary": True} if temporary else {}))
 
     def linear_format(self, prefix):
@@ -754,7 +781,7 @@ class DirectWeightLoader:
             raise ValueError(f"{prefix}: missing quantized_layers declaration for non-plain weight storage")
         return str(weight.dtype).removeprefix("torch.")
 
-    def load_mixed_linear_group(self, prefixes, *, row_ranges=None, column_range=None, temporary=False):
+    def load_mixed_linear_group(self, prefixes, *, row_ranges=None, column_range=None, pad=False, temporary=False):
         """Fuse adjacent compatible projections while retaining every output's position."""
         self._require_open()
         prefixes = tuple(prefixes)
@@ -770,7 +797,8 @@ class DirectWeightLoader:
             else:
                 groups.append((fmt, [prefix], [rows]))
         parts = tuple(self.load_linear_group(names, row_ranges=rows, column_range=column_range,
-                      **({"temporary": True} if temporary else {}))
+                                             **({"pad": True} if pad else {}),
+                                             **({"temporary": True} if temporary else {}))
                       for _, names, rows in groups)
         if len(parts) == 1:
             return parts[0]
@@ -1021,6 +1049,33 @@ class DirectWeightLoader:
         self._session.flush()
         return targets
 
+    def _load_padded_block(self, name, source, rows, columns):
+        """Zero block for a row/column range past `source`, with the covered rectangle copied in.
+
+        Provenance records the covered rectangle as one affine byte piece; the zero remainder has no
+        source. The package schema has a `padding` fill (helios/proto/package.proto WeightPadding), but
+        neither the Python declaration nor Heliopause's view emission carries it yet, so a partially
+        covered owner is stored rather than derived.
+        """
+        import torch
+        from ignition.preparation import provenance
+
+        (r0, r1), (c0, c1) = rows, columns
+        target = torch.zeros((r1 - r0, c1 - c0), dtype=source.dtype, device=self.device)
+        nr, nc = max(0, min(r1, source.shape[0]) - r0), max(0, min(c1, source.shape[1]) - c0)
+        if nr and nc:
+            self._copy(target[:nr, :nc], source[r0:r0 + nr, c0:c0 + nc])
+            width = source.element_size()
+            provenance.record_sources(target, [dict(
+                tensor=name, ranges=((r0, r0 + nr), (c0, c0 + nc)),
+                pieces=(dict(source_offset=(r0 * _source_stride(source, 0) + c0) * width, destination_offset=0,
+                             contiguous_bytes=nc * width, extents=(nr,),
+                             source_strides=(_source_stride(source, 0) * width,),
+                             destination_strides=((c1 - c0) * width,)),))],
+                packing=str(source.dtype).removeprefix("torch."))
+        self._session.flush()
+        return target
+
     def load_padded_tensor(self, name: str, *, rows: tuple[int, int], temporary=False) -> torch.Tensor:
         """Load checkpoint rows unchanged and zero any partition tail beyond the source."""
         import torch
@@ -1054,8 +1109,82 @@ class DirectWeightLoader:
             packing=str(target.dtype).removeprefix("torch."))
         return target
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, scale_name="weight_scale", temporary=False):
-        """Pack compatible projection rows without changing their quantization."""
+    def _dense_group_padded(self, prefixes, row_ranges, column_range, dtype, alignment):
+        """Whether any BF16/FP32/block-FP8 range of a padded load extends past its checkpoint extent."""
+        for prefix, rows in zip(prefixes, row_ranges, strict=True):
+            source = self._sources[prefix + ".weight"]
+            if source.ndim != 2 or source.dtype != dtype:
+                return False  # the regular path reports the mismatch
+            n, k = source.shape
+            r0, r1 = _padded_range(rows, n, alignment, pad=True, name=prefix + ".weight")
+            c0, c1 = _padded_range(column_range, k, alignment, pad=True, name=prefix + ".weight")
+            if (min(r1, n) - r0, min(c1, k) - c0) != (r1 - r0, c1 - c0):
+                return True
+        return False
+
+    def _load_padded_dense_group(self, prefixes, row_ranges, column_range, fmt, dtype, alignment):
+        """TP3 zero-padded BF16/FP32/block-FP8 group: the fork's per-prefix path from before upstream's packed
+        single-destination loader (2026-11 sync). Covered blocks keep their bytes and provenance; zero tails
+        have no source; block-FP8 tails get zero scales."""
+        import torch
+        from ignition.components.block_fp8 import BlockFP8Weight
+
+        values, scales = [], []
+        for prefix, rows in zip(prefixes, row_ranges, strict=True):
+            source = self._sources[prefix + ".weight"]
+            if source.ndim != 2 or source.dtype != dtype:
+                raise ValueError(f"{prefix}: weight dtype disagrees with {fmt} storage")
+            n, k = source.shape
+            r0, r1 = _padded_range(rows, n, alignment, pad=True, name=prefix + ".weight")
+            c0, c1 = _padded_range(column_range, k, alignment, pad=True, name=prefix + ".weight")
+            covered_rows, covered_columns = min(r1, n) - r0, min(c1, k) - c0
+            padded = (covered_rows, covered_columns) != (r1 - r0, c1 - c0)
+            if padded:
+                values.append(self._load_padded_block(prefix + ".weight", source, (r0, r1), (c0, c1)))
+            else:
+                values.append(self.load_tensor(prefix + ".weight", extent=(slice(r0, r1), slice(c0, c1))))
+            if fmt == "block_fp8":
+                scale = self._sources[prefix + ".weight_scale"]
+                if scale.dtype != torch.float32 or scale.shape not in (
+                        (n // 128, k // 128), (n // 128, 1, k // 128, 1)):
+                    raise ValueError(f"{prefix}: expected FP32 scales for 128-by-128 weight blocks")
+                if padded:
+                    # Zero scales for the zero tail; the covered blocks keep their checkpoint values.
+                    scales.append(self._load_padded_block(prefix + ".weight_scale",
+                        scale.reshape(n // 128, k // 128), (r0 // 128, r1 // 128), (c0 // 128, c1 // 128)))
+                    continue
+                extent = ((slice(r0 // 128, r1 // 128), slice(c0 // 128, c1 // 128))
+                          if scale.ndim == 2 else
+                          (slice(r0 // 128, r1 // 128), slice(None), slice(c0 // 128, c1 // 128), slice(None)))
+                scales.append(self.load_tensor(prefix + ".weight_scale", extent=extent).view(
+                    (r1 - r0) // 128, (c1 - c0) // 128))
+        if any(value.shape[1] != values[0].shape[1] for value in values):
+            raise ValueError("packed projections must share input width")
+        self._session.flush()
+        if len(values) > 1:
+            from ignition.preparation import provenance
+
+            parts = [provenance.lookup(value) for value in values]
+            combined = torch.cat(values)
+            if all(parts):
+                provenance.record_sources(
+                    combined,
+                    [source for part in parts for source in part['sources']],
+                    packing=fmt, concatenation_axis=0,
+                    statistics_domain='tensor')
+            values = combined
+        else:
+            values = values[0]
+        return values if not scales else BlockFP8Weight(values, torch.cat(scales) if len(scales) > 1 else scales[0])
+
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, scale_name="weight_scale",
+                          pad=False, temporary=False):
+        """Pack compatible projection rows without changing their quantization.
+
+        ``pad`` admits BF16, FP32, block-FP8, MXFP8 and MXFP4 ranges past the checkpoint extent: the
+        covered rows and columns keep their bytes and the tail holds zero values with neutral scales
+        (zero FP32 block scales, 127 for UE8M0). Other formats reject ranges they do not cover.
+        """
         self._require_open()
         prefixes = tuple(prefixes)
         if all(prefix in self.quantization for prefix in prefixes):
@@ -1077,6 +1206,9 @@ class DirectWeightLoader:
             sources, scale_sources, provenance_sources = [], [], []
             dtype = torch.float8_e4m3fn if fmt == "block_fp8" else getattr(torch, fmt)
             alignment = 128 if fmt == "block_fp8" else 1
+            if pad and self._dense_group_padded(prefixes, row_ranges, column_range, dtype, alignment):
+                # TP3 zero padding (GLM): per-prefix blocks with a zero tail, concatenated (not packed storage).
+                return self._load_padded_dense_group(prefixes, row_ranges, column_range, fmt, dtype, alignment)
             for prefix, rows in zip(prefixes, row_ranges, strict=True):
                 source = self._sources[prefix + ".weight"]
                 if source.ndim != 2 or source.dtype != dtype:
@@ -1117,6 +1249,21 @@ class DirectWeightLoader:
                 packing=fmt if len(sources) > 1 else str(dtype).removeprefix("torch."),
                 concatenation_axis=0 if len(sources) > 1 else None, statistics_domain="tensor")
             return values if scales is None else BlockFP8Weight(values, scales)
+        if pad and fmt in ("tensor_fp8", "nvfp4", "iq2_xxs", "q8_0"):
+            for prefix, rows in zip(prefixes, row_ranges, strict=True):
+                source = self._sources.get(f"{prefix}.weight")
+                if source is None:
+                    continue
+                if fmt in ("iq2_xxs", "q8_0"):
+                    from b12x._lib.quant.block_codec import block_codec
+
+                    columns = source.shape[1] * block_codec(fmt).block_weights
+                else:
+                    columns = source.shape[1] * (2 if fmt == "nvfp4" else 1)
+                for axis, selected, extent in (("rows", rows, source.shape[0]), ("columns", column_range, columns)):
+                    if selected is not None and selected[1] > extent:
+                        raise ValueError(f"{prefix}.weight: partition {tuple(selected)} exceeds its {extent} "
+                                         f"checkpoint {axis} and {fmt} projections cannot be zero-padded")
         if fmt == "tensor_fp8":
             (rows,) = tuple(row_ranges)
             return self._load_tensor_fp8_linear(prefixes[0], rows=rows, columns=column_range, temporary=temporary)
@@ -1149,7 +1296,7 @@ class DirectWeightLoader:
         fp4 = fmt == "mxfp4"
         pack = 2 if fp4 else 1
         dtype = torch.uint8 if fp4 else torch.float8_e4m3fn
-        weights, block_scales = [], []
+        weights, block_scales, widths = [], [], []
         for prefix, row_range in zip(prefixes, row_ranges, strict=True):
             weight = self._sources[f"{prefix}.weight"]
             scale = self._sources[f"{prefix}.{scale_name}"]
@@ -1157,28 +1304,31 @@ class DirectWeightLoader:
                 raise ValueError(f"{prefix}: {fmt.upper()} weight must be a {dtype} matrix")
             rows, stored_columns = weight.shape
             columns = stored_columns * pack
-            r0, r1 = _aligned_range(row_range, rows, 1)
-            c0, c1 = _aligned_range(column_range, columns, 32)
+            r0, r1 = _padded_range(row_range, rows, 1, pad=pad, name=f"{prefix}.weight")
+            c0, c1 = _padded_range(column_range, columns, 32, pad=pad, name=f"{prefix}.weight")
             if (scale.ndim != 2 or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu)
                     or scale.shape[0] < rows or scale.shape[1] < columns // 32):
                 raise ValueError(f"{prefix}: {fmt.upper()} block scale geometry mismatch")
-            weights.append(weight[r0:r1, c0 // pack:c1 // pack])
-            block_scales.append(scale[r0:r1, c0 // 32:c1 // 32].view(torch.uint8))
-        columns = weights[0].shape[1] * pack
-        if any(weight.shape[1] * pack != columns for weight in weights):
+            # Covered rows and columns; a padded range copies only these into the zero-filled buffers.
+            covered_rows, covered_columns = max(0, min(r1, rows) - r0), max(0, min(c1, columns) - c0)
+            weights.append(weight[r0:r0 + covered_rows, c0 // pack:(c0 + covered_columns) // pack])
+            block_scales.append(scale[r0:r0 + covered_rows, c0 // 32:(c0 + covered_columns) // 32].view(torch.uint8))
+            widths.append((r1 - r0, c1 - c0))
+        columns = widths[0][1]
+        if any(width != columns for _, width in widths):
             raise ValueError("packed projections must share input width")
-        rows = sum(weight.shape[0] for weight in weights)
+        rows = sum(height for height, _ in widths)
         stored_columns = (columns + 255) // 256 * 256 if fp4 else columns
         values = (torch.zeros if not fp4 and stored_columns % 128 else zeros)(
             (rows, stored_columns // pack), dtype=dtype, device=self.device)
         scales = (torch.empty if fp4 or stored_columns % 128 else empty)(
             (rows, stored_columns // 32), dtype=torch.uint8, device=self.device).fill_(127)
         offset = 0
-        for weight, scale in zip(weights, block_scales, strict=True):
-            end = offset + weight.shape[0]
-            self._copy(values[offset:end, :columns // pack], weight)
-            self._copy(scales[offset:end, :columns // 32], scale)
-            offset = end
+        for weight, scale, (height, _) in zip(weights, block_scales, widths, strict=True):
+            if weight.numel():
+                self._copy(values[offset:offset + weight.shape[0], :weight.shape[1]], weight)
+                self._copy(scales[offset:offset + scale.shape[0], :scale.shape[1]], scale)
+            offset += height
         self._session.flush()
         if fp4:
             from b12x._lib.intrinsics.reference import swizzle_block_scale
@@ -1322,8 +1472,15 @@ class DirectWeightLoader:
                          weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
                          global_scale_name="weight_scale_2", global_scale_kind="multiplier",
                          input_scale_name=None, activation_outer_scale="expert",
-                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None):
+                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None, host_allocator=None, pad=False):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
+
+        With ``pad``, ``intermediate_range`` may end past ``intermediate_size`` (GLM 5.3's MTP experts
+        at three ranks): the covered columns keep their packed values and block scales and the tail
+        holds zero values with zero scales.
+
+        With ``host_allocator`` (TP3 expert parking) the packed w13/w2 banks move to
+        device-visible host memory after loading and their device copies are freed.
 
         The first two projection names fill the first and second w13 halves in that
         order; ``w13_layout`` declares which halves hold up and gate. CSF compression
@@ -1357,8 +1514,14 @@ class DirectWeightLoader:
             raise ValueError("ordinary FP4 experts require NVFP4 or MXFP4")
         group = 16 if format == "nvfp4" else 32
         scale_dtype = torch.float8_e4m3fn if format == "nvfp4" else torch.uint8
-        first, last = _aligned_range(intermediate_range, intermediate_size, group)
+        first, last = _padded_range(intermediate_range, intermediate_size, group, pad=pad,
+                                    name=f"{prefixes[0]}.{up_name}.{weight_name}")
         local, count = last - first, len(prefixes)
+        covered = min(last, intermediate_size) - first
+        padded = covered != local
+        end = first + covered
+        if padded and (shared_columns is not None or host_allocator is not None):
+            raise ValueError("zero-padded expert partitions cannot be shared across ranks or parked on the host")
         if not sm103:
             activation_options = {}
             if a4_prefill is not None:
@@ -1385,13 +1548,20 @@ class DirectWeightLoader:
                                          packing=packing, n64_repack=local % 128 == 64)
             reuse2 = _mxfp4_source_reuse(hidden_size, local, activation_mode=activation_mode,
                                         packing=packing, n64_repack=local % 128 == 64)
-        w13 = (persistent_empty if reuse13[0] else torch.empty)(
+        if host_allocator is not None:
+            # TP3 parking: the values move to host memory after loading, and the persistent arena never releases
+            # space, so parked values load into ordinary (released) device memory instead.
+            reuse13, reuse2 = (False, reuse13[1]), (False, reuse2[1])
+        # TP3 zero padding (GLM): the tail past the checkpoint stays zero.
+        persistent = persistent_zeros if padded else persistent_empty
+        transient = torch.zeros if padded else torch.empty
+        w13 = (persistent if reuse13[0] else transient)(
             (count, 2 * local, hidden_size // 2), dtype=torch.uint8, device=self.device)
-        w2 = (persistent_empty if reuse2[0] else torch.empty)(
+        w2 = (persistent if reuse2[0] else transient)(
             (count, hidden_size, local // 2), dtype=torch.uint8, device=self.device)
-        s13 = (persistent_empty if reuse13[1] and scale_compression is None else torch.empty)(
+        s13 = (persistent if reuse13[1] and scale_compression is None else transient)(
             (count, 2 * local, hidden_size // group), dtype=scale_dtype, device=self.device)
-        s2 = (persistent_empty if reuse2[1] and scale_compression is None else torch.empty)(
+        s2 = (persistent if reuse2[1] and scale_compression is None else transient)(
             (count, hidden_size, local // group), dtype=scale_dtype, device=self.device)
         globals13, globals2 = [], []
         shared = shared_columns
@@ -1403,9 +1573,9 @@ class DirectWeightLoader:
         for index, prefix in enumerate(prefixes):
             scales = {}
             for projection, values, blocks in (
-                (up_name, w13[index, :local], s13[index, :local]),
-                (gate_name, w13[index, local:], s13[index, local:]),
-                (down_name, w2[index], s2[index]),
+                (up_name, w13[index, :covered], s13[index, :covered]),
+                (gate_name, w13[index, local:local + covered], s13[index, local:local + covered]),
+                (down_name, w2[index, :, :covered // 2], s2[index, :, :covered // group]),
             ):
                 source = self._sources[f"{prefix}.{projection}.{weight_name}"]
                 scale = self._sources[f"{prefix}.{projection}.{scale_name}"]
@@ -1428,10 +1598,10 @@ class DirectWeightLoader:
                         self._copy(shared.view(shared.rank, offset + down_bytes, scale.shape, scale_dtype), scale,
                                    numeric=False)
                 else:
-                    self._copy(values, source[:, first // 2:last // 2] if projection == down_name
-                               else source[first:last])
-                    self._copy(blocks, scale[:, first // group:last // group] if projection == down_name
-                               else scale[first:last])
+                    self._copy(values, source[:, first // 2:end // 2] if projection == down_name
+                               else source[first:end])
+                    self._copy(blocks, scale[:, first // group:end // group] if projection == down_name
+                               else scale[first:end])
                 if format == "mxfp4":
                     continue
                 value = self._sources[f"{prefix}.{projection}.{global_scale_name}"]
@@ -1486,6 +1656,10 @@ class DirectWeightLoader:
             self._copy(target, values)
             device_scales.append(target)
         self._session.flush()
+        if host_allocator is not None:
+            w13, w2 = (_park_on_host(host_allocator, f"{prefixes[0]}.{suffix}", tensor)
+                       for suffix, tensor in (("w13", w13), ("w2", w2)))
+            torch.cuda.empty_cache()
         if sm103:
             if swiglu_clamp_after_silu:
                 raise ValueError("SM103 FP4 experts do not support post-SiLU clamping")
@@ -1503,6 +1677,16 @@ class DirectWeightLoader:
             w2_block_scales=swizzle_block_scale(s2, allocate=scale_allocate) if format == "nvfp4" else s2, **gains)
         del s13, s2, blocks
         prepared = moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scale_scratch, allocate=persistent_empty)
+        if host_allocator is not None:
+            # Parked experts must stay in the host-mapped / mixed range: b12x's W4A8 repack is in place for our TP3
+            # geometry, but a ceil-tiled geometry (e.g. TP4's 4.5 N-tiles) makes it allocate a full device copy, which
+            # would silently undo the parking the planner already subtracted from the VRAM budget.
+            for prepared_name, parked in (("w1_fp4", w13), ("w2_fp4", w2)):
+                kept = next((getattr(obj, prepared_name) for obj in (prepared, getattr(prepared, "_impl", None))
+                             if hasattr(obj, prepared_name)), None)
+                if kept is not None and kept.untyped_storage().data_ptr() != parked.untyped_storage().data_ptr():
+                    raise RuntimeError(f"b12x re-materialised parked expert values ({prepared_name}); "
+                                       "parking would be undone and VRAM over-committed")
         source_metadata = _snapshot_fp4_sources(self._sources, tuple(
             f'{prefix}.{projection}.{name}'
             for prefix in prefixes for projection in projection_names
@@ -1512,7 +1696,7 @@ class DirectWeightLoader:
             projection_names=projection_names, weight_name=weight_name,
             scale_name=scale_name, first=first, last=last, hidden_size=hidden_size,
             local=local, group=group, format=format,
-            scale_compression=scale_compression, w13_layout=w13_layout)
+            scale_compression=scale_compression, w13_layout=w13_layout, covered=covered)
         recorder(prepared)
         _defer_fp4_expert_provenance(prepared, recorder)
         return prepared
@@ -1521,6 +1705,7 @@ class DirectWeightLoader:
         self, prefixes, *, hidden_size, intermediate_size, scale_scratch,
         intermediate_range=None, swiglu_limit=None, scale_compression=None,
         projection_names=("up_proj", "gate_proj", "down_proj"), scale_name="weight_scale",
+        host_allocator=None,
     ):
         """Load MXFP4 storage, optionally compressing native scales losslessly.
 
@@ -1551,9 +1736,11 @@ class DirectWeightLoader:
         geometry = dict(hidden_size=hidden_size, intermediate_size=intermediate_size,
                         intermediate_range=intermediate_range, swiglu_limit=swiglu_limit,
                         scale_name=scale_name)
+        if host_allocator is not None and any(encoded):
+            raise ValueError("host-parked experts support native-scale checkpoints only")
         if not any(encoded) and scale_compression is None:
             return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
-                                         projection_names=projection_names)
+                                         projection_names=projection_names, host_allocator=host_allocator)
         if any(encoded) and not all(encoded):
             raise ValueError("each routed expert group must use one complete MXFP4 scale encoding")
         first, last = _aligned_range(intermediate_range, intermediate_size, 32)
@@ -1565,7 +1752,7 @@ class DirectWeightLoader:
         if not any(encoded):
             return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
                 projection_names=projection_names, scale_compression=scale_compression,
-                scale_scratch=scale_scratch[key])
+                scale_scratch=scale_scratch[key], host_allocator=host_allocator)
         up, gate, down = projection_names
         return self.load_mxfp4_csf_experts(prefixes, **geometry,
             scale_scratch=scale_scratch[key], projection_names=(gate, up, down))
@@ -1650,8 +1837,13 @@ class DirectWeightLoader:
     def load_nvfp4_experts(
         self, prefixes, *, hidden_size, intermediate_size, scale_vectors,
         intermediate_range=None, scale_scratch=None, swiglu_limit=None, activation_mode="a4", a4_prefill=None,
+        pad=False,
     ):
         """Prepare routed NVFP4 experts from packed rank-local checkpoint views.
+
+        With ``pad``, ``intermediate_range`` may end past ``intermediate_size``: the covered
+        columns keep their packed bytes and CSF scales, and the tail holds zero values whose CSF
+        scales decode to the zero padding base, so padded columns contribute nothing.
 
         ``scale_vectors`` supplies up/gate and down global multipliers followed
         by their activation reciprocal scales. Gate/up scalar compatibility is
@@ -1669,8 +1861,14 @@ class DirectWeightLoader:
         prefixes = tuple(prefixes)
         if not prefixes or hidden_size <= 0 or hidden_size % 128:
             raise ValueError("NVFP4 experts require nonempty prefixes and 128-aligned hidden width")
-        first, last = _aligned_range(intermediate_range, intermediate_size, 32)
+        first, last = _padded_range(intermediate_range, intermediate_size, 32, pad=pad,
+                                    name=f"{prefixes[0]}.up_proj.weight")
         local = last - first
+        # Columns the checkpoint covers; the rest of the rank's partition is zero padding.
+        covered = min(last, intermediate_size) - first
+        if covered <= 0 or covered % 32:
+            raise ValueError("NVFP4 expert partitions must cover a positive 32-aligned column range")
+        padded = covered != local
         count = len(prefixes)
         shapes = ((count, (2 * local + 127) // 128 * 128, hidden_size // 16),
                   (count, hidden_size, (local // 16 + 3) // 4 * 4))
@@ -1693,13 +1891,15 @@ class DirectWeightLoader:
         ):
             raise ValueError("expert scales require four positive finite CPU float32 vectors")
 
-        w13 = persistent_empty((count, 2 * local, hidden_size // 2), dtype=torch.uint8, device=self.device)
-        w2 = persistent_empty((count, hidden_size, local // 2), dtype=torch.uint8, device=self.device)
+        allocate = persistent_zeros if padded else persistent_empty
+        w13 = allocate((count, 2 * local, hidden_size // 2), dtype=torch.uint8, device=self.device)
+        w2 = allocate((count, hidden_size, local // 2), dtype=torch.uint8, device=self.device)
+        end = first + covered
         for index, prefix in enumerate(prefixes):
             for projection, destination, rows, columns, rr, cr in (
-                ("up_proj", w13[index, :local], intermediate_size, hidden_size, (first, last), None),
-                ("gate_proj", w13[index, local:], intermediate_size, hidden_size, (first, last), None),
-                ("down_proj", w2[index], hidden_size, intermediate_size, None, (first, last)),
+                ("up_proj", w13[index, :covered], intermediate_size, hidden_size, (first, end), None),
+                ("gate_proj", w13[index, local:local + covered], intermediate_size, hidden_size, (first, end), None),
+                ("down_proj", w2[index, :, :covered // 2], hidden_size, intermediate_size, None, (first, end)),
             ):
                 source = self._sources[f"{prefix}.{projection}.weight"]
                 if source.dtype != torch.uint8 or source.shape != (rows, columns // 2):
@@ -1713,15 +1913,21 @@ class DirectWeightLoader:
                 scale.shape, dtype=scale.dtype, device=self.device)
             self._copy(target, scale)
             device_scales.append(target)
+        # CsfSource pads the selected rectangle to `padded_rows`/`padded_columns` scale entries. The one-time
+        # Triton expansion at load decodes the pad to `padding_base` (0); the compact payload that the shared
+        # scratch path re-decodes before every layer stores one base per row, so a padded column of a covered
+        # row decodes to that row's base (lifted through the W4A16 table at A16) instead
+        # (ignition.reference.qwen38_quant.expand_csf_scales_padded). The packed values in the padding are
+        # zero either way, so padded columns contribute nothing.
         scales13 = self._queue_csf_sources(
             [f"{prefix}.{projection}.weight_scale" for prefix in prefixes
              for projection in ("up_proj", "gate_proj")],
             rows=intermediate_size, columns=hidden_size // 16, join=2, temporary=True,
-            row_range=(first, last))
+            row_range=(first, end), **({"padded_rows": local} if padded else {}))
         scales2 = self._queue_csf_sources(
             [f"{prefix}.down_proj.weight_scale" for prefix in prefixes],
             rows=hidden_size, columns=intermediate_size // 16, temporary=True,
-            column_range=(first // 16, last // 16))
+            column_range=(first // 16, end // 16), **({"padded_columns": local // 16} if padded else {}))
         self._session.flush()
         if self._display is not None:
             self._display.update(self._session.payload_bytes)
@@ -1767,12 +1973,13 @@ class DirectWeightLoader:
         else:
             prepared = moe.prepare_weights(plan=plan, weights=moe.Nvfp4CsfWeights(
                 packed=packed, w13_scales=scales13, w2_scales=scales2), allocate=persistent_empty)
+        # A padded owner maps its covered columns; its zero tail has no checkpoint source.
         _record_fp4_expert_owner_provenance(
             prepared, prefixes=prefixes, sources=self._sources,
             projection_names=('up_proj', 'gate_proj', 'down_proj'),
             weight_name='weight', scale_name='weight_scale', first=first, last=last,
             hidden_size=hidden_size, local=local, group=16, format='nvfp4',
-            scale_compression='csf', w13_layout='w13')
+            scale_compression='csf', w13_layout='w13', covered=covered)
         return prepared
 
     def _queue_csf_sources(self, prefixes, *, rows, columns, quantization="nvfp4", temporary=False, **selection):
@@ -1833,4 +2040,20 @@ def _aligned_range(selected, extent, alignment):
             or start % alignment or end % alignment):
         raise ValueError("weight partition must be aligned, nonempty and in range")
     return start, end
+
+
+def _padded_range(selected, extent, alignment, *, pad, name):
+    """Aligned partition of `extent`; with `pad` the range may end past the extent (the caller zero-fills).
+
+    A padded range must still start inside the extent: a rank whose whole partition lies past the
+    checkpoint would hold an all-zero block, which no supported geometry produces.
+    """
+    if selected is None or type(selected[1]) is not int or selected[1] <= extent:
+        return _aligned_range(selected, extent, alignment)
+    if not pad:
+        raise ValueError(f"{name}: partition {tuple(selected)} exceeds its {extent} checkpoint extent; "
+                         "only padded loads cover a rank's zero tail")
+    if type(selected[0]) is not int or not 0 <= selected[0] < extent:
+        raise ValueError(f"{name}: padded partition {tuple(selected)} starts past its {extent} checkpoint extent")
+    return _aligned_range(selected, selected[1], alignment)
 
