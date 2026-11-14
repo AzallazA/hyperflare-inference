@@ -128,7 +128,8 @@ class PreparedDecoderBoundary:
 
 
 class PreparedLayer:
-    # TP3 fork attributes; class defaults keep the upstream behaviour (no debug hooks).
+    # TP3 fork attributes; class defaults keep the upstream behaviour (one router-ID-ordered bank, no debug hooks).
+    hot_map = None
     no_engram = False
     probe, probe_index, probe_mode = Probe(), None, None
 
@@ -181,6 +182,9 @@ class PreparedLayer:
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
             image_mask=self.image_mask)
+        # TP3 merged bank: router IDs map to the bank's hot-first slots inside the forward (``_run``); the
+        # declaration example has the router IDs' shape and dtype.
+        self.hot_map = getattr(weights.experts, "hot_map", None)
         self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
             s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
             router_plan=self.router.plan)
@@ -253,6 +257,8 @@ class PreparedLayer:
         probe.router(route.ids, route.weights, layer, mode)
         probe.full(normalized, layer, "in", mode)
         ids = route.ids
+        if self.hot_map is not None:
+            ids = torch.index_select(self.hot_map, 0, ids.reshape(-1)).view(ids.shape)
         routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         probe.full(routed, layer, "out", mode)

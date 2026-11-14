@@ -386,7 +386,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    host_allocator=core_storage.host_allocate, tp3=tp3)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
