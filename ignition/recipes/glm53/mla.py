@@ -528,7 +528,12 @@ class PreparedGlmMLA:
         output, _ = self.forward(source, metadata)
         return output
 
-    def forward(self, source, metadata):
+    def forward(self, source, metadata, *, selection=None):
+        """Attend with the indexer's selection, or with `selection` = (physical slots, selected lengths) of an
+        earlier pass. A pass that reuses a selection writes its latent records but leaves the C4 cache and
+        tail unchanged; the returned scratch's index carries the selection either way."""
+        if selection is not None and self.mode != "decode":
+            raise ValueError("GLM MLA reuses a sparse selection only in decode passes")
         s = MLAScratch.allocate(source.shape[0], self.heads, self.blocks, self.mode, self.device,
             context_ranks=self.context_ranks, remote=self.remote)
         p = self.projections
@@ -549,9 +554,14 @@ class PreparedGlmMLA:
         rms_norm(s.latent_input, self.module.kv_a_layernorm.weight, s.latent,
             self.module.kv_a_layernorm.variance_epsilon, round_before_weight=True)
         self.writer(s.latent, metadata.token_slots)
-        selection, index_scratch = self.indexer.forward(source, s.query_residual,
-            s.projected_input[:, 2048:2176], s.projected_input[:, 2176:2208], metadata, s.index)
-        physical, selected_lengths, page_table = selection
+        if selection is None:
+            selection, index_scratch = self.indexer.forward(source, s.query_residual,
+                s.projected_input[:, 2048:2176], s.projected_input[:, 2176:2208], metadata, s.index)
+            physical, selected_lengths, page_table = selection
+        else:
+            physical, selected_lengths = selection
+            page_table = None
+            index_scratch = replace(s.index, physical=physical, selected_lengths=selected_lengths)
         s = replace(s, index=index_scratch, query=query)
         chain_result = chain.finish(chain_pending, physical) if chain is not None else None
         if self.context is None:

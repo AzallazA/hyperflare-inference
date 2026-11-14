@@ -68,7 +68,7 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 _COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "vision", "init", "restore", "snapshot")
 # Fork-only switches whose tp3-main form wrote into the removed scratch pool; each raises until its port stage lands.
-_UNPORTED = {"kda_side_chain": "S9", "vision_stage": "S10"}
+_UNPORTED = {"vision_stage": "S10"}
 # Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
 _DMA_PREFILL_TOKENS = 1024
 # Allocator granularity and fragmentation slack beyond the headroom kept after the final KV allocation.
@@ -328,6 +328,10 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
     shards = Shards.of(shard.world_size, expert_columns=config.expert_columns)
+    # Declaration examples and every KDA layer read the side-chain layout from the recipe module (fork-only TP3 switch).
+    from . import kda as kda_module
+
+    kda_module.configure(side_chain=config.kda_side_chain)
     if (shard.world_size > 1) != (group is not None):
         raise ValueError("a GLM rank group exists exactly when more than one rank prepares")
     device = torch.device("cuda", config.devices[rank])

@@ -15,7 +15,7 @@ from ignition.components.sampling import DeviceRequestState, RequestAdmission
 from ignition.components.speculation import PreparedSpeculativeCommit, SpeculativeAcceptance
 from ignition.recipes.glm53.batch import BatchInputs
 from ignition.recipes.glm53.dcp import ContextShards
-from ignition.recipes.glm53.speculative import PreparedRound
+from ignition.recipes.glm53.speculative import PreparedRound, retain_selection, reuse_selection
 from ignition.recipes.glm53.mtp import DraftMetadata
 
 
@@ -46,8 +46,8 @@ def test_shared_commit_without_previous_token_embeddings():
 
 
 @pytest.mark.parametrize("width,limits,positions,token_slots,state_indices", [
-    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254],
-     [[1, 0, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]]),
+    # Width one decodes each live row in place through a single state column.
+    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254], [[1], [2]]),
     (6, [6, 2], [255, 256, 257, 258, 259, 260, 510, 511, -1, -1, -1, -1],
      [10 * 256 + 255, *range(11 * 256, 11 * 256 + 5), 21 * 256 + 254, 21 * 256 + 255],
      # Verification records tokens against each request's live row only.
@@ -57,6 +57,7 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
         width, limits, positions, token_slots, state_indices):
     op = PreparedRound.__new__(PreparedRound)
     op.batch, op.width = 2, width
+    op.state_columns = len(state_indices[0])
     inputs = BatchInputs.allocate(128, 2, "cpu", capacity=2)
     inputs.page_tables.copy_(torch.tensor([[10, 11], [20, 21]]))
     inputs.live_rows.fill_(2)
@@ -74,6 +75,32 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     repeated = op.target_metadata(*args)
     assert metadata.token_ids.data_ptr() != repeated.token_ids.data_ptr()
     torch.testing.assert_close(metadata.token_ids, repeated.token_ids)
+
+
+def test_later_draft_passes_reuse_each_requests_first_selection():
+    slots, starts = torch.tensor([2, 0, 1]), torch.tensor([255, 510, 300])
+    state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
+    tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    hidden = torch.zeros((3, 4096), dtype=torch.bfloat16)
+    tokens = torch.tensor([7, 8, 9])
+    # The first pass packs requests one and two; request zero has no draft to propose.
+    first_pass = DraftMetadata.pack(slots, torch.tensor([0, 1, 1]), starts, tokens, hidden, tables,
+                                    capacity=1, state_rows=state_rows)
+    first = {1: torch.tensor([3, 5, 9]), 2: torch.tensor([4, 6, 8, 12])}
+    physical = torch.full((3, 2051), -1, dtype=torch.int32)
+    lengths = torch.zeros(3, dtype=torch.int32)
+    for row, request in enumerate((1, 2)):
+        physical[row, :first[request].numel()] = first[request]
+        lengths[row] = first[request].numel()
+    retained = retain_selection((physical, lengths), first_pass.output_indices)
+    # The second pass keeps only request two, which now occupies packed row zero.
+    second_pass = DraftMetadata.pack(slots, torch.tensor([0, 0, 1]), starts + 1, tokens, hidden, tables,
+                                     capacity=1, state_rows=state_rows)
+    reused_physical, reused_lengths = reuse_selection(retained, second_pass.indexed)
+    assert reused_lengths.tolist() == [4, 0, 0] and reused_lengths.dtype == torch.int32
+    assert reused_physical[0, :4].tolist() == first[2].tolist()
+    # Negative control: without the retained copy, packed row zero would read request one's selection.
+    assert physical[0, :3].tolist() == first[1].tolist()
 
 
 @pytest.mark.parametrize("reuse", [False, True])

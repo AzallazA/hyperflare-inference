@@ -70,7 +70,8 @@ def test_serial_graph_variants_share_storage_with_exact_shapes(world, rank):
             assert tensor.shape == expected[name].shape, name
             assert tensor.stride() == expected[name].stride(), name
             assert tensor.dtype == expected[name].dtype, name
-            backing = base.kda.projected_input[:, -128:] if name == "kda.forget_input" and tokens == 1 else storage[name]
+            packed_forget = name == "kda.forget_input" and tokens == 1 and not base.kda.split
+            backing = base.kda.projected_input[:, -128:] if packed_forget else storage[name]
             assert tensor.data_ptr() == backing.data_ptr(), name
         assert view.mla.index.page_table.shape == (tokens if mode == "decode" else 1, 8)
         view.residual.fill_(tokens)

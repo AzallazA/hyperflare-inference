@@ -278,6 +278,11 @@ class PreparedMTP:
         return self
 
     def __call__(self, metadata):
+        return self.forward(metadata)
+
+    def forward(self, metadata, *, selection=None, retain=False):
+        """Absorb, or draft one pass. `selection` reuses an earlier pass's (physical slots, selected lengths)
+        instead of selecting; with `retain` a draft pass also returns the selection it attended through."""
         w, m = self.weights.tensors, metadata
         embedded = self.embedding(token_ids=m.token_ids, num_rows=m.num_tokens)
         embedded = embedded.masked_fill((m.indexed.positions == 0)[:, None], 0)
@@ -301,9 +306,12 @@ class PreparedMTP:
                 m.indexed.query_start_loc, key, gate, index.ape, m.indexed.token_slots,
                 m.indexed.positions, plan=index.pool_plan)
             return
-        attended = self.attention_reduce(self.attention(normalized, m.indexed))
+        attended, attention = self.attention.forward(normalized, m.indexed, selection=selection)
+        attended = self.attention_reduce(attended)
         rms_norm_add_residual(attended, residual, w["post_attention_layernorm"], self.eps, x_out=normalized)
         mlp = self.mlp_reduce(self.moe(normalized))
         hidden = torch.empty_like(normalized)
         rms_norm_add_residual(mlp, residual, w["shared_head.norm"], self.eps, x_out=hidden)
+        if retain:
+            return hidden, self.head(hidden), (attention.index.physical, attention.index.selected_lengths)
         return hidden, self.head(hidden)
