@@ -405,8 +405,10 @@ def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weig
         session.tune()
         for key, op in operations.items():
             def forward(op=op):
-                op.scratch.query.copy_(queries[:op.scratch.query.shape[0]])
-                op.attend_gathered_context()
+                s = op.scratch
+                s.query.copy_(queries[:s.query.shape[0]])
+                # The slice loop takes its scratch and selection as arguments since upstream 4a24d78a.
+                op.attend_gathered_context(s, op.metadata, s.query, s.index.physical, s.index.selected_lengths)
                 arena.tensor.fill_(255)
             compiled[key] = compile_forward(forward)
             compiled[key]()
