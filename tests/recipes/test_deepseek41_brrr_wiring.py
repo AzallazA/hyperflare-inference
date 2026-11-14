@@ -22,6 +22,7 @@ Negative controls: a graph-wider-than-the-gate parked layer takes Flare's path; 
 fails the check; a layer that would run Flare's tail (no BRRR) issues no launch.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -334,7 +335,7 @@ class _Checkpoint:
         return torch.ones(4, 32, dtype=torch.uint8)
 
 
-def _engine(monkeypatch, *, csf):
+def _engine(monkeypatch, *, csf, owned_differs=False):
     engine = object.__new__(brrr.Engine)
     engine.ext, engine.rank, engine.tp3, engine.device = _Ext(), 0, _tp3(), torch.device("cpu")
     engine.local_handle, engine.slots, engine.keep = 0, {}, []
@@ -356,17 +357,26 @@ def _engine(monkeypatch, *, csf):
                                      second=SimpleNamespace(scales=torch.zeros(8, dtype=torch.uint8))) if csf else None
     impl = SimpleNamespace(representation_for=lambda mode: rep, nvfp4_csf=decoder_planes)
     dense = {name: torch.zeros(4, 32, dtype=torch.uint8) for name in ("wo_a", "wo_b", "router", "gate_up", "down")}
+    # Flare's own FFN mHC parameters, FFN norm and gate bias: the checkpoint bytes _Checkpoint returns (ones), or
+    # different bytes (owned_differs: the kernel must then get checkpoint copies, as tp3-main did).
+    value = 2. if owned_differs else 1.
+    residual = {"hc_ffn_fn": torch.full((8,), value), "hc_ffn_scale": torch.full((8,), value),
+                "hc_ffn_base": torch.full((8,), value), "ffn_norm.weight": torch.full((8,), value, dtype=torch.bfloat16)}
     weights = SimpleNamespace(
         experts=SimpleNamespace(experts=SimpleNamespace(_impl=impl), hot_map=torch.arange(384, dtype=torch.int32),
-                                hot_rows=64, router=dense["router"],
+                                hot_rows=64, router=dense["router"], correction=torch.full((8,), value),
                                 shared=SimpleNamespace(gate_up=dense["gate_up"], down=dense["down"])),
-        attention={"output": SimpleNamespace(wo_a=dense["wo_a"], wo_b=dense["wo_b"])})
+        attention={"output": SimpleNamespace(wo_a=dense["wo_a"], wo_b=dense["wo_b"])}, residual=residual)
     return engine, weights, rep, dense, copies
 
 
+@pytest.mark.parametrize("owned_differs", [False, True])
 @pytest.mark.parametrize("csf", [False, True])
-def test_register_packs_checkpoint_copies_and_keeps_weight_views(monkeypatch, csf):
-    engine, weights, rep, dense, copies = _engine(monkeypatch, csf=csf)
+def test_register_packs_checkpoint_copies_and_keeps_weight_views(monkeypatch, csf, owned_differs):
+    pools = []
+    from ignition.recipes.deepseek41 import weights as weights_module
+    monkeypatch.setattr(weights_module, "_parking_pool", lambda: pools.append(1) or nullcontext())
+    engine, weights, rep, dense, copies = _engine(monkeypatch, csf=csf, owned_differs=owned_differs)
     assert engine.register(LAYER, weights) == 0 and engine.register(LAYER, weights) == 0  # registered once
     (kwargs,) = engine.ext.layers
     # Flare's own dense weights and b12x's weight planes are read in place (dense-native default).
@@ -376,7 +386,16 @@ def test_register_packs_checkpoint_copies_and_keeps_weight_views(monkeypatch, cs
     # Everything built from checkpoint reads went through persistent_copy; the hot map is already a persistent
     # int32 forward constant and is passed as is (no second copy).
     assert kwargs["hot_map"] is weights.experts.hot_map
-    copied = {"woa_s", "wob_s", "gate_b", "sh13_s", "sh2_s", "fn", "hc_scale", "hc_base", "norm"}
+    owned = dict(fn=weights.residual["hc_ffn_fn"], hc_scale=weights.residual["hc_ffn_scale"],
+                 hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"],
+                 gate_b=weights.experts.correction)
+    copied = {"woa_s", "wob_s", "sh13_s", "sh2_s"}
+    if owned_differs:  # negative control: different bytes are never read in place
+        copied |= set(owned)
+        assert not any(kwargs[name] is tensor for name, tensor in owned.items())
+    else:  # byte-identical: Flare's persistent tensors in place, no second copy
+        assert all(kwargs[name] is tensor for name, tensor in owned.items())
+    assert pools == [1]  # registration ran in a short pool of its own, once
     if csf:
         copied |= {"csf13_gdesc", "csf2_gdesc"}
     assert len(copies) == len(copied) and {id(kwargs[name]) for name in copied} == {id(t) for t in copies}

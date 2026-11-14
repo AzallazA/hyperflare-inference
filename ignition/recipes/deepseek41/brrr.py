@@ -217,6 +217,15 @@ class Engine:
     def register(self, index, weights, config=None):
         if index in self.slots:
             return self.slots[index]
+        # Checkpoint reads and their conversions are temporaries: a short pool of its own returns their segments as
+        # soon as registration ends, so no catalog allocation is carved from them (G1 2026-11-14 rule). Everything the
+        # kernel keeps is Flare's, b12x's or a persistent-arena copy, all allocated outside this pool.
+        from .weights import _parking_pool
+
+        with _parking_pool():
+            return self._register(index, weights, config)
+
+    def _register(self, index, weights, config):
         ext, r, p, tp3 = self.ext, self.rank, f"layers.{index}", self.tp3
         if config is not None:
             check_constants(ext, config, weights)
@@ -303,13 +312,24 @@ class Engine:
             if kwargs[name].data_ptr() != getattr(rep, {"w13": "w13_rp", "s13": "w13_sfb", "w2": "w2_rp", "s2": "w2_sfb"}[name]).data_ptr():
                 raise RuntimeError(f"BRRR layer {index}: {name} is not b12x's resident plane")
         if decoder is not None:
-            # The kernel reads the CSF payload (issue_csf), never s13/s2; holding b12x's expanded planes here would pin
-            # a per-layer preparation temporary (FlashInfer aa6c4221 releases them after preparation).
+            # The kernel reads the CSF payload (issue_csf), never s13/s2; holding b12x's expanded planes (views of the
+            # loader's one shared scale scratch, ~141 MiB, released by b12x after preparation) would pin that scratch.
             kwargs.update(s13=self.unused_scales, s2=self.unused_scales)
+        # Flare already holds the FFN mHC parameters, the FFN norm and the gate bias as persistent tensors of the
+        # checkpoint's dtype: when they are byte-identical to the checkpoint reads, the kernel reads them in place
+        # (no second copy: 1.98 MB/layer, ~77 MiB/rank for BRRR-40 at preparation and serving).
+        flare_owned = dict(fn=weights.residual["hc_ffn_fn"], hc_scale=weights.residual["hc_ffn_scale"],
+                           hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"],
+                           gate_b=weights.experts.correction)
+        for name, owned in flare_owned.items():
+            if (isinstance(owned, torch.Tensor) and owned.is_contiguous() and owned.dtype == kwargs[name].dtype
+                    and owned.shape == kwargs[name].shape and torch.equal(owned, kwargs[name])):
+                kwargs[name] = owned
         # The kernel holds raw pointers to these tensors: the copies made here are forward constants, packed into the
         # persistent arena with the final weights (registration runs inside the catalog's transient pool).
         for name in PERSISTENT_COPIES:
-            if kwargs.get(name) is not None and not (tp3.brrr_dense_native and name in NATIVE_DENSE):
+            if (kwargs.get(name) is not None and not (tp3.brrr_dense_native and name in NATIVE_DENSE)
+                    and not any(kwargs[name] is owned for owned in flare_owned.values())):
                 kwargs[name] = persistent_copy(kwargs[name])
         self.keep.append(kwargs)
         self.slots[index] = ext.add_layer(self.local_handle, **kwargs)

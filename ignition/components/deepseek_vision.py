@@ -31,6 +31,43 @@ ALIGNER_WEIGHTS = ("aligner.w1.weight", "aligner.w1.bias", "aligner.w2.weight", 
 VISION_BLOCKS = 32
 
 
+def _full(tensor):
+    """The whole declaration buffer behind a row-prefix view (VisionScratch.rows)."""
+    return tensor if tensor._base is None else tensor._base
+
+
+def staging_example_donors(scratch, block, resident, aligner):
+    """(roles {role: template}, donor buffers) per staged weight set: donors are VisionScratch fields that none of
+    the set's kernels use as an operand. Block kernels use residual, normalized, qkv, query/key/value, attended,
+    projected and the MLP buffers; the patch GEMM and final norm use patches, residual and normalized; the aligner
+    uses merged, aligned, activated and output."""
+    return (({"block." + suffix: tensor for suffix, tensor in block.items()},
+             [_full(scratch.merged), _full(scratch.aligned), _full(scratch.activated), _full(scratch.output)]),
+            (dict(resident), [_full(scratch.output), _full(scratch.activated), _full(scratch.aligned)]),
+            (dict(aligner), [_full(scratch.mlp.gate_up), _full(scratch.qkv), _full(scratch.mlp.intermediate),
+                             _full(scratch.projected), _full(scratch.attended)]))
+
+
+def carve_examples(templates, donors, alignment=256):
+    """Views of ``donors`` (contiguous buffers) with each template's shape and dtype, largest first, first fit at
+    ``alignment``-byte offsets; templates that fit nowhere get zero tensors of their own. Returns (views, fresh
+    bytes)."""
+    used, views, fresh = [0] * len(donors), {}, 0
+    for role, template in sorted(templates.items(), key=lambda item: -item[1].nbytes):
+        shape, dtype, nbytes = tuple(template.shape), template.dtype, template.nbytes
+        for index, donor in enumerate(donors):
+            start = -(-used[index] // alignment) * alignment
+            if donor.is_contiguous() and donor.device == template.device and start + nbytes <= donor.nbytes:
+                flat = donor.reshape(-1).view(torch.uint8)
+                views[role] = flat[start:start + nbytes].view(dtype).view(shape)
+                used[index] = start + nbytes
+                break
+        else:
+            views[role] = torch.zeros(shape, dtype=dtype, device=template.device)
+            fresh += nbytes
+    return views, fresh
+
+
 def _projection_with(projection, weight, bias):
     """A prepared UnquantizedProjection reading ``weight``/``bias`` (same geometry as declared) in this forward."""
     rebound = copy.copy(projection)
@@ -141,7 +178,7 @@ class PreparedVision:
         self.staged, self.kernel_copy = bool(stage_weights), bool(kernel_copy)
         bound = weights
         if self.staged:
-            bound = self._prepare_staging(weights, device, {} if examples is None else examples)
+            bound = self._prepare_staging(weights, scratch, {} if examples is None else examples)
 
         def project(key, source, out):
             return UnquantizedProjection(
@@ -216,8 +253,14 @@ class PreparedVision:
         self.align1 = project("aligner.w1", scratch.merged, scratch.aligned)
         self.align2 = project("aligner.w2", scratch.activated, scratch.output)
 
-    def _prepare_staging(self, weights, device, examples):
-        """Parked sources per staged set and the declaration examples the kernels are prepared on."""
+    def _prepare_staging(self, weights, scratch, examples):
+        """Parked sources per staged set and the declaration examples the kernels are prepared on.
+
+        The examples (165.7 MiB at the checkpoint's geometry, mostly the aligner's 140 MiB) are carved from the
+        vision declaration scratch, which lives exactly as long (both are released before capture), in fields that
+        none of the set's own kernels read or write: block weights in the merger stage's buffers, the aligner's in
+        the block stage's buffers (as tp3-main aliased its aligner slots onto dead block scratch). Only what does not
+        fit is allocated afresh (``staging_example_bytes``)."""
         self.block_sources = tuple(
             {suffix: weights[f"vision.blocks.{index}.{suffix}"]
              for suffix in BLOCK_WEIGHTS if f"vision.blocks.{index}.{suffix}" in weights}
@@ -234,13 +277,18 @@ class PreparedVision:
             for tensor in sources.values():
                 record_numeric_tensor(tensor)
 
+        self.staging_example_bytes = 0
+        for roles, donors in staging_example_donors(scratch, first, self.resident_sources, self.aligner_sources):
+            if all("vision.staging." + role in examples for role in roles):
+                continue
+            carved, fresh = carve_examples(roles, donors)
+            examples.update(("vision.staging." + role, value) for role, value in carved.items())
+            self.staging_example_bytes += fresh
+
         def example(role, tensor):
-            key = "vision.staging." + role
-            if key not in examples:
-                examples[key] = torch.zeros(tuple(tensor.shape), dtype=tensor.dtype, device=device)
-            value = examples[key]
+            value = examples["vision.staging." + role]
             if value.shape != tensor.shape or value.dtype != tensor.dtype:
-                raise ValueError(f"vision staging example {key} does not match the parked geometry")
+                raise ValueError(f"vision staging example {role} does not match the parked geometry")
             return value
 
         bound = dict(weights)
