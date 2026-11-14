@@ -11,7 +11,13 @@ copies run on the arena's auxiliary stream, forked after the main stream's enque
 slot's previous reader) and joined before the slot's next consumer, following
 ``ConcurrentProjectionChain``. Both sides are custom operators so compiled and captured graphs
 record the fork and join as event dependencies without host synchronization.
+
+In functional (Inductor-planned) forwards the slots are forward-local copies instead
+(``stage_copies``, DeepSeek V4.1 since the 2026-11-14 upstream port): the copies run on the main
+stream into graph temporaries, which the compiler places and reuses like any other temporary.
 """
+
+from contextlib import nullcontext
 
 import torch
 
@@ -22,13 +28,12 @@ _INTEGER_VIEWS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64
 def _stage(token: torch.Tensor, sources: list[torch.Tensor], destinations: list[torch.Tensor],
            stream: int, kernel_copy: bool) -> None:
     device = token.device
-    current = torch.cuda.current_stream(device)
-    if stream == 0:
-        auxiliary = current
-    else:
+    auxiliary = None
+    if stream:
         auxiliary = torch.cuda.ExternalStream(stream, device=device)
-        auxiliary.wait_stream(current)
-    with torch.cuda.stream(auxiliary):
+        auxiliary.wait_stream(torch.cuda.current_stream(device))
+    # stream 0: copies on the current stream (stream order is program order; no fork, no join needed).
+    with torch.cuda.stream(auxiliary) if auxiliary is not None else nullcontext():
         for source, destination in zip(sources, destinations, strict=True):
             if kernel_copy:
                 # Bitwise identity through an elementwise kernel: coalesced sequential loads from the
@@ -54,6 +59,22 @@ def _join(token: torch.Tensor, dependency: torch.Tensor, destinations: list[torc
 @_join.register_fake
 def _fake_join(token, dependency, destinations, stream):
     pass
+
+
+def stage_copies(token, sources, *, kernel_copy=False):
+    """Functional staging (Inductor-planned forwards): copy ``sources`` (name -> parked tensor) into new contiguous
+    forward-local tensors on the current stream and return them by name.
+
+    The destinations are graph temporaries, so the compiler places them in the forward's combined pool and reuses
+    their bytes once their consumers have run; with one stream there is nothing to fork or join. ``token`` is a
+    tensor the copies must follow (for example the previous block's output): the op reads it, so the compiler
+    cannot hoist the copies above that work and keep many slot sets live at once.
+    """
+    names = tuple(sources)
+    destinations = [torch.empty(tuple(sources[name].shape), dtype=sources[name].dtype, device=token.device)
+                    for name in names]
+    _stage(token, [sources[name] for name in names], destinations, 0, bool(kernel_copy))
+    return dict(zip(names, destinations))
 
 
 class WeightStaging:

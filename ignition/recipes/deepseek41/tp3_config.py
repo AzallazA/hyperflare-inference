@@ -24,7 +24,6 @@ ENV_PREFIX = "FLARE_DS41_"
 UNPORTED = {
     "engram_chunk_rows": "S5 (Engram chunk rows)",
     "share_engram_residual": "S5 (shared Engram residual; expected to be deleted there, Inductor reuses the storage)",
-    "vision_stage": "S7 (vision weight staging)",
 }
 
 # Engram table layouts at export (``engram_tables``).
@@ -115,8 +114,9 @@ class TP3Config:
     """Vision tower parked in device-visible host memory; images ~3 s slower each unless staged. Implied by
     ``vision_stage`` (staging reads from the parked copy), as the pre-config recipe did."""
     vision_stage: bool = False
-    """Stage the host-parked tower's weights through VRAM slots per block inside the vision graphs (image 0.11 s vs
-    1.70 s). Requesting it parks the tower (``vision_host`` is forced on)."""
+    """Stage the host-parked tower's weights into VRAM per block inside the vision graphs (tp3-main: image 0.11 s vs
+    1.70 s; since the 2026-11-14 port the copies are forward-local and on the main stream, not overlapped).
+    Requesting it parks the tower (``vision_host`` is forced on)."""
     vision_stage_copy: str = "memcpy"
     """Staging copy: ``memcpy`` (cudaMemcpy) or ``kernel`` (elementwise kernel over the mapped host range)."""
     # --- collectives and planning (bootstrap.py, recipe.py, planning.py) ---

@@ -262,7 +262,6 @@ def test_preparation_config_carries_the_tp3_config():
 @pytest.mark.parametrize("changes,stage", [
     (dict(engram_chunk_rows=1024), "stage S5"),
     (dict(share_engram_residual=True), "stage S5"),
-    (dict(vision_stage=True), "stage S7"),
 ])
 def test_unported_switches_fail_at_config_time_with_their_stage(changes, stage):
     from ignition.recipes.deepseek41.bootstrap import PreparationConfig
@@ -276,14 +275,14 @@ def test_unported_switches_fail_at_config_time_with_their_stage(changes, stage):
 
 
 def test_release_config_names_every_unported_switch_and_the_base_port_none():
-    assert set(RELEASE_CONFIG.unported()) == {"vision_stage"}
+    # BRRR (S6) and vision staging (S7) are ported; the release config (without the S5 switches) prepares.
+    assert RELEASE_CONFIG.unported() == {} and RELEASE_CONFIG.require_ported() is RELEASE_CONFIG
     assert BASE_PORT_CONFIG.unported() == {} and BASE_PORT_CONFIG.require_ported() is BASE_PORT_CONFIG
-    with pytest.raises(ValueError, match="vision_stage=True is not ported yet \\(stage S7"):
-        RELEASE_CONFIG.require_ported()
     # The release export.sh environment still parses (the switches keep their meaning for the later stages).
     env = dict(RELEASE_ENV, FLARE_DS41_ENGRAM_CHUNK_ROWS="1024", FLARE_DS41_SHARE_ENGRAM_RESIDUAL="1")
-    assert set(TP3Config.from_environment(env).unported()) == {
-        "vision_stage", "engram_chunk_rows", "share_engram_residual"}
+    assert set(TP3Config.from_environment(env).unported()) == {"engram_chunk_rows", "share_engram_residual"}
+    with pytest.raises(ValueError, match="engram_chunk_rows=1024 is not ported yet \\(stage S5"):
+        TP3Config.from_environment(env).require_ported()
 
 
 def test_brrr_is_ported_but_refuses_joint_tuning():

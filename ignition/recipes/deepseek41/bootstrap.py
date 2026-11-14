@@ -55,7 +55,7 @@ from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
 from .tp3_config import TP3Config
-from .weights import ModelWeights
+from .weights import ModelWeights, vision_host_parked
 
 
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
@@ -590,6 +590,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
+            # TP3: tp3.vision_stage copies the host-parked tower's weights into forward-local VRAM tensors per block
+            # inside the vision graphs (PreparedVision(stage_weights=True)); tp3.vision_stage_copy = "kernel" copies
+            # with an elementwise kernel instead of cudaMemcpy. The parked bytes stay host-resident either way.
+            stage_vision = tp3.vision_stage
+            if stage_vision and not vision_host_parked(weights.vision, core_storage.host_regions):
+                # Nothing to stage from: the tower is already resident (no host allocator parked it).
+                if progress is not None:
+                    progress("tp3.vision_stage ignored: the vision tower is not host-parked; using it resident")
+                stage_vision = False
+            staged_bytes = None
             # TP3: the encoder scratch is a declaration example (calls own no scratch), and vision graphs run one at
             # a time, so the smaller capacities take row prefixes of the largest one, as tp3-main's cursors did
             # (0.4 GiB/rank of catalog operands, G1 2026-11-14). vision_storage stays the only owner.
@@ -599,9 +609,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 name = f"vision{capacity}"
                 vision_storage[capacity] = vision_storage[largest].rows(capacity)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                    session=session, workspace=arena, name=name)
+                    session=session, workspace=arena, name=name, stage_weights=stage_vision,
+                    kernel_copy=tp3.vision_stage_copy == "kernel", examples=examples)
+                staged_bytes = encoder.staging_bytes
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence),
                     "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
+            if staged_bytes is not None and progress is not None:
+                block, resident, aligner = staged_bytes
+                progress(f"vision weight staging ({tp3.vision_stage_copy}, main stream, forward-local copies): "
+                         f"{(32 * block + resident + aligner) >> 20} MiB copied per image ({block >> 20} MiB per "
+                         f"block, {resident >> 20} MiB patch embedding + final norm, {aligner >> 20} MiB aligner); "
+                         "placement in the 'Graph pool requests' line")
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             suffix = "-no-mtp" if config.dspark and not enabled else ""

@@ -4,7 +4,9 @@
 
 """Prepared DeepSeek ViT, spatial aligner, and bounded image feature delivery."""
 
-from dataclasses import dataclass
+import copy
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +16,33 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.components.vision_staging import stage_copies
 from ignition.components.weights import MLPWeights
 from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.tensor_metadata import record_numeric_tensor, unrecorded_numeric_tensors
+from ignition.preparation.tuning import register_finalizer
+
+# TP3 weight staging (PreparedVision(stage_weights=True), TP3Config.vision_stage): every block shares these names and
+# shapes; the patch embedding and final norm are staged once per image, the aligner after the last block.
+BLOCK_WEIGHTS = ("norm1.weight", "attn.wqkv.weight", "attn.wqkv.bias", "attn.wo.weight", "attn.wo.bias",
+                 "norm2.weight", "mlp.w1.weight", "mlp.w2.weight")
+RESIDENT_WEIGHTS = ("vision.patch_embed.proj.weight", "vision.patch_embed.proj.bias", "vision.norm.weight")
+ALIGNER_WEIGHTS = ("aligner.w1.weight", "aligner.w1.bias", "aligner.w2.weight", "aligner.w2.bias")
+VISION_BLOCKS = 32
+
+
+def _projection_with(projection, weight, bias):
+    """A prepared UnquantizedProjection reading ``weight``/``bias`` (same geometry as declared) in this forward."""
+    rebound = copy.copy(projection)
+    rebound.weight, rebound.bias = weight, bias
+    return rebound
+
+
+def _mlp_with(mlp, gate_up, down):
+    rebound = copy.copy(mlp)
+    rebound.up_projection = _projection_with(mlp.up_projection, gate_up, None)
+    rebound.down_projection = _projection_with(mlp.down_projection, down, None)
+    return rebound
 
 @dataclass(frozen=True)
 class VisionInputs:
@@ -91,23 +118,49 @@ class VisionScratch:
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name):
+    """Prepared ViT and aligner over one scratch capacity.
+
+    TP3 ``stage_weights`` (TP3Config.vision_stage; the tower is parked in device-visible host memory): every forward
+    copies each block's weights from the parked tensors into forward-local VRAM tensors just before the block runs
+    (``vision_staging.stage_copies``, main stream), and the prepared kernels read those copies instead of re-reading
+    host memory over PCIe per row block. The patch embedding and final norm are copied once before the patch GEMM,
+    the aligner after the last block. The kernels are declared and tuned on VRAM declaration examples of the same
+    geometry (shared by every block and capacity through ``examples``) and rebound to the copies in ``__call__``;
+    the compiler places the copies in the vision graph's pool (the aligner reuses the dead block bytes by itself).
+    tp3-main overlapped block ``i + 1``'s copy with block ``i`` on an auxiliary stream into double-buffered scratch
+    slots; this port copies on the main stream (no fork/join across compiler-planned temporaries).
+    """
+
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name, stage_weights=False,
+                 kernel_copy=False, examples=None):
         self.inputs = inputs
         self.capacity = scratch.patches.shape[0]
         tokens, device = scratch.patches.shape[0], scratch.patches.device
         self.frequencies = persistent_copy(10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32))
         cu = torch.zeros(2, dtype=torch.int32, device=device)
+        self.staged, self.kernel_copy = bool(stage_weights), bool(kernel_copy)
+        bound = weights
+        if self.staged:
+            bound = self._prepare_staging(weights, device, {} if examples is None else examples)
 
         def project(key, source, out):
             return UnquantizedProjection(
                 source,
-                weights[key + ".weight"],
+                bound[key + ".weight"],
                 out,
-                bias=weights.get(key + ".bias"),
+                bias=bound.get(key + ".bias"),
                 session=session,
                 name=name + "." + key,
             ).functional(session=session)
 
+        # Staged kernels are declared on declaration examples, not checkpoint storage: they are not recorded as
+        # numeric storage (_prepare_staging recorded the parked sources the forward copies from).
+        with unrecorded_numeric_tensors() if self.staged else nullcontext():
+            self._prepare_kernels(bound, scratch, tokens, cu, project, session=session, workspace=workspace, name=name)
+        if self.staged:
+            register_finalizer(session, self._release_examples)
+
+    def _prepare_kernels(self, weights, scratch, tokens, cu, project, *, session, workspace, name):
         self.patch = project("vision.patch_embed.proj", scratch.patches, scratch.residual)
         self.blocks = []
         for index in range(32):
@@ -163,8 +216,68 @@ class PreparedVision:
         self.align1 = project("aligner.w1", scratch.merged, scratch.aligned)
         self.align2 = project("aligner.w2", scratch.activated, scratch.output)
 
+    def _prepare_staging(self, weights, device, examples):
+        """Parked sources per staged set and the declaration examples the kernels are prepared on."""
+        self.block_sources = tuple(
+            {suffix: weights[f"vision.blocks.{index}.{suffix}"]
+             for suffix in BLOCK_WEIGHTS if f"vision.blocks.{index}.{suffix}" in weights}
+            for index in range(VISION_BLOCKS))
+        self.resident_sources = {name: weights[name] for name in RESIDENT_WEIGHTS if name in weights}
+        self.aligner_sources = {name: weights[name] for name in ALIGNER_WEIGHTS if name in weights}
+        first = self.block_sources[0]
+        if any(set(sources) != set(first) or any(sources[key].shape != first[key].shape
+                                                 or sources[key].dtype != first[key].dtype for key in first)
+               for sources in self.block_sources):
+            raise ValueError("vision weight staging requires every block to share one weight geometry")
+        # The parked tensors remain the checkpoint storage the package stores and the graph reads from.
+        for sources in (*self.block_sources, self.resident_sources, self.aligner_sources):
+            for tensor in sources.values():
+                record_numeric_tensor(tensor)
+
+        def example(role, tensor):
+            key = "vision.staging." + role
+            if key not in examples:
+                examples[key] = torch.zeros(tuple(tensor.shape), dtype=tensor.dtype, device=device)
+            value = examples[key]
+            if value.shape != tensor.shape or value.dtype != tensor.dtype:
+                raise ValueError(f"vision staging example {key} does not match the parked geometry")
+            return value
+
+        bound = dict(weights)
+        for index in range(VISION_BLOCKS):
+            for suffix, tensor in self.block_sources[index].items():
+                bound[f"vision.blocks.{index}.{suffix}"] = example("block." + suffix, tensor)
+        for name, tensor in (*self.resident_sources.items(), *self.aligner_sources.items()):
+            bound[name] = example(name, tensor)
+        return bound
+
+    def _release_examples(self):
+        """After tuning: drop the declaration examples (every staged kernel is rebound in __call__)."""
+        self.patch = _projection_with(self.patch, None, None)
+        self.blocks = [(replace(norm1, weight=None), _projection_with(qkv, None, None),
+                        _projection_with(output, None, None), replace(norm2, weight=None), _mlp_with(mlp, None, None))
+                       for norm1, qkv, output, norm2, mlp in self.blocks]
+        self.norm = replace(self.norm, weight=None)
+        self.align1 = _projection_with(self.align1, None, None)
+        self.align2 = _projection_with(self.align2, None, None)
+
+    @property
+    def staging_bytes(self):
+        """(block set, patch embedding + final norm, aligner) bytes copied per staged forward; None unstaged."""
+        if not self.staged:
+            return None
+        size = lambda sources: sum(tensor.nbytes for tensor in sources.values())
+        return size(self.block_sources[0]), size(self.resident_sources), size(self.aligner_sources)
+
     def __call__(self, pixels, positions, cu, indices):
-        residual = self.patch(pixels)
+        patch, norm, align1, align2 = self.patch, self.norm, self.align1, self.align2
+        if self.staged:
+            # The patch embedding is needed first; the copies follow the pixel conversion (token).
+            resident = stage_copies(pixels, self.resident_sources, kernel_copy=self.kernel_copy)
+            patch = _projection_with(patch, resident["vision.patch_embed.proj.weight"],
+                                     resident.get("vision.patch_embed.proj.bias"))
+            norm = replace(norm, weight=resident["vision.norm.weight"])
+        residual = patch(pixels)
         angles = (positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None, :]
         cos, sin = angles.cos(), angles.sin()
 
@@ -172,17 +285,30 @@ class PreparedVision:
             a, b = source.float().chunk(2, dim=-1)
             return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1).to(source.dtype)
 
-        for norm1, qkv, output, norm2, mlp in self.blocks:
+        for index, (norm1, qkv, output, norm2, mlp) in enumerate(self.blocks):
+            if self.staged:
+                # Copied after the previous block's output exists (token), so at most this block's copies and the
+                # previous block's still-live operands share the pool.
+                slot = stage_copies(residual, self.block_sources[index], kernel_copy=self.kernel_copy)
+                norm1, norm2 = replace(norm1, weight=slot["norm1.weight"]), replace(norm2, weight=slot["norm2.weight"])
+                qkv = _projection_with(qkv, slot["attn.wqkv.weight"], slot.get("attn.wqkv.bias"))
+                output = _projection_with(output, slot["attn.wo.weight"], slot.get("attn.wo.bias"))
+                mlp = _mlp_with(mlp, slot["mlp.w1.weight"], slot["mlp.w2.weight"])
             q, k, v = qkv(norm1(residual)).view(-1, 3, 16, 64).unbind(1)
             attended = self.attention(rotate(q), rotate(k), v.contiguous(), cu).flatten(1)
             residual = residual + output(attended)
             residual = residual + mlp(norm2(residual))
-        normalized = self.norm(residual)
+        normalized = norm(residual)
         indices = indices.long()
         gathered = normalized[indices.clamp(0, normalized.shape[0] - 1)]
         gathered = torch.where(indices[:, :, None] >= 0, gathered, 0)
         merged = gathered.transpose(1, 2).reshape(indices.shape[0], -1)
-        return self.align2(F.gelu(self.align1(merged)))
+        if self.staged:
+            # After the last block: the compiler can place the aligner copies in the dead block bytes.
+            aligner = stage_copies(merged, self.aligner_sources, kernel_copy=self.kernel_copy)
+            align1 = _projection_with(align1, aligner["aligner.w1.weight"], aligner.get("aligner.w1.bias"))
+            align2 = _projection_with(align2, aligner["aligner.w2.weight"], aligner.get("aligner.w2.bias"))
+        return align2(F.gelu(align1(merged)))
 
 
 @dataclass(frozen=True)

@@ -129,7 +129,7 @@ class ModelWeights:
                 if vision and park_vision:
                     # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections
                     # consume these tensors as-is, so read them from device-visible host memory and give the VRAM to
-                    # KV (images ~3 s slower each; staging them through VRAM slots is stage S7 of the port).
+                    # KV (images ~3 s slower each unless tp3.vision_stage copies them into VRAM per block, PreparedVision).
                     from ignition.components.weights import _park_on_host
                     vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
         return cls(config, shard, embedding, norm, head, layers, draft,
@@ -146,6 +146,13 @@ def _parking_pool():
     segments return to the device; the parked tensors must be dropped inside it."""
     storage = active_core_storage()
     return nullcontext() if storage is None else storage.transient()
+
+
+def vision_host_parked(vision: dict, host_regions) -> bool:
+    """Whether every vision/aligner tensor lives in one of the package's mapped host regions (`_park_on_host`)."""
+    spans = [(region.address, region.address + region.extent) for region in host_regions if not region.closed]
+    tensors = [tensor for name, tensor in vision.items() if name.startswith(("vision.", "aligner."))]
+    return bool(tensors) and all(any(start <= tensor.data_ptr() < end for start, end in spans) for tensor in tensors)
 
 
 def hot_expert_ids(layer: int, experts: int, tp3: TP3Config) -> list | None:
