@@ -536,6 +536,23 @@ def test_functionalized_tail_copies_after_the_final_norm_and_before_every_tail_g
     assert not any(placeholders[1] in _ancestors(mm.args[1]) - _ancestors(node) for mm in mms)
 
 
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_staged_tail_traces_under_dynamo_and_matches_the_resident_tail(tail_checkpoint, backend):
+    """Compiled vision forwards run the tail under Dynamo (fullgraph, as aot_forward does): binding the
+    forward-local copy, rebinding the projections and running the merger must trace without graph breaks (no
+    storage offsets, no module copies) and give the resident result. G3 found the first version breaking here."""
+    weights, parked, _ = tail_checkpoint
+    staging = VisionStaging(parked, "cpu")
+    _, projections, downsample = staging.bound(parked)
+    encoder, _ = _tail_encoder(projections, downsample, staging=staging)
+    encoder._release_tail_examples()
+    for linear in (encoder.downsample, *encoder.module.merger.children()):
+        linear.projection.log = None
+    torch._dynamo.reset()
+    compiled = torch.compile(encoder.tail, fullgraph=True, backend=backend)
+    assert torch.equal(_bytes(compiled(_normed())), _bytes(_resident_tail(weights)))
+
+
 def _quantized(weight, *, encoded=False, sm103=False):
     from ignition.components.linear import QuantizedProjection
 
