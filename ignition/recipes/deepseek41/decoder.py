@@ -231,7 +231,7 @@ class PreparedLayer:
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples)
+            window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream)
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
         # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).

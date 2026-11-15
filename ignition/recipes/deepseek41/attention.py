@@ -201,7 +201,9 @@ class PreparedCompressor:
         if self.ratio == 2:
             self.gates = self.pending = None
 
-    def __call__(self, source, metadata, slots):
+    def __call__(self, source, metadata, slots, *, gates=None):
+        """``gates`` (TP3 index side stream, ratio 2 only): a callable that takes the values projection and returns
+        the gates projection computed on the side stream (it joins there); None = project the gates here (base)."""
         from b12x.attention.mla_compress._impl import _run_ratio1, _run_ratio2
 
         m = metadata
@@ -209,7 +211,7 @@ class PreparedCompressor:
         emitted = torch.zeros(source.shape[0], dtype=torch.bool, device=source.device)
         emitted_slots = torch.full((source.shape[0],), -1, dtype=torch.int64, device=source.device)
         state_ids = torch.arange(m.starts.numel(), dtype=torch.int64, device=source.device)
-        gates = None
+        side_gates, gates = gates, None
         if self.ratio == 2:
             # gather_rows_three stores every column of every request row (one program per row, no row skip),
             # so the pending state starts uninitialised.
@@ -218,8 +220,12 @@ class PreparedCompressor:
                 for key in ("pending_values", "pending_gates", "pending_position")}
             gather_rows_three(tuple(self.pool.region(f"layer{self.layer}.{key}") for key in pending),
                               m.state_rows, tuple(pending.values()))
-            gates = self.project_gates(source)
-            values = self.project_values(source)
+            if side_gates is None:
+                gates = self.project_gates(source)
+                values = self.project_values(source)
+            else:
+                values = self.project_values(source)
+                gates = side_gates(values)
             _run_ratio2(self.plan.handle, values, gates, self.weight, m.query_start_loc, m.starts,
                 state_ids, slots, m.live_counts, *pending.values(), output, emitted, emitted_slots)
             if not self.deferred:
@@ -227,6 +233,8 @@ class PreparedCompressor:
                     save_hidden(value.view(value.shape[0], -1), self.pool.region(f"layer{self.layer}.{key}"),
                                 m.state_rows, m.lengths > 0)
         else:
+            if side_gates is not None:
+                raise ValueError("only ratio-2 compressors project gates")
             values = self.project_values(source)
             _run_ratio1(self.plan.handle, values, self.weight, m.query_start_loc, m.starts,
                        state_ids, slots, m.live_counts, output, emitted, emitted_slots)
@@ -268,14 +276,86 @@ class PreparedGlobalKV:
             name=f"{name}.compressed_write").functional(session=session)
         self.compressor.functional(session=session)
 
-    def __call__(self, source, indexer, metadata, geometry):
-        latent, slots, records = self.compressor(source, metadata, geometry.slots)
+    def __call__(self, source, indexer, metadata, geometry, *, gates=None):
+        latent, slots, records = self.compressor(source, metadata, geometry.slots, gates=gates)
         keys = self.index_norm(self.index_key(latent))
         self.rotary.apply(keys, geometry.position, compressed=True)
         indexer.write_keys(keys, slots)
         self.rotary.apply(latent, geometry.position, compressed=True)
         self.writer(latent, slots)
         return records
+
+
+class IndexSideChain:
+    """TP3 (``TP3Config.index_side_stream``): the indexer query chain, and a ratio-2 compressor's gates GEMV, on a
+    side stream of their own.
+
+    On an index-source layer the query chain (index_q projection -> RoPE -> index-weights GEMV) reads only the
+    layer input and the normalised q latent, so it can start right after the q/KV norm, beside the q_b chain (the
+    auxiliary stream) and the KV path (the main stream); it joins before the selectors, the first readers of its
+    outputs (the weight scaling stays on the main stream after the join, unchanged). On a ratio-2 KV source the
+    gates GEMV (input: the layer input) runs on the same side stream first and joins right before the compression
+    kernel, its first reader; each join waits for its own task only (side_streams events). Same kernels, plans and
+    arguments as the serial path into disjoint buffers: bit-identical.
+    """
+
+    PURPOSE = "ds41-index"
+
+    def __init__(self, attention):
+        from ignition.components.side_streams import register
+
+        self.attention = attention
+        compressor = None if attention.global_kv is None else attention.global_kv.compressor
+        self.compressor = compressor if compressor is not None and compressor.ratio == 2 else None
+        self.gates_task = None if self.compressor is None else register(self._run_gates, self.PURPOSE)
+        self.query_task = register(self._run_query, self.PURPOSE)
+
+    def _run_gates(self, inputs, outputs):
+        source, = inputs
+        gates, = outputs
+        self.compressor.project_gates.run_into(source, gates)
+
+    def _run_query(self, inputs, outputs):
+        attention = self.attention
+        query_low, source, position = inputs
+        index_query, workspace, index_weights, *bases = outputs
+        attention.index_query.run_into(query_low, index_query, workspace,
+                                       encoded_bases=tuple(bases) if bases else None)
+        attention.rotary.apply(index_query.view(source.shape[0], 32, 128), position, compressed=True)
+        attention.index_weight.run_into(source, index_weights)
+
+    def start(self, source, query_low, position):
+        """Traced: fork the gates (ratio-2 sources) and the query chain onto the side stream; returns the pending
+        operands for ``gates`` and ``finish``."""
+        device = source.device
+        gates = None
+        if self.gates_task is not None:
+            gates = self.compressor.project_gates.allocate(device)
+            self.gates_task.launch(query_low, [source], [gates])
+        index_query, workspace, bases = self.attention.index_query.allocate(device)
+        index_weights = self.attention.index_weight.allocate(device)
+        inputs = [query_low, source, position]
+        outputs = [index_query, workspace, index_weights, *(bases or ())]
+        self.query_task.launch(query_low, inputs, outputs)
+        return source, gates, inputs, outputs
+
+    def gates(self, pending):
+        """The compressor's ``gates`` callable: join the gates task after the values projection (its argument)."""
+        source, gates, _, _ = pending
+        if gates is None:
+            return None
+
+        def join(values):
+            self.gates_task.join(values, [source], [gates])
+            return gates
+        return join
+
+    def finish(self, pending, dependency):
+        """Traced: join the query chain after ``dependency``; returns (index query [rows, 32, 128], index weights)."""
+        source, _, inputs, outputs = pending
+        self.query_task.join(dependency, inputs, outputs)
+        index_query, _, index_weights = outputs[:3]
+        return index_query.view(source.shape[0], 32, 128), index_weights
 
 
 @triton.jit
@@ -295,10 +375,11 @@ class PreparedAttention:
     # TP3 BRRR (decoder.PreparedLayer sets it for BRRR layers): the fused layer kernel applies inverse RoPE and the
     # o-projection itself, so _run returns the attention output as the kernel reads it.
     external_tail = False
+    index_side = None  # TP3 tp3.index_side_stream: IndexSideChain (decode/verify index layers); None = serial
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", window_metadata=None, examples=None):
+                 mla_compute_mode="auto", window_metadata=None, examples=None, index_side_stream=False):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -442,6 +523,10 @@ class PreparedAttention:
             self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
                 parallel_plans=parallel_plans, session=session, workspace=workspace)
 
+        # TP3 (tp3.index_side_stream): decode/verify index layers run the indexer query chain (and a ratio-2
+        # source's gates GEMV) on a side stream; prefill keeps the serial order.
+        self.index_side = (IndexSideChain(self) if index_side_stream and self.selectors
+                           and mode in ("decode", "verify") else None)
         self.query_shape = tuple(scratch.query.shape)
         self.candidate_source = config.text["candidate_source_layer_id"]
         self.projections["qkv_a"].functional(session=session)
@@ -502,6 +587,7 @@ class PreparedAttention:
         pending = None
         if self.concurrent_query is not None:
             pending = self.concurrent_query.start(query_low, encoded_bases=encoded_bases)
+        side = None if self.index_side is None else self.index_side.start(source, query_low, position)
         if self.window_norm is not None:
             window_values = self.window_norm(projected[:, 1280:])
         if self.concurrent_query is None:
@@ -516,11 +602,15 @@ class PreparedAttention:
         if self.ratio:
             geometry = indices.compressed(self.ratio)
             if self.global_kv is not None:
-                records = self.global_kv(source, self.selectors[0], m, geometry)
+                records = self.global_kv(source, self.selectors[0], m, geometry,
+                                         gates=None if side is None else self.index_side.gates(side))
             if self.selectors:
-                index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                self.rotary.apply(index_query, position, compressed=True)
-                index_weights = self.index_weight(source)
+                if side is None:
+                    index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
+                    self.rotary.apply(index_query, position, compressed=True)
+                    index_weights = self.index_weight(source)
+                else:
+                    index_query, index_weights = self.index_side.finish(side, window_cache)
                 index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
                 for ordinal, selector in enumerate(self.selectors):
