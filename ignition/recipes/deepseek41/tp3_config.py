@@ -211,6 +211,14 @@ class TP3Config:
     brrr_spin_trap: bool = False
     """Test builds only: a BRRR protocol wait that has not finished after ~2^25 polls prints and traps instead of hanging
     the GPUs (compile-time define BRRR_SPIN_TRAP; never for timing or export)."""
+    brrr_spin_ns: int | None = None
+    """Kernel tuning: ns slept between polls of a BRRR wait (counter, route table, peer flag); None = the kernel default
+    (200). A non-default value is its own extension build (define BRRR_SPIN_NS) and must be exported into the package.
+    Timing only: the arithmetic is unchanged. Environment FLARE_DS41_BRRR_SPIN_NS (unset/empty = default)."""
+    brrr_two_shot_min: int | None = None
+    """Kernel tuning: rows from which the BRRR attention/FFN exchanges reduce two-shot instead of one-shot; None = the
+    kernel default (17); 1 = always two-shot, 129 = never. Same sums in the same rank order either way. Own extension
+    build (define BRRR_TWO_SHOT_MIN), exported into the package. Environment FLARE_DS41_BRRR_TWO_SHOT_MIN."""
     # --- debug and test tooling (config.py, decoder.py, probe.py) ---
     mini: bool = False
     """Truncated real-weight checkpoint view (make_mini.py): accept 6..40 layers, no compacted prefill feedback."""
@@ -266,8 +274,13 @@ class TP3Config:
                              f"0 < hot_experts < {ROUTED_EXPERTS}")
         if self.brrr_layers and self.brrr_ckpt is None:
             raise ValueError("TP3 config: brrr_layers needs brrr_ckpt (the checkpoint view BRRR reads its dense copies from)")
-        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap"):
-            if getattr(self, name) and not self.brrr_layers:
+        for name, low, high in (("brrr_spin_ns", 0, 1_000_000), ("brrr_two_shot_min", 1, 129)):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or not low <= value <= high):
+                raise ValueError(f"TP3 config: {name} must be unset or an integer in [{low}, {high}], not {value!r}")
+        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap", "brrr_spin_ns",
+                     "brrr_two_shot_min"):
+            if getattr(self, name) is not None and getattr(self, name) is not False and not self.brrr_layers:
                 raise ValueError(f"TP3 config: {name} needs brrr_layers")
         if not self.brrr_dense_native and not self.brrr_layers:
             raise ValueError("TP3 config: brrr_dense_native=False needs brrr_layers")
@@ -323,6 +336,10 @@ class TP3Config:
         def integer(name):
             return int(get(name, "0") or 0)
 
+        def optional(name):  # unset/empty = None (the kernel default); otherwise a strict integer
+            value = get(name)
+            return None if value == "" else int(value)
+
         for name, reason in REMOVED.items():
             if env.get(name, "") != "":
                 raise ValueError(f"{name} is no longer supported: {reason}")
@@ -367,6 +384,8 @@ class TP3Config:
             brrr_break=get("BRRR_BREAK") or None,
             fused_attn_per_chunk=per_chunk is None or _atoi(per_chunk) != 0,
             brrr_spin_trap=flag("BRRR_SPIN_TRAP"),
+            brrr_spin_ns=optional("BRRR_SPIN_NS"),
+            brrr_two_shot_min=optional("BRRR_TWO_SHOT_MIN"),
             mini=flag("MINI"),
             no_engram=truthy("NO_ENGRAM"),
             probe=truthy("PROBE"),

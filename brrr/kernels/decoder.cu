@@ -54,7 +54,14 @@ constexpr int CSF_CAP = 36;  // TP3 CSF: staged exception records per 64-row hal
 constexpr int CSF_REC = 200;  // byte offset of the staged records inside the stage scale area
 static_assert(CSF_REC + 2 * CSF_CAP * 4 <= SCALE_BYTES, "staged CSF records must fit the scale area");
 constexpr int OWNA_ROWS = 16;
-constexpr int TWO_SHOT_MIN = 17;
+// Tuning switches (TP3Config brrr_two_shot_min / brrr_spin_ns -> brrr.kernel_defines -> -D, a separately named
+// extension build; unset = these defaults = the serving build). TWO_SHOT_MIN: rows from which the attention and FFN
+// exchanges reduce two-shot (owner rank per chunk) instead of one-shot (every rank sums every chunk); 1 = always
+// two-shot, MAXM + 1 = never. SPIN_NS: __nanosleep between polls of a counter, route or peer flag.
+#ifndef BRRR_TWO_SHOT_MIN
+#define BRRR_TWO_SHOT_MIN 17
+#endif
+constexpr int TWO_SHOT_MIN = BRRR_TWO_SHOT_MIN;
 constexpr int BT = 16384;  // TP3: max(SPAN*KS_INTER*32 = 12288, OTOK*2*KS_WOA*64 = 16384); 2 CTAs/SM still fit
 constexpr int BS = 384;  // TP3: >= max(OTOK, SPAN) * KW_INTER(6) * 4 = 16 * 6 * 4 (TP4: 32 * 5 * 4 = 640)
 
@@ -385,7 +392,11 @@ struct Smem {
   int ready;
 };
 
-constexpr unsigned SPIN_NS = 200;
+#ifndef BRRR_SPIN_NS
+#define BRRR_SPIN_NS 200
+#endif
+constexpr unsigned SPIN_NS = BRRR_SPIN_NS;
+static_assert(TWO_SHOT_MIN >= 1 && TWO_SHOT_MIN <= MAXM + 1 && BRRR_SPIN_NS >= 0 && BRRR_SPIN_NS <= 1000000, "BRRR tuning switch values");
 
 // TP3 debug (DS41_FUSED_PROF=1 only): per-launch phase marks after the 16 x 4 accumulators, in globaltimer ns.
 // Row t < J_END (job type): [first acquire, first run start, last run end, last run start]; row PH_FIN: [first C_FIN
@@ -2182,6 +2193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("HC_EPS") = double(HC_EPS);
   m.attr("NORM_EPS") = double(NORM_EPS);
   m.attr("TWO_SHOT_MIN") = TWO_SHOT_MIN;
+  m.attr("SPIN_NS") = int(SPIN_NS);
   // Compile-time switch of this build (brrr.kernel_defines); Engine checks it against its TP3Config.
   m.attr("SPIN_TRAP") = SPIN_TRAP;
   m.def("route_state", &route_state);

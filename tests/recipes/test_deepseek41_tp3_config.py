@@ -132,6 +132,15 @@ def test_flag_semantics_match_the_historical_parsers():
     ({"FLARE_DS41_BRRR_CSF_CHECK": "1"}, "brrr_csf_check needs brrr_layers"),
     ({"FLARE_DS41_BRRR_NATIVE_SCALES": "1"}, "brrr_native_scales needs brrr_layers"),
     ({"FLARE_DS41_BRRR_BREAK": "rope"}, "brrr_break needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_SPIN_NS": "50"}, "brrr_spin_ns needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_SPIN_NS": "0"}, "brrr_spin_ns needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_TWO_SHOT_MIN": "13"}, "brrr_two_shot_min needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_SPIN_NS": "-1"},
+     r"brrr_spin_ns must be unset or an integer in \[0, 1000000\]"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "0"},
+     r"brrr_two_shot_min must be unset or an integer in \[1, 129\]"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "130"},
+     r"brrr_two_shot_min must be unset or an integer in \[1, 129\]"),
     ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_BREAK": "norm"},
      "brrr_break must be unset or 'rope'"),
     ({"FLARE_DS41_BRRR_DENSE_NATIVE": "0"}, "brrr_dense_native=False needs brrr_layers"),
@@ -367,3 +376,40 @@ def test_layer_sets_are_checked_against_the_model():
     replace(RELEASE_CONFIG, brrr_layers=frozenset(range(8)), host_expert_layers=frozenset({3}),
             brrr_parked_max_rows=12).check_layers(8)
     TP3Config().check_layers(6)
+
+
+def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
+    """ROUND2 #6: unset or the kernel default (SPIN_NS 200, TWO_SHOT_MIN 17) = no define = the plain serving build;
+    any other value = defines (spin first, then two-shot) = its own extension name."""
+    from ignition.recipes.deepseek41.brrr import _tuning, kernel_defines
+
+    base = {"FLARE_DS41_BRRR_LAYERS": "0-39", "FLARE_DS41_BRRR_CKPT": "/c"}
+    plain = TP3Config.from_environment(base)
+    assert plain.brrr_spin_ns is None and plain.brrr_two_shot_min is None
+    assert kernel_defines(plain) == () and kernel_defines(TP3Config.from_environment(RELEASE_ENV)) == ()
+    assert _tuning(plain) == {"SPIN_NS": 200, "TWO_SHOT_MIN": 17}
+    explicit = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "200", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "17"})
+    assert explicit.brrr_spin_ns == 200 and kernel_defines(explicit) == ()
+    empty = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "", "FLARE_DS41_BRRR_TWO_SHOT_MIN": ""})
+    assert empty == plain
+    both = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "0", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "129"})
+    assert kernel_defines(both) == ("BRRR_SPIN_NS=0", "BRRR_TWO_SHOT_MIN=129")
+    assert kernel_defines(replace(plain, brrr_spin_trap=True, brrr_two_shot_min=9)) == ("BRRR_SPIN_TRAP=1", "BRRR_TWO_SHOT_MIN=9")
+    assert both.to_metadata()["brrr_spin_ns"] == 0 and plain.to_metadata()["brrr_two_shot_min"] is None
+    assert "brrr_spin_ns=0" in both.describe() and "brrr_spin_ns" not in plain.describe()
+    with pytest.raises(ValueError):
+        TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "fast"})
+    with pytest.raises(ValueError):
+        replace(plain, brrr_spin_ns=True)  # a bool is not an integer value here
+
+
+def test_brrr_check_switches_compares_the_tuning_values():
+    from types import SimpleNamespace
+
+    from ignition.recipes.deepseek41.brrr import check_switches
+
+    config = TP3Config(brrr_layers=frozenset({3}), brrr_ckpt=Path("/c"), brrr_spin_ns=50)
+    check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17), config)
+    for wrong in (dict(SPIN_NS=200, TWO_SHOT_MIN=17), dict(SPIN_NS=50, TWO_SHOT_MIN=9), dict(TWO_SHOT_MIN=17)):
+        with pytest.raises(RuntimeError, match="do not match"):
+            check_switches(SimpleNamespace(SPIN_TRAP=0, **wrong), config)
