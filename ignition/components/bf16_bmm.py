@@ -59,6 +59,13 @@ def _tactics(query):
     tiles = tuple(("triton", *tile) for tile in _TILES
                   if columns % tile[1] == 0 and depth % tile[2] == 0
                   and tile[0] <= max(16, 2 * rows) and 4 * tile[0] >= min(rows, 128))
+    # Fork containment (2026-11-14): FLARE_BF16_BMM_CUBLAS=0 races the Triton tiles only. On SM120 the cuBLAS BF16
+    # strided-batched kernel chosen for GLM's 2-row decode absorption (nvjet_sm120_tst_mma_128x32x32 ...
+    # tmaAB_alignCD4) faulted with a warp illegal address on clean, validated operands, depending on allocation
+    # layout (GLM-KDA-MLA-PIN-ANALYSIS.md 14-15). The candidate set is part of the selection-cache key, so cached
+    # cuBLAS choices are not reused. Default 1 keeps upstream #231's race; shapes without a legal tile keep cuBLAS.
+    if os.environ.get("FLARE_BF16_BMM_CUBLAS", "1") == "0" and tiles:
+        return tiles
     return ("cublas", *tiles)
 
 

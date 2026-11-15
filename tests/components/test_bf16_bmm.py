@@ -50,3 +50,25 @@ def test_fork_switch_offers_cublas_only(monkeypatch):
     assert len(bf16_bmm.CONTRACT.parameters(query, None)["tactic"]) > 1
     monkeypatch.setenv("FLARE_BF16_BMM_TRITON", "0")
     assert bf16_bmm.CONTRACT.parameters(query, None)["tactic"] == ("cublas",)
+
+
+@pytest.mark.parametrize("heads", [16, 24, 32, 64])
+@pytest.mark.parametrize("rows", [1, 2, 3, 6, 12, 16, 48, 96, 128, 512, 2048, 4096])
+@pytest.mark.parametrize("major", ["n", "k"])
+def test_cublas_containment_offers_triton_tiles_for_every_glm_stack(monkeypatch, heads, rows, major):
+    """FLARE_BF16_BMM_CUBLAS=0 (fork containment) races Triton tiles only, and every GLM absorption/expansion stack at
+    every rank count, decode width and prefill slice keeps at least one legal tile."""
+    query = bf16_bmm.query_from_call(*glm_stacks(rows, heads, major))
+    raced = bf16_bmm.CONTRACT.parameters(query, None)["tactic"]
+    monkeypatch.setenv("FLARE_BF16_BMM_CUBLAS", "0")
+    contained = bf16_bmm.CONTRACT.parameters(query, None)["tactic"]
+    assert contained == raced[1:] and contained
+    assert all(tactic[0] == "triton" for tactic in contained)
+
+
+def test_cublas_containment_is_off_by_default_and_keeps_cublas_without_a_tile(monkeypatch):
+    query = bf16_bmm.query_from_call(*glm_stacks(2, 32, "n"))
+    assert bf16_bmm.CONTRACT.parameters(query, None)["tactic"][0] == "cublas"
+    monkeypatch.setenv("FLARE_BF16_BMM_CUBLAS", "0")
+    monkeypatch.setattr(bf16_bmm, "_TILES", ())
+    assert bf16_bmm.CONTRACT.parameters(query, None)["tactic"] == ("cublas",)
