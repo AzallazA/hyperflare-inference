@@ -4,8 +4,8 @@
 # by the DS41 exports) stays unchanged. World-3 pull gather: +7-8 % GLM a16 c1/c4/c8 (2026-11-09, pkg 092215).
 #   tp3-tools/make-b12x-overlay.sh [OUT]     default OUT: <worktree>/.b12x-overlay
 #   VENV=<dir>  venv whose b12x is copied (default <worktree>/.venv)
-#   B12X_OVERLAY_PATCHES="p1 p2"  patches to apply instead of the GLM pull-gather patch (DS41 overlay:
-#     B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/b12x-mla-decode-remainder-stream.patch, see overlay/README.md)
+#   B12X_OVERLAY_PATCHES="p1 p2"  patches to apply instead of the GLM pull-gather patch (DS41 two-shot overlay:
+#     B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch, see overlay/README.md)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 OUT=${1:-$ROOT/.b12x-overlay}
