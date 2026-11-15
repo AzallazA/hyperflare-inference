@@ -470,7 +470,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     if progress is not None:
         progress(tp3.describe())
     # Truncated mini views (tp3.mini, test tooling) have no ratio-1 decoder suffix to compact prefill feedback.
-    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini)
+    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini,
+                              **({"side_stream": True} if tp3.context_side_stream else {}))
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path

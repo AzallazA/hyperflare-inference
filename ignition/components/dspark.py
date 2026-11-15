@@ -139,8 +139,16 @@ class PreparedFeedbackCapture:
 class PreparedContext:
     """Project accepted target feedback into persistent draft context rings."""
 
+    SIDE_PURPOSE = "dspark-context"
+    side_task = None
+
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 cache_format="deepseek_v41", compact_prefill=False):
+                 cache_format="deepseek_v41", compact_prefill=False, side_stream=False):
+        """``side_stream`` (TP3 DS41 ``tp3.context_side_stream``): ``start`` runs the main projection, its norm and
+        the context projection on a side stream as soon as the target feedback exists (they read only it), beside
+        verification and commit; ``__call__(..., pending=...)`` joins before the per-layer norms and cache writes,
+        which need the accepted counts. Same kernels and operands: the draft rings get the same bytes. False = all
+        of it in ``__call__`` (base)."""
         tokens, device = auxiliary.shape[0], auxiliary.device
         self.compact = compact_prefill and metadata.starts.numel() == 1 and metadata.positions.numel() > 128
         if self.compact and tokens != 128:
@@ -165,11 +173,43 @@ class PreparedContext:
             writer = PreparedCompressedCacheWriter(normalized, pool.window(index, draft=True), slots,
                 page_size=128, kind="swa", session=session, name=f"{name}.{index}.write", cache_format=cache_format)
             self.stages.append((norm, writer.functional(session=session)))
+        self.side_task = None
+        if side_stream and not self.compact:
+            from ignition.components.side_streams import register
+
+            if self.norm.add_residual or self.norm.stage_source:
+                raise ValueError("the context side stream runs the plain main norm only")
+            self.side_task = register(self._run_side, self.SIDE_PURPOSE)
 
     def functional(self):
         return self
 
-    def __call__(self, auxiliary, counts, metadata):
+    def _run_side(self, inputs, outputs):
+        """Side stream: the kernels of ``self.context_projection(self.norm(self.project(auxiliary)))``."""
+        auxiliary, = inputs
+        projected, project_workspace, main, kv, kv_workspace, *bases = outputs
+        first = 3 if self.project.allocates_bases else 0
+        project_bases = tuple(bases[:first]) or None
+        kv_bases = tuple(bases[first:]) or None
+        self.project.run_into(auxiliary, projected, project_workspace, encoded_bases=project_bases)
+        norm = self.norm
+        torch.ops.b12x.hyperconnection_grouped_rmsnorm(projected, norm.weight, main, norm.eps, norm.plan.handle,
+                                                       norm.zero_centered)
+        self.context_projection.run_into(main, kv, kv_workspace, encoded_bases=kv_bases)
+
+    def start(self, auxiliary):
+        """Traced: fork the context projections onto the side stream; None when the side stream is off."""
+        if self.side_task is None:
+            return None
+        device = auxiliary.device
+        projected, project_workspace, project_bases = self.project.allocate(device)
+        main = torch.empty(projected.shape, dtype=torch.bfloat16, device=device)
+        kv, kv_workspace, kv_bases = self.context_projection.allocate(device)
+        outputs = [projected, project_workspace, main, kv, kv_workspace, *(project_bases or ()), *(kv_bases or ())]
+        self.side_task.launch(auxiliary, [auxiliary], outputs)
+        return [auxiliary], outputs
+
+    def __call__(self, auxiliary, counts, metadata, *, pending=None):
         m = metadata
         if self.compact:
             offsets = torch.arange(auxiliary.shape[0], device=auxiliary.device)
@@ -186,7 +226,12 @@ class PreparedContext:
             count = counts[m.requests]
             live = (positions >= 0) & (offset < count) & (offset >= (count - 128).clamp_min(0))
             slots = torch.where(live, m.state_rows[m.requests] * 128 + positions % 128, -1)
-        kv = self.context_projection(self.norm(self.project(auxiliary)))
+        if pending is None:
+            kv = self.context_projection(self.norm(self.project(auxiliary)))
+        else:
+            inputs, outputs = pending
+            self.side_task.join(counts, inputs, outputs)
+            kv = outputs[3]
         for index, (norm, writer) in enumerate(self.stages):
             normalized = norm(kv[:, index * 512:(index + 1) * 512])
             self.rotary.apply(normalized, positions.clamp_min(0), compressed=False)

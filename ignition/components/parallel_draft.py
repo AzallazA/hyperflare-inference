@@ -561,6 +561,10 @@ class PreparedParallelDraftRound:
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        # A context that can start its projections early (DS41 tp3.context_side_stream) forks them here, beside
+        # verification; start() returns None (nothing traced) when it does not.
+        start = None if self.context is None else getattr(self.context, "start", None)
+        early = None if start is None else start(auxiliary)
         if self.vocabulary_parallel:
             target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts)
             acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
@@ -583,5 +587,8 @@ class PreparedParallelDraftRound:
         hidden = hidden.view(b, w, o.weights.config.text["hidden_size"])[rows, (counts - 1).long().clamp_min(0)]
         save_hidden(hidden, o.pool.last_hidden, metadata.state_rows, counts > 0)
         if self.context is not None:
-            self.context(auxiliary, counts, metadata)
+            if early is None:
+                self.context(auxiliary, counts, metadata)
+            else:
+                self.context(auxiliary, counts, metadata, pending=early)
         return metadata, acceptance, committed
