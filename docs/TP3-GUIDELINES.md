@@ -272,8 +272,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 5. **Comparing a branch with upstream: fetch first, and look for reverts, not only subjects.** Remote refs in a
    worktree are only as fresh as the last fetch of that repository, and "commit X is in" is true only if no later
    commit reverts it: check `git log --oneline <base>..<branch> | grep -i revert` and `git merge-base --is-ancestor`
-   against a freshly fetched ref. *Incident (11-14):* the fork checkout's `origin/main` was two commits behind the
-   port base 70069281, and the first upstream check said the port carried #285 and 617ef929 because their subjects
+   against a freshly fetched ref. *Incident (11-14):* the `upstream-sync/main` ref had not been fetched and still
+   pointed at the v0.1.0 commit, so the port looked based on the tag when it is 20 commits later (the fork checkout's
+   `origin/main` was two commits behind the port base 70069281 as well), and the first upstream check said the port carried #285 and 617ef929 because their subjects
    matched; the port reverts both (dc2fa0de, 7c4a0ba0) and the G2 preflight checks the binary has no 617ef929 flag.
    Corrected on the status board 6 minutes later.
 
