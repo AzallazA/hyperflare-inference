@@ -365,6 +365,10 @@ impl Bootstrap {
             scheduling_policy.eager_message_offers = value.as_bool()
                 .ok_or("scheduler_eager_message_offers must be a boolean")?;
         }
+        if let Some(value) = object.get("scheduler_prefill_merge_min_rows") {
+            scheduling_policy.prefill_merge_min_rows = value.as_u64().and_then(|v| usize::try_from(v).ok())
+                .ok_or("scheduler_prefill_merge_min_rows must be a nonnegative integer")?;
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
                 .filter(|v| v.is_finite() && *v > 0.0)
@@ -861,6 +865,19 @@ mod tests {
                 overrides["scheduler_eager_message_offers"] = invalid;
                 assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
                     .to_string().contains("scheduler_eager_message_offers"));
+            }
+            assert_eq!(defaults.prefill_merge_min_rows, 0);
+            for rows in [512u64, 0] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_prefill_merge_min_rows"] = rows.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap().server.scheduling_policy;
+                assert_eq!(loaded.prefill_merge_min_rows as u64, rows);
+            }
+            for invalid in [json!(-1), json!(1.5), json!("512"), json!(null)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_prefill_merge_min_rows"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                    .to_string().contains("scheduler_prefill_merge_min_rows"));
             }
             configured["mtp_adaptive_verification_alpha"] = 0.5.into();
             let loaded = Bootstrap::load(&configured.to_string(), &manifest).unwrap();

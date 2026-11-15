@@ -82,6 +82,17 @@ pub struct PolicyConfig {
     /// checkpoint follows within one page (upstream PR #227); false restores the
     /// deferral until exact reuse.
     pub eager_message_offers: bool,
+    /// Fork: a prefill piece shorter than this many tokens joins the pieces after it instead of
+    /// running as its own prefill graph; zero (default) keeps one graph per message piece.
+    ///
+    /// A chunk that starts at the request's own checkpoint (its cached prefix or the
+    /// message boundary it captured last) runs on past every selected message boundary closer
+    /// than this to its start, so that boundary's checkpoint is not captured. The next turn of a
+    /// linear conversation resumes from the prompt end, the terminal checkpoint, or the last
+    /// message (kept whenever the tail merge does not apply to the request), never from such an
+    /// intermediate boundary; a branch at a skipped boundary resumes from the chunk start, which
+    /// is fewer than this many tokens earlier.
+    pub prefill_merge_min_rows: usize,
 }
 
 impl Default for PolicyConfig {
@@ -102,6 +113,7 @@ impl Default for PolicyConfig {
             ttft_order: TtftOrder::Oldest,
             prefill_tail_merge: PrefillTailMerge::ToolsOnly,
             eager_message_offers: true,
+            prefill_merge_min_rows: 0,
         }
     }
 }
@@ -404,11 +416,8 @@ impl RequestScheduler {
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
         let limit = request.prefill_limit();
-        let mut end = request
-            .message_boundaries
-            .get(request.message_boundaries.partition_point(|&n| n <= start))
-            .copied()
-            .unwrap_or(request.prompt_tokens)
+        let mut end = self
+            .prefill_segment_end(request)
             .min(start.saturating_add(capacity))
             .min(limit);
         // Absorb a short final message segment when the whole remainder fits in
@@ -434,6 +443,35 @@ impl RequestScheduler {
             end = span.start;
         }
         end.saturating_sub(start)
+    }
+
+    /// The next selected message boundary after the consumed tokens (or the prompt end); under
+    /// the prefill merge, past boundaries closer than `prefill_merge_min_rows` to a chunk that
+    /// starts at the request's own checkpoint (see `PolicyConfig::prefill_merge_min_rows`). The
+    /// last message is never skipped for a request the tail merge does not apply to: it is the
+    /// checkpoint that request's next turn resumes from.
+    fn prefill_segment_end(&self, request: &LiveRequest) -> usize {
+        let start = request.consumed_tokens as usize;
+        let next = |position: usize| {
+            request
+                .message_boundaries
+                .get(request.message_boundaries.partition_point(|&n| n <= position))
+                .copied()
+                .unwrap_or(request.prompt_tokens)
+        };
+        let mut end = next(start);
+        let rows = self.policy.prefill_merge_min_rows;
+        if rows > 0 && start as u64 == request.prefix_tokens {
+            let kept = if self.policy.prefill_tail_merge.applies(request.tools, request.reasoning_prompt) {
+                None
+            } else {
+                request.message_boundaries.last().copied()
+            };
+            while end < request.prompt_tokens && end - start < rows && Some(end) != kept {
+                end = next(end);
+            }
+        }
+        end
     }
 
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {

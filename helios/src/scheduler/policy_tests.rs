@@ -14,6 +14,8 @@ const MS: u64 = 1_000_000;
 mod planning_tests;
 #[path = "ttft_order_tests.rs"]
 mod ttft_order_tests;
+#[path = "prefill_merge_tests.rs"]
+mod prefill_merge_tests;
 
 #[test]
 fn padding_pruning_keeps_three_requests_on_batch_four_and_two_requests_on_batch_two() {
