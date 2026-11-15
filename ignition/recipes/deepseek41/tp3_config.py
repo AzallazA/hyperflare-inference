@@ -260,6 +260,14 @@ class TP3Config:
     """Vocabulary-parallel speculative rounds read one persistent copy of this rank's global vocabulary ids
     (``copy_columns``, 345 KB) instead of one per round (72 per rank: ~23 MiB). Same values, compared only.
     False = one copy per round (base)."""
+    # --- decode glue, second pass (export-time, bit-identical; round2/glue2 notes) ---
+    glue_pass2: bool = False
+    """Decode/verify/draft graphs drop launches no reader needs: the zero fill of the verification window staging
+    and of the draft window cache (every byte a reader addresses is written first), the draft metadata's state rows
+    realised once instead of per draft layer, the first layer's mHC pre-mix one-hot from one kernel, DSpark's
+    target-layer feedback concatenated once instead of copied slice by slice, and the proposal admission check
+    without in-place mask updates (functional ``&``, fused). Same values. False = today's graphs (base). The
+    MXFP8 MMA-scale padding fills are ``mma_pad_once`` (perf/ds41-launch-merge), not this switch."""
     # --- packed verification graph shapes for exports above 8 slots (bootstrap.PreparationConfig) ---
     packed_keep_batches: int = 0
     """Batches up to N keep exactly the packed verification shapes an export with ``--max-concurrency N`` builds (same
@@ -366,7 +374,7 @@ class TP3Config:
         for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
                      "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual", "mhc_pdl",
-                     "index_side_stream", "context_side_stream", *VRAM_RECLAIM):
+                     "index_side_stream", "context_side_stream", "glue_pass2", *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if type(self.mma_pad_once) is not bool:  # own line: keeps merges with other branches' switch lists clean
@@ -546,6 +554,7 @@ class TP3Config:
             packed_wide_graphs=integer("PACKED_WIDE_GRAPHS"),
             packed_wide_tokens=integer("PACKED_WIDE_TOKENS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
+            glue_pass2=flag("GLUE_PASS2"),
             index_side_stream=flag("INDEX_SIDE_STREAM"),
             engram_side_layers=parse_layers(get("ENGRAM_SIDE_LAYERS")),
             context_side_stream=flag("CONTEXT_SIDE_STREAM"),

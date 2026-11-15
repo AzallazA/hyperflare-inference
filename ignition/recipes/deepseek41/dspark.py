@@ -4,6 +4,8 @@
 
 """Block drafts conditioned on accepted target states, with sequential Markov logits."""
 
+import dataclasses
+
 import torch
 
 from ignition.components.embedding import PreparedEmbedding
@@ -12,7 +14,9 @@ from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, Rotary, normalize
 from .decoder import PreparedLayer, allocate_mma_pads, mma_pad_layouts
+from .decoder import initial_mix
 from .host_embedding import HostRowGather
+from .tp3_config import TP3Config
 
 
 # TP3 tp3.draft_vocab: logit of a token outside the draft vocabulary (finite: block-wise max/LSE stay defined)
@@ -21,6 +25,7 @@ DRAFT_FILL = -1e30
 
 class PreparedDraft:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+    glue_pass2 = False  # TP3 tp3.glue_pass2 (state rows once, functional pre-mix); set per instance
     mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
     draft_columns = None  # TP3 tp3.draft_vocab: local columns of the trimmed draft head; None = full head
 
@@ -39,6 +44,9 @@ class PreparedDraft:
             weights.embedding, metadata.token_ids, scratch.embedding, num_rows=metadata.live_counts[:1],
             session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         rotary = Rotary(weights.config, scratch.embedding.device)
+        # TP3 glue_pass2 (draft layers get no other TP3 switch, as before): see __call__ and PreparedAttention._run.
+        self.glue_pass2 = tp3 is not None and tp3.glue_pass2
+        layer_tp3 = TP3Config(glue_pass2=True) if self.glue_pass2 else None
         page_size = 128 + metadata.max_query_tokens
         self.window_metadata = AttentionIndices(metadata, mode="draft",
             tokens=metadata.positions.numel(), page_size=page_size, width=page_size)
@@ -46,7 +54,7 @@ class PreparedDraft:
             shard=weights.shard, mode="draft", runtime=runtime, coordinator=coordinator,
             session=session, name=f"{name}.layer{i}", workspace=workspace, carry=i > 0,
             defer_post=i + 1 < len(weights.draft.layers), mla_compute_mode=mla_compute_mode,
-            window_metadata=self.window_metadata, examples=examples)
+            window_metadata=self.window_metadata, examples=examples, tp3=layer_tp3)
             for i, layer in enumerate(weights.draft.layers))
         # TP3 (tp3.mma_pad_once): the draft layers share one zero fill per padded MXFP8 MMA-scale tile shape.
         self.mma_pad_layouts = (mma_pad_layouts(layer.attention for layer in self.layers)
@@ -74,11 +82,15 @@ class PreparedDraft:
         self.scratch = self.metadata = self.head_hidden = None
 
     def __call__(self, metadata):
+        if self.glue_pass2:
+            # The draft metadata's state rows are a pointwise expression of the round inputs that every draft
+            # layer's window writer reads through an opaque call; realised once instead of once per layer (same
+            # values: snapshot is a copy).
+            metadata = dataclasses.replace(metadata, state_rows=torch.ops.flare.snapshot(metadata.state_rows))
         embedding = (self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
                      if self.host_rows is None else self.host_rows(metadata.token_ids, metadata.live_counts[:1]))
         incoming = (embedding[:, None, :].expand(-1, 4, -1).contiguous(),)
-        pre_mix = torch.zeros((embedding.shape[0], 4), dtype=torch.float32, device=embedding.device)
-        pre_mix[:, 0].fill_(1)
+        pre_mix = initial_mix(embedding.shape[0], embedding.device, functional=self.glue_pass2)
         indices = self.window_metadata(metadata)
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         mma_pads = allocate_mma_pads(self.mma_pad_layouts, embedding.device)  # TP3 tp3.mma_pad_once; None = off

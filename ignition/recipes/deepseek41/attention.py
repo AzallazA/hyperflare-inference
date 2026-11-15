@@ -377,11 +377,14 @@ class PreparedAttention:
     external_tail = False
     inv_rope_output = None  # exl3/merges.py FLARE_DS41_EXL3_MERGE_ROPEQ (set in __init__ when on)
     index_side = None  # TP3 tp3.index_side_stream: IndexSideChain (decode/verify index layers); None = serial
+    glue_pass2 = False  # TP3 tp3.glue_pass2 (draft window cache without a fill); set per instance
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", window_metadata=None, examples=None, index_side_stream=False):
+                 mla_compute_mode="auto", window_metadata=None, examples=None, index_side_stream=False,
+                 glue_pass2=False):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
+        self.glue_pass2 = glue_pass2  # TP3 tp3.glue_pass2 (see _run); False = base graphs
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
         config = pool.config
@@ -594,7 +597,11 @@ class PreparedAttention:
                    if self.owns_window_metadata else indices)
         position = indices.position
         if window_cache is None:
-            window_cache = self.window if self.mode == "decode" else torch.zeros(
+            # TP3 glue_pass2, draft only: the writer below copies all 128 snapshot records of every request with a
+            # valid state row and stores each live token's record; attention reads only the snapshot records before
+            # the request's start and the live tokens' records (window indices), so no read sees the fill.
+            allocate = torch.empty if self.glue_pass2 and self.mode == "draft" else torch.zeros
+            window_cache = self.window if self.mode == "decode" else allocate(
                 (m.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=source.device)
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])

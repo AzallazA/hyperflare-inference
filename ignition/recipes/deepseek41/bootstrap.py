@@ -307,6 +307,12 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         return None
     from ignition.components.parallel_draft import PreparedParallelDraftRound
 
+    def glue(round_):
+        # TP3 glue_pass2: the round's admission check combines its masks functionally (paged_batch.PreparedBatch).
+        if config.tp3.glue_pass2:
+            round_.validator.functional_validation = True
+        return round_
+
     confidence = None
     if config.draft_tokens:
         from ignition.components.capacity import proposal_shapes
@@ -330,8 +336,8 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
             if batch not in packed_batches:
                 continue
             name = f"proposal{batch}x{depth + 1}"
-            source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
-                proposal_only=True)
+            source = glue(PreparedParallelDraftRound(speculation, batch, depth + 1, name,
+                proposal_only=True))
             source.prepare()
             proposals[batch] = source
     # TP3: the packed verification graphs are built before the width-1 rounds (their verify staging and window
@@ -342,8 +348,8 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
             key=lambda shape: (shape[1], shape[0]), reverse=True):
         logical_width = max(config.speculative_widths)
         target_name = f"verification{batch}x{logical_width}-tokens{packed_tokens}"
-        target = PreparedParallelDraftRound(speculation, batch, logical_width, target_name,
-            generate_proposals=False, target_token_capacity=packed_tokens)
+        target = glue(PreparedParallelDraftRound(speculation, batch, logical_width, target_name,
+            generate_proposals=False, target_token_capacity=packed_tokens))
         target.prepare()
         name = f"packed-speculative{batch}x{logical_width}-drafts{config.draft_tokens}-tokens{packed_tokens}"
         forward = PreparedPackedSpeculativeRound(proposals[batch], target, prefix_limits, confidence.device_view,
@@ -351,7 +357,7 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         packed.append((name, forward, batch, logical_width, packed_tokens))
     for batch, _ in reversed(config.speculative_shapes):
         name = f"speculative{batch}x1"
-        forward = PreparedParallelDraftRound(speculation, batch, 1, name)
+        forward = glue(PreparedParallelDraftRound(speculation, batch, 1, name))
         forward.prepare()
         add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
     for name, forward, batch, logical_width, packed_tokens in packed:

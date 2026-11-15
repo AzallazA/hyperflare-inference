@@ -165,6 +165,19 @@ def _mhc_weights(weights, kind, norm):
                       residual[f"hc_{kind}_base"], residual[norm + ".weight"])
 
 
+def initial_mix(rows, device, *, functional=False):
+    """mHC pre-mix of the first layer: [rows, 4] float32 with column 0 one and the rest zero.
+
+    Base: a zero fill plus an in-place fill of column 0 (a Triton fill and an eager kernel per forward).
+    ``functional`` (TP3 glue_pass2): the same values from one pointwise expression (one Triton kernel).
+    """
+    if not functional:
+        mix = torch.zeros((rows, 4), dtype=torch.float32, device=device)
+        mix[:, 0].fill_(1)
+        return mix
+    return (torch.arange(4, device=device) == 0).to(torch.float32).expand(rows, 4).contiguous()
+
+
 class PreparedDecoderBoundary:
     """Produce complete global KV, then gather the decoder's bounded replay rows."""
 
@@ -257,7 +270,8 @@ class PreparedLayer:
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream)
+            window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream,
+            glue_pass2=tp3.glue_pass2 and mode != "prefill")
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
         # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).
@@ -505,6 +519,7 @@ def configure_engram_side(layers, engram_side_layers, mode):
 
 class PreparedDecoder:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+    glue_pass2 = concatenated_feedback = False  # TP3 tp3.glue_pass2; set per instance
     mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
 
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
@@ -515,6 +530,8 @@ class PreparedDecoder:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
         self.probe = Probe(tp3.probe)
+        # TP3 tp3.glue_pass2 (see __call__): decode/verification graphs only; False = base graphs
+        self.glue_pass2 = tp3.glue_pass2 and mode in ("decode", "verify")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
@@ -548,6 +565,10 @@ class PreparedDecoder:
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = None if encoder_only else torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16,
                                                                device=metadata.positions.device)
+        # TP3 glue_pass2: with every draft target layer in this stack and unpacked rows, the feedback slices are
+        # concatenated once after the layers (one kernel) instead of copied into a buffer one slice at a time.
+        self.concatenated_feedback = (self.glue_pass2 and self.packing is None and bool(self.aux_layers)
+                                      and all(layer < len(weights.layers) for layer in self.aux_layers))
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
         # TP3 (tp3.embed_rows): decode and verification graphs gather the host-parked table's rows with one
         # vectorised launch (host_embedding.py, same values); prefill graphs and the default keep b12x's lookup.
@@ -670,18 +691,22 @@ class PreparedDecoder:
         if self.vision is not None:
             self.vision.inject(metadata, embedding)
         residual = embedding[:, None, :].expand(-1, 4, -1).contiguous()
-        pre_mix = torch.zeros((embedding.shape[0], 4), dtype=torch.float32, device=embedding.device)
-        pre_mix[:, 0].fill_(1)
+        pre_mix = initial_mix(embedding.shape[0], embedding.device, functional=self.glue_pass2)
         incoming = (residual,)
         indices = self.window_metadata(metadata)
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
-        staging = (None if self.staging_shape is None else torch.zeros(
+        # TP3 glue_pass2: every layer's window writer copies the 128 snapshot records of each request with a valid
+        # state row and stores each live token's record before attention reads its slice; attention reads only
+        # those (window indices) and the ring commit only accepted live tokens of rows > 0, so the staging needs no
+        # zero fill (2.8 MB at 1 request, 22.6 MB at 8, per verification round).
+        staging = (None if self.staging_shape is None else (torch.empty if self.glue_pass2 else torch.zeros)(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         # Each draft target layer's feedback is copied into its whole 5120-column slice of every row below
         # (rows match or broadcast); every slice is written when every target layer is in this stack.
-        auxiliary = None if self.encoder_only else (
+        auxiliary = None if self.encoder_only or self.concatenated_feedback else (
             torch.empty if all(layer < len(self.layers) for layer in self.aux_layers) else torch.zeros)(
             self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
+        feedbacks = {}
         suffix, records = None, []
         engram_projected = None  # TP3 tp3.engram_side_layers: projection handed from the previous layer
         mma_pads = allocate_mma_pads(self.mma_pad_layouts, embedding.device)  # TP3 tp3.mma_pad_once; None = off
@@ -703,7 +728,10 @@ class PreparedDecoder:
                 if suffix is not None:
                     feedback = torch.where(suffix.live[:, None], feedback, 0)
                 column = self.aux_layers.index(index)
-                auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
+                if self.concatenated_feedback:
+                    feedbacks[column] = feedback
+                else:
+                    auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
             handoff = None if layer.engram_side is None else []
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
                 boundary=boundary, window_cache=None if staging is None else staging[index],
@@ -715,6 +743,10 @@ class PreparedDecoder:
             self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
             return None
         residual, = incoming
+        if self.concatenated_feedback:
+            auxiliary = torch.cat([feedbacks[column] for column in range(len(self.aux_layers))], dim=1).to(torch.bfloat16)
+            if tuple(auxiliary.shape) != self.auxiliary_shape:
+                raise ValueError("concatenated draft feedback must match the auxiliary rows")
         samples = metadata.sample_indices
         head_residual = residual if self.compact_head else residual[samples]
         head_mix = pre_mix if self.compact_head else pre_mix[samples]

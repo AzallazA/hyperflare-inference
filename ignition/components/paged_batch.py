@@ -205,8 +205,17 @@ class PreparedBatch:
             self.metadata = self.validation_input = self.validation_sum = None
         return self
 
+    # DS41 TP3 glue_pass2 sets True on its speculative rounds' validators: the same masks combined with functional
+    # ``&`` (fused by Inductor) instead of in-place ``&=`` (one eager kernel each), and the validation row built
+    # by one concatenation instead of a zero fill plus two in-place copies. Same values; False = base graphs.
+    functional_validation = False
+
     def validate(self):
         b, r = self.inputs, self.requests
+        functional = self.functional_validation
+
+        def conj(value, term):
+            return value & term if functional else value.__iand__(term)
         device = r.generation.device
         row_ids = torch.arange(self.rows, device=device)
         slot_ids = torch.arange(r.capacity, device=device)
@@ -214,7 +223,7 @@ class PreparedBatch:
         slots = b.row_slot_ids[: self.rows].long()
         safe = slots.clamp(0, r.capacity - 1)
         resident = (row_ids < b.live_rows) & (slots >= 0) & (slots < r.capacity)
-        resident &= b.row_generations[: self.rows] == r.generation[safe]
+        resident = conj(resident, b.row_generations[: self.rows] == r.generation[safe])
         duplicate = ((slots[:, None] == slots[None, :]) & resident[:, None] & resident[None, :]).sum(1) > 1
         lengths = (
             b.query_lengths[: self.rows]
@@ -227,28 +236,31 @@ class PreparedBatch:
         valid = ~duplicate & (b.live_rows <= self.rows) & (lengths > 0) & (lengths <= capacity)
         if self.mode == "decode":
             offered = torch.where(resident & (r.status[safe] == RUNNING), lengths, 0)
-            valid &= offered.sum() <= self.target_token_capacity
-        valid &= (position >= 0) & (end <= b.page_tables.shape[1] * self.page_tokens)
+            valid = conj(valid, offered.sum() <= self.target_token_capacity)
+        valid = conj(valid, (position >= 0) & (end <= b.page_tables.shape[1] * self.page_tokens))
         pages = b.page_tables[safe]
-        valid &= (
+        valid = conj(valid, (
             ((pages >= 0) & (pages < self.pool.memory_capacity[1]))
             | (block_ids >= (end[:, None] + self.page_tokens - 1) // self.page_tokens)
-        ).all(1)
+        ).all(1))
         state = b.request_state_rows[safe, 0]
-        valid &= (state > 0) & (state < self.pool.memory_capacity[0])
+        valid = conj(valid, (state > 0) & (state < self.pool.memory_capacity[0]))
         pending, tokens = r.pending_token[safe], b.token_ids[: self.tokens]
         if self.mode == "prefill":
             offsets = torch.arange(self.tokens, device=device)
             invalid = ((tokens < 0) | (tokens >= self.input_vocabulary)) & (offsets < lengths[0])
-            valid &= (pending < 0) & ~invalid.any()
+            valid = conj(valid, (pending < 0) & ~invalid.any())
             if self.validate_prefill is not None:
-                valid &= self.validate_prefill(tokens, lengths)
+                valid = conj(valid, self.validate_prefill(tokens, lengths))
         else:
-            valid &= (pending >= 0) & (pending < r.vocab_size)
+            valid = conj(valid, (pending >= 0) & (pending < r.vocab_size))
         present = resident & (r.status[safe] == RUNNING)
         bad = present & ~valid
         bad_slots = ((slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
         present_slots = ((slot_ids[:, None] == slots[None, :]) & present[None, :]).any(1)
+        if functional:
+            padding = torch.zeros(max(8, 2 * r.capacity) - 2 * r.capacity, dtype=torch.bool, device=device)
+            return torch.cat((bad_slots, present_slots, padding)).to(torch.bfloat16)[None], present_slots
         validation = torch.zeros((1, max(8, 2 * r.capacity)), dtype=torch.bfloat16, device=device)
         validation[0, :r.capacity].copy_(bad_slots)
         validation[0, r.capacity:2 * r.capacity].copy_(present_slots)
