@@ -126,8 +126,20 @@ class SpeculativePreparation:
         self.scratch = self.draft_scratch = self.kda_records = None
 
     def records(self):
+        """Invocation-local verification records, left uninitialised.
+
+        Their only reader is the accepted-prefix commit of the same round (``commit_state``), which reads
+        record positions ``[0, emitted_count)`` of a request's column-zero state row and skips null rows
+        and zero counts (b12x ``gdn_decode`` commit, ``kda_recovery._commit``). Verification writes, for every
+        request below ``num_seqs`` with a non-null row, every head, value row, key and gate column of
+        positions ``[0, query length)`` of that same row (b12x recording kernel, ``kda_recovery._verify``).
+        Committed rows are live, so below ``num_seqs``; verification and commit both take the query lengths
+        as token limits, which bound emitted_count, and an active row verifies exactly its query length;
+        invalid, dead and inactive rows commit nothing (count 0 or null row). Every record read was
+        therefore written this round; positions past it and other rows stay unread.
+        """
         device = self.pool.backing.device
-        planes = [torch.zeros(shape, dtype=dtype, device=device) for shape, dtype in self.record_layouts]
+        planes = [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in self.record_layouts]
         return KDARecords(self.record_layers, *planes, *self.record_weights)
 
     def draft(self, metadata, name, *, cache_only=False, mode="decode"):

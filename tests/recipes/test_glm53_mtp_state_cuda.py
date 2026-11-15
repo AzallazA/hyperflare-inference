@@ -26,8 +26,11 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("records_fill", [None, 0x7F, 0xFF])
 @torch.no_grad()
-def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
+def test_learned_kda_verification_commits_each_prefix_before_plain_decode(records_fill):
+    """``records_fill`` poisons the record planes before every round: the speculative forward's
+    records are uninitialised (SpeculativePreparation.records), so recycled bytes must never be read."""
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
     manifest = inspect_indexed_checkpoint(snapshot)
@@ -98,6 +101,9 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
         state.recurrent.copy_(initial_r)
         state.convolution.zero_()
         counts.fill_(1)
+        if records_fill is not None:
+            for plane in (records.corrections, records.keys_and_gates):
+                plane.view(torch.uint8).fill_(records_fill)
         graph.replay()
         torch.cuda.synchronize()
         verified = verified_output.float()
@@ -117,6 +123,9 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
             state.recurrent.copy_(initial_r)
             state.convolution.copy_(initial_c)
             counts.fill_(accepted)
+            if records_fill is not None:
+                for plane in (records.corrections, records.keys_and_gates):
+                    plane.view(torch.uint8).fill_(records_fill)
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(state.recurrent[1], expected_r, rtol=.025, atol=.002)
