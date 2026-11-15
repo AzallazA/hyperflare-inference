@@ -68,17 +68,14 @@ def test_gather_int32_ids_and_fp32_tables():
     assert torch.equal(gather(ids, torch.tensor([3], dtype=torch.int32)), reference(weights, ids.long(), 3))
 
 
-def test_noise_row_is_one_device_copy_per_table_and_token():
+def test_noise_row_is_an_independent_device_copy():
     weights = table()
     first = HostRowGather(weights, rows=5, noise_token=NOISE)
-    second = HostRowGather(weights, rows=40, noise_token=NOISE)
-    assert first.noise_row is second.noise_row  # shared by every graph of the rank
-    assert device_noise_row(weights, NOISE) is first.noise_row
+    assert first.noise_row.shape == (1, weights.shape[1]) and first.noise_row.is_contiguous()
     saved = weights[NOISE].clone()
-    assert torch.equal(first.noise_row[0], saved)
+    assert torch.equal(first.noise_row[0], saved) and torch.equal(device_noise_row(weights, NOISE)[0], saved)
     weights[NOISE].fill_(0.5)  # an independent copy
     assert torch.equal(first.noise_row[0], saved)
-    assert HostRowGather(table(), rows=5, noise_token=NOISE).noise_row is not first.noise_row
     assert HostRowGather(weights, rows=5).noise_row is None
 
 

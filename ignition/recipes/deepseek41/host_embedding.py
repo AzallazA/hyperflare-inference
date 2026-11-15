@@ -21,7 +21,6 @@ clamped into that range.
 import torch
 import triton
 import triton.language as tl
-from torch.utils.weak import WeakIdKeyDictionary
 
 from ignition.preparation.persistent import persistent_copy
 
@@ -51,15 +50,10 @@ def _gather_host_rows(table, ids, count, noise_row, out, capacity, table_rows, n
     tl.store(out + row.to(tl.int64) * WIDTH + cols, values, mask=inside)
 
 
-_NOISE_ROWS = WeakIdKeyDictionary()
-
-
 def device_noise_row(table, token):
-    """One device copy of ``table[token]`` per (table, token), shared by every graph of the rank (persistent)."""
-    rows = _NOISE_ROWS.setdefault(table, {})
-    if token not in rows:
-        rows[token] = persistent_copy(table[token:token + 1].contiguous())
-    return rows[token]
+    """A persistent device copy of ``table[token]`` (10 KB at DS41's width). One per graph, made where the graph's other
+    persistent constants are (``CompressedRotary``'s frequency tables), so its lifetime is theirs."""
+    return persistent_copy(table[token:token + 1].contiguous())
 
 
 class HostRowGather:
