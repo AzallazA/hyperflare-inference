@@ -88,8 +88,11 @@ class MLAScratch:
         exchange = min(tokens, SLICE_ROWS) if context_ranks > 1 and not prefill else 0
         # Context-parallel rows absorb, attend and expand one slice at a time; otherwise every row at once.
         absorbed = exchange or (min(tokens, PREFILL_SLICE_ROWS) if prefill else tokens)
-        # One 528-byte record per global position: `blocks` pages of 256 records on every rank.
+        # One 528-byte record per global position: `blocks` pages of 256 records on every rank. The context pull
+        # writes every position below the request's end before attention reads selected positions, all below it,
+        # so the 528 MiB (1M-token) slab stays unfilled instead of zeroed per layer and forward.
         positions = blocks * 256 * context_ranks if prefill else 0
+        slab = torch.empty((positions, 528), dtype=torch.uint8, device=device)
         from ignition.components.head_exchange import pack_width
 
         width = pack_width(context_ranks, heads * context_ranks, 512) if remote and exchange else 0
@@ -100,7 +103,7 @@ class MLAScratch:
             query, zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), expanded,
             buffer(4096), zeros(tokens, dtype=torch.int32), index,
             zeros(exchange, heads * context_ranks, 512), zeros(exchange, heads * context_ranks, 512),
-            zeros(exchange, heads * context_ranks, dtype=torch.float32), zeros(positions, 528, dtype=torch.uint8),
+            zeros(exchange, heads * context_ranks, dtype=torch.float32), slab,
             zeros(exchange if width else 0, width), zeros(exchange if width else 0, width * context_ranks),
             zeros(context_ranks if window else 0, window * 528, dtype=torch.uint8),
             zeros(context_ranks if window else 0, dtype=torch.int64))

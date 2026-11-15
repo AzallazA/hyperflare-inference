@@ -21,6 +21,22 @@ from ignition.preparation.tuning import declare
 _SELECT_ROWS = 512
 
 
+def gather_candidates(gathers, slices, candidates, shape):
+    """Gather every rank's packed FP32 (score, pool) candidates slice by slice into FP32 `shape` rows.
+
+    Each gather writes plain row slices of one BF16 buffer, viewed as FP32 pairs only after the last one.
+    Writing through gathered[start:end].view(torch.bfloat16) of an FP32 buffer instead miscompiles under
+    Inductor (torch 2.14): the reinplaced base of the custom op's output is sized to one slice, so every later
+    slice wrote past it and the merge read unwritten rows (CP prefill rows past the first slices selected
+    garbage, per request and state)."""
+    rows = candidates.shape[0]
+    packed = candidates.view(torch.bfloat16).view(rows, -1)
+    gathered = torch.empty((rows, shape[1] * shape[2] * 2), dtype=torch.bfloat16, device=candidates.device)
+    for gather, (start, end) in zip(gathers, slices, strict=True):
+        gather(packed[start:end], output=gathered[start:end])
+    return gathered.view(torch.float32).view(shape)
+
+
 @dataclass(frozen=True)
 class IndexState:
     cache: torch.Tensor
@@ -276,9 +292,8 @@ class PreparedGlmIndexer:
 
         # Every rank merges identical global candidates, then keeps the records it owns.
         pack_candidates(s.pools, s.scores, s.candidates, self.context.shards)
-        for gather, (start, end) in zip(self.gathers, self.context.slices(s.pools.shape[0]), strict=True):
-            gather(s.candidates[start:end].view(torch.bfloat16).view(end - start, -1),
-                   output=s.gathered[start:end].view(torch.bfloat16).view(end - start, -1))
+        s = replace(s, gathered=gather_candidates(self.gathers, self.context.slices(rows), s.candidates,
+                                                    s.gathered.shape))
         if self.mode == "prefill":
             # Prefill attends over gathered context blocks addressed by global position.
             merge_candidates(s.gathered, s.global_pools)
