@@ -63,23 +63,30 @@ class KDAScratch:
         return self.projected_input.shape[-1] == self.projected_qkv.shape[-1]
 
     @classmethod
-    def allocate(cls, tokens, heads, device, *, split=None):
+    def allocate(cls, tokens, heads, device, *, split=None, forward=False):
+        """Zeroed scratch. With `forward` (one KDA call) the recurrence output is left unfilled: the recurrence
+        kernels write every live row and its only reader, the gated output norm, selects zero for rows at or
+        after the live count without using their values. The other buffers stay zeroed: the convolution writes
+        only live rows while readers may index the rest, and width-one decode writes `gated`, which o_proj reads
+        whole, through a kernel that skips idle rows."""
         if type(tokens) is not int or tokens <= 0 or heads not in HEAD_COUNTS:
             raise ValueError("GLM KDA scratch requires positive capacity and a supported rank-count head partition")
         split = _SIDE_CHAIN if split is None else split
         width = heads * 128
         def buffer(channels):
             return torch.zeros((tokens, channels), dtype=torch.bfloat16, device=device)
+        recurrence = (torch.empty((tokens, width), dtype=torch.bfloat16, device=device) if forward
+                      else buffer(width))
         if split:
             qkv = buffer(3 * width)
             return cls(qkv, qkv, buffer(3 * width), buffer(128), buffer(128), buffer(width), buffer(heads),
-                       buffer(width), buffer(width), buffer(width), buffer(4096))
+                       buffer(width), recurrence, buffer(width), buffer(4096))
         projected = buffer(3 * width + heads + 128)
         qkv, beta, forget = projected.split((3 * width, heads, 128), dim=-1)
         if tokens > 1:
             forget = buffer(128)
         return cls(projected, qkv, buffer(3 * width), forget, buffer(128), buffer(width), beta,
-                   buffer(width), buffer(width), buffer(width), buffer(4096))
+                   buffer(width), recurrence, buffer(width), buffer(4096))
 
     def rows(self, tokens):
         if type(tokens) is not int or not 0 < tokens <= self.output.shape[0]:
@@ -302,7 +309,7 @@ class PreparedGlmKDA:
         if self.recording and records is None:
             raise ValueError("recording KDA execution requires invocation-local records")
         tokens = source.shape[0]
-        scratch = KDAScratch.allocate(tokens, self.heads, source.device, split=self.side_chain)
+        scratch = KDAScratch.allocate(tokens, self.heads, source.device, split=self.side_chain, forward=True)
         if self.side_chain:
             projected_qkv, raw_g, raw_beta, z = self._side_chain_projections(source)
         else:

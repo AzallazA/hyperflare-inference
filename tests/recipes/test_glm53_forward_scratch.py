@@ -91,3 +91,15 @@ def test_mla_scratch_keeps_exchange_and_record_windows_zeroed(poisoned_empty, wo
     # Cross-host staging and record windows keep their zeros.
     assert set(observed.values()) <= {"zero", "none"}, observed
     assert any(v == "zero" for v in observed.values()) == (world > 1)
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_kda_scratch_leaves_only_the_recurrence_output_unfilled(poisoned_empty, split, tokens):
+    from ignition.recipes.glm53.kda import KDAScratch
+
+    heads = Shards.of(3).heads
+    assert set(layout(KDAScratch.allocate(tokens, heads, "cpu", split=split)).values()) == {"zero"}
+    observed = layout(KDAScratch.allocate(tokens, heads, "cpu", split=split, forward=True))
+    assert observed.pop("recurrence") == "unfilled"
+    assert set(observed.values()) == {"zero"}, observed
