@@ -7,6 +7,7 @@ import torch
 from b12x.preparation import PreparedCall
 from b12x.quantization import mla_norm_mxfp8, mxfp8
 
+from ignition.components.linear import mxfp8_dense_bases
 from ignition.preparation.fixtures.projection import input_factory
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tensor_metadata import record_numeric_tensor
@@ -73,8 +74,14 @@ class PreparedMLANormQuant:
 
     def __call__(self, projected):
         if self.query is None:
-            query, kv, *bases = (torch.zeros(shape, dtype=dtype, device=projected.device)
-                                 for shape, dtype in self.layouts)
+            # The kernel (b12x mla_norm_mxfp8, grid = rows x {query, kv}) stores every element of the
+            # query, KV, values and compact scales of each planned row, so those start uninitialised.
+            # It stores MMA scales only for real rows; mxfp8_dense_bases keeps the padding rows the
+            # q_b GEMM loads (whole 128-row scale tiles) zero.
+            (query_shape, query_dtype), (kv_shape, kv_dtype), *encoded = self.layouts
+            query = torch.empty(query_shape, dtype=query_dtype, device=projected.device)
+            kv = torch.empty(kv_shape, dtype=kv_dtype, device=projected.device)
+            bases = mxfp8_dense_bases(encoded, projected.device)
             mla_norm_mxfp8.run(projected, *self.weights, query, kv, *bases, plan=self.plan)
             return query, kv, tuple(bases)
         mla_norm_mxfp8.run(projected, *self.weights, self.query, self.kv,
