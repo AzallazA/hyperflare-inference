@@ -1311,9 +1311,8 @@ the bundled DSpark weights in `mtp.safetensors`. Target experts retain the
 checkpoint's static NVFP4 scales, with A4 activations for prefill and A16
 activations for decoding and speculative verification. DSpark uses MXFP8
 feed-forward projections and BF16 attention and recurrent state. Target and
-draft attention use b12x. The local FlashInfer checkout must provide relative
-bias, private paged-attention tails, and explicit expert activation selection;
-install it using the local-source instructions under environment setup.
+draft attention use b12x. The pinned FlashInfer dependency provides relative
+bias, private paged-attention tails, and explicit expert activation selection.
 
 The recipe declares a 1048576-token context, eight concurrent requests,
 4096-token prefill chunks, and seven draft tokens per round. Adaptive packed
@@ -1346,9 +1345,10 @@ flare-cli/target/release/flare run CACHE_ENTRY --gpus 0,1,2,3 \
 On four RTX PRO 6000 Blackwell Max-Q GPUs, this configuration compiled and
 captured all 130 graphs and passed native text, eight-request concurrency,
 streaming, prefix reuse and branching, tool, structured-response, and multi-image
-tests at the default reasoning effort. Native loading used 87.66 GiB per GPU
-and allocated 1351680 aggregate KV-token slots. Admission is bounded by that
-shared pool as well as the declared per-request context limit. A raw completion
+tests at the default reasoning effort. The captured graph pool uses 1580 MiB
+per GPU. Native loading used 85.72 GiB per GPU and allocated 1761280 aggregate
+KV-token slots. Admission is bounded by that shared pool as well as the declared
+per-request context limit. A raw completion
 with 1048575 repeated input tokens and one generated token passed the context
 capacity check; an over-limit prompt was rejected. Run the default-effort
 serving checks with:
