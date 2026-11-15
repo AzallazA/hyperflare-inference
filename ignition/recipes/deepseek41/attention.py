@@ -205,7 +205,9 @@ class PreparedCompressor:
         state_ids = torch.arange(m.starts.numel(), dtype=torch.int64, device=source.device)
         gates = None
         if self.ratio == 2:
-            pending = {key: torch.zeros((m.starts.numel(), 512) if key != "pending_position" else (m.starts.numel(),),
+            # gather_rows_three stores every column of every request row (one program per row, no row skip),
+            # so the pending state starts uninitialised.
+            pending = {key: torch.empty((m.starts.numel(), 512) if key != "pending_position" else (m.starts.numel(),),
                 dtype=torch.float32 if key != "pending_position" else torch.int64, device=source.device)
                 for key in ("pending_values", "pending_gates", "pending_position")}
             gather_rows_three(tuple(self.pool.region(f"layer{self.layer}.{key}") for key in pending),
