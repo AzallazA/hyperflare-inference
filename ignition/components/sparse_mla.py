@@ -121,9 +121,13 @@ class PreparedSparseMLA:
 
     def __call__(self, query=None, selected=None, cache_lengths=None, selected_lengths=None, *, cache=None):
         if self.output is None:
+            # Output and LSE stay unfilled: _attend ends with output.copy_(result[0]) and, whenever an LSE is
+            # requested (the plan's return_lse, which also makes run() return a tuple), lse.copy_(result[1]).
+            # Both results are [rows, heads, ...] views exactly the shape of these tensors, so every element is
+            # overwritten before any reader. Idle rows are zeroed by b12x in its own scratch result, not here.
             shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
-            lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device).zero_() if self.return_lse else None
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
+            lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device) if self.return_lse else None
             scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
             _attend(query, self.inputs["kv_cache"] if cache is None else cache, selected, cache_lengths,
                     selected_lengths, self.inputs["attention_sink"], output, lse, scratch, self.plan.handle)

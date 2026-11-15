@@ -23,6 +23,7 @@ from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from ignition.components.window_indices import PreparedWindowIndices, WindowIndices
+from ignition.preparation import compilation as _compilation  # noqa: F401 (registers flare::snapshot)
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.scratch import ScratchArena
@@ -90,14 +91,19 @@ class AttentionIndices(PreparedWindowIndices):
         ratios = {}
         if self.ratio_ids:
             pages = m.page_table[m.requests, (position // PAGE_TOKENS).clamp(max=m.page_table.shape[1] - 1)]
+        # The per-row vectors below are pure functions of this forward's metadata that every attention layer
+        # reads through opaque mutating operators. Left as pointwise expressions, Inductor recomputes them into
+        # fresh buffers next to each reader (16 launches per DS41 decode round); flare.snapshot realises each once.
+        # Values are unchanged (snapshot is a copy); the [rows, width] window indices are left as they are.
+        snapshot = torch.ops.flare.snapshot
         for ratio in self.ratio_ids:
             lengths = torch.where(live, (position + 1) // ratio, 0).to(torch.int32)
-            ratios[ratio] = CompressionGeometry(lengths=lengths, index_lengths=lengths.clamp(max=512),
+            ratios[ratio] = CompressionGeometry(lengths=snapshot(lengths), index_lengths=snapshot(lengths.clamp(max=512)),
                 active_width=lengths.amax().view(1),
-                slots=torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1),
-                position=(position + 1) // ratio * ratio - ratio)
-        return AttentionGeometry(window.window_slots, window.window_indices, window.window_lengths,
-                                 window.window_page_size, position, ratios)
+                slots=snapshot(torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1)),
+                position=snapshot((position + 1) // ratio * ratio - ratio))
+        return AttentionGeometry(snapshot(window.window_slots), window.window_indices, snapshot(window.window_lengths),
+                                 window.window_page_size, snapshot(position), ratios)
 
 
 def normalize(source, weight, out, eps):

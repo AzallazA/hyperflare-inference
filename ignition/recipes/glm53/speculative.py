@@ -4,6 +4,8 @@
 
 """Captured GLM proposals, packed target verification and accepted state commits."""
 
+from dataclasses import replace
+
 import torch
 import triton
 import triton.language as tl
@@ -17,6 +19,7 @@ from ignition.components.speculation import (
     PreparedStochasticVerification, SpeculativeRngState,
 )
 from ignition.components.state import gather_rows, save_hidden
+from ignition.preparation import compilation as _compilation  # noqa: F401  (registers flare::snapshot)
 from ignition.preparation.persistent import persistent_copy
 from ignition.components.kda_speculation import PreparedKDAReplay as PreparedRecordedKDAReplay
 
@@ -349,7 +352,11 @@ class PreparedRound:
         m.token_ids.copy_(torch.where(live, candidates.reshape(-1)[source], 0))
         columns = torch.arange(w, device=device)
         m.sample_indices.copy_((starts[:, None] + columns).clamp(0, b * w - 1).reshape(-1))
-        return m
+        # fresh (False: verification never starts a state) and accepted_tokens (1: column zero holds the live row)
+        # are constants here. Inductor re-materialises such a constant for every opaque reader, one fill per KDA
+        # layer; a snapshot realises each once and every layer reads that buffer. The values are unchanged.
+        return replace(m, recurrent=replace(g, fresh=torch.ops.flare.snapshot(g.fresh),
+                                            accepted_tokens=torch.ops.flare.snapshot(g.accepted_tokens)))
 
     def commit_state(self, slots, counts, records, metadata, hidden):
         """Replay accepted KDA records, shift convolution history, and retain endpoint feedback.
