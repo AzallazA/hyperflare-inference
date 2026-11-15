@@ -10,6 +10,7 @@ import torch
 
 from b12x.attention import dsa_indexer
 from b12x.preparation import PreparedCall, plan_from_handle
+from b12x.preparation.types import require_prepared
 
 from ignition.preparation.fixtures import indexer as fixtures
 from ignition.preparation.scratch import planned_scratch, prime_owners
@@ -84,6 +85,8 @@ class PreparedSparseIndexer:
 
     def _finalize_functional(self):
         self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        layout = getattr(require_prepared(self.plan, "attention.dsa_indexer"), "layout", None)
+        self.writes_every_slot = getattr(layout, "route", None) == "paged_fused"
         self.inputs = {"index_k_cache": self.inputs["index_k_cache"]}
         self.output = self.scores = self.binding = self._finalize = None
 
@@ -91,9 +94,18 @@ class PreparedSparseIndexer:
         if self.output is not None:
             return dsa_indexer.run(self.binding)
         shape, stride, dtype = self.output_layout
-        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).fill_(-1)
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
         scores = None if self.score_layout is None else torch.empty_strided(self.score_layout[0], self.score_layout[1],
-            dtype=self.score_layout[2], device=query.device).zero_()
+            dtype=self.score_layout[2], device=query.device)
+        if not self.writes_every_slot:
+            # Tiled and packed-contiguous routes are not audited for whole-output stores: keep the fills.
+            output.fill_(-1)
+            if scores is not None:
+                scores.zero_()
+        # The fused decode route (b12x fused_indexer.py, FP8) stores all top-k slots of every row itself: one CTA
+        # group per query row (grid rows x ctas_per_group, empty rows keep one CTA), and every exit arm writes
+        # [0, topk) with -1 / -inf past the row's survivors (single CTA, unmerged, serial last-CTA and the
+        # cooperative radix arm, whose winners plus pivot ties cover [0, topk)), so the fills would be dead.
         scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
         _select(query, weights, self.inputs["index_k_cache"] if cache is None else cache, page_table,
                 lengths, active_width, output, scores, scratch, self.plan.handle)
