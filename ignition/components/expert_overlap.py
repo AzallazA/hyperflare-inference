@@ -9,7 +9,7 @@ from functools import partial
 
 import torch
 
-from ignition.components.linear import QuantizedProjection
+from ignition.components.linear import QuantizedProjection, mxfp8_dense_bases
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
@@ -253,6 +253,26 @@ class ConcurrentSharedExpert:
     def defer_launch(self, value):
         self.launch_order = int(bool(value))
 
+    def _encoded_bases(self, device):
+        """Invocation-local activation encodings, one segment per projection (``encoding_offsets``).
+
+        Block-FP8 segments are written whole before the GEMM reads them: ``_quantize_out`` fills the
+        values and FP32 scales of the full [rows, columns] source (FlashInfer checks the shapes), and
+        the SM103 transposed copies are ``copy_`` destinations of the same shapes. MXFP8 segments
+        follow ``mxfp8_dense_bases``, which keeps the never-written MMA-scale padding rows zero.
+        """
+        encoded = []
+        for index, quantizer in enumerate(self.quantizers):
+            layouts = self.encoded_layouts[self.encoding_offsets[index]:self.encoding_offsets[index + 1]]
+            if quantizer:
+                encoded.extend(mxfp8_dense_bases(layouts, device))
+            else:
+                encoded.extend(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in layouts)
+        # Layouts no projection segment claims keep the conservative zero fill.
+        encoded.extend(torch.zeros(shape, dtype=dtype, device=device)
+                       for shape, dtype in self.encoded_layouts[len(encoded):])
+        return encoded
+
     def refresh(self, parallel_plans, arena):
         main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in parallel_plans)
         shared_bytes = max(projection.plan.memory_requirements().scratch_nbytes for projection in self.projections)
@@ -263,7 +283,7 @@ class ConcurrentSharedExpert:
             outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
                        for shape, stride, dtype in self.output_layouts]
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
-            encoded = [torch.zeros(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
+            encoded = self._encoded_bases(source.device)
             pending = PendingSharedExpert(source, outputs, workspace, encoded)
             _start_shared_expert(source, self.weights, self.scales, self.gains, self.scale_kinds,
                 outputs, workspace, self.plans, self.activation, self.limit, self.round_silu,

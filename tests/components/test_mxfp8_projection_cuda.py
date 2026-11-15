@@ -354,3 +354,75 @@ def test_packed_rows_reduction_permission(atomic):
                 assert before[counter] == after[counter]
             assert output.eq(fill * 1024).all()
         graph.reset()
+
+
+def _poison(empty, byte):
+    def poisoned(*args, **kwargs):
+        tensor = empty(*args, **kwargs)
+        if tensor.numel():
+            tensor.view(torch.uint8).fill_(byte)
+        return tensor
+    return poisoned
+
+
+@pytest.mark.parametrize("rows", [1, 5, 8, 32, 127, 128, 130])
+@torch.no_grad()
+def test_functional_dense_rows_bases_are_written_before_the_gemm_reads_them(monkeypatch, rows):
+    """Uninitialised values/compact scales (mxfp8_dense_bases) on recycled memory change nothing."""
+    from ignition.components import linear
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(rows)
+    width, features = 512, 256
+    values = (torch.randn((features, width), device=device) * 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 130, (features, width // 32), dtype=torch.uint8, device=device)
+    weight = blockscaled.pack_weight(values, scales, recipe="mxfp8")
+    source = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
+    output = torch.empty((rows, features), dtype=torch.bfloat16, device=device)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="mxfp8-dense-bases",
+            workload_schema=f"dense-bases-{rows}", numerical_policy="floor1e-4", autotune_effort="off") as session:
+        session.register_scratch(arena)
+        projection = QuantizedProjection(source, weight, output, session=session, name="dense",
+            workspace=arena, activation_mode="auto", mxfp8_min_amax=1e-4)
+        quantizer = projection.quantizer_plan
+        projection.functional(session=session)
+        session.tune(show_progress=False)
+        arena.release_preparation()
+    layout = projection.encoded_layout
+
+    # The quantizer covers every value and compact scale, and leaves MMA-scale padding rows untouched.
+    zero = [torch.zeros(shape, dtype=dtype, device=device) for shape, dtype in layout]
+    dirty = [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in layout]
+    for base in dirty:
+        base.view(torch.uint8).fill_(0x7F)
+    mxfp8.quantize_dense_rows(source, *zero, plan=quantizer)
+    mxfp8.quantize_dense_rows(source, *dirty, plan=quantizer)
+    for written, reference in zip(dirty[:2], zero[:2], strict=True):
+        assert torch.equal(written.view(torch.uint8), reference.view(torch.uint8))
+    padding = zero[2].ne(dirty[2])
+    assert padding.any() == (rows % 128 != 0)
+    assert dirty[2][padding].eq(0x7F).all() and zero[2][padding].eq(0).all()
+    # Data for dropping the remaining fill later (kept zero here): does NaN-scale padding reach a row?
+    from b12x import gemm
+
+    workspace = torch.empty(projection.workspace_nbytes, dtype=torch.uint8, device=device)
+    padded = {}
+    for byte in (0x00, 0xFF):
+        dirty[2][padding] = byte
+        result = torch.empty((rows, features), dtype=torch.bfloat16, device=device)
+        gemm.mxfp8_mm_bases(dirty[0], dirty[2], *projection.parts[:2], result, workspace, plan=projection.plan)
+        padded[byte] = result
+    torch.cuda.synchronize()
+    print(f"[padding] rows {rows}: NaN-scale padding {'changes' if not torch.equal(*padded.values()) else 'keeps'}"
+          " the logical output", flush=True)
+
+    expected = projection(source).clone()
+    for byte in (0x7F, 0xFF, 0x00):
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", _poison(torch.empty, byte))
+            patch.setattr(torch, "empty_strided", _poison(torch.empty_strided, byte))
+            actual = projection(source)
+        torch.cuda.synchronize()
+        assert torch.equal(actual, expected), f"poison 0x{byte:02X}"
+    assert expected.isfinite().all()

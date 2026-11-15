@@ -6,7 +6,7 @@
 
 import torch
 
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection, mxfp8_dense_bases
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
@@ -220,8 +220,7 @@ class ConcurrentProjectionChain:
                     _start_preencoded(source, *self.encoded_weights, outputs[0], *encoded_bases,
                                       workspace, self.dense_handle, self.stream_handle)
                 else:
-                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
-                                          for shape, dtype in self.encoded_layouts)
+                    encoded_bases = mxfp8_dense_bases(self.encoded_layouts, source.device)
                     _start_encoded(source, *self.encoded_weights, outputs[0], *encoded_bases, workspace,
                                    self.quantizer_handle, self.dense_handle, self.stream_handle)
             else:
