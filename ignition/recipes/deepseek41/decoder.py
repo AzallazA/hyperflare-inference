@@ -517,7 +517,10 @@ class PreparedDecoder:
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         staging = (None if self.staging_shape is None else torch.zeros(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
-        auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
+        # Each draft target layer's feedback is copied into its whole 5120-column slice of every row below
+        # (rows match or broadcast); every slice is written when every target layer is in this stack.
+        auxiliary = (torch.empty if all(layer < len(self.layers) for layer in self.aux_layers) else torch.zeros)(
+            self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
         for index, layer in enumerate(self.layers):
             boundary = None
