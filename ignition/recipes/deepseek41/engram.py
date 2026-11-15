@@ -255,7 +255,9 @@ class EngramScratch:
 
 class PreparedEngram:
     def __init__(self, layer, weights, tables, source, output, metadata, pool, *, scratch, session, name, workspace,
-                 runtime=None, coordinator=None, examples=None):
+                 runtime=None, coordinator=None, examples=None, max_part_rows=0):
+        # max_part_rows (TP3Config.engram_part_rows): the projection all-reduce's parts are cut at that many rows of its
+        # (rows x 5, 5120) view (a 1024-token chunk at 768: 6 x 768 + 512) instead of halving (8 x 640); 0 = halving.
         self.pool = pool
         tokens, device = metadata.token_ids.numel(), source.device
         mask, gathered, projected = scratch.mask, scratch.gathered, scratch.projected
@@ -295,8 +297,8 @@ class PreparedEngram:
                 session=session, name=name + ".projection" + label, workspace=workspace, activation_mode="auto",
                 examples=examples, example_role="engram.projection" + label).functional(session=session)
             reduce = (PreparedChunkedAllReduce(partial[:rows].view(-1, 5120), projected[:rows].view(-1, 5120),
-                runtime=runtime, session=session, coordinator=coordinator, name=name + ".reduce" + label
-                ).functional(session=session) if self.sharded else None)
+                runtime=runtime, session=session, coordinator=coordinator, name=name + ".reduce" + label,
+                max_part_rows=max_part_rows).functional(session=session) if self.sharded else None)
             self.chunk_ops[rows] = (projection, reduce)
         self.projection, self.reduce = self.chunk_ops[chunk]
         self.norm_weight = weights["weight"].view(-1)

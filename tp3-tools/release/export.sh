@@ -17,6 +17,10 @@
 #   B12X_MLA_DECODE_REMAINDER_STREAM 1 = run each attention decode's 16-head grid on a side stream beside the 8-head
 #            remainder grid (ignition/components/mla_remainder_stream.py; no overlay, no b12x change); unset/0 = serial
 #   FLARE_DS41_AR_PART_ROWS  decoder prefill all-reduce part cap (0 = halving to what the runtime accepts, default)
+#   FLARE_DS41_ENGRAM_PART_ROWS  the same cap for the Engram projection all-reduce (0 = halving, default; 768 = 6 x 768
+#            + 512 per 1024-token chunk instead of 8 x 640)
+#   B12X_MHC_PDL 1 = programmatic dependent launch in b12x's mHC norm kernels (new mHC compile/tuning keys: the prefill
+#            mHC races run again); unset/0 = off (default). Recorded as tp3-config.json mhc_pdl
 #   FLARE_DS41_VISION_HOST  1 (default) = vision tower in host RAM (implied by VISION_STAGE=1); VISION_HOST=0 together
 #            with VISION_STAGE=0 keeps the tower in VRAM, which needs a lower HOT (unmeasured, no longer useful)
 #   PARKED_ROWS  BRRR row gate of the parked layers 20-33 (FLARE_DS41_BRRR_PARKED_MAX_ROWS; default 12 = graphs of at most

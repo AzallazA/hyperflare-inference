@@ -131,7 +131,10 @@ class _Projection:
 class _Reduce:
     created = []
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, max_part_rows):
+        # max_part_rows = TP3Config.engram_part_rows (PreparedEngram's default 0 = halving; part plans are tested in
+        # test_deepseek41_prefill_parts.py)
+        assert max_part_rows == 0
         self.rows, self.name = source.shape[0], name
         _Reduce.created.append(self)
 

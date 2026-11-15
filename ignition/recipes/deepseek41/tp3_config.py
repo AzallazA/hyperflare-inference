@@ -17,6 +17,8 @@ from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
 ENV_PREFIX = "FLARE_DS41_"
+# b12x's own switch for programmatic dependent launch in its mHC kernels; TP3Config records it as ``mhc_pdl``.
+MHC_PDL_ENV = "B12X_MHC_PDL"
 
 # Switches whose code is not on the 2026-11-14 upstream port yet: TP3Config still parses and records them (the release
 # environment keeps its meaning), but preparation refuses a non-default value until the named stage lands
@@ -138,7 +140,17 @@ class TP3Config:
     ar_part_rows: int = 0
     """Decoder attention/MLP all-reduces of more rows than this run in parts of exactly N rows plus a remainder
     (4096 at 768: 5 x 768 + 256) instead of halving to what the runtime accepts (4096 at 1024: 4 x 1024); 0 = halving
-    (base). Engram reductions keep halving. Export-time only (prepared graphs)."""
+    (base). Engram reductions follow ``engram_part_rows``. Export-time only (prepared graphs)."""
+    engram_part_rows: int = 0
+    """The same part cut for the Engram projection all-reduce (its (rows x 5, 5120) view: a 1024-token chunk is 5,120
+    rows, at 768: 6 x 768 + 512 instead of halving to 8 x 640); 0 = halving (base). Separate from ``ar_part_rows`` so
+    the two can be measured apart. Export-time only (prepared graphs)."""
+    mhc_pdl: bool = False
+    """Record of ``B12X_MHC_PDL`` (b12x reads it once, when its mHC kernel module is imported): programmatic dependent
+    launch in the mHC norm kernels. The value is part of every mHC tuning query and compile key, so turning it on
+    compiles new mHC programs and re-races the multi-candidate (prefill) mHC requests. Read from ``B12X_MHC_PDL`` with
+    b12x's rule (unset or "0" = off); preparation refuses a record that disagrees with the imported b12x module.
+    False = off (base)."""
     tp3_graph_gib: float | None = None
     """Override of the per-rank captured-graph estimate for world size 3 (GiB); None = the 8 GiB default."""
     tp3_vocab_parallel: bool = False
@@ -245,14 +257,14 @@ class TP3Config:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "ar_rows", "ar_part_rows", "brrr_parked_max_rows", "engram_chunk_rows",
+        for name in ("hot_experts", "ar_rows", "ar_part_rows", "engram_part_rows", "brrr_parked_max_rows", "engram_chunk_rows",
                      "packed_keep_batches", "packed_wide_graphs", "packed_wide_tokens"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
         for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
-                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual",
+                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual", "mhc_pdl",
                      "index_side_stream", "context_side_stream", *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
@@ -325,6 +337,25 @@ class TP3Config:
         """Planner-side peek at FLARE_DS41_TP3_VOCAB_PARALLEL alone (no validation; generic planner code)."""
         return cls._get(os.environ if environ is None else environ, "TP3_VOCAB_PARALLEL") not in ("", "0")
 
+    @staticmethod
+    def mhc_pdl_from_environment(environ=None) -> bool:
+        """``B12X_MHC_PDL`` exactly as b12x's mHC kernel module reads it (``os.getenv(name, "0") != "0"``: unset or "0"
+        is off, any other value, even "", is on). Not a ``FLARE_DS41_*`` variable: b12x owns the switch, the TP3 record
+        only mirrors it."""
+        return (os.environ if environ is None else environ).get(MHC_PDL_ENV, "0") != "0"
+
+    def check_mhc_pdl(self, compiled=None):
+        """Raise when ``mhc_pdl`` disagrees with b12x's imported value (``compiled``; default: read from the b12x mHC
+        kernel module, importing it). A mismatch means B12X_MHC_PDL changed after b12x was imported, or the config was
+        built from another environment: the record would not describe the compiled mHC programs."""
+        if compiled is None:
+            from b12x.norm.mhc import _kernels
+            compiled = _kernels._MHC_PDL
+        if bool(compiled) != self.mhc_pdl:
+            raise ValueError(f"TP3 config: mhc_pdl={self.mhc_pdl} but b12x's mHC kernels were imported with "
+                             f"{MHC_PDL_ENV} {'on' if compiled else 'off'}; set {MHC_PDL_ENV} before starting the export")
+        return self
+
     @classmethod
     def from_environment(cls, environ=None) -> "TP3Config":
         """Build and validate the whole config from ``FLARE_DS41_*`` variables (``environ`` defaults to
@@ -368,6 +399,8 @@ class TP3Config:
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),
+            engram_part_rows=integer("ENGRAM_PART_ROWS"),
+            mhc_pdl=cls.mhc_pdl_from_environment(env),
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             engram_tables=get("ENGRAM_TABLES", "auto"),
