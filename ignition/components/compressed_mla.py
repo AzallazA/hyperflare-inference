@@ -157,7 +157,12 @@ class PreparedCompressedMLA:
         if self.inputs is not None:
             return self._bound_call()
         shape, stride, dtype = self.output_layout
-        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+        # Unfilled: b12x writes every (row, head, value) of a provided output. Decode always ends in the split
+        # merge (_shared/mla/merge.py), launched on grid (rows, heads, 4 value groups) with unconditional stores;
+        # splits with -inf LSE get weight 0 and are skipped, so idle rows store exact 0. Extend/verify/draft
+        # prefill (prefill_mg.py) runs one CTA per query row over head partitions covering every head; empty
+        # rows store 0. b12x itself allocates this output with torch.empty when the caller gives none.
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
         scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
         _attend(query, self.window if window is None else window, indices, lengths, self.indexed, indexed_indices, indexed_lengths,
                 page_table, self.sink, output, scratch, self.scale, self.plan.handle)
