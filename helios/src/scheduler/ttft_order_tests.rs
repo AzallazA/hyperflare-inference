@@ -8,8 +8,7 @@
 
 use super::*;
 
-/// One simulated round: the step, its estimated duration, and the requests that produced their
-/// first token in it.
+/// One simulated round: the step and its estimated duration.
 type Round = (ScheduledStep, u64);
 
 struct Arrival {
@@ -297,5 +296,19 @@ fn shortest_on_agent_like_turns_of_different_sizes() {
         assert!(mean(&short) <= mean(&old) && p(&short, 0.5) <= p(&old, 0.5), "interleave {interleave}");
         assert!(p(&short, 1.0) <= 1.5 * p(&old, 1.0), "interleave {interleave}");
         assert!(short_turns as f64 >= 0.97 * old_turns as f64, "interleave {interleave}");
+    }
+}
+
+/// The guard's validation loads (one 1.9K probe at a time next to 3-7 decoders, DS41 and GLM
+/// costs) have a single waiting request, so `shortest` reproduces their first-token latencies.
+#[test]
+fn shortest_leaves_the_single_probe_guard_simulations_unchanged() {
+    for decoders in [3, 7] {
+        for (engine, accepted) in [(ds41_engine as fn(usize) -> RequestScheduler, 3), (glm_engine, 1)] {
+            let oldest = simulate_probe_load_on(engine, accepted, ordered(TtftOrder::Oldest, 1, 0), decoders, 30);
+            let shortest = simulate_probe_load_on(engine, accepted, ordered(TtftOrder::Shortest, 1, 0), decoders, 30);
+            assert_eq!(oldest.ttft_ms, shortest.ttft_ms, "decoders {decoders}");
+            assert_eq!(oldest.decoder_tokens_per_s, shortest.decoder_tokens_per_s);
+        }
     }
 }
