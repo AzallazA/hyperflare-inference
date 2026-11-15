@@ -242,3 +242,60 @@ fn shortest_matches_oldest_when_waiting_turns_fit_one_chunk() {
         assert_eq!(oldest.rounds, shortest.rounds, "interleave {interleave}");
     }
 }
+
+/// Eight agents, each sending its next turn as soon as the previous one finishes (64 output
+/// tokens); new prompt work per turn 0.8K-14K tokens (1-4 chunks), as when tool results of very
+/// different sizes join a cached history. Returns (sorted TTFTs in ms, completed turns).
+fn agent_load(order: TtftOrder, interleave: u32, seconds: u64) -> (Vec<f64>, usize) {
+    let mut s = ds41_engine(8);
+    s.configure_policy(ordered(order, interleave, 0)).unwrap();
+    let start = s.now_ns;
+    let mut seed = 12345u64;
+    let mut next_size = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        800 + (seed >> 33) as usize % 13_200
+    };
+    let mut live: Vec<(RequestHandle, u64, bool)> = Vec::new();
+    let mut ttft = Vec::new();
+    let mut turns = 0;
+    let mut id = 1000;
+    while s.now_ns < start + seconds * 1000 * MS {
+        while live.len() < 8 {
+            let h = add(&mut s, id, next_size(), 64);
+            id += 1;
+            live.push((h, s.now_ns, false));
+        }
+        ds41_step(&mut s, 3);
+        for (h, arrival, seen) in &mut live {
+            if !*seen && first_token(&s, *h) {
+                *seen = true;
+                ttft.push((s.now_ns - *arrival) as f64 / 1e6);
+            }
+        }
+        let before = live.len();
+        live.retain(|(h, _, _)| s.request(*h).is_ok());
+        turns += before - live.len();
+    }
+    ttft.sort_by(f64::total_cmp);
+    (ttft, turns)
+}
+
+#[test]
+fn shortest_on_agent_like_turns_of_different_sizes() {
+    for interleave in [1, 2] {
+        let (old, old_turns) = agent_load(TtftOrder::Oldest, interleave, 120);
+        let (short, short_turns) = agent_load(TtftOrder::Shortest, interleave, 120);
+        let p = |v: &[f64], q: f64| v[((q * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        eprintln!("interleave {interleave}: TTFT ms mean/p50/p90/max, turns: oldest {:.0}/{:.0}/{:.0}/{:.0} {old_turns}; \
+            shortest {:.0}/{:.0}/{:.0}/{:.0} {short_turns}",
+            mean(&old), p(&old, 0.5), p(&old, 0.9), p(&old, 1.0), mean(&short), p(&short, 0.5), p(&short, 0.9), p(&short, 1.0));
+        assert!(old.len() > 50 && short.len() > 50);
+        // Shortest-first lowers mean and median TTFT, raises the tail somewhat (bounded by the
+        // owed rounds), and keeps throughput. Recorded 11-15: interleave 1 mean 2312 -> 2142,
+        // p50 2249 -> 1772, p90 3883 -> 4118, max 5210 -> 5825 ms, turns 147 -> 145.
+        assert!(mean(&short) <= mean(&old) && p(&short, 0.5) <= p(&old, 0.5), "interleave {interleave}");
+        assert!(p(&short, 1.0) <= 1.5 * p(&old, 1.0), "interleave {interleave}");
+        assert!(short_turns as f64 >= 0.97 * old_turns as f64, "interleave {interleave}");
+    }
+}
