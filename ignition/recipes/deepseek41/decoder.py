@@ -195,6 +195,9 @@ class PreparedLayer:
     hot_map = None
     brrr = None
     no_engram = False
+    # TP3 tp3.engram_side_layers: the NEXT layer's PreparedEngram whose hidden-state-free part this layer runs on a
+    # side stream (started before this layer's attention, joined before its tail); None = none (base).
+    engram_side = None
     probe, probe_index, probe_mode = Probe(), None, None
 
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
@@ -231,7 +234,7 @@ class PreparedLayer:
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples)
+            window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream)
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
         # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).
@@ -314,17 +317,28 @@ class PreparedLayer:
         if self.concurrent_shared is not None:
             self.shared = None
 
-    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
+                 engram_projected=None, engram_handoff=None):
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
-            selection, boundary=boundary, window_cache=window_cache)
+            selection, boundary=boundary, window_cache=window_cache, engram_projected=engram_projected,
+            engram_handoff=engram_handoff)
         return incoming, next_mix, records, selection
 
-    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
+             engram_projected=None, engram_handoff=None):
+        """TP3 tp3.engram_side_layers: ``engram_projected`` = this layer's Engram projection, already reduced on the
+        side stream by the previous layer; ``engram_handoff`` = a list that receives the next layer's (when this
+        layer is the one that starts it, ``engram_side``)."""
         probe, layer, mode = self.probe, self.probe_index, self.probe_mode
+        if (engram_projected is not None) != (self.engram is not None and self.engram.side_task is not None):
+            raise ValueError("an Engram layer started on the side stream must receive its projection (and only it)")
+        if (engram_handoff is not None) != (self.engram_side is not None):
+            raise ValueError("only the layer before a side-stream Engram layer hands its projection over")
+        side = None if self.engram_side is None else self.engram_side.start_side(incoming[0], metadata)
         if self.engram is not None and self.no_engram:
-            self.engram(incoming[0], metadata)  # debug A/B: readiness wait and lookup run, the result is dropped
+            self.engram(incoming[0], metadata, projected=engram_projected)  # debug A/B: result dropped
         elif self.engram is not None:
-            incoming = (self.engram(incoming[0], metadata),)
+            incoming = (self.engram(incoming[0], metadata, projected=engram_projected),)
         if len(incoming) == 1:
             probe.record(incoming[0], layer, 0, mode)
         if boundary is None:
@@ -335,6 +349,10 @@ class PreparedLayer:
         attention_normalized = normalized
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
             indices=indices, window_cache=window_cache)
+        if side is not None:
+            # Before the tail: BRRR (persistent, cross-rank) and the attention reduction read ``attended``, which the
+            # join declares written, so neither can be scheduled before it.
+            engram_handoff.append(self.engram_side.finish_side(side, attended))
         if self.brrr is not None:
             # TP3 BRRR: ``attended`` is the attention output before inverse RoPE (attention.external_tail); the kernel
             # runs inverse RoPE .. MLP all-reduce and returns what Flare's path below would.
@@ -376,6 +394,23 @@ class PreparedLayer:
         observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route.ids,
                              "output": incoming[0]})
         return incoming, next_mix, records, selection, observations
+
+
+def configure_engram_side(layers, engram_side_layers, mode):
+    """TP3 tp3.engram_side_layers: Engram layer L's readiness wait, lookup, projection and reduction run on a side
+    stream during layer L-1's attention, in decode/verify graphs (prefill keeps them in place). Marks the starting
+    layers; raises for a named layer that is not an Engram layer after the first."""
+    if mode not in ("decode", "verify"):
+        return
+    for index in sorted(engram_side_layers):
+        engram = layers[index].engram if index < len(layers) else None
+        if engram is None or index == 0:
+            raise ValueError(f"TP3 config: engram_side_layers names layer {index}, which is not an Engram layer "
+                             "after the first (the side stream starts in the previous layer)")
+        previous = layers[index - 1]
+        if previous.boundary is not None or previous.engram_side is not None or previous.engram is not None:
+            raise ValueError(f"TP3 config: engram_side_layers cannot start layer {index}'s Engram in layer {index - 1}")
+        previous.engram_side = engram.enable_side()
 
 
 class PreparedDecoder:
@@ -475,6 +510,7 @@ class PreparedDecoder:
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, tp3=tp3, probe=self.probe))
             carry = defer
+        configure_engram_side(self.layers, tp3.engram_side_layers, mode)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
             logits_dtype=torch.float32)
@@ -534,6 +570,7 @@ class PreparedDecoder:
         auxiliary = (torch.empty if all(layer < len(self.layers) for layer in self.aux_layers) else torch.zeros)(
             self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
+        engram_projected = None  # TP3 tp3.engram_side_layers: projection handed from the previous layer
         for index, layer in enumerate(self.layers):
             boundary = None
             if layer.boundary is not None:
@@ -550,8 +587,11 @@ class PreparedDecoder:
                     feedback = torch.where(suffix.live[:, None], feedback, 0)
                 column = self.aux_layers.index(index)
                 auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
+            handoff = None if layer.engram_side is None else []
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
-                boundary=boundary, window_cache=None if staging is None else staging[index])
+                boundary=boundary, window_cache=None if staging is None else staging[index],
+                engram_projected=engram_projected, engram_handoff=handoff)
+            engram_projected = handoff[0] if handoff else None
             records.append(record)
         residual, = incoming
         samples = metadata.sample_indices

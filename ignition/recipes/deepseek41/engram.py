@@ -307,13 +307,85 @@ class PreparedEngram:
             run=lambda: state.launch(source.view(tokens, -1)[:chunk], projected, self.norm_weight,
                                       mask[:chunk], output.view(tokens, -1)[:chunk], eps=self.eps))),))
 
-    def __call__(self, source, metadata):
+    # --- TP3 (tp3.engram_side_layers): the hidden-state-free part on a side stream, started one layer early ---
+    # Readiness wait + lookup + column gather + projection + all-reduce read only this round's staged rows (hashed
+    # at the start of the target forward) and constants, never the hidden state; only the mix needs it. The decoder
+    # starts them at the beginning of the previous layer (right after its predecessor's tail) and joins them after
+    # that layer's attention, before its BRRR tail / attention reduction: the window between two tails runs no
+    # collective on the main stream, so the side stream may use the shared all-reduce runtime (one channel, every
+    # use still totally ordered and in the same order on every rank) and a spinning reduction never shares the GPU
+    # with BRRR's persistent kernel. Same kernels, plans and arguments; the mix then runs where it always did.
+
+    SIDE_PURPOSE = "ds41-engram"
+
+    def enable_side(self):
+        """Register the side task (decode/verify graphs: one projection chunk)."""
+        from ignition.components.side_streams import register
+
+        if self.chunked or len(self.bounds) != 1:
+            raise ValueError("the Engram side stream needs a graph that projects in one chunk (decode/verify)")
+        if not self.sharded:
+            raise ValueError("the Engram side stream is for tensor-parallel ranks (it moves the reduction too)")
+        self.side_task = register(self._run_side, self.SIDE_PURPOSE, self.columns.device)
+        return self
+
+    side_task = None
+
+    def _run_side(self, inputs, outputs):
+        """Side stream: exactly the kernels of ``__call__``'s one-chunk path up to the mix."""
+        from ignition.components.engram import _lookup
+
+        anchor, count = inputs
+        gathered, barrier_input, barrier_output, local, partial, workspace, projected, *bases = outputs
+        lookup, wait = self.lookup, self.lookup.wait
+        _lookup(anchor, lookup.weights, lookup.scales, lookup.hashes, count, gathered, wait.timings.timestamps,
+                wait.timings.frame, barrier_input, barrier_output, wait.interval, wait.handle, lookup.plan.handle,
+                lookup.handle)
+        torch.index_select(gathered, 1, self.columns, out=local)
+        self.projection.run_into(local, partial, workspace, encoded_bases=tuple(bases) if bases else None)
+        flat_in, flat_out = partial.view(-1, 5120), projected.view(-1, 5120)
+        for (begin, end), part in zip(self.reduce.bounds, self.reduce.parts, strict=True):
+            part(flat_in[begin:end], flat_out[begin:end])
+
+    def start_side(self, anchor, metadata):
+        """Traced, main stream: allocate every side buffer (as ``__call__`` would), fork after ``anchor`` (the
+        previous layer's input). Returns the pending operands for ``finish_side``."""
+        tokens, device = anchor.shape[0], anchor.device
+        shape, dtype = self.lookup.output_layout
+        gathered = torch.zeros(shape, dtype=dtype, device=device)
+        barrier_input, barrier_output = self.lookup.wait.operands(anchor)
+        local = torch.empty((tokens, self.columns.numel()), dtype=gathered.dtype, device=device)
+        partial, workspace, bases = self.projection.allocate(device)
+        projected = torch.empty((tokens, 25600), dtype=partial.dtype, device=device)
+        outputs = [gathered, barrier_input, barrier_output, local, partial, workspace, projected, *(bases or ())]
+        inputs = [anchor, metadata.live_counts[:1]]
+        self.side_task.launch(anchor, inputs, outputs)
+        return inputs, outputs
+
+    def finish_side(self, pending, attended):
+        """Traced, main stream: join after ``attended``'s producer and before its readers (it is declared written,
+        so the BRRR tail / attention reduction that reads it is ordered after the join). Returns the projection."""
+        inputs, outputs = pending
+        self.side_task.join(inputs[0], inputs, [*outputs, attended])
+        return outputs[6]
+
+    def __call__(self, source, metadata, *, projected=None):
+        """``projected`` (TP3 tp3.engram_side_layers): the reduced projection the side stream produced; only the mix
+        runs here then. None = the whole Engram layer here (base)."""
         tokens = source.shape[0]
         if tokens != self.bounds[-1][1]:
             # The chunks tile exactly the declared rows: a wider source would leave its extra rows zero, a narrower one
             # would slice past its end (the one-pass mix used to refuse it by its capacity check).
             raise ValueError(f"Engram forward got {tokens} rows; it was declared for {self.bounds[-1][1]}")
         mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
+        if projected is not None:
+            if self.side_task is None or len(self.bounds) != 1:
+                raise ValueError("a precomputed Engram projection needs the side stream (one chunk)")
+            output = torch.zeros_like(source)
+            (begin, end), = self.bounds  # the same operands as the one-chunk loop below
+            hyperconnection.run_engram_mix(source.view(tokens, -1)[begin:end], projected, self.norm_weight,
+                eps=self.eps, plan=self.mix_plan, out=output.view(tokens, -1)[begin:end], token_mask=mask[begin:end])
+            return output
         gathered = self.lookup(source, metadata.live_counts[:1])
         output = torch.zeros_like(source)
         state, mixed = source.view(tokens, -1), output.view(tokens, -1)
