@@ -57,7 +57,10 @@ class PreparedGroupedOutputProjection:
         output, scratch = self.output, self.scratch
         if output is None:
             shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+            # b12x's WO projection stores every [tokens, hidden] element: its WO-B GEMMs (plain or fused-quant
+            # dense GEMM) write whole outputs or, for atomic BF16 split-K, zero the output inside the launch
+            # (_lib/dense_gemm execution/preparation; WO projection never passes a precleared output).
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
             scratch, = (torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.scratch_layout)
         wo_projection.run_out(source, self.weights, out=output, scratch=scratch, plan=self.plan)
         return output

@@ -114,8 +114,14 @@ class PreparedMXFP4Indexer:
         if self.arguments is None:
             def allocate(name, fill):
                 layout = self.layouts[name]
-                return None if layout is None else torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=query.device).fill_(fill)
-            packed, scales = allocate("q_mxfp4", 0), allocate("q_scales", 127)
+                if layout is None:
+                    return None
+                tensor = torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=query.device)
+                return tensor if fill is None else tensor.fill_(fill)
+            # _quantize stores every packed byte and scale of every query row (b12x dsa_indexer mxfp4 _Quantize:
+            # one warp per 32-value group, rows x 4 groups, 16 data bytes + 1 scale each) before _select reads
+            # them. Selection outputs keep their sentinels (-1 indices, zero counts): _select may leave entries.
+            packed, scales = allocate("q_mxfp4", None), allocate("q_scales", None)
             output = allocate("output_indices", -1)
             candidates_out, counts_out = allocate("candidate_output", -1), allocate("candidate_output_lengths", 0)
             scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)

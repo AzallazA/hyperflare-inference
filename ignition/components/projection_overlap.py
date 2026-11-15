@@ -6,7 +6,7 @@
 
 import torch
 
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection, mxfp8_dense_bases
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
@@ -210,7 +210,11 @@ class ConcurrentProjectionChain:
 
     def start(self, source, *, encoded_bases=None):
         if self.projections is None:
-            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+            # Every chain output is written whole before anything reads it: b12x's BF16 GEMVs and the
+            # SM103 dense GEMM store every [M,N] element, and the blockscaled/MXFP8 dense GEMMs either
+            # store every element or, for atomic split-K, zero their output themselves before
+            # accumulating (b12x _lib/dense_gemm). The prepared chain reused these outputs unzeroed.
+            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
                        for shape, stride, dtype in self.output_layouts]
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
             if self.encoded_layouts is not None:
@@ -220,8 +224,7 @@ class ConcurrentProjectionChain:
                     _start_preencoded(source, *self.encoded_weights, outputs[0], *encoded_bases,
                                       workspace, self.dense_handle, self.stream_handle)
                 else:
-                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
-                                          for shape, dtype in self.encoded_layouts)
+                    encoded_bases = mxfp8_dense_bases(self.encoded_layouts, source.device)
                     _start_encoded(source, *self.encoded_weights, outputs[0], *encoded_bases, workspace,
                                    self.quantizer_handle, self.dense_handle, self.stream_handle)
             else:

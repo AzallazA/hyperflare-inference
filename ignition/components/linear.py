@@ -210,6 +210,23 @@ class UnquantizedProjection:
         return bf16_gemv.mm(source, self.weight, out=output, plan=self.plan, bias=self.bias)
 
 
+def mxfp8_dense_bases(layout, device):
+    """Invocation-local bases for ``mxfp8.quantize_dense_rows``: values, compact scales, MMA scales.
+
+    The quantizer writes every element of the [M,K] values and the [1,M,K/32] compact scales
+    (each row below M, every K/32 group; dense rows require K % 128 == 0, so no K padding), so
+    those two start uninitialised. It writes the MMA scales only for rows below M, while the GEMM
+    loads whole 128-row scale tiles: rows M..ceil128(M) are padding nothing writes. Those keep the
+    zero the prepared (non-functional) bases always held, unless M fills its tiles exactly.
+    """
+    (values_shape, values_dtype), (rows_shape, rows_dtype), (mma_shape, mma_dtype) = layout
+    rows = values_shape[0]
+    mma = torch.empty if rows % 128 == 0 else torch.zeros
+    return (torch.empty(values_shape, dtype=values_dtype, device=device),
+            torch.empty(rows_shape, dtype=rows_dtype, device=device),
+            mma(mma_shape, dtype=mma_dtype, device=device))
+
+
 class QuantizedProjection:
     def __init__(
         self,
@@ -465,8 +482,7 @@ class QuantizedProjection:
                 if self.encoded is not None:
                     encoded_bases = self.encoded_bases
                 elif self.quantizer_plan is not None:
-                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
-                                          for shape, dtype in self.encoded_layout)
+                    encoded_bases = mxfp8_dense_bases(self.encoded_layout, source.device)
                 else:
                     raise ValueError("functional preencoded projection requires encoded_bases")
             if self.quantizer_plan is not None:
