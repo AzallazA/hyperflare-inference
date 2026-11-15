@@ -243,7 +243,9 @@ def test_metadata_record_is_json_ready_and_complete():
     from dataclasses import fields
 
     record = TP3Config.from_environment(RELEASE_ENV).to_metadata()
-    assert set(record) == {item.name for item in fields(TP3Config)}
+    from ignition.recipes.deepseek41.tp3_config import RECORDED_WHEN_SET
+
+    assert set(record) == {item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET)
     assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"
     counts, counts_digest = record["expert_counts_dir"].split("#")
     assert counts == "expert-order" and (counts_digest == "missing" or len(counts_digest) == 12)
@@ -395,7 +397,9 @@ def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
     both = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "0", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "129"})
     assert kernel_defines(both) == ("BRRR_SPIN_NS=0", "BRRR_TWO_SHOT_MIN=129")
     assert kernel_defines(replace(plain, brrr_spin_trap=True, brrr_two_shot_min=9)) == ("BRRR_SPIN_TRAP=1", "BRRR_TWO_SHOT_MIN=9")
-    assert both.to_metadata()["brrr_spin_ns"] == 0 and plain.to_metadata()["brrr_two_shot_min"] is None
+    # recorded only when set: a default export's record is the 151744 reference's, key for key
+    assert both.to_metadata()["brrr_spin_ns"] == 0 and both.to_metadata()["brrr_two_shot_min"] == 129
+    assert "brrr_spin_ns" not in plain.to_metadata() and "brrr_two_shot_min" not in plain.to_metadata()
     assert "brrr_spin_ns=0" in both.describe() and "brrr_spin_ns" not in plain.describe()
     with pytest.raises(ValueError):
         TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "fast"})

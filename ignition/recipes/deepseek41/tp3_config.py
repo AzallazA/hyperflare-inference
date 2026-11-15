@@ -35,6 +35,10 @@ VRAM_RECLAIM = {
     "share_vocab_columns": "SHARE_VOCAB_COLUMNS",
 }
 
+# Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
+# record of a default export stays the reference's (the quick/combined chains require an identical record).
+RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min")
+
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
 
@@ -422,11 +426,13 @@ class TP3Config:
         return self.engram_tables == "auto" and world == 3
 
     def to_metadata(self) -> dict:
-        """JSON-ready record of every switch: layer sets as ``"20-33"`` strings; the two paths as basename plus a
+        """JSON-ready record of every switch (RECORDED_WHEN_SET ones only when set): layer sets as ``"20-33"`` strings; the two paths as basename plus a
         short content fingerprint (never an absolute path, so the record can live in a package or a report)."""
         record = {}
         for item in fields(self):
             value = getattr(self, item.name)
+            if item.name in RECORDED_WHEN_SET and value is None:
+                continue  # kernel default: absent, so a default export's record (tp3-config.json) is unchanged
             if isinstance(value, frozenset):
                 value = format_layers(value)
             elif item.name == "expert_counts_dir":
