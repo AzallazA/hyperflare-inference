@@ -22,6 +22,22 @@ from .speculation import (
 from .state import save_hidden
 
 
+def vocabulary_columns(owner, width, start, device):
+    """``arange(width) + start`` (int64) in persistent storage: this rank's global vocabulary ids.
+
+    Each vocabulary-parallel round compares copied-history token ids with it (``_apply_copied_proposals``; read
+    only). Base: one copy per round. TP3 fork: an owner with ``share_vocabulary_columns`` (DS41
+    tp3.share_vocab_columns) keeps one persistent tensor per (width, start, device) for all of its rounds: same
+    values, and persistent storage lives as long as the core storage that prepares every round."""
+    if not getattr(owner, "share_vocabulary_columns", False):
+        return persistent_copy(torch.arange(width, device=device) + start)
+    key = (int(width), int(start), torch.device(device))
+    cache = owner.vocabulary_columns
+    if key not in cache:
+        cache[key] = persistent_copy(torch.arange(width, device=device) + start)
+    return cache[key]
+
+
 def prepare_sampling_broadcasts(proposals, verification, *, collectives, session, name, result_runtime=None):
     """Synchronize proposals before dependent work and acceptance before state commits."""
     operations = [(f"proposal{index}", proposal) for index, proposal in enumerate(proposals)]
@@ -329,8 +345,8 @@ class PreparedParallelDraftRound:
         copy_start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         # A constant of the shared forwards: persistent storage, as upstream's vocabulary offsets
         # (preparation may build this inside a transient pool).
-        self.copy_columns = persistent_copy(
-            torch.arange(self.probabilities.shape[-1], device=self.probabilities.device) + copy_start)
+        self.copy_columns = vocabulary_columns(o, self.probabilities.shape[-1], copy_start,
+                                               self.probabilities.device)
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         options = dict(start=start, runtime=o.sampling_runtime, session=o.session,

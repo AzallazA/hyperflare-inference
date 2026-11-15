@@ -55,7 +55,7 @@ from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
-from .tp3_config import TP3Config
+from .tp3_config import TP3Config, VRAM_RECLAIM
 from .config import ModelConfig
 from .weights import ModelWeights, vision_host_parked
 
@@ -349,6 +349,35 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
     return confidence
 
 
+def vocabulary_channels(config, sample_rows):
+    """Rows of the FP32 vocabulary all-gather channel and whether the BF16 draft-vocabulary channel exists (PCIe).
+
+    Base: ``sample_rows`` rows (every verification sample) and a draft channel whenever DSpark drafts. TP3 VRAM
+    reclaim, only with vocabulary-parallel sampling (every speculative target and draft head is then local-only,
+    ``gather=False``): ``tp3.trim_vocab_gather`` sizes the channel for the gathers left on it (prefill heads 1 row,
+    resume heads and the non-speculative decode heads ``max(batch_capacities)`` rows; their sampling broadcasts need
+    one row), and ``tp3.skip_draft_vocab_gather`` drops the draft channel (its only user is the DSpark proposal
+    head's gather). A declaration needing more rows fails PreparedAllGather's row check at export, never silently."""
+    tp3, parallel = config.tp3, config.vocabulary_parallel_sampling
+    rows = sample_rows
+    if tp3.trim_vocab_gather and parallel:
+        rows = min(sample_rows, max(1, *config.batch_capacities))
+    return rows, bool(config.dspark) and not (tp3.skip_draft_vocab_gather and parallel)
+
+
+def vram_reclaim_report(config, verification_samples):
+    """Effective TP3 VRAM reclaim choices (memory report and export progress): the switches' requests resolved
+    against this export's sampling mode, so a package states what it was built with, not only what was asked."""
+    tp3 = config.tp3
+    sample_rows = max(verification_samples, config.request_capacity * config.draft_tokens)
+    rows, draft_channel = vocabulary_channels(config, sample_rows)
+    return {"share_engram_token_map": tp3.share_engram_token_map,
+            "vocabulary_gather_rows": rows, "vocabulary_gather_rows_base": sample_rows,
+            "draft_vocabulary_gather": draft_channel,
+            "share_vocab_columns": tp3.share_vocab_columns and bool(config.dspark)
+                                   and config.vocabulary_parallel_sampling}
+
+
 def _collective_runtimes(config, group, device, *, coordinator, core_storage, verification_samples):
     """Share one RoCE channel across ordered graph collectives on separate hosts."""
     tokens = max(config.prefill_chunk_size, config.decode_tokens, config.request_capacity * config.draft_tokens)
@@ -394,10 +423,11 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         prefill = create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
-    vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
+    vocabulary_rows, draft_vocabulary_channel = vocabulary_channels(config, sample_rows)
+    vocabulary = create_all_gather_runtime(group, device, max_rows=vocabulary_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
     draft_vocabulary = (create_all_gather_runtime(group, device, max_rows=sample_rows,
-        columns=local_vocab * len(config.devices), ipc=ipc) if config.dspark else None)
+        columns=local_vocab * len(config.devices), ipc=ipc) if draft_vocabulary_channel else None)
     result = create_result_broadcast_runtime(group, device, layouts=layouts, ipc=ipc) if layouts else None
     return collective, prefill, vocabulary, result, draft_vocabulary
 
@@ -466,6 +496,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         coordinator = CollectivePreparation(group)
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)
+        if progress is not None and any(getattr(tp3, name) for name in VRAM_RECLAIM):
+            progress("TP3 VRAM reclaim (PCIe channels): " + ", ".join(
+                f"{name}={value}" for name, value in vram_reclaim_report(config, verification_samples).items()))
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             verification_samples=verification_samples)
@@ -477,7 +510,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             logprob_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
                 group, device, max_rows=verification_samples, columns=512 * shard.world_size,
                 ipc=core_storage.peer_storage))
-        tables = replace(tables, readiness_runtime=collective)
+        # TP3 tp3.share_engram_token_map: set before any graph reads device_token_map (a cached property per instance).
+        tables = replace(tables, readiness_runtime=collective, share_token_map=tp3.share_engram_token_map)
         identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
@@ -542,6 +576,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
+                share_vocabulary_columns=tp3.share_vocab_columns,
                 forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 
@@ -761,7 +796,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),
         "tuning": tuning, "compiled_decoder": config.compile_decoder,
         # TP3 fork: the switches this rank was prepared with (also written beside the package as tp3-config.json).
-        "tp3_config": tp3.to_metadata()}
+        "tp3_config": tp3.to_metadata(),
+        # TP3 VRAM reclaim: what the switches did on this rank (the record above states what was asked for).
+        "tp3_vram_reclaim": vram_reclaim_report(config, verification_samples)}
     if scoring is not None:
         memory.update(scoring.memory_report())
     memory["draft_prefix_selection"] = config.draft_prefix_selection

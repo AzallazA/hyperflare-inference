@@ -56,6 +56,40 @@ class EngramInputs:
         return {f"engram_{layer}_{name}": getattr(self, name) for name in ("weights", "scales", "hashes")}
 
 
+def share_hash_token_map(plan, token_map):
+    """Make a b12x Engram hash plan's materialized state read ``token_map`` instead of its own copy.
+
+    TP3 fork (DS41 ``tp3.share_engram_token_map``). b12x's hash ``materialize`` builds a private int64 device copy of
+    the token map per plan (1 MiB; two Engram layers per graph). The map is a read-only constant: the compress kernel
+    only loads from it and the binding's mutation-alias contract lists it read-only. Every plan of a rank receives
+    the same values, so they can all read one persistent tensor (``Tables.device_token_map``, which the graphs'
+    history lookups already read and the package already restores). The plan's own copy is released as soon as
+    ``materialize`` returns; the caching allocator hands its block to the next plan's (equally transient) copy.
+    No b12x source file changes (kernel fingerprints and compile/discovery keys stay put)."""
+    from dataclasses import replace
+
+    if plan.query.operation != "hash":
+        raise ValueError("only Engram hash plans own a token map")
+    if (token_map.dtype != torch.int64 or token_map.ndim != 1 or not token_map.is_contiguous()
+            or token_map.numel() != plan.query.vocab_size or token_map.device != plan._device):
+        raise ValueError("a shared Engram token map must be a contiguous int64 vector of the plan's vocabulary "
+                         "on the plan's device")
+    original = plan._materialize
+
+    def materialize(selection, device):
+        state = original(selection, device)
+        own = state.token_map
+        # Bit-identity at export: the plan's own copy (b12x's construction) must equal the shared tensor.
+        if own.shape != token_map.shape or own.dtype != token_map.dtype or not torch.equal(own, token_map):
+            raise ValueError("a shared Engram token map differs from the plan's own token map")
+        return replace(state, token_map=token_map)
+
+    # Plans are frozen; replacing the callback before declaration keeps the plan's identity (its handle and
+    # persistent-memory key) and its query, so selection and compile caches see the same declaration.
+    object.__setattr__(plan, "_materialize", materialize)
+    return plan
+
+
 class PreparedEngramLookup:
     def __init__(self, inputs, output, count, *, layer, token_map, geometry, session, name,
                  runtime=None, coordinator=None):
@@ -100,7 +134,7 @@ class PreparedEngramRequests:
     """Hash packed token rows on the GPU and release their mapped delivery mailbox."""
 
     def __init__(self, inputs, token_ids, starts, history, counts, mailbox, sequence, *,
-                 layer, token_map, geometry, session, name, row_mapping=None):
+                 layer, token_map, geometry, session, name, row_mapping=None, shared_token_map=None):
         tokens, rows = token_ids.numel(), history.shape[0]
         device = token_ids.device
         self.mask = torch.ones(tokens, dtype=torch.bool, device=device)
@@ -118,6 +152,8 @@ class PreparedEngramRequests:
         self.plan = engram.plan(engram.Caps(device=device, max_tokens=tokens, max_seqs=rows,
             max_requests=rows, vocab_size=len(token_map), layer_id=layer, tp_size=1, tp_rank=0),
             token_map=token_map, geometry=geometry, invocation={"operation": "hash"})
+        if shared_token_map is not None:
+            share_hash_token_map(self.plan, shared_token_map)
         binding = SimpleNamespace(**dict(zip(("token_ids", "token_mask", "query_start_loc", "request_slots",
             "committed_history", "num_seqs", "num_tokens", "hash_ids", "compressed", "request_ids"), self.args[:-1])))
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(

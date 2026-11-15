@@ -61,8 +61,13 @@ class SpeculativePreparation:
         vocabulary_parallel_sampling=False,
         sampling_runtime=None,
         logprob_runtime=None,
+        share_vocabulary_columns=False,
     ):
         self.forwards = forwards
+        # TP3 fork (DS41 tp3.share_vocab_columns): vocabulary-parallel rounds read one persistent copy of this rank's
+        # global vocabulary ids (parallel_draft.vocabulary_columns) instead of one per round; False = one per round.
+        self.share_vocabulary_columns = share_vocabulary_columns
+        self.vocabulary_columns = {}
         self.page_tokens = page_tokens
         self.weights, self.tables, self.pool = weights, tables, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch

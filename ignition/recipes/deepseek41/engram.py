@@ -41,6 +41,8 @@ class Tables:
     # TP3 fork: every rank keeps the whole tables (TP3Config.engram_tables); False = upstream #220's per-rank head
     # partitions. Each rank projects only its own heads' columns either way.
     shared: bool = False
+    # TP3 fork (tp3.share_engram_token_map): Engram hash plans read ``device_token_map`` instead of their own copy.
+    share_token_map: bool = False
 
     @classmethod
     def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None, shard=None,
@@ -192,7 +194,9 @@ class PreparedTableRequests:
         self.operations = tuple(PreparedEngramRequests(inputs, metadata.token_ids, metadata.query_start_loc,
             history, metadata.live_counts, tables.mailboxes[layer].device_view, tables.sequence,
             layer=layer, token_map=tables.token_map, geometry=tables.geometry, session=session,
-            name=f"{name}.{layer}", row_mapping=tables.row_mapping[layer]).functional()
+            name=f"{name}.{layer}", row_mapping=tables.row_mapping[layer],
+            # TP3 tp3.share_engram_token_map: the hash plans read this rank's one persistent map (same values).
+            shared_token_map=self.token_map if tables.share_token_map else None).functional()
             for layer, inputs in tables.inputs.items())
 
     def __call__(self, metadata):

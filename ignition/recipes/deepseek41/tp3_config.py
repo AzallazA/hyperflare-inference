@@ -26,6 +26,15 @@ UNPORTED = {}
 # Routed experts per DeepSeek V4.1 MoE layer (hot_experts >= this keeps a parked layer fully resident).
 ROUTED_EXPERTS = 384
 
+# VRAM reclaim switches (2026-11-15 memory map) and their environment names. FLARE_DS41_VRAM_RECLAIM=1 is the
+# umbrella: it turns every one on unless its own variable says otherwise ("1" on, any other set value off).
+VRAM_RECLAIM = {
+    "share_engram_token_map": "SHARE_ENGRAM_TOKEN_MAP",
+    "trim_vocab_gather": "TRIM_VOCAB_GATHER",
+    "skip_draft_vocab_gather": "SKIP_DRAFT_VOCAB_GATHER",
+    "share_vocab_columns": "SHARE_VOCAB_COLUMNS",
+}
+
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
 
@@ -148,6 +157,24 @@ class TP3Config:
     """Declare ``engram_residual`` on ``ffn_hc.residual``'s storage (preparation memory only). In the functional
     forwards the Engram output is a value Inductor already places on dead storage, so serving graphs are the same
     either way (tp3-main's scratch alias is subsumed); False = separate declaration (base)."""
+    # --- VRAM reclaim (2026-11-15 memory map items 2, 5, 8; FLARE_DS41_VRAM_RECLAIM=1 turns all four on) ---
+    share_engram_token_map: bool = False
+    """Every Engram hash plan reads the rank's one persistent token map (``Tables.device_token_map``, which the
+    history lookups already read) instead of materializing its own 1 MiB copy (two per graph: ~152 MiB/rank).
+    Same values, read-only (b12x's mutation contract); False = one copy per plan (base). Export-time only."""
+    trim_vocab_gather: bool = False
+    """With vocabulary-parallel sampling, size the FP32 vocabulary all-gather channel for the widest graph that still
+    gathers through it (prefill heads 1 row, resume/decode heads ``max(batch_capacities)`` rows) instead of every
+    verification sample (48 rows: ~41 MiB/rank). A graph needing more rows fails the export (PreparedAllGather's row
+    check). No effect without vocabulary-parallel sampling. False = sized for the verification samples (base)."""
+    skip_draft_vocab_gather: bool = False
+    """With vocabulary-parallel sampling, do not create the BF16 draft-vocabulary all-gather channel: its only user,
+    the DSpark proposal head's gather, is local-only then (``gather=False``; ~25 MiB/rank). Without
+    vocabulary-parallel sampling the channel is created as before. False = always created (base)."""
+    share_vocab_columns: bool = False
+    """Vocabulary-parallel speculative rounds read one persistent copy of this rank's global vocabulary ids
+    (``copy_columns``, 345 KB) instead of one per round (72 per rank: ~23 MiB). Same values, compared only.
+    False = one copy per round (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -193,7 +220,8 @@ class TP3Config:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
         for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
-                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual"):
+                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual",
+                     *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
@@ -281,6 +309,12 @@ class TP3Config:
         for name, reason in REMOVED.items():
             if env.get(name, "") != "":
                 raise ValueError(f"{name} is no longer supported: {reason}")
+        umbrella = flag("VRAM_RECLAIM")
+
+        def reclaim(name):  # per-item variable wins when set (non-empty); unset/empty follows the umbrella
+            value = get(name)
+            return umbrella if value == "" else value == "1"
+
         counts = get("EXPERT_COUNTS_DIR")
         ckpt = get("BRRR_CKPT")
         dense_native = env.get(ENV_PREFIX + "BRRR_DENSE_NATIVE")  # set-but-empty means staged copies (base semantics)
@@ -302,6 +336,7 @@ class TP3Config:
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
+            **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),
             brrr_ckpt=None if not ckpt else Path(ckpt),
