@@ -46,6 +46,21 @@ def _sliced(values: torch.Tensor) -> torch.Tensor:
     return values.unflatten(-1, (slices, values.shape[-1] // slices))
 
 
+def _distributions_valid(probabilities: torch.Tensor, used: torch.Tensor | None = None) -> torch.Tensor:
+    """Per row: every used column is a finite, nonnegative distribution of unit mass.
+
+    Unused columns pass. This equals checking ``where(used, probabilities, dummy)`` with the one-hot
+    dummy (finite, nonnegative, mass exactly 1) without materialising that copy over the vocabulary.
+    """
+    slices = _sliced(probabilities)
+    entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
+    mass = slices.sum(-1).sum(-1)
+    columns = entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)
+    if used is not None:
+        columns |= ~used
+    return columns.all(-1)
+
+
 def _tensor(value, shape, dtype, device, name):
     if value.shape != torch.Size(shape) or value.dtype != dtype or value.device != device or not value.is_contiguous():
         raise ValueError(f"{name} requires contiguous {dtype} {tuple(shape)} on {device}")
@@ -418,14 +433,9 @@ class PreparedStochasticVerification:
             valid = live & (draft_valid | ~draft_used).all(-1) & (target_valid | ~target_used).all(-1)
             valid &= (((drafts >= 0) & (drafts < self.state.vocab_size)) | ~draft_used).all(-1)
             valid &= (token_limits >= 1) & (token_limits <= target_probs.shape[1])
-            draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
-            target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
             ids = torch.where(draft_used, drafts, 0)
-        for probabilities in (draft_probs, target_probs):
-            slices = _sliced(probabilities)
-            entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
-            mass = slices.sum(-1).sum(-1)
-            valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
+        valid &= _distributions_valid(draft_probs, None if token_limits is None else draft_used)
+        valid &= _distributions_valid(target_probs, None if token_limits is None else target_used)
         out.valid.copy_(valid)
         if disjoint or functional:
             self.probability_masks[0].run_disjoint(draft_source, scratch["safe_draft_probs"],
