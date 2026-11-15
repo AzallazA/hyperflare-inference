@@ -67,3 +67,27 @@ def test_index_scratch_leaves_only_whole_written_selection_buffers_unfilled(pois
                 "pools": "unfilled", "page_table": "unfilled",
                 **(single if world == 1 else {"physical": "unfilled", "selected_lengths": "unfilled"}), **context}
     assert observed == expected
+
+
+@pytest.mark.parametrize("world", [1, 3])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_mla_scratch_keeps_exchange_and_record_windows_zeroed(poisoned_empty, world, mode):
+    from ignition.recipes.glm53.mla import MLAScratch
+
+    tokens, blocks, heads = 6, 2, Shards.of(world).heads
+    prepared = MLAScratch.allocate(tokens, heads, blocks, mode, "cpu", context_ranks=world, remote=world > 1)
+    assert all(v in ("zero", "none") for k, v in layout(prepared).items() if k not in ("index", "slab")), \
+        layout(prepared)
+    scratch = MLAScratch.allocate(tokens, heads, blocks, mode, "cpu", context_ranks=world, remote=world > 1,
+                                  forward=True)
+    observed = {k: v for k, v in layout(scratch).items() if k != "index"}
+    cp_decode, cp_prefill = world > 1 and mode == "decode", world > 1 and mode == "prefill"
+    for name in ("projected_input", "query_input", "query_residual", "latent_input", "latent", "query",
+                 "absorbed_query", "attended", "expanded", "output", "visible"):
+        assert observed.pop(name) == "unfilled", name
+    for name in ("gathered", "partial", "lse"):
+        assert observed.pop(name) == ("unfilled" if cp_decode else "none"), name
+    assert observed.pop("slab") == ("unfilled" if cp_prefill else "none")
+    # Cross-host staging and record windows keep their zeros.
+    assert set(observed.values()) <= {"zero", "none"}, observed
+    assert any(v == "zero" for v in observed.values()) == (world > 1)

@@ -69,14 +69,21 @@ class MLAScratch:
     record_counts: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False):
+    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False, forward=False):
+        """Zeroed scratch for preparation; `forward` (`PreparedGlmMLA.forward`) leaves unfilled what the forward
+        writes whole before any read: the fused input projection (copy), both RMSNorm outputs, the query, absorbed
+        and gathered heads (whole outputs of q_b, the absorption BMM and the head gather, or copies of them), the
+        expanded values (one copy per slice, covering every row) and the visible counts. Buffers of the
+        cross-host exchange and record windows stay zeroed, and so does the index scratch's single-rank
+        selection (`IndexScratch.allocate`)."""
         if heads not in HEAD_COUNTS:
             raise ValueError("GLM MLA scratch requires a supported rank-count head partition")
         from .dcp import PREFILL_SLICE_ROWS, SLICE_ROWS
 
-        index = IndexScratch.allocate(tokens, blocks, mode, device, context_ranks=context_ranks)
-        def zeros(*shape, dtype=torch.bfloat16):
-            return torch.zeros(shape, dtype=dtype, device=device)
+        index = IndexScratch.allocate(tokens, blocks, mode, device, context_ranks=context_ranks, forward=forward)
+        def zeros(*shape, dtype=torch.bfloat16, written=True):
+            fill = torch.empty if forward and written else torch.zeros
+            return fill(shape, dtype=dtype, device=device)
         def buffer(*shape):
             return zeros(tokens, *shape)
         # Fused layer-input projection: query 1536, latent 512, index key 128 and index head weights 32.
@@ -104,9 +111,10 @@ class MLAScratch:
             buffer(4096), zeros(tokens, dtype=torch.int32), index,
             zeros(exchange, heads * context_ranks, 512), zeros(exchange, heads * context_ranks, 512),
             zeros(exchange, heads * context_ranks, dtype=torch.float32), slab,
-            zeros(exchange if width else 0, width), zeros(exchange if width else 0, width * context_ranks),
-            zeros(context_ranks if window else 0, window * 528, dtype=torch.uint8),
-            zeros(context_ranks if window else 0, dtype=torch.int64))
+            zeros(exchange if width else 0, width, written=False),
+            zeros(exchange if width else 0, width * context_ranks, written=False),
+            zeros(context_ranks if window else 0, window * 528, dtype=torch.uint8, written=False),
+            zeros(context_ranks if window else 0, dtype=torch.int64, written=False))
 
     def rows(self, tokens, mode):
         if type(tokens) is not int or not 0 < tokens <= self.output.shape[0]:
@@ -495,10 +503,10 @@ class PreparedGlmMLA:
             # The indexer's candidate gather orders this layer's peer cache writes before these reads.
             pull_context(self.state.peers, m.block_table[0], end, s.slab.view(torch.int32), shards)
         # Selected indices are global positions, which index the slab directly.
-        s.visible.copy_(m.positions + 1)
+        visible = (m.positions + 1).to(torch.int32)
         for start, end, absorb, attention, expand in self.slices:
             absorbed = absorb(query[start:end].transpose(0, 1)).transpose(0, 1)
-            attended = attention(absorbed, physical[start:end], s.visible[start:end],
+            attended = attention(absorbed, physical[start:end], visible[start:end],
                 selected_lengths[start:end], cache=s.slab.view(-1, 64, 528))
             expanded = expand(attended.transpose(0, 1)).transpose(0, 1)
             s.expanded[start:end].copy_(expanded)
@@ -546,7 +554,7 @@ class PreparedGlmMLA:
         if selection is not None and self.mode != "decode":
             raise ValueError("GLM MLA reuses a sparse selection only in decode passes")
         s = MLAScratch.allocate(source.shape[0], self.heads, self.blocks, self.mode, self.device,
-            context_ranks=self.context_ranks, remote=self.remote)
+            context_ranks=self.context_ranks, remote=self.remote, forward=True)
         p = self.projections
         projected = p["qkv_a_proj"](source)
         s.projected_input.copy_(projected)
@@ -576,7 +584,8 @@ class PreparedGlmMLA:
         s = replace(s, index=index_scratch, query=query)
         chain_result = chain.finish(chain_pending, physical) if chain is not None else None
         if self.context is None:
-            s.visible.copy_(metadata.positions + 1)
+            # Visible counts are computed values, not a copy into scratch (Inductor zero-fills opaque targets).
+            s = replace(s, visible=(metadata.positions + 1).to(torch.int32))
             if self.sm103_prefill:
                 end = metadata.positions.max().reshape(1) + 1
                 attended = self.attention(chain_result if chain_result is not None else s.absorbed_query,
@@ -589,7 +598,7 @@ class PreparedGlmMLA:
         elif self.mode == "prefill":
             self.attend_gathered_context(s, metadata, query, physical, selected_lengths)
         else:
-            s.visible.copy_(self.context.shards.local_tokens(metadata.positions + 1))
+            s = replace(s, visible=self.context.shards.local_tokens(metadata.positions + 1).to(torch.int32))
             for start, end, absorb, gather, attention, combine, expand in self.slices:
                 count = end - start
                 absorbed = s.absorbed_query[start:end] if chain is not None else absorb(query[start:end].transpose(0, 1)).transpose(0, 1)
