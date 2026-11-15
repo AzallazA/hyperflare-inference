@@ -21,3 +21,14 @@ Patches applied only to the b12x overlay (`tp3-tools/make-b12x-overlay.sh` -> `.
   change DS41's vocab gathers): `VENV=<fork>/.venv B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/b12x-mla-decode-remainder-stream.patch tp3-tools/make-b12x-overlay.sh <out>`,
   then export with `B12X_OVERLAY=<out> B12X_MLA_DECODE_REMAINDER_STREAM=1 tp3-tools/release/export.sh`.
   GPU checks: `tests/components/test_compressed_mla_remainder_stream_cuda.py` (bit-identity + optional timing).
+- `flashinfer-pcie-twoshot-pull-world3.patch` (DS41, 2026-11-15, branch fix/ar-twoshot-pull, copied here on
+  perf/ds41-exp-combined): `B12X_PCIE_TWOSHOT_PULL=1` adds a `twoshot_pull` alternative (the PCIeTwoShotBF16 runtime's
+  single-launch pull transport, same thread/block sweep as `twoshot`) to every staged plain BF16 all-reduce that admits
+  two-shot; unset/0 = upstream candidate set and selection keys. Host-side only (`comm/pcie/_collective_tuning.py`,
+  `comm/pcie/pcie_allreduce.py`): no CuTe source-closure fingerprint moves, only the queries of those all-reduce races
+  (80 in a DS41 TP3 export) change when the switch is on. Combined DS41 overlay (venv b12x + this + the remainder-stream
+  patch; no GLM pull-gather patch, so DS41's 21 head-gather races keep their keys):
+  `VENV=<fork>/.venv B12X_OVERLAY_PATCHES="$PWD/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch $PWD/tp3-patches/overlay/b12x-mla-decode-remainder-stream.patch" tp3-tools/make-b12x-overlay.sh <out>`.
+  Note: any overlay carrying the remainder-stream patch changes `attention/_shared/mla/kernel.py`, which is in the CuTe
+  source closure of 32 b12x MLA modules: every MLA program gets a new compile key and every
+  `attention.compressed_sparse_mla` race (208 in a DS41 export) re-discovers and re-measures, even with the switch off.

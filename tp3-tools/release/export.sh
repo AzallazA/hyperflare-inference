@@ -15,6 +15,9 @@
 #   B12X_MLA_DECODE_REMAINDER_STREAM 1 = with the b12x-mla-decode-remainder-stream overlay patch, run the 8-head
 #            remainder grid of each attention decode concurrently with the 16-head grid (captured into the graphs);
 #            unset/0 = serial (default). Needs the overlay; without it the variable is ignored.
+#   B12X_PCIE_TWOSHOT_PULL 1 = with the flashinfer-pcie-twoshot-pull-world3 overlay patch, race the BF16 two-shot pull
+#            all-reduce beside the upstream candidates (prefill parts); unset/0 = upstream set (default). Needs the overlay.
+#   FLARE_DS41_AR_PART_ROWS  decoder prefill all-reduce part cap (0 = halving to what the runtime accepts, default).
 #   FLARE_DS41_VISION_HOST  1 (default) = vision tower in host RAM (implied by VISION_STAGE=1); VISION_HOST=0 together
 #            with VISION_STAGE=0 keeps the tower in VRAM, which needs a lower HOT (unmeasured, no longer useful)
 #   PARKED_ROWS  BRRR row gate of the parked layers 20-33 (FLARE_DS41_BRRR_PARKED_MAX_ROWS; default 12 = graphs of at most
