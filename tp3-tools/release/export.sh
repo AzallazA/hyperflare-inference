@@ -11,6 +11,10 @@
 #            block (image 0.11 s instead of 1.70 s, no KV cost); 0 = no staging
 #   FLARE_DS41_ENGRAM_CHUNK_ROWS 1024 (default) + FLARE_DS41_SHARE_ENGRAM_RESIDUAL 1 (default) = graph scratch: chunked Engram
 #            projection and engram_residual on ffn_hc.residual (KV 2.46M -> 3.01M at HOT 342, decode level); 0/0 = previous layout
+#   B12X_OVERLAY  optional patched b12x copy put ahead of the venv (tp3-tools/make-b12x-overlay.sh); default none
+#   B12X_MLA_DECODE_REMAINDER_STREAM 1 = with the b12x-mla-decode-remainder-stream overlay patch, run the 8-head
+#            remainder grid of each attention decode concurrently with the 16-head grid (captured into the graphs);
+#            unset/0 = serial (default). Needs the overlay; without it the variable is ignored.
 #   FLARE_DS41_VISION_HOST  1 (default) = vision tower in host RAM (implied by VISION_STAGE=1); VISION_HOST=0 together
 #            with VISION_STAGE=0 keeps the tower in VRAM, which needs a lower HOT (unmeasured, no longer useful)
 # A cold tuning cache needs more free VRAM than serving. If tuning runs out of memory, export once with HOT=300,
@@ -25,6 +29,10 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=20-33 FLARE_DS41
        FLARE_DS41_EMBED_HOST=1 FLARE_DS41_VISION_HOST="${FLARE_DS41_VISION_HOST:-1}" FLARE_DS41_VISION_STAGE="${FLARE_DS41_VISION_STAGE:-1}" \
        FLARE_DS41_AR_ROWS=1024 FLARE_DS41_ENGRAM_CHUNK_ROWS="${FLARE_DS41_ENGRAM_CHUNK_ROWS:-1024}" \
        FLARE_DS41_SHARE_ENGRAM_RESIDUAL="${FLARE_DS41_SHARE_ENGRAM_RESIDUAL:-1}"
+if [ -n "${B12X_OVERLAY:-}" ]; then
+    [ -d "$B12X_OVERLAY/b12x_tree" ] || { echo "B12X_OVERLAY=$B12X_OVERLAY has no b12x_tree" >&2; exit 1; }
+    export PYTHONPATH="$B12X_OVERLAY${PYTHONPATH:+:$PYTHONPATH}"
+fi
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-8}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --verbose
