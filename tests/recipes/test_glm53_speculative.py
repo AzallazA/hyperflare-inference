@@ -72,6 +72,9 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     assert metadata.indexed.token_slots.tolist()[:sum(limits)] == token_slots
     # Columns past the round's width stay on the null row instead of reaching the next slot's rows.
     assert metadata.recurrent.state_indices.tolist() == state_indices
+    # Verification's constant recurrent metadata is realised once per forward (one buffer for every KDA layer).
+    assert metadata.recurrent.fresh.tolist() == [False, False]
+    assert metadata.recurrent.accepted_tokens.tolist() == [1, 1]
     repeated = op.target_metadata(*args)
     assert metadata.token_ids.data_ptr() != repeated.token_ids.data_ptr()
     torch.testing.assert_close(metadata.token_ids, repeated.token_ids)
