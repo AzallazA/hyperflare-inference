@@ -344,6 +344,14 @@ impl Bootstrap {
             scheduling_policy.ttft_decode_interleave = value.as_u64().and_then(|v| u32::try_from(v).ok())
                 .ok_or("scheduler_ttft_decode_interleave must be a nonnegative 32-bit integer")?;
         }
+        if let Some(value) = object.get("scheduler_ttft_order") {
+            use crate::scheduler::TtftOrder;
+            scheduling_policy.ttft_order = match value.as_str() {
+                Some("oldest") => TtftOrder::Oldest,
+                Some("shortest") => TtftOrder::Shortest,
+                _ => return Err("scheduler_ttft_order must be \"oldest\" or \"shortest\"".into()),
+            };
+        }
         if let Some(value) = object.get("scheduler_prefill_tail_merge") {
             use crate::scheduler::PrefillTailMerge;
             scheduling_policy.prefill_tail_merge = match value {
@@ -811,6 +819,20 @@ mod tests {
                         assert!(result.err().unwrap().to_string().contains(key));
                     }
                 }
+            }
+            use crate::scheduler::TtftOrder;
+            assert_eq!(defaults.ttft_order, TtftOrder::Oldest);
+            for (value, order) in [("oldest", TtftOrder::Oldest), ("shortest", TtftOrder::Shortest)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_ttft_order"] = value.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap().server.scheduling_policy;
+                assert_eq!(loaded.ttft_order, order);
+            }
+            for invalid in [json!(0), json!(true), json!("fewest"), json!(null)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_ttft_order"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                    .to_string().contains("scheduler_ttft_order"));
             }
             use crate::scheduler::PrefillTailMerge;
             assert_eq!(defaults.prefill_tail_merge, PrefillTailMerge::ToolsOnly);

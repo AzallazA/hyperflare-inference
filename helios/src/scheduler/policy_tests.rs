@@ -12,6 +12,8 @@ const MS: u64 = 1_000_000;
 
 #[path = "planning_tests.rs"]
 mod planning_tests;
+#[path = "ttft_order_tests.rs"]
+mod ttft_order_tests;
 
 #[test]
 fn padding_pruning_keeps_three_requests_on_batch_four_and_two_requests_on_batch_two() {

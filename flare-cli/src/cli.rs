@@ -853,6 +853,12 @@ pub struct SchedulerOptions {
     #[arg(long, value_name = "N", help_heading = "Scheduler options")]
     pub scheduler_ttft_decode_interleave: Option<u32>,
 
+    /// Which overdue prompt forced rounds serve: oldest (arrival order), or shortest (fewest
+    /// remaining prefill chunks first; after each forced chunk of another prompt the next forced
+    /// round goes to the oldest, so long prompts keep at least every second one) [default: oldest].
+    #[arg(long, value_name = "ORDER", value_parser = ["oldest", "shortest"], help_heading = "Scheduler options")]
+    pub scheduler_ttft_order: Option<String>,
+
     /// Absorb a final message segment of at most chunk/16 tokens (64-512) into the preceding
     /// prefill chunk instead of running it as its own prefill graph (the prompt-end checkpoint is
     /// still captured). true: every request except one without tools whose generation prompt
@@ -870,7 +876,7 @@ pub struct SchedulerOptions {
 }
 
 impl SchedulerOptions {
-    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 10] {
+    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 11] {
         [
             ("output_token_value", self.scheduler_output_token_value.map(Into::into)),
             ("token_fairness", self.scheduler_token_fairness.map(Into::into)),
@@ -880,6 +886,7 @@ impl SchedulerOptions {
             ("ttft_target_ms", self.scheduler_ttft_target_ms.map(Into::into)),
             ("ttft_max_chunk", self.scheduler_ttft_max_chunk.map(Into::into)),
             ("ttft_decode_interleave", self.scheduler_ttft_decode_interleave.map(Into::into)),
+            ("ttft_order", self.scheduler_ttft_order.as_deref().map(Into::into)),
             ("prefill_tail_merge", self.scheduler_prefill_tail_merge.as_deref().map(|mode| match mode {
                 "true" => true.into(),
                 "false" => false.into(),
@@ -1501,7 +1508,7 @@ mod tests {
             "--scheduler-delivery-fairness", "2.5", "--scheduler-decode-age-price", "0",
             "--scheduler-adaptation-ms", "25", "--scheduler-ttft-target-ms", "50",
             "--scheduler-ttft-max-chunk", "2048", "--scheduler-ttft-decode-interleave", "2",
-            "--scheduler-prefill-tail-merge", "false", "--scheduler-eager-message-offers", "false"];
+            "--scheduler-ttft-order", "shortest", "--scheduler-prefill-tail-merge", "false", "--scheduler-eager-message-offers", "false"];
         let args = run(&[["flare", "run", "model"].as_slice(), &flags].concat());
         let mut config = serde_json::json!({});
         args.scheduler.configure(&mut config);
@@ -1509,7 +1516,8 @@ mod tests {
             "scheduler_token_fairness": 0.0, "scheduler_delivery_fairness": 2.5,
             "scheduler_decode_age_price": 0.0, "scheduler_adaptation_ms": 25.0,
             "scheduler_ttft_target_ms": 50.0, "scheduler_ttft_max_chunk": 2048,
-            "scheduler_ttft_decode_interleave": 2, "scheduler_prefill_tail_merge": false,
+            "scheduler_ttft_decode_interleave": 2, "scheduler_ttft_order": "shortest",
+            "scheduler_prefill_tail_merge": false,
             "scheduler_eager_message_offers": false}));
         let forwarded = run(&[["flare", "run", "model"].as_slice(),
             &args.scheduler.options().iter().map(String::as_str).collect::<Vec<_>>()].concat());
@@ -1527,7 +1535,8 @@ mod tests {
         for (flag, invalid) in [("--scheduler-output-token-value", "0"), ("--scheduler-adaptation-ms", "0"),
             ("--scheduler-token-fairness", "-1"), ("--scheduler-ttft-target-ms", "NaN"),
             ("--scheduler-decode-age-price", "inf"), ("--scheduler-ttft-max-chunk", "-1"),
-            ("--scheduler-ttft-decode-interleave", "1.5"), ("--scheduler-prefill-tail-merge", "tools")] {
+            ("--scheduler-ttft-decode-interleave", "1.5"), ("--scheduler-ttft-order", "fewest"),
+            ("--scheduler-prefill-tail-merge", "tools")] {
             assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={invalid}")]).is_err(), "{flag}");
         }
     }
