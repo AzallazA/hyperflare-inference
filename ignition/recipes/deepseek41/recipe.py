@@ -17,7 +17,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     from .bootstrap import PreparationConfig, prepare_rank
 
     # TP3 fork: the FLARE_DS41_* environment is read once here and travels with the preparation config.
-    tp3 = TP3Config.from_environment()
+    # mhc_pdl mirrors B12X_MHC_PDL; the check imports b12x's mHC kernels (as preparation does) and refuses a mismatch.
+    tp3 = TP3Config.from_environment().check_mhc_pdl()
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
