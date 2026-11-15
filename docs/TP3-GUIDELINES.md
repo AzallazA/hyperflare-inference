@@ -14,7 +14,8 @@ claim, D.3 before any kernel edit, D.4 before any push.
 
 | What | Where |
 | --- | --- |
-| **Main branch (since 2026-11-13)** | `tp3-main` = DS41 + GLM-5.3-Flash on one branch (merge of `ds41-tp3-sync` and `glm-hyperflare`, validated 11-13: speed level, DS41 eval 43/43, GLM probe/smoke, GLM TP2 bit-identical across binaries). Worktree `~/flare-up-main`, ONE binary `flare-cli/target/release/flare` serves both models (`serve-best.sh`, `serve-glm.sh`, `~/switch-model.sh`). Exports from it need `PYTHONPATH=~/flare-up-main` (GLM: `~/flare-up-main/.b12x-overlay:~/flare-up-main`) or `ignition` imports another worktree. Workflow: every change on its own branch (`ds41-*`, `glm-*`, `fix/*`), merged into `tp3-main` only after it is confirmed on the GPU; shared-code changes also need the other model's CPU tests + smoke/speed; upstream syncs go through a `sync-<date>` branch. Public fork gets scrubbed release snapshots only. |
+| **Main branch (since 2026-11-13)** | `tp3-main` = DS41 + GLM-5.3-Flash on one branch (merge of `ds41-tp3-sync` and `glm-hyperflare`, validated 11-13: speed level, DS41 eval 43/43, GLM probe/smoke, GLM TP2 bit-identical across binaries). Worktree `~/flare-up-main`, ONE binary `flare-cli/target/release/flare` serves both models (`serve-best.sh`, `serve-glm.sh`, `~/switch-model.sh`). Exports from it need `PYTHONPATH=~/flare-up-main` (GLM: `~/flare-up-main/.b12x-overlay:~/flare-up-main`) or `ignition` imports another worktree. Workflow: every change on its own branch (`ds41-*`, `glm-*`, `fix/*`), merged into `tp3-main` only after it is confirmed on the GPU; shared-code changes also need the other model's CPU tests + smoke/speed; upstream syncs go through a `sync-<date>` branch. Public fork gets scrubbed release snapshots only. **State 11-14:** `tp3-main` has NOT moved for the upstream port; it moves only after GLM passes on the port (user OK needed), and still serves GLM. |
+| **Upstream port (2026-11-14, in progress)** | Port of our TP3 work onto upstream 70069281 (20 commits after the v0.1.0 tag; #285 and 617ef929 reverted). Worktrees: `~/flare-up-port` (branch `port-20261114`, own venv, kernel cache `~/.cache/flare/kernels-port`, config `~/.config/flare-port`), DS41 and GLM feature branches `port-20261114-ds41` / `port-20261114-glm`, and the merge of both in `~/flare-up-port-int` (branch `port-20261114-int`, own venv, overlay, wheel and binary; GLM config `~/.config/flare-port-glm`). **The DS41 local default serves from `~/flare-up-port-int` since 11-14 19:07** (B.8). GLM has NOT been exported from the port yet: the GLM defaults are still the tp3-main packages on the tp3-main binary. A Rust rebuild in `~/flare-up-port-int` changes what the next DS41 restart serves. |
 | Fork checkout (branch `ds41-tp3-v3`, pre-merge; history only) | `~/flare-up-v3` (`.venv/`, `flare/target/release/flare`, `.brrr-ext/` compiled kernels) |
 | Other worktrees of the same repo | `~/flare-up` (old v2, its `serve-best.sh` just execs v3), `~/flare-up-base` (detached baseline), `~/flare-up-stage2` (kernel stage 2), `~/flare-up-vision` (vision staging). `git worktree list` from any of them. |
 | Recipe (the Python that defines the model for Ignition) | `ignition/recipes/deepseek41/` (`decoder.py`, `attention.py`, `weights.py`, `brrr.py`, `bootstrap.py`, `fused_qkv_norm.py`) |
@@ -28,8 +29,8 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | KV capacity without a serve | `flare run <pkg> <serve flags> --dry-run` (per-rank memory plan + KV tokens + snapshot slots; exact on 5 recorded loads; `--dry-run-free-memory` overrides the assumed free VRAM) |
 | Full qualification suite | release folder `qualification/qual_all.sh` (eval tools lavd hotel retrieval longgen eos livebench stress); needs `~/llm-inference-bench`, `~/LiveBench` |
 | Checkpoints | full view `/m2-2/flare-ckpt/ds41-1017-engram-mxfp4` (built by `release/make_checkpoint_view.sh`; the release docs' `~/ds41-1017-engram-mxfp4` is an example path, not ours); truncated test models `/m2-2/flare-ckpt/ds41-mini6` (6 layers) and `ds41-mini8` (8 layers, has native scales, use for parking/BRRR tests) |
-| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; default `...202611090700` (graph scratch, c8); each non-default package is ~4 GB on disk (shared blobs) |
-| Server scripts | `~/flare-up-v3/serve-best.sh` (defaults: pkg 090700, K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=interactive), restart via `/tmp/restart-default.sh` |
+| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; DS41 default `...202611142139` since 11-14 (upstream port, HOT 342, served KV 5,024,384); rollback `...202611121241` (served KV 3,189,376; also serves on the port binary); each non-default package is ~4 GB on disk (shared blobs) |
+| Server scripts | `~/flare-up-v3/serve-best.sh` (defaults since 11-14 19:07: `P` = pkg 142139, `FLARE_DIR` = `~/flare-up-port-int`; K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=interactive, private Engram tables + fast exit), restart via `/tmp/restart-default.sh`. Rollback: `FLARE_DIR=~/flare-up-main P=<...121241> ./serve-best.sh`. Previous script: `serve-best.sh.bak-1114-1241default` |
 | Release folder (public) | `~/rtx-recipes/DeepSeek-V4.1-Flash Hyperflare-tp3-YYYYMMDD/` from the Hyperflare release on (earlier: `... Flare-tp3-2026110x/`) (README, EXPORT, MEASUREMENTS, ENGRAM-PRECISION, export.sh, serve.sh, source.patch, qualification/) |
 | Upstream proposals | `docs/upstream-proposals/` in the fork (public with the branch, not submitted upstream); mirrored on the `proposals` branch of the private staging repo |
 | Scratch / logs / older vLLM-era work | `~/ds41-tp3/` (bench logs, eval_*.json, analyze_trace.py, compose files); `~/engram-eval/` (FP8 vs MXFP4 Engram perplexity eval) |
@@ -72,7 +73,9 @@ python3 ~/llm-inference-bench/llm_decode_bench.py --port 15015 --model DeepSeek-
 ```
 
 Reference numbers for the default build at 450 W, cap 24, 32G prefix cache: c1/c4/c8 32K ≈ 298/738/959 tok/s,
-coding c1 ≈ 456 tok/s. Spread between runs is 2-3%. See D.1 before interpreting anything.
+coding c1 ≈ 456 tok/s. Spread between runs is 2-3%. See D.1 before interpreting anything. Port default 142139
+against 1241 on the same binary (11-14, 2 alternating 30 s rounds): c1/c4/c8 32K 301/717/970 vs 318/720/979 tok/s;
+c1 is 0.974x in steps/s (accepted by the user 11-14, speed work later, D.1.12).
 
 ### A.4 Quality checks (cheapest first)
 
@@ -80,7 +83,8 @@ coding c1 ≈ 456 tok/s. Spread between runs is 2-3%. See D.1 before interpretin
 2. `python3 ~/ds41-tp3/bench.py out.json` : 43 known-answer checks (expect 42-43/43), 1,500-token decodes, 32K needle,
    4 concurrent.
 3. `.venv/bin/python tp3-tools/consistency.py 96 6 <tokenizer dir>` : decode-vs-prefill logprob agreement; compare against the
-   same number from the default build in the same session (it is biased toward b12x rounding).
+   same number from the default build in the same session (it is biased toward b12x rounding). The summary line ends
+   with `empty one-token replies retried N, positions skipped M` (D.2.10); read both before the top-1 number.
 4. `qualification/qual_all.sh` from the release folder (about 1 h at c8). Needs `FLARE_LOG`, `CKPT`, writes to
    `QUAL_OUT`. LiveBench needs `--livebench-release-option 2024-11-25`. Expected: eval 43/43, tools 60/60, lavd/hotel
    30/30, retrieval pass, longgen 4/4, LiveBench ~82, c8 stress PASS.
@@ -108,6 +112,12 @@ never absolute). Everything downstream receives the `TP3Config` instance; new sw
 copy; `VISION_HOST=0` alone keeps the tower in VRAM only when staging is off too). Export and serving cannot overlap
 (VRAM). Mini export for kernel/wiring checks: `SNAP=<truncated view> LAYERS=<brrr layers> tp3-tools/mini-export.sh`
 (export, serve, `tp3-tools/consistency.py`, stop; ~10 min; refuses to start next to a running server).
+
+On the port (upstream memory scheme, D.2.18) read these export log lines after every full export: `before tuning:
+... MiB free` (rank 0; 3,083 MiB at HOT 342 on 11-14), `Shared declaration examples: ...` (expect 0 MiB superseded),
+`Graph pool requests (...)` (per-graph pools, largest first; the largest sets the capture pool), `[brrr] placement
+rank <r>: ...` (one per rank; 11-14: `in_place=200` on all three) and `Routed-expert selections: ...` (which graphs
+chose micro/tiny_decode MoE). Before any export from a port venv, check the native module is current (D.2.17).
 
 ### A.6 GPU tests and traces
 
@@ -150,7 +160,7 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 
 | Knob | Effect / verdict |
 | --- | --- |
-| `HOT` (hot experts per parked layer, layers 20-33) | 342 = 2.37M KV default; each expert fewer ≈ +92K KV tokens; 300 = 2.99M KV release build, ~4% slower |
+| `HOT` (hot experts per parked layer, layers 20-33) | 342 = 2.37M KV default; each expert fewer ≈ +92K KV tokens; 300 = 2.99M KV release build, ~4% slower. On the upstream port (11-14) HOT 342 serves 5,024,384 KV (1241 on tp3-main: 3,189,376) and HOT 300 8,708,992 |
 | `BUDGET` (`--mtp-max-verification-token-budget`) | 24 adopted: +1-2% at c1/c8 vs 128; also drops 13 speculative graphs (~76 MiB/rank) = +87K KV tokens |
 | `PCM` (`--prefix-cache-memory`) | 32G adopted: ~78 warm 127K prompts vs ~37 at 16G; costs ~10 MiB device headroom (-6K KV), host RAM only otherwise |
 | `K` drafts | keep 5; coding acceptance is high; k7 was -3-6% at c4/c8 |
@@ -166,7 +176,7 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | Engram: `FLARE_ENGRAM_RAM_TABLES=0` vs `--embedding-table-storage disk` | disk = -90 GiB RAM, -3-4% decode; MXFP4 vs FP8 tables: wiki ppl +2.6%, benchmarks within noise |
 | `FLARE_DS41_EMBED_HOST=1`, `FLARE_DS41_VISION_HOST=1` | embeddings/vision in host RAM; images ~3 s slower each |
 | `FLARE_DS41_AR_ROWS=1024` | chunked all-reduce sizing for prefill |
-| `FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1` | graph scratch, default on in `export.sh`: Engram projection/reduce/mix in 1024-row chunks (-300 MiB/rank) and `engram_residual` on `ffn_hc.residual` (-165 MiB/rank); KV 2.46M -> 3.01M at HOT 342, decode level |
+| `FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1` | graph scratch, default on in `export.sh`: Engram projection/reduce/mix in 1024-row chunks (-300 MiB/rank) and `engram_residual` on `ffn_hc.residual` (-165 MiB/rank); KV 2.46M -> 3.01M at HOT 342, decode level. On the port there is no graph scratch pool: chunk rows act on the functional forwards (planned prefill4096 pool 560 MiB unchunked vs 428 MiB chunked) and the shared residual is only a declaration alias (the planner already reuses it) |
 | `MAXC` (`--max-concurrency` at export) | 8 default; 16 = c16 package: its graphs cost ~650K KV vs c8 (dry run) |
 | BRRR item 6: `FLARE_DS41_BRRR_SPLIT_TAIL`, `_FAST_ROUTE`, `_COUNTER_PARITY` | default off, not adopted (11-09): split tail and counter parity slower in the layer A/B; fast route -0.5/-1.9/-2.0 µs/layer at m 1/6/12 but end to end level (c1 1.004x, c4 0.989x, c8 0.998x) |
 
@@ -259,6 +269,14 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 4. Validate before trusting it: `cargo build --release`, the 3-GPU layer test, a full export, `verify_fix` (0 true
    corruptions), one alternating A/B round vs the current default. Then commit, push to Gitea, and only then update
    the release folder (`source.patch` is regenerated from the new base).
+5. **Comparing a branch with upstream: fetch first, and look for reverts, not only subjects.** Remote refs in a
+   worktree are only as fresh as the last fetch of that repository, and "commit X is in" is true only if no later
+   commit reverts it: check `git log --oneline <base>..<branch> | grep -i revert` and `git merge-base --is-ancestor`
+   against a freshly fetched ref. *Incident (11-14):* the `upstream-sync/main` ref had not been fetched and still
+   pointed at the v0.1.0 commit, so the port looked based on the tag when it is 20 commits later (the fork checkout's
+   `origin/main` was two commits behind the port base 70069281 as well), and the first upstream check said the port carried #285 and 617ef929 because their subjects
+   matched; the port reverts both (dc2fa0de, 7c4a0ba0) and the G2 preflight checks the binary has no 617ef929 flag.
+   Corrected on the status board 6 minutes later.
 
 ### B.7 Upstream watch (what NVIDIA's branches hold for us, 2026-11-08)
 
@@ -273,6 +291,23 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
   form (the explicit top_p range our bootstrap adds to the server config is now redundant; proposal 03 can drop it).
 - `fix/checkpoint-gds-capability-probe`: forces the bounce read mode this host already uses; arrives with the next sync.
 - Everything else (GLM, Windows, RoCE, multi-host, scheduler) does not touch our path.
+
+### B.8 Switching the local default (procedure used 11-14)
+
+1. Get the user's decision; record it on the status board with the time from `date` (C.34).
+2. Back up `serve-best.sh` with a dated name (`serve-best.sh.bak-1114-1241default`).
+3. Change only the defaults: `P=${P:-<new package>}` and `cd ${FLARE_DIR:-<worktree with the binary>}`, and add the
+   rollback line as a comment.
+4. Restart through `/tmp/restart-default.sh` (it calls `serve-best.sh`; wait for `/v1/models`, C.19).
+5. Verify on the live server: package name in the `ps` line (A.2), the binary's sha256 against the one that passed
+   the gates, served KV (`flare_total_kv_tokens`), and a test reply.
+6. Update A.1 (packages, server scripts) and the memory note.
+7. Afterwards: every chain's "restore default" restores the NEW default, and chain preflights that pin the old
+   default (for example `g2-ds41-full.sh` checks `serve-best.sh` defaults to 1241) refuse until updated. If the
+   default now runs from a worktree, a Rust rebuild there changes what the next restart serves.
+
+*11-14:* package 142139 on the `~/flare-up-port-int` binary (sha256 67c691d29041...), live at 19:07 with served KV
+5,024,384 and a correct test reply; `tp3-main` and GLM untouched.
 
 ---
 
@@ -315,6 +350,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     exact on the five DeepSeek-V4.1-Flash TP3 loads it was calibrated on, but 0.2 % low on the later packages 081024 and
     090700 (2,461,184 vs 2,467,200 and 3,007,360 vs 3,014,656 served: quote the served `Allocate cache` count); 0.4 % low (TP3) and 1.3 % low (TP2) on
     GLM-5.3-Flash, which was not in the calibration, so read it as a slightly conservative estimate for other models.
+    On the upstream port (11-14) it is further off: 4,754,944 vs 5,024,384 served at HOT 342 (5.4 % low) and
+    8,419,328 vs 8,708,992 at HOT 300 (3.3 % low); quote the served number for port packages.
     `--dry-run-free-memory` replaces the assumed free memory (driver total minus 606 MiB) when a GPU is shared.
     Dry runs are cheap, so answer KV questions with them before an export: c16 graphs cost ~650K KV against c8, and
     a serve-time verification budget below the export's drops the unused verify graphs.
@@ -386,6 +423,30 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     test THP effects with `prctl(PR_SET_THP_DISABLE)` (41) on a wrapper around the launcher (inherited across exec).
     serve-best.sh runs private tables + `FLARE_FAST_EXIT=1` by default (DS41 restart ~55 s vs ~80 s); off:
     `PRIVTABLES=0 FASTEXIT=0`.
+30. **Chain dry runs take `--dry-run` as an argument, not `DRY=1` in the environment.** The chain scripts set
+    `DRY` themselves from `$1` (`DRY=0; [ "${1:-}" = --dry-run ] && DRY=1`), so an exported `DRY=1` is overwritten
+    and the chain runs for real, including its EXIT trap that restarts the default. Read a script's usage line before
+    a dry run. *Incident (11-14 12:45):* testing the G1 chain's new preflight with `DRY=1` ran it for real; it refused
+    in preflight (stale wheel, D.2.17), and its exit trap restarted the live DS41 server once (about 1 min down).
+31. **Under `set -o pipefail`, never `cmd | grep -q pattern`.** `grep -q` exits at the first match, the writer gets
+    SIGPIPE, and the pipeline returns non-zero although the pattern was found, so the test reads as "not found" at
+    random (more often on long output). Grep the file directly (`grep -qa pattern file`; `-a` because logs carry
+    `\r` progress and binary bytes) or a here-string (`grep -q pattern <<< "$var"`), as the 11-14 port chains'
+    preflights do.
+32. **GPU tests that need "raw replay" need the qualification build of the native module.** `flare_heliopause` built
+    without the `qualification` Cargo feature raises "raw replay requires the native qualification Cargo feature"
+    (or skips); that is a test-environment limit, not a product failure. Run those tests from a separate venv with
+    the qualification build; do not rebuild the export/serving venv's wheel for them. Chains mark them optional
+    (`G3_QUAL_WHEEL=1` runs them). *Incident (11-14):* the first G2 chain stopped before its export on
+    `T-vocab_tp3` for this reason (10 min lost), and GLM `kda_tp`/`mlp_tp` failed the same way in G3. Upstream's own
+    baseline has 21 `native_recipe_contract` failures from the same missing feature.
+33. **A CUDA illegal memory access poisons the rest of its process.** Every later test in the same pytest process
+    fails (first `torch.zeros`, fixture setup "illegal memory access"), so only the first failure carries
+    information. Rerun suspect cases one per process, with `CUDA_LAUNCH_BLOCKING=1` to name the faulting kernel.
+    *Incident (11-14):* in G3 one GLM reused-selection case faulted and took the other world sizes with it; run
+    alone, one case per process, the crashing cases passed (cause still open; suspected cold-cache tuning).
+34. **Status board times come from `date`, never from an estimate.** *Incident (11-14):* two entries (18:05,
+    18:10) were written with guessed times and had to be corrected afterwards.
 
 ---
 
@@ -431,7 +492,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     what llm-inference-bench reports); keep rounds/s as an informational column. *Incident (2026-11-12):* the DS41
     sync package 0438 showed c8 "steps" 0.94x while the user's llm-inference-bench showed identical per-request steps
     and tok/s. The DS41 sync qual (stage A), the GLM sync scripts and the GLM pick script were switched to the right
-    metric.
+    metric. The standing decode gate (set 11-11) is per cell: steps/s >= 0.98x AND tok/s >= 0.96x. Chains must use
+    exactly this rule. *Incident (11-14):* the G2 chain's own looser rule (fail only if both are below 0.97x) passed
+    c1 at 0.974x steps / 0.947x tok/s, which the standing rule fails; the miss was found by recomputing from the raw
+    files.
 11. **Determinism probes must bypass the prefix cache.** Identical repeats are served from Flare's prefix cache, so
     "first token stable x8 within a run" is an artifact; only fresh computation tests determinism (decode repeats are
     what exposed the real non-determinism). Flare's OpenAI server has no per-request cache bypass (no `cache_salt`),
@@ -441,6 +505,16 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     where the candidate is unstable and the base stable, WARN when both are unstable. *Incident (2026-11-12):* the
     11-11 sync runs failed "not bit-identical across a restart where 1227 is", but 1227 had been probed once, from the
     cache.
+12. **Before blaming a binary or package for a decode delta, compare GPU time per step at equal tokens per step.**
+    tok/s alone swings with draft acceptance: 1241 by itself ranged 2.42-2.80 generated tokens per step over four
+    c1 rounds on 11-14. Take `verification_gpu_nanoseconds / verification_graphs` from the bench counters, fit it
+    against verified tokens per graph for the reference, and read the candidate's residual. *Incidents (11-14):* G0
+    suggested the new port binary cost ~2% c1 steps; at equal verified tokens per step it was within 0.2 %, the old
+    binary had simply verified fewer tokens per step in those rounds. The port package's real c1 cost (+0.21/+0.25 ms
+    GPU per step, all inside graph replay, host side 0.015 ms on both) survived that check. Lead for the later speed
+    work (not fixed): decode graphs on the new scheme carry several hundred zero-fill kernels (429-467 per compiled
+    decode forward vs 0 in the 1241-era code; speculative1x1 1,531 graph nodes vs 885), from functional components
+    allocating custom-op outputs with `torch.zeros`. Details and next tests: `~/ds41-tp3/analysis/work/port1114/G2-C1-ANALYSIS.md`.
 
 ### D.2 Exporting and serving
 
@@ -449,6 +523,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 2. **Warm the tuning cache before an H342 export.** A cold tuning cache runs out of VRAM at HOT=342; export HOT=300
    first. Needed again after every tuning version or draft-count change, and for a new `MAXC`: the c16 package's
    new verify shapes ran out of memory in tuning at HOT=342 until a HOT=300 c16 export had warmed the cache.
+   A new kernel cache (the port's `kernels-port`) or FlashInfer pin is cold too. *Data point (11-14, port):* the cold
+   HOT 300 export had 6,003 MiB free before tuning and tuned for 955 s from scratch; the HOT 342 export after it had
+   3,083 MiB free before tuning (1241: 3,235) and tuned in 227 s from the warm cache, 41 min for the whole export,
+   no memory error.
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
 4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
    five times (twice more on 11-12). The `grep '[x]yz'` bracket trick does NOT help when the same command line also
@@ -492,6 +570,34 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     0.7.1 -> 0.7.3 raised it 296 -> 438 MiB (-2.9% KV), most likely the prefill-4096 MoE tile choice. Patch df4e92cd
     (branch ds41-tp3-sync) makes tuning prefer lower-scratch kernels within a tolerance of the fastest:
     `FLARE_TUNE_SCRATCH_TOLERANCE` (default 0.02, 0 = off) and `FLARE_TUNE_SCRATCH_MIN_SAVING_MIB` (default 16).
+    On the upstream port the memory lines are different; see D.2.18.
+17. **Reinstall the native module after every Rust or proto change.** `flare_heliopause` is a non-editable wheel in
+    the venv, so `cargo build` does not update what `ignition export` loads. After any change under `helios`,
+    `heliopause` or `flare`: `uv pip install --python .venv/bin/python --no-deps --reinstall --refresh ./heliopause`
+    (about 41 s). Chains pre-flight this: the wheel's `.so` must contain the newest symbol (`grep -qa
+    MXFP4_E2M1_E8M0 <so>`) and be newer than the last Rust commit (`git log -1 --format=%ct -- helios heliopause
+    flare`). *Incident (11-14):* the first G1 mini export failed after 28 min at the native core export with
+    "unrecognized enum value 'MXFP4_E2M1_E8M0'" (the MXFP4 Engram encoding): the port venv's wheel was built at 07:48,
+    the Rust commit that added the encoding (ee9c2479) landed at 07:56.
+18. **The upstream memory scheme (in v0.1.0; 2b38bf9d "Let Inductor plan model temporary storage", 4a24d78a), on
+    the port since 11-14.** There is no graph scratch pool any more. Each compiled forward's temporaries are planned
+    by the compiler into one pool per graph; captured graphs share ONE capture pool, allocated largest first, so its
+    size is the largest per-graph pool. Op shapes come from shared "declaration examples" that are released before
+    capture. Persistent storage (the bump-allocated arena) is never freed, so anything loaded there to be parked
+    (embedding, vision tower) must load as a temporary, or it stays as a dead device copy (~2 GiB/rank). KV gets what
+    is left after capture. *Effect (DS41, HOT 342, 11-14):* persistent memory per rank 1,602 MiB lower than 1241, capture
+    pool 650 MiB (1241: graph scratch 1,343.5 MiB + capture pool 42 MiB), served KV 5,024,384 vs 3,189,376 (+58 %).
+    Read the export lines in A.5 on every port export: free memory before tuning, `Shared declaration examples`
+    (superseded must be 0 MiB: build the largest shapes first), `Graph pool requests`, `[brrr] placement rank`, the
+    routed-expert selections. *Incident (11-14):* the first full export on the new scheme ran out of GPU memory at
+    "Construct graph catalog" (78/99, all ranks) with 5.74 GiB of Torch preparation memory against ~2.3 GiB on
+    tp3-main: the parked embedding's 1.23 GiB load copy stayed cached in the open load pool and a long-lived buffer
+    pinned 1.06 GiB of it (`empty_cache` does not help; a pool of its own destroyed after parking does), and ~2.5 GiB of
+    declaration operands were allocated per graph and per layer instead of shared. Fix 22960712 (own short load pool
+    for parked embedding/vision, declaration operands shared through declaration examples, one vision scratch, CPU
+    test) brought the catalog to 99/99 with 2.64 GiB free before tuning; S5 and the review improvements later reached
+    3,083 MiB at HOT 342. Report: `~/ds41-tp3/analysis/work/port1114/G1-OOM-REPORT.md`. The ~27 GiB that looked
+    "unaccounted" in the failure was the merged bank's hot experts (26.33 GiB), mapped outside Torch.
 16. **Queue scripts: never let a waiter see its own trigger, and never start a server inside `$(...)`.**
     (a) A waiter that greps the shared queue log for "X done" must not log any line containing "X done" (or anchor the
     pattern to the exact line format, e.g. `grep -qE "^[0-9-]{5} [0-9:]{5} seq71 done$"`); free-text notes in the log
@@ -502,6 +608,13 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     *Incidents (2026-11-12):* a 30-min hang on a server that was already up (b), a 30-min wait on a TP2 package refused
     on 3 GPUs (c), and a DS41 chain that started early on its own "(waits for seq71 done)" line and stopped a GLM qual
     mid-GPQA (a).
+    (e) Two waiters on the same end line both fire when it appears: launch the second only after the first has
+    written its start line (and make it wait for the first's end), or give it a guard that checks nothing else holds
+    the GPUs. *11-14:* seq115 and seq114 both followed seq113; seq114 was queued only after seq115 had logged its start
+    and ran after seq115's end. (f) A failed hard gate in a chain's test stage stops the chain before its export by
+    design; read the gate, fix or reclassify the test (known upstream failure = INFO, environment-only = skipped),
+    then rerun with the later stages only (`STAGES=...`). *11-14:* G2 stopped at `T-vocab_tp3` (C.32) and G3 at two
+    GLM attention tests, both before exporting.
 11. **Exports from a worktree must put the worktree first on the import path.** The shared venv's `ignition` console
     script imports the editable install, which points at `~/flare-up-v3`, whatever the current directory is; pytest
     imports from the cwd, so tests look right while exports silently build the main checkout's code. Run
@@ -518,7 +631,13 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    check `nvidia-smi` and `docker ps`; never run a chain's steps by hand while another chain is queued on the GPUs.
 10. **Qualification tooling quirks**: `long_context.py` asserted power ≤ 400 W (now 600) and refused existing output
     dirs; LiveBench needs `--livebench-release-option 2024-11-25`; docker engine crashes restart the container, so
-    re-check which model is up after an OOM.
+    re-check which model is up after an OOM. **`tp3-tools/consistency.py` and empty one-token replies:** when the
+    sampled token is a terminating end-of-sequence the server writes no logprob record (`helios/src/server/runtime.rs`,
+    terminating EOS), and DS41 always samples at temperature 1.0 (C.25), so a one-token probe can come back empty at
+    random. The tool now retries up to 4 times and counts `retried` / `skipped` positions (e90adcc7). A chain gate
+    that "did not evaluate" because its tool crashed is neither a pass nor a fail: rerun it, with the reference in
+    the same session. *Incident (11-14):* the G2 consistency gate crashed (IndexError) on both the new package and
+    1241; the rerun with the fixed tool gave 0.962 vs 0.963 top-1 with 0 retries and 0 skips.
 
 ### D.3 Kernel and runtime code
 
@@ -558,6 +677,16 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 13. **Several compile-time kernel variants in one process need `-fno-gnu-unique`** (or no function-local static
     guards in inline templates). GCC makes such guards GNU-unique symbols shared by every loaded `.so`, so only the
     first variant set its shared-memory attribute; the others failed with "layer kernel fits 0 CTAs per SM".
+14. **"auto" activation precision makes graphs of different widths differ by design.** With `activation_mode="auto"`
+    (GLM asks for it on every KDA projection) the tuner races BF16 activations against on-the-fly 8-bit activations
+    per GEMM shape, so the one-row decode graph and the six-row verification graph can land on different precisions,
+    and a FlashInfer pin that bumps the candidate contract (55 -> 56 in aa6c4221) re-races every shape. A test that
+    compares those two shapes then reports a precision mix as an error. Check like-for-like (autotune off, or 8-bit
+    activations everywhere) before calling it a kernel regression. *Incident (11-14):* the GLM learned-KDA verification
+    test failed on the port at 0.026 (world 1) / 0.040 (world 4) relative error against a 0.01 tolerance (2.6-4.4 %
+    per row): the one-row `o_proj` ran 8-bit, the six-row one BF16. With 8-bit everywhere the error was 0.000000,
+    with autotune off 0.000119. Open product question (not decided): whether the mix costs GLM draft acceptance.
+    Analysis: `~/ds41-tp3/analysis/work/port1114/GLM-KDA-MLA-PIN-ANALYSIS.md`.
 
 ### D.4 Release folder
 
