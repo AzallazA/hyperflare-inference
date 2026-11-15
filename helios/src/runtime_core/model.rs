@@ -287,6 +287,8 @@ pub(super) struct Staged {
     pub staging_bytes: u64,
     /// The load options after the legacy embedding-storage environment shim.
     pub options: LoadOptions,
+    /// The CUDA stack limit the first core recorded, before any override replaced it.
+    pub recorded_stack_limit: Option<usize>,
 }
 
 /// Host bytes of embedding table planes kept resident: every plane of a RAM table, and the scale
@@ -333,13 +335,19 @@ impl Staged {
             Some(_) => Ok(None),
             None => super::selection::EmbeddingTableStorageSpec::from_legacy_env(),
         };
-        let options = match &legacy_env {
+        let mut options = match &legacy_env {
             Ok(Some(spec)) => LoadOptions {
                 embedding_table_storage_per_table: Some(spec.clone()),
                 ..options.clone()
             },
             _ => options.clone(),
         };
+        // The stack-limit override is resolved here once, like the shim above: the option, else
+        // FLARE_CUDA_STACK_LIMIT; later stages read only `options.cuda_stack_limit`.
+        options.cuda_stack_limit = super::stack_limit::resolve_stack_limit(
+            options.cuda_stack_limit,
+            std::env::var(super::STACK_LIMIT_ENV).ok().as_deref(),
+        )?;
         let device_labels = options.device_labels.as_deref().unwrap_or(devices);
         if device_labels.len() != devices.len() {
             return Err(invalid("GPU label count must match selected devices"));
@@ -414,9 +422,14 @@ impl Staged {
         if cores.is_empty() || cores.len() != devices.len() {
             return Err(invalid("model rank count differs from its cores"));
         }
-        for core in &cores {
+        let recorded_stack_limit =
+            cores.first().and_then(|core| super::stack_limit::recorded_stack_limit(&core.context.limits));
+        for core in &mut cores {
             core.validate()?;
             Files::validate(&files, core)?;
+            if let Some(bytes) = options.cuda_stack_limit {
+                core.context.limits = super::stack_limit::with_stack_limit(&core.context.limits, bytes);
+            }
         }
         let roce = transports
             .into_iter()
@@ -681,6 +694,7 @@ impl Staged {
             has_disk_tables,
             staging_bytes,
             options,
+            recorded_stack_limit,
         })
     }
 }
@@ -711,6 +725,7 @@ impl NativeModel {
             has_disk_tables,
             staging_bytes,
             options,
+            recorded_stack_limit,
         } = Staged::prepare(authorized, devices, options, progress)?;
         let options = &options;
         let device_labels = options.device_labels.as_deref().unwrap_or(devices);
@@ -848,7 +863,20 @@ impl NativeModel {
             model.parallel(&cores, &files, |rank, core, path| {
                 rank.prepare_kernels(path, core, &phase)
             })?;
-            phase.finish(format!("{kernels} kernels"));
+            match options.cuda_stack_limit {
+                None => phase.finish(format!("{kernels} kernels")),
+                Some(limit) => {
+                    let mut largest = 0;
+                    for rank in &model.ranks {
+                        largest = largest.max(rank.check_stack_limit(limit)?);
+                    }
+                    let recorded = recorded_stack_limit
+                        .map_or("none".to_owned(), |bytes| format!("{bytes} B"));
+                    phase.finish(format!(
+                        "{kernels} kernels · CUDA stack limit {limit} B per thread (recorded {recorded}, largest kernel stack {largest} B)"
+                    ));
+                }
+            }
             let nodes = cores
                 .iter()
                 .flat_map(|p| &p.graphs)

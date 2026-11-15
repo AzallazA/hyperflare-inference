@@ -23,6 +23,8 @@ mod format;
 #[cfg(any(windows, test))]
 mod host;
 mod limits;
+mod stack_limit;
+pub use stack_limit::{STACK_LIMIT_ENV, parse_stack_limit};
 mod metadata;
 pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
@@ -103,6 +105,9 @@ pub struct NativeResources {
     integrated: bool,
     events: HashMap<String, Handle>,
     cache: Option<flare_selene::CacheGeometry>,
+    /// Largest per-thread stack requirement (bytes, kernel) among the registered kernels, read
+    /// from the module images by `prepare_kernels`; consulted only under a stack-limit override.
+    kernel_stack: std::result::Result<(u64, String), String>,
     #[cfg(windows)]
     host_mappings: Vec<(u64, usize)>,
 }
@@ -361,6 +366,7 @@ impl NativeResources {
                 integrated: integrated != 0,
                 events: HashMap::new(),
                 cache: None,
+                kernel_stack: Err("kernels are not prepared".into()),
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
             };
@@ -688,6 +694,7 @@ impl NativeResources {
         phase: &Phase,
     ) -> Result<()> {
         let driver = self.driver.clone();
+        let mut stack_needs = HashMap::new();
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             let mut modules = HashMap::new();
@@ -696,6 +703,7 @@ impl NativeResources {
                 if !image.starts_with(b"\x7fELF") {
                     return Err(invalid("module image is not a compiled cubin"));
                 }
+                stack_needs.insert(&module.name, stack_limit::kernel_stack_needs(&image));
                 let mut handle = null_mut();
                 driver.check(
                     "cuModuleLoadData",
@@ -769,7 +777,20 @@ impl NativeResources {
                 phase.advance(1);
             }
         }
+        self.kernel_stack = stack_limit::registered_stack_need(core.functions.iter().map(|function| {
+            (
+                function.symbol.as_str(),
+                stack_needs[&function.module].as_ref(),
+            )
+        }));
         Ok(())
+    }
+
+    /// Refuse a CUDA stack-limit override below the largest stack of this rank's kernels;
+    /// returns that largest stack in bytes.
+    pub(super) fn check_stack_limit(&self, limit: usize) -> Result<u64> {
+        stack_limit::check_stack_limit(limit, self.rank, &self.kernel_stack)?;
+        Ok(self.kernel_stack.as_ref().map(|(bytes, _)| *bytes).unwrap_or(0))
     }
 
     unsafe fn prepare_graphs<F: payload::Files>(

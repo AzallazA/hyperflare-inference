@@ -18,7 +18,7 @@ use flare_helios::{
         PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
-    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
+    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit, parse_stack_limit},
 };
 
 /// The serving option that routes every peer over subnets every rank holds.
@@ -975,6 +975,14 @@ pub struct ServingOptions {
     )]
     pub memory_limit: Option<MemoryLimit>,
 
+    /// Advanced: CUDA per-thread stack limit in bytes, replacing the limit the core recorded
+    /// (1024 on exported cores). The driver reserves this much local memory for every thread the
+    /// GPU can hold resident, so a smaller limit leaves more memory for the KV cache. The load
+    /// refuses a value below the largest stack of any kernel the core registers
+    /// [default: FLARE_CUDA_STACK_LIMIT, then the recorded limit].
+    #[arg(long, value_name = "BYTES", value_parser = parse_stack_limit, help_heading = "Serving options")]
+    pub cuda_stack_limit: Option<usize>,
+
     /// Route RoCE rails and fabric transfers only over subnets every rank holds, as on a switch
     /// alone, leaving direct cables between ranks unused.
     #[arg(long, help_heading = "Multi-host options")]
@@ -1188,6 +1196,9 @@ impl ServingOptions {
         if let Some(limit) = self.memory_limit {
             options.push(format!("--memory-limit={limit}"));
         }
+        if let Some(bytes) = self.cuda_stack_limit {
+            options.extend(["--cuda-stack-limit".into(), bytes.to_string()]);
+        }
         match shape {
             Shape::Mesh => {}
             Shape::Ring => options.push("--roce-ring".into()),
@@ -1312,6 +1323,7 @@ impl ServingOptions {
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
             no_mixed_prefill: self.no_mixed_prefill,
+            cuda_stack_limit: self.cuda_stack_limit,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {
@@ -2389,6 +2401,27 @@ mod tests {
                     .load_options()
                     .embedding_table_resident_scales,
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_stack_limit_parses_reaches_every_rank_and_defaults_to_the_recorded_limit() {
+        assert_eq!(run(&["flare", "run", "model.safetensors"]).load_options().cuda_stack_limit, None);
+        assert!(!run(&["flare", "run", "model.safetensors"]).rank_options().iter().any(|o| o.contains("stack")));
+        for flags in [vec!["--cuda-stack-limit", "256"], vec!["--cuda-stack-limit=256"]] {
+            let args = run(&[["flare", "run", "model.safetensors"].as_slice(), &flags].concat());
+            assert_eq!(args.load_options().cuda_stack_limit, Some(256));
+            let forwarded = args.rank_options();
+            let mut peer = vec!["flare", "run", "model.safetensors"];
+            peer.extend(forwarded.iter().map(String::as_str));
+            assert_eq!(run(&peer).load_options().cuda_stack_limit, Some(256));
+        }
+        for value in ["0", "-256", "256B", "1048577", "0x100", ""] {
+            assert!(
+                Cli::try_parse_from(["flare", "run", "model.safetensors", "--cuda-stack-limit", value])
+                    .is_err(),
+                "{value}"
             );
         }
     }
