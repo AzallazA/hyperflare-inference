@@ -873,10 +873,21 @@ pub struct SchedulerOptions {
     /// exact reuse [default: true].
     #[arg(long, value_name = "BOOL", help_heading = "Scheduler options")]
     pub scheduler_eager_message_offers: Option<bool>,
+
+    /// Run a prefill piece shorter than ROWS tokens together with the pieces after it instead of
+    /// as its own prefill graph, when the chunk starts at the request's own checkpoint (an agent
+    /// turn's one-token answer end joins its next message). Skipped message checkpoints are never
+    /// a linear next turn's resume point; the last message stays whenever the tail merge does not
+    /// apply. 0 = off [default: FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS, then 0].
+    #[arg(long, value_name = "ROWS", help_heading = "Scheduler options")]
+    pub scheduler_prefill_merge_min_rows: Option<usize>,
 }
 
+/// Read by rank zero's `flare run` when `--scheduler-prefill-merge-min-rows` is absent.
+pub const PREFILL_MERGE_ENV: &str = "FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS";
+
 impl SchedulerOptions {
-    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 11] {
+    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 12] {
         [
             ("output_token_value", self.scheduler_output_token_value.map(Into::into)),
             ("token_fairness", self.scheduler_token_fairness.map(Into::into)),
@@ -893,7 +904,22 @@ impl SchedulerOptions {
                 mode => mode.into(),
             })),
             ("eager_message_offers", self.scheduler_eager_message_offers.map(Into::into)),
+            ("prefill_merge_min_rows", self.scheduler_prefill_merge_min_rows.map(Into::into)),
         ]
+    }
+
+    /// Takes `--scheduler-prefill-merge-min-rows` from `value` (the `PREFILL_MERGE_ENV`
+    /// environment variable) when the flag is absent; true when the environment set it.
+    pub fn apply_environment(&mut self, value: Option<&str>) -> Result<bool, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(false);
+        };
+        if self.scheduler_prefill_merge_min_rows.is_some() {
+            return Ok(false);
+        }
+        let rows = value.parse().map_err(|_| format!("{PREFILL_MERGE_ENV} must be a nonnegative integer, got {value:?}"))?;
+        self.scheduler_prefill_merge_min_rows = Some(rows);
+        Ok(true)
     }
 
     /// The equivalent command-line flags, for forwarding to rank zero.
@@ -1520,7 +1546,8 @@ mod tests {
             "--scheduler-delivery-fairness", "2.5", "--scheduler-decode-age-price", "0",
             "--scheduler-adaptation-ms", "25", "--scheduler-ttft-target-ms", "50",
             "--scheduler-ttft-max-chunk", "2048", "--scheduler-ttft-decode-interleave", "2",
-            "--scheduler-ttft-order", "shortest", "--scheduler-prefill-tail-merge", "false", "--scheduler-eager-message-offers", "false"];
+            "--scheduler-ttft-order", "shortest", "--scheduler-prefill-tail-merge", "false", "--scheduler-eager-message-offers", "false",
+            "--scheduler-prefill-merge-min-rows", "512"];
         let args = run(&[["flare", "run", "model"].as_slice(), &flags].concat());
         let mut config = serde_json::json!({});
         args.scheduler.configure(&mut config);
@@ -1530,7 +1557,7 @@ mod tests {
             "scheduler_ttft_target_ms": 50.0, "scheduler_ttft_max_chunk": 2048,
             "scheduler_ttft_decode_interleave": 2, "scheduler_ttft_order": "shortest",
             "scheduler_prefill_tail_merge": false,
-            "scheduler_eager_message_offers": false}));
+            "scheduler_eager_message_offers": false, "scheduler_prefill_merge_min_rows": 512}));
         let forwarded = run(&[["flare", "run", "model"].as_slice(),
             &args.scheduler.options().iter().map(String::as_str).collect::<Vec<_>>()].concat());
         assert_eq!(forwarded.scheduler, args.scheduler);
@@ -1548,8 +1575,33 @@ mod tests {
             ("--scheduler-token-fairness", "-1"), ("--scheduler-ttft-target-ms", "NaN"),
             ("--scheduler-decode-age-price", "inf"), ("--scheduler-ttft-max-chunk", "-1"),
             ("--scheduler-ttft-decode-interleave", "1.5"), ("--scheduler-ttft-order", "fewest"),
-            ("--scheduler-prefill-tail-merge", "tools")] {
+            ("--scheduler-prefill-tail-merge", "tools"), ("--scheduler-prefill-merge-min-rows", "-1"),
+            ("--scheduler-prefill-merge-min-rows", "1.5")] {
             assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={invalid}")]).is_err(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn prefill_merge_rows_come_from_the_flag_then_the_environment() {
+        let mut flag = run(&["flare", "run", "model", "--scheduler-prefill-merge-min-rows", "256"]).scheduler;
+        assert_eq!(flag.apply_environment(Some("512")), Ok(false));
+        assert_eq!(flag.scheduler_prefill_merge_min_rows, Some(256));
+        let mut absent = run(&["flare", "run", "model"]).scheduler;
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(absent.apply_environment(unset), Ok(false));
+            assert_eq!(absent, SchedulerOptions::default());
+        }
+        assert_eq!(absent.apply_environment(Some(" 512 ")), Ok(true));
+        assert_eq!(absent.options(), ["--scheduler-prefill-merge-min-rows", "512"]);
+        let mut config = serde_json::json!({});
+        absent.configure(&mut config);
+        assert_eq!(config, serde_json::json!({"scheduler_prefill_merge_min_rows": 512}));
+        let mut zero = SchedulerOptions::default();
+        assert_eq!(zero.apply_environment(Some("0")), Ok(true));
+        assert_eq!(zero.scheduler_prefill_merge_min_rows, Some(0));
+        for invalid in ["-1", "1.5", "lots"] {
+            let error = SchedulerOptions::default().apply_environment(Some(invalid)).unwrap_err();
+            assert!(error.contains(PREFILL_MERGE_ENV), "{error}");
         }
     }
 

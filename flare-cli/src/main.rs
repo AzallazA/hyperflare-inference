@@ -161,6 +161,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return trust::revoke(&fingerprint, trust_store.as_deref());
         }
     };
+    if args
+        .scheduler
+        .apply_environment(std::env::var(cli::PREFILL_MERGE_ENV).ok().as_deref())?
+    {
+        eprintln!(
+            "scheduler: prefill merge below {} rows (from {})",
+            args.scheduler.scheduler_prefill_merge_min_rows.unwrap_or_default(),
+            cli::PREFILL_MERGE_ENV
+        );
+    }
     #[cfg(windows)]
     if args.rank.is_some()
         || args.rendezvous.is_some()
