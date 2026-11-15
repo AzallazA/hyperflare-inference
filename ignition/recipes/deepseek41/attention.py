@@ -16,7 +16,7 @@ from b12x.preparation import PreparedCall
 from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection, mxfp8_dense_bases
 from ignition.components.mla_norm_quant import PreparedMLANormQuant
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.components.projection_overlap import ConcurrentProjectionChain
@@ -479,8 +479,12 @@ class PreparedAttention:
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])
         qkv = self.projections["qkv_a"]
-        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
-            torch.zeros(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
+        # qkv_a is a projection-owned MXFP8 quantizer (mxfp8_min_amax), so its call quantizes ``source`` into
+        # these bases before the GEMM reads them; mxfp8_dense_bases keeps only the unwritten MMA-scale padding zero.
+        if qkv.encoded_layout is not None and qkv.quantizer_plan is None:
+            raise RuntimeError("qkv_a bases must be written by its own activation quantizer")
+        qkv_encoded_bases = (None if qkv.encoded_layout is None
+                             else mxfp8_dense_bases(qkv.encoded_layout, source.device))
         projected = qkv(source, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
         if self.norm_quant is None:
