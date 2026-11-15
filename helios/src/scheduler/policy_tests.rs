@@ -17,6 +17,9 @@ mod ttft_order_tests;
 #[path = "prefill_merge_tests.rs"]
 mod prefill_merge_tests;
 
+#[path = "acceptance_population_tests.rs"]
+mod acceptance_population_tests;
+
 #[test]
 fn padding_pruning_keeps_three_requests_on_batch_four_and_two_requests_on_batch_two() {
     let mut s = engine(8, false);
