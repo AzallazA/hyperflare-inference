@@ -181,7 +181,9 @@ class PreparedDecoderBoundary:
 
     def __call__(self, incoming, pre_mix, metadata, indices, indexer):
         suffix = self.packing.begin(metadata)
-        attn_mix = torch.zeros_like(pre_mix)
+        # Lagged mHC writes every [tokens, 4] coefficient of pre_out (b12x mhc finalize / lagged producer, one
+        # program per row; shapes are validated equal to pre_mix), so the next-layer mix needs no zero fill.
+        attn_mix = torch.empty_like(pre_mix)
         residual, post, comb, normalized = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
         self.global_kv(normalized, indexer, metadata, indices.compressed(self.global_kv.ratio))
         return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
@@ -322,7 +324,7 @@ class PreparedLayer:
         if len(incoming) == 1:
             probe.record(incoming[0], layer, 0, mode)
         if boundary is None:
-            attn_mix = torch.zeros_like(pre_mix)
+            attn_mix = torch.empty_like(pre_mix)  # written whole by the lagged mHC (see PreparedBoundary)
             residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
         else:
             (residual, post, comb, normalized), attn_mix = boundary
@@ -341,7 +343,7 @@ class PreparedLayer:
             return incoming, next_mix, records, selection, observations
         attention_output = self.attention_reduce(attended)
         probe.record(attention_output, layer, 1, mode)
-        next_mix = torch.zeros_like(attn_mix)
+        next_mix = torch.empty_like(attn_mix)  # written whole by the lagged mHC
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
