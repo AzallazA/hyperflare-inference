@@ -75,3 +75,69 @@ def test_functional_projection_chain_replay_preserves_local_input(rows):
                 torch.testing.assert_close(main_output, expected_main, rtol=0, atol=0)
         finally:
             graph.reset()
+
+
+def _poison(empty, byte):
+    def poisoned(*args, **kwargs):
+        tensor = empty(*args, **kwargs)
+        if tensor.numel():
+            tensor.view(torch.uint8).fill_(byte)
+        return tensor
+    return poisoned
+
+
+@pytest.mark.parametrize("rows", [1, 5, 16])
+@pytest.mark.parametrize("kind", ["bf16", "mxfp8-atomic"])
+@torch.no_grad()
+def test_functional_chain_outputs_need_no_zero_fill(monkeypatch, rows, kind):
+    """Chain outputs start uninitialised; recycled 0x7F/0xFF memory must not reach the result."""
+    from b12x.gemm import blockscaled
+
+    from ignition.components.linear import QuantizedProjection
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(rows)
+    width = 4096
+    seed = torch.randn(rows, width, dtype=torch.bfloat16, device=device)
+    arena = ScratchArena(device)
+
+    def projection(source, features, name, session):
+        output = torch.empty(rows, features, dtype=torch.bfloat16, device=device)
+        if kind == "bf16":
+            weight = torch.randn(features, source.shape[1], dtype=torch.bfloat16, device=device) * .02
+            return UnquantizedProjection(source, weight, output, session=session, name=name)
+        values = (torch.randn(features, source.shape[1], device=device) * 4).to(torch.float8_e4m3fn)
+        scales = torch.randint(118, 124, (features, source.shape[1] // 32), dtype=torch.uint8, device=device)
+        weight = blockscaled.pack_weight(values, scales, recipe="mxfp8")
+        return QuantizedProjection(source, weight, output, session=session, name=name, workspace=arena,
+                                   activation_mode="quantized", allow_bf16_atomic_reduction=True)
+
+    with RecordedPreparationSession(device=device, checkpoint="projection-chain-poison",
+            workload_schema=f"chain-poison-{kind}-{rows}",
+            numerical_policy="bf16" if kind == "bf16" else "default") as session:
+        session.register_scratch(arena)
+        first = projection(seed, 1024, "first", session)
+        second = projection(first.output, 128, "second", session)
+        main = projection(seed, 1024, "main", session)
+        chain = ConcurrentProjectionChain((first, second), parallel_plans=(main.plan,), session=session,
+                                          workspace=arena)
+        chain.functional(session=session)
+        main.functional(session=session)
+        session.tune(show_progress=False)
+        arena.release_preparation()
+    for plan in (p.plan for p in chain.plan_owners):
+        print(f"[plan] {kind} rows {rows}: {getattr(plan, 'query', plan)!r}"[:400], flush=True)
+
+    def run():
+        pending = chain.start(seed)
+        return chain.finish(pending, main(seed)).clone()
+
+    expected = run()
+    for byte in (0x7F, 0xFF):
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty_strided", _poison(torch.empty_strided, byte))
+            patch.setattr(torch, "empty", _poison(torch.empty, byte))
+            actual = run()
+        torch.cuda.synchronize()
+        assert torch.equal(actual, expected), f"poison 0x{byte:02X}"
+    assert expected.isfinite().all()

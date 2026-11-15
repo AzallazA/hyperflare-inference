@@ -144,3 +144,33 @@ def test_functional_quantizer_projection_allocates_mxfp8_dense_bases(monkeypatch
     projection(source)
     values, scale_rows, scale_mma = seen[0]
     assert values.eq(POISON).all() and scale_rows.eq(POISON).all() and scale_mma.eq(0).all()
+
+
+def test_functional_projection_chain_leaves_outputs_to_its_writers(monkeypatch, poisoned):
+    from ignition.components import projection_overlap
+
+    chain = object.__new__(projection_overlap.ConcurrentProjectionChain)
+    chain.projections, chain.encoded_layouts = None, None
+    chain.output_layouts = (((3, 4), (6, 1), torch.float32), ((3, 2), (2, 1), torch.float32))
+    chain.workspace_nbytes, chain.stream_handle = 8, 0
+    chain.weights = [torch.randn(4, 5), torch.randn(2, 4)]
+    chain.scales = chain.gains = chain.activation_scales = [None, None]
+    chain.scale_kinds, chain.plans = [0, 0], [1, 2]
+    seen = []
+
+    def start(source, weights, scales, gains, activation_scales, kinds, outputs, workspace, plans, stream):
+        # The writers (b12x GEMVs / dense GEMMs) store every logical element of each output.
+        seen.extend(output.clone() for output in outputs)
+        value = source
+        for weight, output in zip(weights, outputs, strict=True):
+            output.copy_(value @ weight.T)
+            value = output
+
+    monkeypatch.setattr(torch, "empty_strided", _poisoning(torch.empty_strided))
+    monkeypatch.setattr(projection_overlap, "_start", start)
+    monkeypatch.setattr(projection_overlap, "_join", lambda *args: None)
+    source = torch.randn(3, 5)
+    result = chain.finish(chain.start(source), source)
+    assert all(output.view(torch.uint8).eq(POISON).all() for output in seen)
+    assert result.stride() == (2, 1)
+    torch.testing.assert_close(result, source @ chain.weights[0].T @ chain.weights[1].T, rtol=0, atol=0)
