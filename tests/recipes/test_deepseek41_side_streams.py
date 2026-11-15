@@ -69,10 +69,10 @@ def clock(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _Stream(clock, clock.current))
     monkeypatch.setattr(torch.cuda, "stream", Context)
     monkeypatch.setattr(torch.cuda, "Event", Event)
-    # one stable fake stream handle per purpose
+    # one stable fake stream handle per purpose, resolved when a task is registered
     fake_handles = {}
-    monkeypatch.setattr(side_streams.Task, "stream_handle",
-                        lambda self, device: fake_handles.setdefault(self.purpose, 100 + len(fake_handles)))
+    monkeypatch.setattr(side_streams, "side_stream", lambda device, purpose: SimpleNamespace(
+        cuda_stream=fake_handles.setdefault(purpose, 100 + len(fake_handles))))
     return clock
 
 
@@ -92,7 +92,7 @@ def names(clock, stream=None):
 def test_launch_forks_runs_the_task_on_the_side_stream_and_join_waits_for_its_event(clock):
     seen = []
     task = side_streams.register(lambda inputs, outputs: (kernel(clock, "task"), seen.append((inputs, outputs))),
-                                 "unit")
+                                 "unit", "cpu")
     anchor, source, out = torch.zeros(2), torch.ones(2), torch.empty(2)
     task.launch(anchor, [source], [out])
     kernel(clock, "main-work")
@@ -105,8 +105,8 @@ def test_launch_forks_runs_the_task_on_the_side_stream_and_join_waits_for_its_ev
 
 
 def test_join_waits_only_for_its_own_task_and_needs_a_launch(clock):
-    first = side_streams.register(lambda i, o: kernel(clock, "first"), "unit")
-    second = side_streams.register(lambda i, o: kernel(clock, "second"), "unit")
+    first = side_streams.register(lambda i, o: kernel(clock, "first"), "unit", "cpu")
+    second = side_streams.register(lambda i, o: kernel(clock, "second"), "unit", "cpu")
     a, b = torch.empty(1), torch.empty(1)
     first.launch(a, [], [torch.empty(1)])
     second.launch(b, [], [torch.empty(1)])
@@ -116,13 +116,31 @@ def test_join_waits_only_for_its_own_task_and_needs_a_launch(clock):
         first.join(a, [], [torch.empty(1)])  # each launch is joined once
 
 
-def test_outputs_may_not_alias_other_operands():
-    task = side_streams.register(lambda i, o: None, "unit")
+def test_outputs_may_not_alias_other_operands(clock):
+    task = side_streams.register(lambda i, o: None, "unit", "cpu")
     x = torch.empty(2)
     with pytest.raises(ValueError, match="output may not"):
         task.launch(torch.empty(1), [x], [x])
     with pytest.raises(ValueError, match="output may not"):
         task.join(x, [], [x])
+
+
+def _noop(inputs, outputs):
+    pass
+
+
+def test_stream_handle_is_resolved_at_registration_not_at_trace(clock, monkeypatch):
+    task = side_streams.register(_noop, "registered", "cpu")
+    handle = task.stream_handle
+    # A compile worker traces with its own process state: a later stream lookup must not change the baked handle.
+    monkeypatch.setattr(side_streams, "side_stream", lambda device, purpose: pytest.fail("stream looked up at trace"))
+    launched = []
+    monkeypatch.setattr(side_streams, "_launch", lambda anchor, i, o, h, stream: launched.append((h, stream)))
+    task.launch(torch.empty(1), [], [torch.empty(1)])
+    assert launched == [(task.handle, handle)]
+    import pickle
+    clone = pickle.loads(pickle.dumps(task))  # a worker's copy keeps both integers
+    assert (clone.handle, clone.stream_handle) == (task.handle, handle)
 
 
 def test_ops_are_registered_with_fake_kernels():
@@ -283,7 +301,7 @@ def test_index_side_off_keeps_the_serial_order(clock, kv_source):
 @pytest.mark.parametrize("kv_source", [True, False])
 def test_index_side_runs_the_query_chain_and_gates_on_the_side_stream(clock, kv_source):
     attention = _fake_attention(clock, kv_source=kv_source)
-    attention.index_side = attention_module.IndexSideChain(attention)
+    attention.index_side = attention_module.IndexSideChain(attention, "cpu")
     assert (attention.index_side.gates_task is not None) is kv_source
     _run(attention)
     side = "side100"
@@ -308,7 +326,7 @@ def test_index_side_runs_the_query_chain_and_gates_on_the_side_stream(clock, kv_
 
 def test_index_side_join_keeps_every_side_input_alive_and_outputs_are_fresh(clock, monkeypatch):
     attention = _fake_attention(clock, kv_source=True)
-    attention.index_side = chain = attention_module.IndexSideChain(attention)
+    attention.index_side = chain = attention_module.IndexSideChain(attention, "cpu")
     launches, joins = [], []
     real_launch, real_join = side_streams.Task.launch, side_streams.Task.join
     monkeypatch.setattr(side_streams.Task, "launch",
@@ -517,7 +535,7 @@ def _fake_context(clock, monkeypatch, *, side):
     context.rotary = SimpleNamespace(apply=lambda *a, **k: kernel(clock, "rope"))
     context.stages = [((lambda x: (kernel(clock, f"norm{i}"), x)[1]),
                        (lambda x, slots, i=i: kernel(clock, f"write{i}"))) for i in range(3)]
-    context.side_task = side_streams.register(context._run_side, context.SIDE_PURPOSE) if side else None
+    context.side_task = side_streams.register(context._run_side, context.SIDE_PURPOSE, "cpu") if side else None
     return context
 
 

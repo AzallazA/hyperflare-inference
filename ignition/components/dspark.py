@@ -179,7 +179,7 @@ class PreparedContext:
 
             if self.norm.add_residual or self.norm.stage_source:
                 raise ValueError("the context side stream runs the plain main norm only")
-            self.side_task = register(self._run_side, self.SIDE_PURPOSE)
+            self.side_task = register(self._run_side, self.SIDE_PURPOSE, device)
 
     def functional(self):
         return self

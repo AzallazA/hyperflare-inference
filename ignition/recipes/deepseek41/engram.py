@@ -326,7 +326,7 @@ class PreparedEngram:
             raise ValueError("the Engram side stream needs a graph that projects in one chunk (decode/verify)")
         if not self.sharded:
             raise ValueError("the Engram side stream is for tensor-parallel ranks (it moves the reduction too)")
-        self.side_task = register(self._run_side, self.SIDE_PURPOSE)
+        self.side_task = register(self._run_side, self.SIDE_PURPOSE, self.columns.device)
         return self
 
     side_task = None

@@ -301,14 +301,14 @@ class IndexSideChain:
 
     PURPOSE = "ds41-index"
 
-    def __init__(self, attention):
+    def __init__(self, attention, device):
         from ignition.components.side_streams import register
 
         self.attention = attention
         compressor = None if attention.global_kv is None else attention.global_kv.compressor
         self.compressor = compressor if compressor is not None and compressor.ratio == 2 else None
-        self.gates_task = None if self.compressor is None else register(self._run_gates, self.PURPOSE)
-        self.query_task = register(self._run_query, self.PURPOSE)
+        self.gates_task = None if self.compressor is None else register(self._run_gates, self.PURPOSE, device)
+        self.query_task = register(self._run_query, self.PURPOSE, device)
 
     def _run_gates(self, inputs, outputs):
         source, = inputs
@@ -525,7 +525,7 @@ class PreparedAttention:
 
         # TP3 (tp3.index_side_stream): decode/verify index layers run the indexer query chain (and a ratio-2
         # source's gates GEMV) on a side stream; prefill keeps the serial order.
-        self.index_side = (IndexSideChain(self) if index_side_stream and self.selectors
+        self.index_side = (IndexSideChain(self, device) if index_side_stream and self.selectors
                            and mode in ("decode", "verify") else None)
         self.query_shape = tuple(scratch.query.shape)
         self.candidate_source = config.text["candidate_source_layer_id"]

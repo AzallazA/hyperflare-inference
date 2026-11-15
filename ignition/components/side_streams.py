@@ -51,22 +51,24 @@ def side_stream(device, purpose):
 
 
 class Task:
-    """A registered side-stream task: ``run(inputs, outputs)`` on the stream named ``purpose``."""
+    """A registered side-stream task: ``run(inputs, outputs)`` on the stream named ``purpose`` of ``device``.
 
-    def __init__(self, run, purpose):
+    Registered at preparation in the process that captures and replays: the stream handle and the task handle are
+    plain integers baked into the traced graph, so compile workers (which only trace, through the fake kernels) see
+    the preparing process's stream, as ``ConcurrentProjectionChain`` does with the arena's auxiliary stream."""
+
+    def __init__(self, run, purpose, device):
         if not callable(run) or not isinstance(purpose, str) or not purpose:
             raise ValueError("a side-stream task needs a callable and a purpose name")
         self.run, self.purpose = run, purpose
+        self.stream_handle = int(side_stream(device, purpose).cuda_stream)
         self.handle = next(_HANDLES)
         _TASKS[self.handle] = self
-
-    def stream_handle(self, device):
-        return side_stream(device, self.purpose).cuda_stream
 
     def launch(self, anchor, inputs, outputs):
         """Traced: fork after ``anchor`` (read only) and the inputs' producers; run the task on the side stream."""
         _check_disjoint(anchor, inputs, outputs)
-        _launch(anchor, list(inputs), list(outputs), self.handle, self.stream_handle(anchor.device))
+        _launch(anchor, list(inputs), list(outputs), self.handle, self.stream_handle)
         return outputs
 
     def join(self, dependency, inputs, outputs):
@@ -76,8 +78,8 @@ class Task:
         return outputs
 
 
-def register(run, purpose):
-    return Task(run, purpose)
+def register(run, purpose, device):
+    return Task(run, purpose, device)
 
 
 def _check_disjoint(anchor, inputs, outputs):
