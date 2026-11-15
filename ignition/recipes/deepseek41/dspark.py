@@ -12,16 +12,26 @@ from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, Rotary, normalize
 from .decoder import PreparedLayer
+from .host_embedding import HostRowGather
 
 
 class PreparedDraft:
+    host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
-                 coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False, examples=None):
+                 coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False, examples=None,
+                 tp3=None):
         if scratch.local_logits.dtype != torch.bfloat16 or scratch.logits.dtype != torch.bfloat16:
             raise ValueError("DSpark proposal vocabulary logits require BF16 storage")
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
-        self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
-            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
+        # TP3 (tp3.embed_rows): one vectorised gather of the host-parked table's rows, and the block's noise-token rows
+        # from a device copy instead of repeated reads of one host row (host_embedding.py, same values).
+        self.host_rows = (HostRowGather(weights.embedding, rows=metadata.token_ids.numel(),
+                                        noise_token=weights.config.draft.noise_token)
+                          if tp3 is not None and tp3.embed_rows else None)
+        self.embedding = None if self.host_rows is not None else PreparedEmbedding(
+            weights.embedding, metadata.token_ids, scratch.embedding, num_rows=metadata.live_counts[:1],
+            session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         rotary = Rotary(weights.config, scratch.embedding.device)
         page_size = 128 + metadata.max_query_tokens
         self.window_metadata = AttentionIndices(metadata, mode="draft",
@@ -46,7 +56,8 @@ class PreparedDraft:
         self.scratch = self.metadata = self.head_hidden = None
 
     def __call__(self, metadata):
-        embedding = self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
+        embedding = (self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
+                     if self.host_rows is None else self.host_rows(metadata.token_ids, metadata.live_counts[:1]))
         incoming = (embedding[:, None, :].expand(-1, 4, -1).contiguous(),)
         pre_mix = torch.zeros((embedding.shape[0], 4), dtype=torch.float32, device=embedding.device)
         pre_mix[:, 0].fill_(1)

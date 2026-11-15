@@ -24,6 +24,7 @@ from ignition.preparation.tuning import register_finalizer
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .host_embedding import HostRowGather
 from .probe import Probe
 from .tp3_config import TP3Config
 
@@ -378,6 +379,8 @@ class PreparedLayer:
 
 
 class PreparedDecoder:
+    host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
@@ -414,8 +417,13 @@ class PreparedDecoder:
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
-        self.embedding = PreparedEmbedding(weights.embedding, self.safe_tokens, scratch.embedding,
-            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
+        # TP3 (tp3.embed_rows): decode and verification graphs gather the host-parked table's rows with one
+        # vectorised launch (host_embedding.py, same values); prefill graphs and the default keep b12x's lookup.
+        self.host_rows = (HostRowGather(weights.embedding, rows=metadata.token_ids.numel())
+                          if tp3.embed_rows and mode in ("decode", "verify") else None)
+        self.embedding = None if self.host_rows is not None else PreparedEmbedding(
+            weights.embedding, self.safe_tokens, scratch.embedding, num_rows=metadata.live_counts[:1],
+            session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         self.rotary = Rotary(weights.config, scratch.embedding.device)
         self.window_commit = None
         if mode == "verify":
@@ -509,7 +517,8 @@ class PreparedDecoder:
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
                   if self.vision is not None else metadata.token_ids)
-        embedding = self.embedding(token_ids=tokens, num_rows=metadata.live_counts[:1])
+        embedding = (self.embedding(token_ids=tokens, num_rows=metadata.live_counts[:1]) if self.host_rows is None
+                     else self.host_rows(tokens, metadata.live_counts[:1]))
         if self.vision is not None:
             self.vision.inject(metadata, embedding)
         residual = embedding[:, None, :].expand(-1, 4, -1).contiguous()
