@@ -233,8 +233,10 @@ class PreparedLayer:
             window_metadata=window_metadata, examples=examples)
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
+        # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).
         self.attention_reduce = PreparedChunkedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".attention_reduce")
+            coordinator=coordinator, session=session, name=name + ".attention_reduce",
+            max_part_rows=tp3.ar_part_rows)
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
             _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
             pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
@@ -261,7 +263,8 @@ class PreparedLayer:
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
         self.mlp_reduce = PreparedChunkedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".mlp_reduce")
+            coordinator=coordinator, session=session, name=name + ".mlp_reduce",
+            max_part_rows=tp3.ar_part_rows)
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
         # TP3 BRRR: one fused kernel from the attention output to the MLP all-reduce in decode/verify graphs
