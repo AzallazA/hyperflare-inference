@@ -204,6 +204,15 @@ class UnquantizedProjection:
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        return self.run_into(source, output)
+
+    def allocate(self, device):
+        """A functional call's output (the buffer ``__call__`` would allocate), for ``run_into`` elsewhere."""
+        shape, stride, dtype = self.output_layout
+        return torch.empty_strided(shape, stride, dtype=dtype, device=device)
+
+    def run_into(self, source, output):
+        """Launch the selected projection into ``output`` on the current stream (the tail of ``__call__``)."""
         if self.dense:
             sm103_projection.bf16_out(source, self.weight, output, self.plan.handle)
             return output
@@ -474,6 +483,28 @@ class QuantizedProjection:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+        return self.run_into(source, output, workspace, encoded_bases=encoded_bases)
+
+    def allocate(self, device):
+        """A functional call's invocation-local buffers, allocated as ``__call__`` would: (output, workspace,
+        activation bases or None). The bases exist only for a projection-owned MXFP8 quantizer; ``run_into`` with
+        them launches exactly ``__call__``'s kernels on the current stream."""
+        if self.workspace_nbytes is None:
+            raise RuntimeError("functional projection requires preparation before execution")
+        shape, stride, dtype = self.output_layout
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=device)
+        workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=device)
+        bases = mxfp8_dense_bases(self.encoded_layout, device) if self.allocates_bases else None
+        return output, workspace, bases
+
+    @property
+    def allocates_bases(self):
+        """Whether a functional call allocates MXFP8 activation bases (a projection-owned quantizer)."""
+        return self.encoded is None and self.encoded_layout is not None and self.quantizer_plan is not None
+
+    def run_into(self, source, output, workspace, *, encoded_bases=None):
+        """Launch the selected projection into ``output`` with ``workspace`` on the current stream (the tail of
+        ``__call__``)."""
         if self.encoded is not None or self.encoded_layout is not None:
             from b12x import gemm
             from b12x.quantization import mxfp8

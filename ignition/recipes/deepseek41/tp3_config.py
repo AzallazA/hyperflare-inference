@@ -187,6 +187,24 @@ class TP3Config:
     packed_wide_tokens: int = 0
     """With ``packed_keep_batches``: largest packed token capacity of the wide batches (e.g. 48: shapes only where a
     served verification budget <= 48 can select them); 0 = the export's speculative token capacity (batch x width)."""
+    # --- side streams in decode/verify graphs (components/side_streams.py; export-time, bit-identical) ---
+    index_side_stream: bool = False
+    """Index-source layers run the indexer query chain (index_q projection, RoPE, index-weights GEMV) on a side
+    stream from right after the q/KV norm, joined before the selectors; ratio-2 KV sources also run the compressor's
+    gates GEMV there, joined before the compression kernel (attention.IndexSideChain). Decode/verify graphs only.
+    False = serial on the main stream (base)."""
+    engram_side_layers: frozenset = field(default_factory=frozenset)
+    """Engram layers (``"14"``) whose readiness wait, lookup, projection and all-reduce run on a side stream during
+    the previous layer's attention (started after its predecessor's tail, joined before its own tail), leaving only
+    the mix in place (engram.PreparedEngram.start_side). Uses the shared all-reduce runtime: no extra VRAM.
+    Decode/verify graphs only. Layer 1 is allowed but its rows are staged by the host only ~0.2 ms before layer 1
+    today (hashes are published at the start of the target forward), so starting it in layer 0 can stall.
+    Empty = in place (base)."""
+    context_side_stream: bool = False
+    """Verification rounds run DSpark's context projections (main projection, norm, context KV projection) on a
+    side stream from the end of the target forward, beside verification and commit; the per-layer norms and draft
+    ring writes stay after the accepted counts (components/dspark.PreparedContext). Draft acceptance only; the
+    rings get the same bytes. False = after verification (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -222,6 +240,7 @@ class TP3Config:
     def __post_init__(self):
         object.__setattr__(self, "host_expert_layers", frozenset(self.host_expert_layers))
         object.__setattr__(self, "brrr_layers", frozenset(self.brrr_layers))
+        object.__setattr__(self, "engram_side_layers", frozenset(self.engram_side_layers))
         for name in ("expert_counts_dir", "brrr_ckpt"):
             value = getattr(self, name)
             if value is not None:
@@ -234,10 +253,11 @@ class TP3Config:
         for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
                      "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual",
-                     *VRAM_RECLAIM):
+                     "index_side_stream", "context_side_stream", *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
-        if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
+        if any(type(layer) is not int or layer < 0
+               for layer in (*self.host_expert_layers, *self.brrr_layers, *self.engram_side_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
         if self.engram_tables not in ENGRAM_TABLES:
             raise ValueError(f"TP3 config: engram_tables must be one of {', '.join(ENGRAM_TABLES)}, "
@@ -356,6 +376,9 @@ class TP3Config:
             packed_wide_graphs=integer("PACKED_WIDE_GRAPHS"),
             packed_wide_tokens=integer("PACKED_WIDE_TOKENS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
+            index_side_stream=flag("INDEX_SIDE_STREAM"),
+            engram_side_layers=parse_layers(get("ENGRAM_SIDE_LAYERS")),
+            context_side_stream=flag("CONTEXT_SIDE_STREAM"),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),
@@ -390,10 +413,11 @@ class TP3Config:
     def check_layers(self, layers: int):
         """Raise when a layer set names a layer the model (or its mini view) does not have; preparation calls it
         with the checkpoint's layer count before loading weights."""
-        beyond = sorted(layer for layer in self.brrr_layers if layer >= layers)
-        if beyond:
-            raise ValueError(f"TP3 config: brrr_layers names layers {format_layers(beyond)} but the model has "
-                             f"{layers} layers (0-{layers - 1})")
+        for name in ("brrr_layers", "engram_side_layers"):
+            beyond = sorted(layer for layer in getattr(self, name) if layer >= layers)
+            if beyond:
+                raise ValueError(f"TP3 config: {name} names layers {format_layers(beyond)} but the model has "
+                                 f"{layers} layers (0-{layers - 1})")
         return self
 
     def shared_engram_tables(self, world: int) -> bool:
