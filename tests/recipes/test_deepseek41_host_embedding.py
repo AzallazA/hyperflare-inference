@@ -119,6 +119,48 @@ def test_kernel_in_the_triton_interpreter():
     assert "interpreter ok" in completed.stdout
 
 
+def test_traced_launch_mutates_only_its_output():
+    """torch's Triton mutation analysis (what functionalization of the traced forward relies on) must see the kernel
+    write ``out`` only; were it to fail, every tensor argument, the 1.23 GiB host table included, would count as
+    mutated. The analysis lowers the kernel to TTIR for a CUDA target, which needs no GPU (fake driver, subprocess)."""
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=os.pathsep.join(filter(None, (str(root), os.environ.get("PYTHONPATH")))))
+    completed = subprocess.run([sys.executable, "-m", "tests.recipes.test_deepseek41_host_embedding", "mutations"],
+                               cwd=root, env=env, capture_output=True, text=True, timeout=900)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.count("mutated ['out']") == 4, completed.stdout
+
+
+def _mutations():
+    import triton
+    from torch._higher_order_ops import triton_kernel_wrap
+    from triton.backends.compiler import GPUTarget
+
+    from ignition.recipes.deepseek41.host_embedding import _gather_host_rows
+
+    class Driver:
+        def get_current_target(self):
+            return GPUTarget("cuda", 120, 32)
+
+        def get_active_torch_device(self):
+            return torch.device("cpu")
+
+    triton.runtime.driver.set_active(Driver())
+    weights = torch.empty((TABLE_ROWS, 5120), dtype=torch.bfloat16)
+    ids, count = torch.zeros(10, dtype=torch.int64), torch.zeros(1, dtype=torch.int32)
+    noise_row, out = torch.empty((1, 5120), dtype=torch.bfloat16), torch.empty((10, 5120), dtype=torch.bfloat16)
+    for has_noise in (True, False):
+        for has_count in (True, False):
+            tensors = dict(table=weights, ids=ids, count=count if has_count else ids,
+                           noise_row=noise_row if has_noise else weights, out=out)
+            constants = dict(capacity=10, table_rows=TABLE_ROWS, noise_token=NOISE, WIDTH=5120, STRIDE=5120,
+                             BLOCK=8192, HAS_COUNT=has_count, HAS_NOISE=has_noise)
+            kernel = triton_kernel_wrap.kernel_side_table.add_kernel(_gather_host_rows)
+            constant = triton_kernel_wrap.kernel_side_table.add_constant_args(constants)
+            print("mutated", triton_kernel_wrap.get_mutated_tensors(kernel, constant, tensors, {}))
+
+
 def _interpret():
     """Run _gather_host_rows itself (DS41 width, BF16) on outputs poisoned with 0x7F/0xFF: every element is stored."""
     from ignition.recipes.deepseek41.host_embedding import _gather_host_rows
@@ -287,4 +329,4 @@ def test_forwards_embed_the_same_rows_either_way(stubs, monkeypatch, tp3, live):
 
 
 if __name__ == "__main__":
-    _interpret()
+    _mutations() if sys.argv[1:] == ["mutations"] else _interpret()
