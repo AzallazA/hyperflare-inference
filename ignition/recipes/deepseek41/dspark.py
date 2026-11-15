@@ -11,12 +11,13 @@ from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, Rotary, normalize
-from .decoder import PreparedLayer
+from .decoder import PreparedLayer, allocate_mma_pads, mma_pad_layouts
 from .host_embedding import HostRowGather
 
 
 class PreparedDraft:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+    mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
 
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
                  coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False, examples=None,
@@ -42,6 +43,9 @@ class PreparedDraft:
             defer_post=i + 1 < len(weights.draft.layers), mla_compute_mode=mla_compute_mode,
             window_metadata=self.window_metadata, examples=examples)
             for i, layer in enumerate(weights.draft.layers))
+        # TP3 (tp3.mma_pad_once): the draft layers share one zero fill per padded MXFP8 MMA-scale tile shape.
+        self.mma_pad_layouts = (mma_pad_layouts(layer.attention for layer in self.layers)
+                                if tp3 is not None and tp3.mma_pad_once else ())
         self.head_hidden = torch.zeros_like(scratch.hidden)
         self.head_hidden_shape = tuple(scratch.hidden.shape)
         self.logit_shape, self.logit_dtype = tuple(scratch.logits.shape), scratch.logits.dtype
@@ -63,8 +67,10 @@ class PreparedDraft:
         pre_mix[:, 0].fill_(1)
         indices = self.window_metadata(metadata)
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
+        mma_pads = allocate_mma_pads(self.mma_pad_layouts, embedding.device)  # TP3 tp3.mma_pad_once; None = off
         for layer in self.layers:
-            incoming, pre_mix, _, selection = layer(incoming, pre_mix, metadata, indices, selection)
+            incoming, pre_mix, _, selection = layer(incoming, pre_mix, metadata, indices, selection,
+                                                    **({} if mma_pads is None else {"mma_pads": mma_pads}))
         residual, = incoming
         head_hidden = (residual[metadata.sample_indices].float()
                        * pre_mix[metadata.sample_indices, :, None]).sum(1).bfloat16()

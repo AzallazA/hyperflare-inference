@@ -239,6 +239,13 @@ class TP3Config:
     side stream from the end of the target forward, beside verification and commit; the per-layer norms and draft
     ring writes stay after the accepted counts (components/dspark.PreparedContext). Draft acceptance only; the
     rings get the same bytes. False = after verification (base)."""
+    # --- launch merging in decode/verify/draft graphs (attention.py, decoder.py, dspark.py; export-time) ---
+    mma_pad_once: bool = False
+    """Decode, verification and DSpark draft forwards zero the MXFP8 MMA-scale tiles of the qkv_a and q_b activations
+    once per forward (one fill per tile shape) and every layer reuses them, instead of one zero fill per layer and tile
+    (``mxfp8_dense_bases``: 2 x 43 Inductor fills of 20 / 5 KB per c1 round, ~0.6 us each on the critical path). Each
+    layer's quantizer (b12x MXFP8 rows quantizer, mla_norm_mxfp8) still writes every real row's scales before its GEMM
+    reads them; padding rows are written by nothing and stay zero. Same bytes. False = per-layer fills (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -311,6 +318,8 @@ class TP3Config:
                      "index_side_stream", "context_side_stream", *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
+        if type(self.mma_pad_once) is not bool:  # own line: keeps merges with other branches' switch lists clean
+            raise TypeError("TP3 config: mma_pad_once must be a boolean")
         if any(type(layer) is not int or layer < 0
                for layer in (*self.host_expert_layers, *self.brrr_layers, *self.engram_side_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
@@ -474,6 +483,7 @@ class TP3Config:
             index_side_stream=flag("INDEX_SIDE_STREAM"),
             engram_side_layers=parse_layers(get("ENGRAM_SIDE_LAYERS")),
             context_side_stream=flag("CONTEXT_SIDE_STREAM"),
+            mma_pad_once=flag("MMA_PAD_ONCE"),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),

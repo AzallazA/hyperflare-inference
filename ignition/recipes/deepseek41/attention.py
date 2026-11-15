@@ -16,8 +16,8 @@ from b12x.preparation import PreparedCall
 from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection, mxfp8_dense_bases
-from ignition.components.mla_norm_quant import PreparedMLANormQuant
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.mla_norm_quant import PreparedMLANormQuant, dense_bases_with_pads, padded_mma_layout
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
@@ -565,12 +565,30 @@ class PreparedAttention:
         self.window_slots = self.window_indices = self.window_lengths = self.token_offsets = None
         self.lengths = self.active_width = self.index_lengths = self.page_table = None
 
-    def __call__(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
+    def padded_mma_layouts(self):
+        """Functional: MMA-scale layouts ``(shape, dtype)`` of this layer's MXFP8 activation bases that
+        ``mxfp8_dense_bases`` zero-fills per call (qkv_a's quantizer, the q/KV norm's q_b encoding); TP3 mma_pad_once
+        zeroes each once per forward instead (decoder/dspark ``mma_pads``)."""
+        qkv = self.projections["qkv_a"]
+        layouts = []
+        if qkv.encoded_layout is not None and qkv.quantizer_plan is not None:
+            layouts.append(padded_mma_layout(qkv.encoded_layout))
+        if self.norm_quant is not None:
+            layouts.append(self.norm_quant.padded_mma_layout)
+        return tuple(layout for layout in layouts if layout is not None)
+
+    def __call__(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None,
+                 mma_pads=None):
         output, record, selection, _ = self._run(source, metadata, selection, indices=indices,
-                                               replay_start=replay_start, window_cache=window_cache)
+                                               replay_start=replay_start, window_cache=window_cache,
+                                               mma_pads=mma_pads)
         return output, record, selection
 
-    def _run(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
+    def _run(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None,
+             mma_pads=None):
+        """``mma_pads`` (TP3 mma_pad_once): MMA-scale tiles the forward zeroed once (decoder.allocate_mma_pads); the
+        qkv_a and q_b activation bases take their MMA scales from them instead of fresh zero-filled tiles (None =
+        per-call fills)."""
         m = metadata
         indices = (self.window_metadata(m, replay_start=replay_start)
                    if self.owns_window_metadata else indices)
@@ -586,13 +604,14 @@ class PreparedAttention:
         if qkv.encoded_layout is not None and qkv.quantizer_plan is None:
             raise RuntimeError("qkv_a bases must be written by its own activation quantizer")
         qkv_encoded_bases = (None if qkv.encoded_layout is None
-                             else mxfp8_dense_bases(qkv.encoded_layout, source.device))
+                             else dense_bases_with_pads(qkv.encoded_layout, source.device, mma_pads))
         projected = qkv(source, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
         if self.norm_quant is None:
             query_low = self.query_norm(projected[:, :1280])
         else:
-            query_low, window_values, encoded_bases = self.norm_quant(projected)
+            query_low, window_values, encoded_bases = (self.norm_quant(projected) if mma_pads is None
+                                                       else self.norm_quant(projected, mma_pads=mma_pads))
         pending = None
         if self.concurrent_query is not None:
             pending = self.concurrent_query.start(query_low, encoded_bases=encoded_bases)

@@ -14,6 +14,34 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_context_plan, register_finalizer
 
 
+def dense_bases_with_pads(layout, device, mma_pads=None):
+    """``mxfp8_dense_bases`` whose MMA scales come from ``mma_pads`` (DS41 TP3 ``mma_pad_once``).
+
+    ``mma_pads`` is a tuple of buffers the forward zeroed once (one per padded MMA-scale layout) and shares between
+    every layer whose quantizer has that layout (matched by shape and dtype, static while tracing). The quantizer
+    still writes every real row's scales before its GEMM reads them; the padding rows of the 128-row tiles are
+    written by nothing, so they keep that one fill's zero, as a fresh ``mxfp8_dense_bases`` tile would. A layout
+    without a pad (or ``mma_pads`` None) allocates as before.
+    """
+    (values_shape, values_dtype), (rows_shape, rows_dtype), (mma_shape, mma_dtype) = layout
+    pad = None
+    for candidate in mma_pads or ():
+        if tuple(candidate.shape) == tuple(mma_shape) and candidate.dtype == mma_dtype:
+            pad = candidate
+            break
+    if pad is None:
+        return mxfp8_dense_bases(layout, device)
+    return (torch.empty(values_shape, dtype=values_dtype, device=device),
+            torch.empty(rows_shape, dtype=rows_dtype, device=device), pad)
+
+
+def padded_mma_layout(layout):
+    """The MMA-scale layout ``(shape, dtype)`` of MXFP8 dense bases whose tiles have padding rows (the ones
+    ``mxfp8_dense_bases`` zero-fills), else None."""
+    (values_shape, _), _, (mma_shape, mma_dtype) = layout
+    return None if values_shape[0] % 128 == 0 else (tuple(mma_shape), mma_dtype)
+
+
 class PreparedMLANormQuant:
     """Normalize query and KV slices, then encode the rounded BF16 query."""
 
@@ -72,7 +100,12 @@ class PreparedMLANormQuant:
     def _release_examples(self):
         self.query = self.kv = self.encoded_bases = self.encoded = None
 
-    def __call__(self, projected):
+    @property
+    def padded_mma_layout(self):
+        """Functional: the q_b activation's MMA-scale layout when its tiles have padding rows, else None."""
+        return padded_mma_layout(self.layouts[2:])
+
+    def __call__(self, projected, *, mma_pads=None):
         if self.query is None:
             # The kernel (b12x mla_norm_mxfp8, grid = rows x {query, kv}) stores every element of the
             # query, KV, values and compact scales of each planned row, so those start uninitialised.
@@ -81,7 +114,8 @@ class PreparedMLANormQuant:
             (query_shape, query_dtype), (kv_shape, kv_dtype), *encoded = self.layouts
             query = torch.empty(query_shape, dtype=query_dtype, device=projected.device)
             kv = torch.empty(kv_shape, dtype=kv_dtype, device=projected.device)
-            bases = mxfp8_dense_bases(encoded, projected.device)
+            # TP3 mma_pad_once: ``mma_pads`` supplies the MMA scales zeroed once per forward (dense_bases_with_pads).
+            bases = dense_bases_with_pads(encoded, projected.device, mma_pads)
             mla_norm_mxfp8.run(projected, *self.weights, query, kv, *bases, plan=self.plan)
             return query, kv, tuple(bases)
         mla_norm_mxfp8.run(projected, *self.weights, self.query, self.kv,

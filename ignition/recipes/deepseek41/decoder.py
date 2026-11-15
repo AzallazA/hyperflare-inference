@@ -359,17 +359,18 @@ class PreparedLayer:
             self.shared = None
 
     def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-                 engram_projected=None, engram_handoff=None):
+                 engram_projected=None, engram_handoff=None, mma_pads=None):
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
             selection, boundary=boundary, window_cache=window_cache, engram_projected=engram_projected,
-            engram_handoff=engram_handoff)
+            engram_handoff=engram_handoff, mma_pads=mma_pads)
         return incoming, next_mix, records, selection
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-             engram_projected=None, engram_handoff=None):
+             engram_projected=None, engram_handoff=None, mma_pads=None):
         """TP3 tp3.engram_side_layers: ``engram_projected`` = this layer's Engram projection, already reduced on the
         side stream by the previous layer; ``engram_handoff`` = a list that receives the next layer's (when this
-        layer is the one that starts it, ``engram_side``)."""
+        layer is the one that starts it, ``engram_side``). TP3 tp3.mma_pad_once: ``mma_pads`` = the forward's
+        once-zeroed MXFP8 MMA-scale tiles (``PreparedAttention._run``); None = per-layer fills."""
         probe, layer, mode = self.probe, self.probe_index, self.probe_mode
         if (engram_projected is not None) != (self.engram is not None and self.engram.side_task is not None):
             raise ValueError("an Engram layer started on the side stream must receive its projection (and only it)")
@@ -389,7 +390,7 @@ class PreparedLayer:
             (residual, post, comb, normalized), attn_mix = boundary
         attention_normalized = normalized
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
-            indices=indices, window_cache=window_cache)
+            indices=indices, window_cache=window_cache, **({} if mma_pads is None else {"mma_pads": mma_pads}))
         if side is not None:
             # Before the tail: BRRR (persistent, cross-rank) and the attention reduction read ``attended``, which the
             # join declares written, so neither can be scheduled before it.
@@ -458,6 +459,26 @@ class PreparedLayer:
         return incoming, next_mix, records, selection, observations
 
 
+def mma_pad_layouts(attentions):
+    """TP3 tp3.mma_pad_once: the distinct padded MXFP8 MMA-scale layouts of a forward's attention layers (qkv_a and
+    q_b activations; ``PreparedAttention.padded_mma_layouts``), in first-use order."""
+    layouts = []
+    for attention in attentions:
+        for layout in attention.padded_mma_layouts():
+            if layout not in layouts:
+                layouts.append(layout)
+    return tuple(layouts)
+
+
+def allocate_mma_pads(layouts, device):
+    """Inside a forward: one zero-filled tile per layout (a tuple in ``layouts`` order), shared by every layer (None when
+    there is none; ``dense_bases_with_pads`` matches them by shape and dtype). Each layer's
+    quantizer rewrites every real row's scales before its GEMM reads the tile; padding rows are written by nothing."""
+    if not layouts:
+        return None
+    return tuple(torch.zeros(shape, dtype=dtype, device=device) for shape, dtype in layouts)
+
+
 def configure_engram_side(layers, engram_side_layers, mode):
     """TP3 tp3.engram_side_layers: Engram layer L's readiness wait, lookup, projection and reduction run on a side
     stream during layer L-1's attention, in decode/verify graphs (prefill keeps them in place). Marks the starting
@@ -477,6 +498,7 @@ def configure_engram_side(layers, engram_side_layers, mode):
 
 class PreparedDecoder:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
+    mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
 
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
@@ -579,6 +601,10 @@ class PreparedDecoder:
             for index, layer in enumerate(self.layers[:-1]):
                 following = weights.layers[index + 1].experts
                 layer.route_capture_next = (following.router, following.correction)
+        # TP3 (tp3.mma_pad_once): decode/verification forwards zero each padded MXFP8 MMA-scale tile shape once and
+        # every layer's qkv_a/q_b quantizer reuses it (prefill and the packed suffix keep per-layer fills).
+        self.mma_pad_layouts = (mma_pad_layouts(layer.attention for layer in self.layers)
+                                if tp3.mma_pad_once and mode in ("decode", "verify") and self.packing is None else ())
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
             logits_dtype=torch.float32)
@@ -641,6 +667,7 @@ class PreparedDecoder:
             self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
         engram_projected = None  # TP3 tp3.engram_side_layers: projection handed from the previous layer
+        mma_pads = allocate_mma_pads(self.mma_pad_layouts, embedding.device)  # TP3 tp3.mma_pad_once; None = off
         for index, layer in enumerate(self.layers):
             boundary = None
             if layer.boundary is not None:
@@ -660,7 +687,8 @@ class PreparedDecoder:
             handoff = None if layer.engram_side is None else []
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
                 boundary=boundary, window_cache=None if staging is None else staging[index],
-                engram_projected=engram_projected, engram_handoff=handoff)
+                engram_projected=engram_projected, engram_handoff=handoff,
+                **({} if mma_pads is None else {"mma_pads": mma_pads}))
             engram_projected = handoff[0] if handoff else None
             records.append(record)
         residual, = incoming
