@@ -49,6 +49,10 @@ def test_three_rank_shards_and_pages():
     assert -(-1048576 // 768) == 1366 and 1366 * 768 - 1048576 == 512
 
 
+# Fill for outputs the kernels must overwrite whole (the compiled forward allocates them unfilled).
+POISON = 0x7F7F7F7F
+
+
 def owner_local(t, world):
     return (t // 4) % world, (t // (4 * world)) * 4 + t % 4
 
@@ -168,9 +172,11 @@ def _merge_expand_local(world, device):
         candidates = candidates.to(device)
         for rank in range(world):
             shards = ContextShards.on(rank, world, device)
-            output = torch.empty((rows, 2051), dtype=torch.int32, device=device)
-            counts = torch.empty(rows, dtype=torch.int32, device=device)
-            merged = torch.empty((rows, 512), dtype=torch.int32, device=device)
+            # Poisoned outputs: the compiled forward hands these kernels unfilled scratch, so every row is checked
+            # whole, inactive rows (position -1) included.
+            output = torch.full((rows, 2051), POISON, dtype=torch.int32, device=device)
+            counts = torch.full((rows,), POISON, dtype=torch.int32, device=device)
+            merged = torch.full((rows, 512), POISON, dtype=torch.int32, device=device)
             merge_expand_local(candidates, merged, positions, requests, tables, output, counts, shards)
             for r in range(rows):
                 take = int((pools[r] >= 0).sum())
@@ -213,14 +219,14 @@ def _expand_tokens(world, device):
             ids[live & (ids * world + rank >= complete[r])] = -1
     packed = []
     for rank in range(world):
-        out = torch.empty((rows, 512, 2), device=device)
+        out = torch.full((rows, 512, 2), 7.0, device=device)
         pack_candidates(local_ids[rank], scores[rank], out, ContextShards.on(rank, world, device))
         packed.append(out)
     gathered = torch.cat(packed, dim=1).contiguous()
-    merged = torch.empty((rows, 512), dtype=torch.int32, device=device)
+    merged = torch.full((rows, 512), POISON, dtype=torch.int32, device=device)
     merge_candidates(gathered, merged)
-    output = torch.empty((rows, 2051), dtype=torch.int32, device=device)
-    counts = torch.empty(rows, dtype=torch.int32, device=device)
+    output = torch.full((rows, 2051), POISON, dtype=torch.int32, device=device)
+    counts = torch.full((rows,), POISON, dtype=torch.int32, device=device)
     expand_tokens(merged, positions, output, counts)
     for r in range(rows):
         want_pools = _brute_top(local_ids, scores, world, r)

@@ -91,25 +91,35 @@ class IndexScratch:
     global_pools: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, blocks, mode, device, *, context_ranks=1):
+    def allocate(cls, tokens, blocks, mode, device, *, context_ranks=1, forward=False):
+        """Zeroed scratch for preparation; `forward` leaves unfilled what `PreparedGlmIndexer.forward` writes
+        whole before any read: the query encodings and weights (quantize_queries), key norm, pool counts and
+        page table (copies), selected pools (one copy per selection slice, covering every row), and with
+        context ranks the scores, packed candidates, global pools, physical records and their counts (the
+        dcp.py pack, merge and expansion kernels write every row). Single-rank physical records and counts
+        stay zeroed: b12x's pooled expansion is not audited for full-row writes."""
         if tokens <= 0 or blocks <= 0 or mode not in ("decode", "prefill"):
             raise ValueError("GLM index scratch requires positive capacities and decode/prefill mode")
-        def tensor(width, dtype=torch.bfloat16):
-            return torch.zeros((tokens, width), dtype=dtype, device=device)
+        fill = torch.empty if forward else torch.zeros
+        def tensor(width, dtype=torch.bfloat16, fill=fill):
+            return fill((tokens, width), dtype=dtype, device=device)
+        records = torch.empty if forward and context_ranks > 1 else torch.zeros
         return cls(tensor(4096), tensor(4096, torch.float8_e4m3fn), tensor(32, torch.float32),
             tensor(128), tensor(128), tensor(32, torch.float32),
-            torch.zeros(tokens, dtype=torch.int32, device=device),
+            fill(tokens, dtype=torch.int32, device=device),
             tensor(512, torch.int32),
-            tensor(2051, torch.int32), torch.zeros(tokens, dtype=torch.int32, device=device),
-            torch.zeros((tokens if mode == "decode" else 1, blocks), dtype=torch.int32, device=device),
-            *cls._context_selection(tokens if context_ranks > 1 else 0, context_ranks, device))
+            tensor(2051, torch.int32, records), records(tokens, dtype=torch.int32, device=device),
+            fill((tokens if mode == "decode" else 1, blocks), dtype=torch.int32, device=device),
+            *cls._context_selection(tokens if context_ranks > 1 else 0, context_ranks, device, forward))
 
     @staticmethod
-    def _context_selection(tokens, ranks, device):
-        return (torch.zeros((tokens, 512), dtype=torch.float32, device=device),
-                torch.zeros((tokens, 512, 2), dtype=torch.float32, device=device),
-                torch.zeros((tokens, ranks * 512, 2), dtype=torch.float32, device=device),
-                torch.full((tokens, 512), -1, dtype=torch.int32, device=device))
+    def _context_selection(tokens, ranks, device, forward=False):
+        fill = torch.empty if forward else torch.zeros
+        return (fill((tokens, 512), dtype=torch.float32, device=device),
+                fill((tokens, 512, 2), dtype=torch.float32, device=device),
+                fill((tokens, ranks * 512, 2), dtype=torch.float32, device=device),
+                fill((tokens, 512), dtype=torch.int32, device=device) if forward
+                else torch.full((tokens, 512), -1, dtype=torch.int32, device=device))
 
     def rows(self, tokens, mode):
         if type(tokens) is not int or not 0 < tokens <= self.query.shape[0] or mode not in ("decode", "prefill"):
@@ -250,33 +260,36 @@ class PreparedGlmIndexer:
     def forward(self, source, query_residual, key_input, weight_input, metadata, scratch=None):
         rows = source.shape[0]
         s = IndexScratch.allocate(rows, self.blocks, self.mode, source.device,
-            context_ranks=1 if self.context is None else self.context.shards.world) if scratch is None else scratch
+            context_ranks=1 if self.context is None else self.context.shards.world,
+            forward=True) if scratch is None else scratch
         query = self.query_projection(query_residual)
         s.normalized_key.copy_(self.module.k_norm(key_input))
         gate = self.gate_projection(source)
-        s = replace(s, query=query, gate=gate)
-        s.weights.copy_(weight_input)
+        # Weights, pool counts and the page table are computed values, not copies into zeroed scratch: each
+        # copy into scratch was an opaque write that Inductor preceded with a zero fill.
+        pools = (metadata.positions + 1) // 4
+        pools = pools if self.context is None else self.context.shards.local_pools(pools)
+        page_table = metadata.block_table if self.mode == "prefill" else metadata.block_table[metadata.requests.long()]
+        s = replace(s, query=query, gate=gate,
+                    weights=weight_input.to(torch.float32, memory_format=torch.contiguous_format),
+                    pool_lengths=pools.to(torch.int32), page_table=page_table.to(torch.int32))
         glm_pool.quantize_queries(query.view(-1, 128), s.query_fp8.view(-1, 128),
             s.query_scales.view(-1), s.weights.view(-1), plan=self.query_plan)
         glm_pool.update_pools(self.cache, self.state.tail, metadata.state_slots, metadata.query_start_loc,
             s.normalized_key, gate, self.ape, metadata.token_slots, metadata.positions, plan=self.pool_plan)
-        pools = (metadata.positions + 1) // 4
-        s.pool_lengths.copy_(pools if self.context is None else self.context.shards.local_pools(pools))
-        if self.mode == "prefill":
-            s.page_table.copy_(metadata.block_table)
-        else:
-            s.page_table.copy_(metadata.block_table[metadata.requests.long()])
         page_table = s.page_table.expand(rows, -1) if self.mode == "prefill" else s.page_table
         for selector, (start, end) in zip(self.selectors,
                 ((start, min(rows, start + (_SELECT_ROWS if self.mode == "prefill" else rows)))
                  for start in range(0, rows, _SELECT_ROWS if self.mode == "prefill" else rows)), strict=True):
             result = selector(s.query_fp8[start:end].view(end - start, 32, 128), s.weights[start:end], page_table[start:end],
                 s.pool_lengths[start:end], None, cache=self.cache.view(self.cache.shape[0], -1))
-            if isinstance(result, tuple):
-                selected, scores = result
+            selected, scores = result if isinstance(result, tuple) else (result, None)
+            if end - start == rows:
+                # One selection covers every row: its outputs are the scratch, without copies.
+                s = replace(s, pools=selected, **({} if scores is None else {"scores": scores}))
+                continue
+            if scores is not None:
                 s.scores[start:end].copy_(scores)
-            else:
-                selected = result
             s.pools[start:end].copy_(selected)
         if self.logical:
             from .dcp import expand_tokens
