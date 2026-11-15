@@ -9,8 +9,8 @@ every cache byte. FLARE_STREAMS_TIMING=1 also times FLARE_STREAMS_REPS (default 
 ``STREAMS item=<index|engram|context> rows=N serial_us=.. side_us=.. saved_us=..``.
 
 - index: index-source attention layers 2 (ratio-2 KV source: gates GEMV + query chain on the side), 20 (ratio-1 KV
-  and candidate source) and 24 (index-only), TP4 head shard as the other DS41 layer tests; the native replay worker
-  (PreparedGraphBundle) replays both graphs too.
+  and candidate source) and 24 (index-only), TP4 head shard as the other DS41 layer tests; when the native extension
+  has the qualification replay worker (PreparedGraphBundle), it replays both graphs too (else a STREAMS-NOTE line).
 - engram: layer 14's Engram (TP3 rank-0 projection columns, synthetic staged rows) started before layer 13's
   attention and joined after it; the all-reduce is a single-rank copy here (one GPU), so the timing leaves out the
   ~18 us reduction that the side stream also hides at TP3.
@@ -220,6 +220,13 @@ def test_index_side_stream_is_bit_identical(attention_weights, rows):
 
         try:
             _replay_and_compare(graphs, reset, lambda: (*outputs, *selected, pool.backing))
+            import flare_heliopause
+            if not hasattr(flare_heliopause, "GraphReplayWorker"):
+                # The venv's extension is built without the qualification feature: torch replay only.
+                print(f"\nSTREAMS-NOTE rows={rows} native replay worker not built (qualification feature): skipped")
+                reset()
+                _timing("index", rows, graphs)
+                return
             bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={"source": sources[0]},
                 resources=(weights, pool, scratch, metadata, arena, session, owners))
             worker = bundle.start_worker()
