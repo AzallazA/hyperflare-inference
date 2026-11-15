@@ -71,7 +71,7 @@ def _forward_factories(mla_compute_mode, *, vision,
     """Bind attention arithmetic, the proposal head's BF16 gather channel and the TP3 fork switches."""
     return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples, tp3=tp3),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
-                    mla_compute_mode=mla_compute_mode, examples=examples))
+                    mla_compute_mode=mla_compute_mode, examples=examples, tp3=tp3))
 
 
 def _can_race_contextual_plans(config, signatures, device):

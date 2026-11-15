@@ -109,6 +109,10 @@ class TP3Config:
     """Directory of ``expert-routes-rank0-layer{L}.json`` route counts (vLLM route-monitor format)."""
     embed_host: bool = False
     """Token embedding read from device-visible host memory (only its tokens' rows are gathered per step)."""
+    embed_rows: bool = False
+    """With ``embed_host``: decode, verification and draft graphs gather the parked table's rows with one vectorised
+    Triton launch (all of a row's loads before its stores) and take DSpark's noise-token rows from a 10 KB device copy
+    (host_embedding.py; same values). False = b12x's embedding kernel everywhere (base); prefill graphs always keep it."""
     # --- vision tower (weights.py, bootstrap.py, components/vision_staging.py) ---
     vision_host: bool = False
     """Vision tower parked in device-visible host memory; images ~3 s slower each unless staged. Implied by
@@ -183,7 +187,7 @@ class TP3Config:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
-        for name in ("merged_bank", "embed_host", "vision_host", "vision_stage", "tp3_vocab_parallel",
+        for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
                      "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual"):
             if type(getattr(self, name)) is not bool:
@@ -203,6 +207,8 @@ class TP3Config:
             raise ValueError("TP3 config: hot_experts needs expert_counts_dir (route counts pick the hot set)")
         if self.hot_experts and self.host_expert_layers and not self.merged_bank:
             raise ValueError("TP3 config: hot_experts needs merged_bank (separate hot + cold banks were not ported)")
+        if self.embed_rows and not self.embed_host:
+            raise ValueError("TP3 config: embed_rows needs embed_host (it replaces the host-parked table's lookup)")
         if self.brrr_parked_max_rows and not self.brrr_layers:
             raise ValueError("TP3 config: brrr_parked_max_rows needs brrr_layers")
         if self.brrr_parked_max_rows and not (self.brrr_layers & self.host_expert_layers
@@ -281,6 +287,7 @@ class TP3Config:
             merged_bank=flag("MERGED_BANK"),
             expert_counts_dir=None if not counts else Path(counts),
             embed_host=flag("EMBED_HOST"),
+            embed_rows=flag("EMBED_ROWS"),
             vision_host=flag("VISION_HOST"),
             vision_stage=flag("VISION_STAGE"),
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
