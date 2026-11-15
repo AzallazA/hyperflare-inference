@@ -968,7 +968,12 @@ class PreparedLseReduceScatter:
     def __call__(self, partial, lse):
         output = self.output
         if output is None:
-            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=partial.device).zero_()
+            # Unfilled: both combiners store every (row, local head, value). b12x's PCIe lse_reduce_scatter
+            # (comm/pcie/_dcp_a2a_cute.py) walks rows * heads_per_rank with grid-stride warps and stores all
+            # head_dim / 8 packs per row unconditionally (zero when every LSE is -inf; b12x itself allocates this
+            # output with torch.empty). The RoCE merge (head_exchange._merge) runs on grid (rows, local heads)
+            # and stores all DIM columns, zero where no rank attended anything.
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=partial.device)
         if self.roce:
             from .head_exchange import merge, pack
 
