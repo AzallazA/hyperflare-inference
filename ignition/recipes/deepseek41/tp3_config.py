@@ -122,6 +122,10 @@ class TP3Config:
     # --- collectives and planning (bootstrap.py, recipe.py, planning.py) ---
     ar_rows: int = 0
     """Rows the shared TP3 all-reduce runtime is sized for (chunked prefill reductions); 0 = a whole prefill chunk."""
+    ar_part_rows: int = 0
+    """Decoder attention/MLP all-reduces of more rows than this run in parts of exactly N rows plus a remainder
+    (4096 at 768: 5 x 768 + 256) instead of halving to what the runtime accepts (4096 at 1024: 4 x 1024); 0 = halving
+    (base). Engram reductions keep halving. Export-time only (prepared graphs)."""
     tp3_graph_gib: float | None = None
     """Override of the per-rank captured-graph estimate for world size 3 (GiB); None = the 8 GiB default."""
     tp3_vocab_parallel: bool = False
@@ -179,7 +183,7 @@ class TP3Config:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "ar_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
+        for name in ("hot_experts", "ar_rows", "ar_part_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
@@ -285,6 +289,7 @@ class TP3Config:
             vision_stage=flag("VISION_STAGE"),
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
             ar_rows=integer("AR_ROWS"),
+            ar_part_rows=integer("AR_PART_ROWS"),
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             engram_tables=get("ENGRAM_TABLES", "auto"),
