@@ -12,12 +12,8 @@ Patches applied only to the b12x overlay (`tp3-tools/make-b12x-overlay.sh` -> `.
   `_gather_push_tp2`). `auto` is unchanged (world 3 only), so TP2 exports stay on push unless `PULL=1` is exported.
   CPU check: world-2 push PTX identical to the unpatched venv, world-3 auto PTX identical to the 11-09 overlay; world-2
   pull compiles for both ranks and slot modes. Not measured on GPU yet (glm-tp2 chain stage G).
-- `b12x-mla-decode-remainder-stream.patch` (DS41, 2026-11-15, branch perf/ds41-attn-one-launch): with BF16 MLA (the
-  DS41 recipe default) b12x tiles 16 heads per decode CTA, so a TP3 rank's 24 heads run as a 16-head grid plus an
-  8-head remainder grid that serialize (no PDL). `B12X_MLA_DECODE_REMAINDER_STREAM=1` launches the remainder grid on
-  a dedicated side stream (fork/join around it, merge after the join): same kernels and arguments, disjoint output
-  heads, so bit-identical. Unset/0 = serial, byte-identical to the unpatched launch order. It shapes the captured
-  graph, so it takes effect at export. Build a DS41-only overlay (without the GLM pull-gather patch, which would
-  change DS41's vocab gathers): `VENV=<fork>/.venv B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/b12x-mla-decode-remainder-stream.patch tp3-tools/make-b12x-overlay.sh <out>`,
-  then export with `B12X_OVERLAY=<out> B12X_MLA_DECODE_REMAINDER_STREAM=1 tp3-tools/release/export.sh`.
-  GPU checks: `tests/components/test_compressed_mla_remainder_stream_cuda.py` (bit-identity + optional timing).
+- (removed) `b12x-mla-decode-remainder-stream.patch` (cc3e8764): editing b12x `attention/_shared/mla/kernel.py`
+  changes the source fingerprint (`b12x/_lib/source_dependencies.py`) of 32 MLA modules even with its switch off, so
+  every MLA program recompiles and all `compressed_sparse_mla` tuning races re-run. Replaced by the ignition-side
+  wrapper `ignition/components/mla_remainder_stream.py` (same switch `B12X_MLA_DECODE_REMAINDER_STREAM=1`, no b12x
+  file changed, no overlay needed). Do not combine the two.

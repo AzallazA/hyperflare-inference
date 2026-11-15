@@ -3,7 +3,7 @@
 
 """Twenty-four-head BF16 decode: the concurrent remainder grid is bit-identical and (optionally) timed.
 
-Needs the b12x overlay with tp3-patches/overlay/b12x-mla-decode-remainder-stream.patch on PYTHONPATH. One prepared
+Uses ignition/components/mla_remainder_stream.py (no b12x overlay). One prepared
 DS41-shaped decode (24 heads, 128-token window + mapped indexed pages, BF16 arithmetic) is captured twice in one
 session: B12X_MLA_DECODE_REMAINDER_STREAM unset (today's serial 16 + 8 head grids) and =1 (8-head grid on a side
 stream). Both graphs are replayed on the same inputs and must write the same bytes; both must match the reference.
@@ -15,23 +15,31 @@ import statistics
 
 import pytest
 import torch
-from b12x.attention._shared.mla import kernel as mla_kernel
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference, pack_deepseek_v41_cache_reference,
 )
 
+from ignition.components import mla_remainder_stream
 from ignition.components.compressed_mla import PreparedCompressedMLA
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 
 
 ENV = "B12X_MLA_DECODE_REMAINDER_STREAM"
-pytestmark = [
-    pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
-                       reason="requires an explicitly assigned CUDA device"),
-    pytest.mark.skipif(not hasattr(mla_kernel, "_launch_head_blocks"),
-                       reason="needs the b12x-mla-decode-remainder-stream overlay on PYTHONPATH"),
-]
+pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                                reason="requires an explicitly assigned CUDA device")
+
+
+@pytest.fixture(autouse=True)
+def hook():
+    """Install the wrapper for this test; it reads the switch per call, so off = b12x's own serial launches."""
+    from b12x.attention._shared.mla import kernel
+
+    installed_before = isinstance(kernel._sparse_mla_decode_grid_flat_launch, mla_remainder_stream._RemainderStreamLaunch)
+    mla_remainder_stream.install()
+    yield
+    if not installed_before:
+        mla_remainder_stream.uninstall()
 
 
 def _replay_us(graph, reps):
@@ -94,6 +102,7 @@ def test_remainder_stream_is_bit_identical(rows, width, monkeypatch):
             with torch.cuda.graph(concurrent):
                 attention()
             monkeypatch.delenv(ENV)
+    assert 0 in mla_remainder_stream._STREAMS  # the concurrent capture really forked onto the side stream
     try:
         output.fill_(torch.nan)
         serial.replay()

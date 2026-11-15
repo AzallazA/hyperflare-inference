@@ -12,9 +12,8 @@
 #   FLARE_DS41_ENGRAM_CHUNK_ROWS 1024 (default) + FLARE_DS41_SHARE_ENGRAM_RESIDUAL 1 (default) = graph scratch: chunked Engram
 #            projection and engram_residual on ffn_hc.residual (KV 2.46M -> 3.01M at HOT 342, decode level); 0/0 = previous layout
 #   B12X_OVERLAY  optional patched b12x copy put ahead of the venv (tp3-tools/make-b12x-overlay.sh); default none
-#   B12X_MLA_DECODE_REMAINDER_STREAM 1 = with the b12x-mla-decode-remainder-stream overlay patch, run the 8-head
-#            remainder grid of each attention decode concurrently with the 16-head grid (captured into the graphs);
-#            unset/0 = serial (default). Needs the overlay; without it the variable is ignored.
+#   B12X_MLA_DECODE_REMAINDER_STREAM 1 = run the 8-head remainder grid of each attention decode beside the 16-head grid
+#            (ignition/components/mla_remainder_stream.py; captured into the graphs, no b12x change); unset/0 = serial
 #   FLARE_DS41_VISION_HOST  1 (default) = vision tower in host RAM (implied by VISION_STAGE=1); VISION_HOST=0 together
 #            with VISION_STAGE=0 keeps the tower in VRAM, which needs a lower HOT (unmeasured, no longer useful)
 # A cold tuning cache needs more free VRAM than serving. If tuning runs out of memory, export once with HOT=300,
