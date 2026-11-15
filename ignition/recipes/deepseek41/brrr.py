@@ -59,7 +59,12 @@ SWITCHES = (("brrr_spin_trap", "BRRR_SPIN_TRAP", "SPIN_TRAP"),)
 # Valued tuning switches: (TP3Config field, compile-time define, extension attribute, decoder.cu default). None or the
 # kernel default emits no define, so the default build (and its extension name) is the plain serving build.
 TUNING = (("brrr_spin_ns", "BRRR_SPIN_NS", "SPIN_NS", 200),
-          ("brrr_two_shot_min", "BRRR_TWO_SHOT_MIN", "TWO_SHOT_MIN", 17))
+          ("brrr_two_shot_min", "BRRR_TWO_SHOT_MIN", "TWO_SHOT_MIN", 17),
+          # Job layout (deep dive 2026-11-15): WOB slices per job, WOA 4-stage row limit, uneven WOA split, CTAs per SM.
+          ("brrr_ks_wob", "BRRR_KS_WOB", "KS_WOB", 16),
+          ("brrr_woa_small", "BRRR_WOA_SMALL", "WOA_SMALL", 16),
+          ("brrr_woa_uneven", "BRRR_WOA_UNEVEN", "WOA_UNEVEN", 0),
+          ("brrr_per_sm", "BRRR_PER_SM", "PER_SM", 2))
 
 
 def _tuning(tp3: TP3Config) -> dict:

@@ -380,6 +380,33 @@ def test_layer_sets_are_checked_against_the_model():
     TP3Config().check_layers(6)
 
 
+LAYOUT_DEFAULTS = {"KS_WOB": 16, "WOA_SMALL": 16, "WOA_UNEVEN": 0, "PER_SM": 2}  # job-layout switches (deep dive 11-15)
+
+
+def test_brrr_layout_switches_default_to_the_serving_build():
+    """Deep dive 2026-11-15: the job-layout switches (wo_b slices per job, wo_a 4-stage row limit, uneven wo_a split,
+    CTAs per SM) emit no define and no record key when unset or at the kernel default; a value is its own build."""
+    from ignition.recipes.deepseek41.brrr import kernel_defines
+
+    base = {"FLARE_DS41_BRRR_LAYERS": "0-39", "FLARE_DS41_BRRR_CKPT": "/c"}
+    plain = TP3Config.from_environment(base)
+    names = ("brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm")
+    assert all(getattr(plain, name) is None for name in names) and kernel_defines(plain) == ()
+    assert not set(names) & set(plain.to_metadata())
+    explicit = replace(plain, brrr_ks_wob=16, brrr_woa_small=16, brrr_woa_uneven=0, brrr_per_sm=2)
+    assert kernel_defines(explicit) == ()
+    env = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_KS_WOB": "24", "FLARE_DS41_BRRR_WOA_UNEVEN": "1",
+                                      "FLARE_DS41_BRRR_WOA_SMALL": "0"})
+    assert kernel_defines(env) == ("BRRR_KS_WOB=24", "BRRR_WOA_SMALL=0", "BRRR_WOA_UNEVEN=1")
+    assert env.to_metadata()["brrr_ks_wob"] == 24 and env.to_metadata()["brrr_woa_uneven"] == 1
+    assert kernel_defines(replace(plain, brrr_per_sm=1)) == ("BRRR_PER_SM=1",)
+    for bad in (dict(brrr_ks_wob=20), dict(brrr_woa_small=8), dict(brrr_woa_uneven=2), dict(brrr_per_sm=3)):
+        with pytest.raises(ValueError):
+            replace(plain, **bad)
+    with pytest.raises(ValueError):
+        TP3Config(brrr_ks_wob=24)  # needs brrr_layers
+
+
 def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
     """ROUND2 #6: unset or the kernel default (SPIN_NS 200, TWO_SHOT_MIN 17) = no define = the plain serving build;
     any other value = defines (spin first, then two-shot) = its own extension name."""
@@ -389,7 +416,7 @@ def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
     plain = TP3Config.from_environment(base)
     assert plain.brrr_spin_ns is None and plain.brrr_two_shot_min is None
     assert kernel_defines(plain) == () and kernel_defines(TP3Config.from_environment(RELEASE_ENV)) == ()
-    assert _tuning(plain) == {"SPIN_NS": 200, "TWO_SHOT_MIN": 17}
+    assert _tuning(plain) == {"SPIN_NS": 200, "TWO_SHOT_MIN": 17, **LAYOUT_DEFAULTS}
     explicit = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "200", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "17"})
     assert explicit.brrr_spin_ns == 200 and kernel_defines(explicit) == ()
     empty = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "", "FLARE_DS41_BRRR_TWO_SHOT_MIN": ""})
@@ -413,7 +440,11 @@ def test_brrr_check_switches_compares_the_tuning_values():
     from ignition.recipes.deepseek41.brrr import check_switches
 
     config = TP3Config(brrr_layers=frozenset({3}), brrr_ckpt=Path("/c"), brrr_spin_ns=50)
-    check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17), config)
+    check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17, **LAYOUT_DEFAULTS), config)
     for wrong in (dict(SPIN_NS=200, TWO_SHOT_MIN=17), dict(SPIN_NS=50, TWO_SHOT_MIN=9), dict(TWO_SHOT_MIN=17)):
         with pytest.raises(RuntimeError, match="do not match"):
-            check_switches(SimpleNamespace(SPIN_TRAP=0, **wrong), config)
+            check_switches(SimpleNamespace(SPIN_TRAP=0, **{**LAYOUT_DEFAULTS, **wrong}), config)
+    with pytest.raises(RuntimeError, match="do not match"):  # a build without the layout attributes (older extension)
+        check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17), config)
+    with pytest.raises(RuntimeError, match="do not match"):
+        check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17, **{**LAYOUT_DEFAULTS, "KS_WOB": 24}), config)

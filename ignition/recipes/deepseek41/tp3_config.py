@@ -39,7 +39,7 @@ VRAM_RECLAIM = {
 
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
-RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min")
+RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm")
 
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
@@ -253,6 +253,19 @@ class TP3Config:
     """Kernel tuning: rows from which the BRRR attention/FFN exchanges reduce two-shot instead of one-shot; None = the
     kernel default (17); 1 = always two-shot, 129 = never. Same sums in the same rank order either way. Own extension
     build (define BRRR_TWO_SHOT_MIN), exported into the package. Environment FLARE_DS41_BRRR_TWO_SHOT_MIN."""
+    brrr_ks_wob: int | None = None
+    """Kernel job layout: k32 slices of z per BRRR wo_b job; None = the kernel default (16 = 6 parts, 480 jobs at <= 16
+    rows); 24 = 4 parts, 320 jobs (one round on 376 CTAs, as TP4 had). Regroups float sums only. Own extension build
+    (define BRRR_KS_WOB). Environment FLARE_DS41_BRRR_KS_WOB."""
+    brrr_woa_small: int | None = None
+    """Kernel job layout: rows up to which BRRR wo_a jobs are 4 stages (384 jobs); None = the kernel default (16);
+    0 = always 2 stages. Define BRRR_WOA_SMALL. Environment FLARE_DS41_BRRR_WOA_SMALL."""
+    brrr_woa_uneven: int | None = None
+    """Kernel job layout: 1 = at <= 8 rows split each wo_a row block into 7 uneven k parts (336 jobs, one round);
+    None/0 = the kernel default. Define BRRR_WOA_UNEVEN. Environment FLARE_DS41_BRRR_WOA_UNEVEN."""
+    brrr_per_sm: int | None = None
+    """Diagnostic only: BRRR CTAs per SM (None = 2; 1 halves the weight reads in flight). Define BRRR_PER_SM.
+    Environment FLARE_DS41_BRRR_PER_SM."""
     # --- debug and test tooling (config.py, decoder.py, probe.py) ---
     mini: bool = False
     """Truncated real-weight checkpoint view (make_mini.py): accept 6..40 layers, no compacted prefill feedback."""
@@ -310,12 +323,15 @@ class TP3Config:
                              f"0 < hot_experts < {ROUTED_EXPERTS}")
         if self.brrr_layers and self.brrr_ckpt is None:
             raise ValueError("TP3 config: brrr_layers needs brrr_ckpt (the checkpoint view BRRR reads its dense copies from)")
-        for name, low, high in (("brrr_spin_ns", 0, 1_000_000), ("brrr_two_shot_min", 1, 129)):
+        for name, low, high in (("brrr_spin_ns", 0, 1_000_000), ("brrr_two_shot_min", 1, 129), ("brrr_ks_wob", 16, 24),
+                                ("brrr_woa_small", 0, 16), ("brrr_woa_uneven", 0, 1), ("brrr_per_sm", 1, 2)):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or not low <= value <= high):
                 raise ValueError(f"TP3 config: {name} must be unset or an integer in [{low}, {high}], not {value!r}")
+        if self.brrr_ks_wob not in (None, 16, 24) or self.brrr_woa_small not in (None, 0, 16):
+            raise ValueError("TP3 config: brrr_ks_wob must be 16 or 24 and brrr_woa_small 0 or 16")
         for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap", "brrr_spin_ns",
-                     "brrr_two_shot_min"):
+                     "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm"):
             if getattr(self, name) is not None and getattr(self, name) is not False and not self.brrr_layers:
                 raise ValueError(f"TP3 config: {name} needs brrr_layers")
         if not self.brrr_dense_native and not self.brrr_layers:
@@ -446,6 +462,10 @@ class TP3Config:
             brrr_spin_trap=flag("BRRR_SPIN_TRAP"),
             brrr_spin_ns=optional("BRRR_SPIN_NS"),
             brrr_two_shot_min=optional("BRRR_TWO_SHOT_MIN"),
+            brrr_ks_wob=optional("BRRR_KS_WOB"),
+            brrr_woa_small=optional("BRRR_WOA_SMALL"),
+            brrr_woa_uneven=optional("BRRR_WOA_UNEVEN"),
+            brrr_per_sm=optional("BRRR_PER_SM"),
             mini=flag("MINI"),
             no_engram=truthy("NO_ENGRAM"),
             probe=truthy("PROBE"),
