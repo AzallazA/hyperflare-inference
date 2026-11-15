@@ -148,19 +148,23 @@ def prepare_sequence_binding(
 def run_short_conv(plan, *, scratch, x, conv_weight, query_start_loc, state_slot_ids,
                    state_is_fresh, num_accepted_tokens, num_seqs, num_tokens,
                    conv_state, out, request_is_prefill=None, conv_bias=None):
-    """Run a prepared short convolution with compiler-owned operand views."""
-    from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up
+    """Run a prepared short convolution with compiler-owned operand views.
+
+    The kernel's two private operands get tensors of their own. They used to be dtype views at offsets into the
+    uint8 ``scratch``; Inductor then cloned the scratch per call and based that clone on the offset int32 view,
+    reading past the scratch's end (the dtype-view base miscompile). Both are pure scratch, written before they
+    are read in every mode (request IDs by the first program, gathered state by the second), and b12x checks only
+    their device and alignment. ``scratch`` is accepted for callers' compatibility and no longer used.
+    """
     from b12x.preparation.types import require_prepared
     from b12x.sequence.short_conv.api import _pipeline
 
+    del scratch
     state = require_prepared(plan, "sequence.short_conv", x.device)
     query = state.query
-    ids_offset = align_up(query.max_seqs * query.channels * query.state_length * 2,
-                          SCRATCH_ALIGN_BYTES)
-    gathered_bytes = query.max_seqs * query.channels * query.state_length * 2
-    gathered_state = scratch[:gathered_bytes].view(torch.bfloat16).view(
-        query.max_seqs, query.channels, query.state_length)
-    request_ids = scratch[ids_offset:ids_offset + query.max_tokens * 4].view(torch.int32)
+    gathered_state = torch.empty((query.max_seqs, query.channels, query.state_length),
+                                 dtype=torch.bfloat16, device=x.device)
+    request_ids = torch.empty((query.max_tokens,), dtype=torch.int32, device=x.device)
     if request_is_prefill is None:
         request_is_prefill = state_is_fresh
     _pipeline(x, conv_weight, query_start_loc, state_slot_ids, state_is_fresh,
