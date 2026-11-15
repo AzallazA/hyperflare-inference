@@ -6,15 +6,23 @@ the first token string that maps to several IDs), so every teacher-forced prefil
 re-tokenization drift. Prefill always runs Flare's own path, so a decode-only change (BRRR layers) must stay within the
 floor measured on a build without it. Reports |delta logprob| of the decode top-1 token and top-1 agreement.
   .venv/bin/python consistency.py [tokens=48] [prompts=4] [tokenizer dir]
+
+The one-token prefill reply can be empty: Flare samples at temperature 1.0 and returns no logprob record for a
+terminating end-of-sequence token (helios/src/server/runtime.rs, `terminating_eos`), so the reply's top_logprobs list
+is empty when the single sampled token is EOS. The top-5 distribution does not depend on the sample, so such a request
+is retried (RETRIES extra attempts); a position still empty after that is skipped and counted. The counts are appended
+at the end of the summary line, which otherwise keeps its format.
 """
 import json
+import os
 import statistics
 import sys
 import urllib.request
 
 from transformers import PreTrainedTokenizerFast
 
-URL = "http://localhost:15015/v1/completions"
+URL = os.environ.get("CONSISTENCY_URL", "http://localhost:15015/v1/completions")
+RETRIES = 4
 PROMPTS = ["def fibonacci(n):\n    ", "The capital of France is", "for (int i = 0; i < n; ++i) {\n    ",
            "Once upon a time, in a small village,", "import numpy as np\nx = np.", "SELECT name, age FROM users WHERE"]
 
@@ -33,7 +41,7 @@ def post(body):
     return json.load(urllib.request.urlopen(req, timeout=600))["choices"][0]["logprobs"]
 
 
-deltas, agree, total, stopped = [], 0, 0, 0
+deltas, agree, total, stopped, retried, skipped = [], 0, 0, 0, 0, 0
 for prompt in PROMPTS[:k]:
     ids = [tok.bos_token_id or 0] + tok.encode(prompt, add_special_tokens=False)
     lp = post({"prompt": ids, "max_tokens": n, "top_p": 1.0, "logprobs": 5})
@@ -45,7 +53,17 @@ for prompt in PROMPTS[:k]:
             break
         generated.append(match[0])
     for i in range(len(generated)):
-        ref = post({"prompt": ids + generated[:i], "max_tokens": 1, "top_p": 1.0, "logprobs": 5})["top_logprobs"][0]
+        ref = None
+        for attempt in range(1 + RETRIES):
+            top = (post({"prompt": ids + generated[:i], "max_tokens": 1, "top_p": 1.0, "logprobs": 5}) or {}).get("top_logprobs")
+            if top:
+                ref = top[0]
+                break
+            if attempt < RETRIES:
+                retried += 1
+        if ref is None:
+            skipped += 1
+            continue
         dec = lp["top_logprobs"][i]
         best = max(dec, key=dec.get)
         total += 1
@@ -56,4 +74,5 @@ q = lambda p: finite[min(len(finite) - 1, int(p * len(finite)))] if finite else 
 print(f"{total} positions ({stopped} sequences cut at ambiguous tokens): top-1 agree {agree / max(total, 1):.3f}, "
       f"decode top-1 missing from prefill top-5 {len(deltas) - len(finite)}, |dlogprob| median "
       f"{statistics.median(finite) if finite else float('nan'):.4f} p90 {q(0.9):.4f} p99 {q(0.99):.4f} "
-      f"max {finite[-1] if finite else float('nan'):.4f}")
+      f"max {finite[-1] if finite else float('nan'):.4f}, empty one-token replies retried {retried}, "
+      f"positions skipped {skipped}")
