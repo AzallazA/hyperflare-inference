@@ -14,9 +14,8 @@ import pytest
 import torch
 from b12x.attention import dsa_indexer
 from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
-from b12x.preparation.types import require_prepared
 
-from ignition.components.indexer import PreparedSparseIndexer
+from ignition.components.indexer import PreparedSparseIndexer, prepared_route
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
@@ -51,7 +50,7 @@ def test_fused_decode_writes_every_slot(rows):
         operation = PreparedSparseIndexer(query, weights, cache, table, lengths, width, output,
             caps=caps, session=session, name="indexer", workspace=arena, scores=scores)
         session.tune()
-        assert require_prepared(operation.plan, "attention.dsa_indexer").layout.route == "paged_fused"
+        assert prepared_route(operation.plan) == "paged_fused"
         compiled = compile_forward(lambda: operation())
         compiled()
         torch.cuda.synchronize()

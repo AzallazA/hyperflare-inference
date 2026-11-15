@@ -17,6 +17,15 @@ from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
 
+def prepared_route(plan):
+    """The paged route b12x prepared for an FP8 indexer plan, or None (MXFP4 states, contiguous sources).
+
+    The FP8 state holds a scratch plan whose paged layout records the route resolved from the caps.
+    """
+    plan_layout = getattr(require_prepared(plan, "attention.dsa_indexer"), "layout", None)
+    return getattr(getattr(plan_layout, "layout", None), "route", None)
+
+
 @torch.library.custom_op("flare::sparse_indexer", mutates_args=("output", "scores", "scratch"))
 def _select(query: torch.Tensor, weights: torch.Tensor, cache: torch.Tensor, pages: torch.Tensor,
             lengths: torch.Tensor, active: torch.Tensor | None, output: torch.Tensor, scores: torch.Tensor | None,
@@ -85,8 +94,7 @@ class PreparedSparseIndexer:
 
     def _finalize_functional(self):
         self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
-        layout = getattr(require_prepared(self.plan, "attention.dsa_indexer"), "layout", None)
-        self.writes_every_slot = getattr(layout, "route", None) == "paged_fused"
+        self.writes_every_slot = prepared_route(self.plan) == "paged_fused"
         self.inputs = {"index_k_cache": self.inputs["index_k_cache"]}
         self.output = self.scores = self.binding = self._finalize = None
 
