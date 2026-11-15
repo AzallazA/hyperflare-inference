@@ -43,8 +43,9 @@ class DecoderScratch:
 
     @classmethod
     def allocate(cls, tokens, blocks, mode, device, *, shard: TensorParallelShard, sample_rows, context_ranks=1,
-                 remote=False):
-        """Allocate declaration examples for each operator's layouts and tuning."""
+                 remote=False, slab_segment=False):
+        """Allocate declaration examples for each operator's layouts and tuning; `slab_segment` gives the MLA
+        prefill slab whole allocator segments (`MLAScratch.allocate(own_segment=True)`)."""
         if type(sample_rows) is not int or not 0 < sample_rows <= tokens:
             raise ValueError("GLM sampling capacity must be positive and fit the token capacity")
         def buffer(*shape):
@@ -52,7 +53,7 @@ class DecoderScratch:
         shards = Shards.of(shard.world_size)
         layers = (KDAScratch.allocate(tokens, shards.heads, device),
             MLAScratch.allocate(tokens, shards.heads, blocks, mode, device, context_ranks=context_ranks,
-                                remote=remote),
+                                remote=remote, own_segment=slab_segment),
             MLPScratch.allocate(tokens, 4096, shards.dense_width, device),
             MoeScratch.allocate(tokens, shard.world_size, device))
         return cls(buffer(tokens, 4096), buffer(tokens, 4, 4096), buffer(sample_rows, 4, 4096),
@@ -94,7 +95,8 @@ class PreparedDecoder:
 
     def __init__(self, weights: ModelWeights, scratch: DecoderScratch, state: DecoderState,
                  metadata: DecoderMetadata, *, mode, runtime, vocabulary_runtime, coordinator, session, name,
-                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None, vision=None):
+                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None, vision=None,
+                 chunked_reduce=False):
         language = weights.tree.model.language_model
         if len(weights.layers) != 45 or len(language.layers) != 45 or len(state.layers) != 45:
             raise ValueError("GLM text execution requires all 45 decoder layers")
@@ -125,7 +127,8 @@ class PreparedDecoder:
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
                 carry=None if index == 0 else scratch.mlp_hc, defer_post=index < len(language.layers) - 1,
                 max_cache_pages=max_cache_pages, context=context,
-                kda_records=None if kda_records is None or indexed else kda_records.layer(index))
+                kda_records=None if kda_records is None or indexed else kda_records.layer(index),
+                chunked_reduce=chunked_reduce)
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")

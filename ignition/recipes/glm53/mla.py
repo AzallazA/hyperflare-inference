@@ -40,6 +40,20 @@ class MLAState:
         return cls(torch.zeros((pages * 4, 64, 528), dtype=torch.uint8, device=device), index)
 
 
+# PyTorch's caching allocator rounds a large allocation's new segment up to 2 MiB (kRoundLarge), the core
+# allocator's mapping granularity; Flare's export keeps or drops whole mappings.
+_SEGMENT_BYTES = 2 << 20
+
+
+def _segment_slab(positions, device):
+    """A [positions, 528] uint8 slab at offset 0 of a storage rounded up to whole `_SEGMENT_BYTES`.
+
+    A fresh segment for the rounded size has no free remainder for the allocator to hand to a later tensor."""
+    nbytes = positions * 528
+    storage = torch.empty(-(-nbytes // _SEGMENT_BYTES) * _SEGMENT_BYTES, dtype=torch.uint8, device=device)
+    return storage[:nbytes].view(positions, 528)
+
+
 @dataclass(frozen=True)
 class MLAScratch:
     projected_input: torch.Tensor
@@ -69,15 +83,26 @@ class MLAScratch:
     record_counts: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False, forward=False):
+    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False, forward=False,
+                 own_segment=False):
         """Zeroed scratch for preparation; `forward` (`PreparedGlmMLA.forward`) leaves unfilled what the forward
         writes whole before any read: the fused input projection (copy), both RMSNorm outputs, the query, absorbed
         and gathered heads (whole outputs of q_b, the absorption BMM and the head gather, or copies of them), the
         expanded values (one copy per slice, covering every row) and the visible counts. Buffers of the
         cross-host exchange and record windows stay zeroed, and so does the index scratch's single-rank
-        selection (`IndexScratch.allocate`)."""
+        selection (`IndexScratch.allocate`).
+
+        `own_segment` (fork-only `PreparationConfig.slab_segment`, persistent preparation scratch only) allocates
+        the context-parallel prefill slab as whole caching-allocator segments (`_SEGMENT_BYTES`): 1,049,088 x 528
+        bytes at three ranks end 1.74 MiB into a 2 MiB granule, and a graph-reachable tensor placed in that tail
+        would keep the whole 530 MiB mapping in the package although no serving graph reads the slab (each
+        prefill forward allocates its own). The slab keeps its shape and offset; only its storage grows."""
         if heads not in HEAD_COUNTS:
             raise ValueError("GLM MLA scratch requires a supported rank-count head partition")
+        if own_segment and forward:
+            # Forward-local storage must stay a whole graph-local tensor: Inductor sizes the base of a view of a
+            # slice of a graph-local buffer for that slice (torch 2.14.1, GLM-KDA-MLA-PIN-ANALYSIS section 16).
+            raise ValueError("a forward allocates its own slab; own_segment applies to persistent scratch only")
         from .dcp import PREFILL_SLICE_ROWS, SLICE_ROWS
 
         index = IndexScratch.allocate(tokens, blocks, mode, device, context_ranks=context_ranks, forward=forward)
@@ -99,7 +124,8 @@ class MLAScratch:
         # writes every position below the request's end before attention reads selected positions, all below it,
         # so the 528 MiB (1M-token) slab stays unfilled instead of zeroed per layer and forward.
         positions = blocks * 256 * context_ranks if prefill else 0
-        slab = torch.empty((positions, 528), dtype=torch.uint8, device=device)
+        slab = _segment_slab(positions, device) if own_segment and positions else torch.empty(
+            (positions, 528), dtype=torch.uint8, device=device)
         from ignition.components.head_exchange import pack_width
 
         width = pack_width(context_ranks, heads * context_ranks, 512) if remote and exchange else 0

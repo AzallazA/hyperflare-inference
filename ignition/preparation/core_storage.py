@@ -276,6 +276,19 @@ class CoreStorage:
                 # Returned segments may reopen low addresses that later library allocations would take.
                 self.seal_low_window()
 
+    def trial_graph_pool(self):
+        """A core-backed graph pool for trial captures that are never exported (GLM's "Measure graph memory").
+
+        The caller keeps the only reference; once its graphs are reset and the reference is dropped,
+        ``torch.cuda.empty_cache`` returns its segments. It is registered as a preparation pool: if a block stays
+        live there, the segment's free blocks are unused ranges (zeroed, not stored), as in the other preparation
+        pools. Nothing else allocates from it, so serving graphs never reuse its segments."""
+        import torch
+
+        pool = torch.cuda.MemPool(self._allocator.allocator())
+        self._preparation_pools.add(pool.id)
+        return pool
+
     def scratch_pool(self):
         """Own zero-initialized scratch whose physical backing can be released during compilation."""
         pool = ScratchPool(self)

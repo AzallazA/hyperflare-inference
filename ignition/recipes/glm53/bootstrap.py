@@ -131,6 +131,19 @@ class PreparationConfig:
     # tensors in the vision graph's pool. In-process preparation has no host mappings and keeps the tower resident.
     vision_stage: bool = False
     vision_stage_tail: bool = True
+    # Fork-only export-layout VRAM switches (recipe.py; VRAM map 2026-11-15). None changes a graph's arithmetic:
+    # - trial_pool "separate": package exports capture the eager "Measure graph memory" trials, whose free-memory
+    #   result only in-process preparation uses, into their own pool, returned to the device once the trials are
+    #   reset; "shared" (upstream) lets the serving capture reuse, and the export retain, trial segments.
+    # - slab_segment: the preparation-only 1M-position prefill slab is allocated as whole 2 MiB granules, so no
+    #   graph-reachable tensor can share its last segment and keep it in the package.
+    # - oneshot_fit: where prefill chunks of _DMA_PREFILL_TOKENS rows or more use the copy-engine ring, size the
+    #   one-shot all-reduce for `oneshot_rows` (the largest reduction left on it) instead of the token capacity.
+    # - ar_rows (three ranks): size the single one-shot channel for this many rows and reduce prefill in parts.
+    trial_pool: str = "shared"
+    slab_segment: bool = False
+    oneshot_fit: bool = False
+    ar_rows: int = 0
     # Run shared experts, KDA gate projections, and decode query chains on an auxiliary stream;
     # without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -173,6 +186,20 @@ class PreparationConfig:
             raise TypeError("embed_host must be a boolean")
         if type(self.vision_stage) is not bool or type(self.vision_stage_tail) is not bool:
             raise TypeError("vision_stage and vision_stage_tail must be booleans")
+        if self.trial_pool not in ("shared", "separate"):
+            raise ValueError("GLM trial graph pool must be shared or separate")
+        if type(self.slab_segment) is not bool or type(self.oneshot_fit) is not bool:
+            raise TypeError("slab_segment and oneshot_fit must be booleans")
+        if type(self.ar_rows) is not int or self.ar_rows and (not 128 <= self.ar_rows <= 4096 or self.ar_rows % 128):
+            raise ValueError("GLM all-reduce part rows must be 0 or a multiple of 128 in [128, 4096]")
+        if (self.oneshot_fit or self.ar_rows) and self.hosts is not None:
+            raise ValueError("oneshot_fit and ar_rows size PCIe channels; ranks on separate hosts reduce through RoCE")
+        if self.oneshot_fit and 4096 % len(self.devices):
+            raise ValueError("oneshot_fit needs the copy-engine prefill ring (two or four ranks); three ranks reduce "
+                             "prefill through their one-shot channel: use ar_rows (FLARE_GLM53_AR_ROWS) there")
+        if self.ar_rows and not 4096 % len(self.devices):
+            raise ValueError("ar_rows applies to three ranks, whose one-shot channel carries prefill; two or four "
+                             "ranks reduce prefill through the copy-engine ring: use oneshot_fit (FLARE_GLM53_ONESHOT_FIT)")
         if self.draft_head not in ("target", "nvfp4") or self.draft_eh_proj not in ("bf16", "mxfp8"):
             raise ValueError("GLM draft head must be target or nvfp4 and draft eh_proj bf16 or mxfp8")
         if self.expert_columns is not None and type(self.expert_columns) is not int:
@@ -222,6 +249,29 @@ class PreparationConfig:
                    max((b * w for b, w in self.speculative_shapes), default=0) if self.mtp else 0)
 
     @property
+    def oneshot_rows(self):
+        """Rows the PCIe one-shot all-reduce channel is sized for (local ranks, more than one).
+
+        Upstream sizes it for `token_capacity`. Decode, verification, resume and maintenance reduce at most
+        `decode_rows`. With `oneshot_fit`, prefill graphs of _DMA_PREFILL_TOKENS rows or more reduce through
+        the copy-engine ring, so the channel carries only the smaller prefill (and scored-prefill) graphs; with
+        `ar_rows`, prefill reductions are split into parts of at most that many rows."""
+        if self.oneshot_fit:
+            from ignition.components.prompt_logprobs import scored_prefill_capacities
+
+            prefills = (*self.prefill_capacities,
+                        *(scored_prefill_capacities(self.prefill_chunk_size) if self.prompt_logprobs else ()))
+            return max(self.decode_rows, max((c for c in prefills if c < _DMA_PREFILL_TOKENS), default=0))
+        if self.ar_rows:
+            return max(self.decode_rows, min(self.prefill_chunk_size, self.ar_rows))
+        return self.token_capacity
+
+    @property
+    def decode_rows(self):
+        """Rows of the widest non-prefill forward: a decode batch, or a speculative round's batch x width."""
+        return max(self.request_capacity, max((b * w for b, w in self.speculative_shapes), default=1) if self.mtp else 1)
+
+    @property
     def prefill_capacities(self):
         return prefill_capacities(self.prefill_chunk_size)
 
@@ -259,6 +309,42 @@ class PreparationConfig:
     @property
     def completion_token_capacity(self):
         return max((width for _, width in self.speculative_shapes), default=1) if self.mtp else 1
+
+
+def one_shot_tokens(config, *, prefill_ring):
+    """Rows the local PCIe one-shot all-reduce runtime is created for (`create_all_reduce_runtime(max_tokens=)`).
+
+    With the copy-engine `prefill_ring` (rank counts dividing 4096) upstream sizes it for `token_capacity`;
+    three ranks reduce prefill on it too, so at least a whole chunk. The fork-only switches size it for
+    `PreparationConfig.oneshot_rows` instead: `oneshot_fit` with the ring, `ar_rows` without."""
+    if prefill_ring:
+        return config.oneshot_rows
+    return config.oneshot_rows if config.ar_rows else max(config.oneshot_rows, config.prefill_chunk_size)
+
+
+def trial_graph_pool(config, core_storage):
+    """The pool the "Measure graph memory" trials capture into when not the serving graph pool (None).
+
+    Only package exports separate it (`trial_pool="separate"`): in-process preparation sizes its KV pages from
+    the memory left after the trials, which the serving capture then reuses."""
+    if config.trial_pool != "separate" or core_storage is None:
+        return None
+    return core_storage.trial_graph_pool()
+
+
+def _oneshot_parts(config, name, rows, *, one_shot):
+    """Whether graph `name`, whose layers reduce `rows` rows, reduces them in parts of the one-shot channel.
+
+    Only `ar_rows` plans parts. Without it a graph whose reductions exceed the channel fails the export here,
+    before tuning, instead of inside b12x's capacity check (`oneshot_fit` sizes the channel from the catalog's
+    own routing, so this fires only if that routing and `PreparationConfig.oneshot_rows` disagree)."""
+    if not one_shot or rows <= config.oneshot_rows:
+        return False
+    if config.ar_rows:
+        return True
+    raise ValueError(f"GLM graph {name!r} reduces {rows} rows through the one-shot all-reduce channel sized for "
+                     f"{config.oneshot_rows} rows (oneshot_fit={config.oneshot_fit}, FLARE_GLM53_ONESHOT_FIT); "
+                     "unset the switch or route this graph through the copy-engine ring")
 
 
 def _tensor_bytes(*owners):
@@ -442,20 +528,31 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             # requires numel % (world * 128) == 0), which three ranks cannot divide for power-of-two prefill
             # capacities. As in deepseek41/bootstrap.py (`if 5120 % len(config.devices)`: one PCIe runtime shared
             # by decode and prefill so capture enters a single collective's protocol), size one PCIe all-reduce
-            # for the whole prefill chunk. DeepSeek's `ar_rows` chunked prefill reductions are not ported yet:
-            # a 4096-row chunk reduces 32 MiB per layer call.
+            # for the whole prefill chunk: a 4096-row chunk reduces 32 MiB per layer call. Fork-only `ar_rows`
+            # (DeepSeek's TP3 chunked prefill reductions) sizes it for that many rows; the decoder layers then
+            # reduce larger prefill activations in parts (PreparedChunkedAllReduce, decoder.py).
             collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
-                max_tokens=max(config.token_capacity, config.prefill_chunk_size), hidden_size=4096, ipc=ipc)
+                max_tokens=one_shot_tokens(config, prefill_ring=False), hidden_size=4096, ipc=ipc)
             prefill_collective = collective
             vocabulary_collective = create_all_gather_runtime(group, device,
                 max_rows=sample_rows, columns=shards.padded_vocabulary, ipc=ipc)
         elif group is not None:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
+            # Fork-only `oneshot_fit` sizes the one-shot channel for the rows left on it (`oneshot_rows`, 512 at
+            # the shipped settings) instead of `token_capacity`: prefill of _DMA_PREFILL_TOKENS rows or more never
+            # uses it. A larger reduction planned on it fails the export (`_oneshot_parts` and b12x's capacity check).
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+                                                   max_tokens=one_shot_tokens(config, prefill_ring=True),
                                                    hidden_size=4096, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)
             vocabulary_collective = create_all_gather_runtime(group, device,
                 max_rows=sample_rows, columns=shards.padded_vocabulary, ipc=ipc)
+        if (config.oneshot_fit or config.ar_rows) and collective is not None:
+            report(f"one-shot all-reduce sized for {config.oneshot_rows} rows ({config.oneshot_rows * 4096 * 2 >> 20} MiB "
+                   f"per call) instead of {config.token_capacity} ("
+                   + ("FLARE_GLM53_ONESHOT_FIT=1; prefill of "
+                      f"{_DMA_PREFILL_TOKENS}+ rows uses the copy-engine ring)" if config.oneshot_fit else
+                      f"FLARE_GLM53_AR_ROWS={config.ar_rows}; larger prefill reductions run in parts)"))
         identity = hashlib.sha256(json.dumps({"config": json.loads((snapshot / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
@@ -508,7 +605,12 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         context_shards = None if context is None else context.shards
         remote = context is not None and context.remote
         prefill_storage = DecoderScratch.allocate(config.prefill_chunk_size, blocks, "prefill", device,
-            shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote)
+            shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote, slab_segment=config.slab_segment)
+        if config.slab_segment:
+            slab = prefill_storage.mla.slab
+            report(f"prefill slab {slab.nbytes / (1 << 20):.2f} MiB in {slab.untyped_storage().nbytes() >> 20} MiB "
+                   "of its own segments (FLARE_GLM53_SLAB_SEGMENT=1)" if slab.numel() else
+                   "FLARE_GLM53_SLAB_SEGMENT ignored: no context-parallel prefill slab at these settings")
         decode_rows = max(config.request_capacity,
                           max((b * w for b, w in config.speculative_shapes), default=1) if config.mtp else 1)
         decoder_storage = DecoderScratch.allocate(decode_rows, blocks, "decode", device,
@@ -586,12 +688,14 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     scratch[name] = storage.rows(capacity, mode, sample_rows=rows)
                     feedback = (prefill_feedback[:capacity]
                                 if enabled and kind != "scored_prefill" else None)
+                    runtime = prefill_collective if mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS else collective
                     decoders[name] = PreparedDecoder(weights, scratch[name], pool.decoder, metadata[name], mode=mode,
-                        scoring=scoring if kind == "scored_prefill" else None,
-                        runtime=prefill_collective if mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS else collective,
+                        scoring=scoring if kind == "scored_prefill" else None, runtime=runtime,
                         vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
                         session=session, name=name, workspace=arena, feedback=feedback,
-                        max_cache_pages=max_cache_pages, context=context, vision=vision_state)
+                        max_cache_pages=max_cache_pages, context=context, vision=vision_state,
+                        chunked_reduce=_oneshot_parts(config, name, capacity,
+                                                      one_shot=runtime is collective and collective is not None))
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard,
                                           pages=pool.memory_capacity[1:], shards=context_shards,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None)
@@ -649,9 +753,19 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     arena.release_preparation()
     stream = torch.cuda.Stream(device=device)
     graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
+    # Package exports keep only the preparation pages (below), so the trials' measurement is unused there. With
+    # the fork-only trial_pool "separate" their eager graphs record into a pool of their own, returned to the
+    # device once they are reset (materialize_cache); the serving capture then starts from an empty graph pool
+    # instead of carving its plans out of trial segments, which the export would otherwise keep whole.
+    trial_pool = trial_graph_pool(config, core_storage)
+    if config.trial_pool == "separate":
+        report("trial graphs in their own pool, released before the serving capture (FLARE_GLM53_TRIAL_POOL=separate)"
+               if trial_pool is not None else
+               "FLARE_GLM53_TRIAL_POOL ignored: in-process preparation sizes KV pages from the trials' shared pool")
     trials, _ = capture_forwards(forwards, signatures, session=session, device=device,
-        stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
-        compile_decoder=False, progress=progress, label="Measure graph memory", warmup_storage=core_storage)
+        stream=stream, pool=graph_pool if trial_pool is None else trial_pool.id, collective=collective,
+        coordinator=coordinator, compile_decoder=False, progress=progress, label="Measure graph memory",
+        warmup_storage=core_storage)
     from ignition.preparation.host_memory import COMPILED_FORWARD_BYTES, device_memory_info
 
     # An integrated GPU's allocatable memory includes the reclaimable RAM CUDA's free memory excludes.
@@ -720,7 +834,28 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             for graph in trials.values():
                 graph.reset()
             trials.clear()
+            release_trial_pool()
         memory("after KV allocation")
+
+    def release_trial_pool():
+        """Return the separate trial pool's segments; any block still live there stays (and is reported)."""
+        nonlocal trial_pool
+        if trial_pool is None:
+            return
+        pool_id = tuple(trial_pool.id)
+
+        def segments():
+            return [s for s in torch.cuda.memory_snapshot(include_traces=False)
+                    if s["device"] == device.index and tuple(s["segment_pool_id"]) == pool_id]
+        torch.cuda.synchronize(device)
+        held = sum(s["total_size"] for s in segments())
+        trial_pool = None
+        torch.cuda.empty_cache()
+        live = segments()
+        kept = sum(s["total_size"] for s in live)
+        report(f"trial graph pool released: {(held - kept) >> 20} of {held >> 20} MiB returned before the serving "
+               "capture" + (f"; {kept >> 20} MiB in {len(live)} segments still hold "
+                            f"{sum(s['active_size'] for s in live)} live bytes" if live else ""))
 
     graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
         stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,

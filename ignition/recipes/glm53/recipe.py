@@ -62,6 +62,20 @@ def _context_parallel_three_ranks():
     return _tp3_override("DCP3", ("1", "0"), "0") == "1"
 
 
+def _ar_rows():
+    """FLARE_GLM53_AR_ROWS=N (fork-only, default unset = 0): rows of one prefill all-reduce part at three ranks.
+
+    Three ranks reduce prefill through their single PCIe one-shot channel (bootstrap.py), sized for a whole
+    4096-row chunk. N (a multiple of 128 in [128, 4096]) sizes it for N rows and splits larger prefill reductions
+    into N-row parts (DeepSeek's TP3 `ar_rows`, PreparedChunkedAllReduce). Decode rows stay within N."""
+    value = os.environ.get("FLARE_GLM53_AR_ROWS", "").strip()
+    if not value:
+        return 0
+    if not value.isdigit() or not 128 <= int(value) <= 4096 or int(value) % 128:
+        raise ValueError(f"FLARE_GLM53_AR_ROWS={value!r}: expected a multiple of 128 in [128, 4096]")
+    return int(value)
+
+
 def _warn_ignored_overrides(config):
     """Fork-only overrides an export cannot apply are reported rather than silently dropped (review 2026-11-14)."""
     if not config.mtp and (config.draft_head, config.draft_eh_proj) != ("target", "bf16"):
@@ -133,6 +147,16 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         # Only meaningful with images (export without --language-model-only).
         vision_stage=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "0",
         vision_stage_tail=_tp3_override("VISION_STAGE", ("1", "blocks", "0"), "0") != "blocks",
+        # Fork-only export-layout VRAM switches (2026-11-15, VRAM map T1/W1, T2, W2, T3; unset = upstream layout).
+        # They change which allocations the package keeps, not what any graph computes:
+        # TRIAL_POOL=separate captures the eager "Measure graph memory" trials into their own pool, returned before
+        # the serving capture; SLAB_SEGMENT=1 gives the preparation-only 1M-position prefill slab a segment of its
+        # own; ONESHOT_FIT=1 sizes the one-shot all-reduce for the rows it carries when prefill chunks of 1024+
+        # rows use the copy-engine ring (two or four ranks); AR_ROWS=N (three ranks) reduces prefill in N-row parts.
+        trial_pool=_tp3_override("TRIAL_POOL", ("shared", "separate"), "shared"),
+        slab_segment=_tp3_override("SLAB_SEGMENT", ("1", "0"), "0") == "1",
+        oneshot_fit=_tp3_override("ONESHOT_FIT", ("1", "0"), "0") == "1",
+        ar_rows=_ar_rows(),
         mtp=speculation is not None, **drafting)
     _warn_ignored_overrides(config)
     if plan.world_size == 1:

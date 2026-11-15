@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
 from ignition.components.mhc import MHCScratch, MHCWeights, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
 
@@ -66,7 +66,9 @@ class PreparedGlmLayer:
     def __init__(self, module, attention_weights, mlp_weights, residual_weights,
                  source, output, scratch: LayerScratch, state, metadata, *,
                  mode, runtime, coordinator, session, name, workspace, carry=None, defer_post=False,
-                 max_cache_pages=None, context=None, kda_records=None):
+                 max_cache_pages=None, context=None, kda_records=None, chunked_reduce=False):
+        """`chunked_reduce` (fork-only TP3 `ar_rows`, prefill graphs only): the runtime holds fewer rows than this
+        layer's prefill, so both output reductions run in row parts the runtime accepts."""
         if module.block_type not in ("linear_attention", "indexed_attention"):
             raise ValueError("prepared GLM layer requires canonical KDA or sparse MLA attention")
         rows = scratch.attention.output.shape[0]
@@ -96,7 +98,8 @@ class PreparedGlmLayer:
             self.attention = PreparedGlmMLA(*attention_args, mode=mode, session=session, name=f"{name}.mla",
                                             workspace=workspace, max_cache_pages=max_cache_pages,
                                             context=context)
-        self.attention_reduce = PreparedAllReduce(scratch.attention.output, scratch.attention_output, runtime=runtime,
+        reduce = PreparedChunkedAllReduce if chunked_reduce else PreparedAllReduce
+        self.attention_reduce = reduce(scratch.attention.output, scratch.attention_output, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.attention_reduce")
         self.mlp_hc = PreparedMHC((scratch.attention_output, scratch.attention_hc.residual,
                                   scratch.attention_hc.post, scratch.attention_hc.comb),
@@ -109,7 +112,7 @@ class PreparedGlmLayer:
             self.mlp = PreparedMLP(scratch.mlp_hc.normalized, mlp_weights, scratch.mlp.gate_up,
                 scratch.mlp.intermediate, scratch.mlp.output, session=session, name=f"{name}.mlp", workspace=workspace,
                 swiglu_limit=module.mlp.swiglu_limit)
-        self.mlp_reduce = PreparedAllReduce(scratch.mlp.output, scratch.mlp_output, runtime=runtime,
+        self.mlp_reduce = reduce(scratch.mlp.output, scratch.mlp_output, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(scratch.mlp_output, scratch.mlp_hc.residual,
             scratch.mlp_hc.post, scratch.mlp_hc.comb, output, session=session, name=f"{name}.post")
