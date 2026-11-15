@@ -175,6 +175,18 @@ class TP3Config:
     """Vocabulary-parallel speculative rounds read one persistent copy of this rank's global vocabulary ids
     (``copy_columns``, 345 KB) instead of one per round (72 per rank: ~23 MiB). Same values, compared only.
     False = one copy per round (base)."""
+    # --- packed verification graph shapes for exports above 8 slots (bootstrap.PreparationConfig) ---
+    packed_keep_batches: int = 0
+    """Batches up to N keep exactly the packed verification shapes an export with ``--max-concurrency N`` builds (same
+    graph budget), so a 16-slot package verifies 1-8 requests with today's 8-slot shapes; the wider batches get their
+    own graphs (``packed_wide_graphs``) on top. 0 = upstream enumeration (one budget spread over every batch). A power
+    of two; no effect when the export's request capacity is not above it."""
+    packed_wide_graphs: int = 0
+    """With ``packed_keep_batches``: packed graphs for the batches above it, split by the same geometric rule; 0 = only
+    each wide batch's two endpoint shapes."""
+    packed_wide_tokens: int = 0
+    """With ``packed_keep_batches``: largest packed token capacity of the wide batches (e.g. 48: shapes only where a
+    served verification budget <= 48 can select them); 0 = the export's speculative token capacity (batch x width)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -214,7 +226,8 @@ class TP3Config:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "ar_rows", "ar_part_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
+        for name in ("hot_experts", "ar_rows", "ar_part_rows", "brrr_parked_max_rows", "engram_chunk_rows",
+                     "packed_keep_batches", "packed_wide_graphs", "packed_wide_tokens"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
@@ -260,6 +273,10 @@ class TP3Config:
             raise ValueError("TP3 config: brrr_dense_native=False needs brrr_layers")
         if self.brrr_break not in (None, "rope"):
             raise ValueError(f"TP3 config: brrr_break must be unset or 'rope', not {self.brrr_break!r}")
+        if self.packed_keep_batches & (self.packed_keep_batches - 1):
+            raise ValueError("TP3 config: packed_keep_batches must be 0 or a power of two (a batch capacity)")
+        if (self.packed_wide_graphs or self.packed_wide_tokens) and not self.packed_keep_batches:
+            raise ValueError("TP3 config: packed_wide_graphs / packed_wide_tokens need packed_keep_batches")
         if self.engram_chunk_rows % 128:
             raise ValueError("TP3 config: engram_chunk_rows must be a multiple of 128 (row-slice alignment of the "
                              "chunked Engram operands and the graph capacity ladder)")
@@ -335,6 +352,9 @@ class TP3Config:
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
+            packed_keep_batches=integer("PACKED_KEEP_BATCHES"),
+            packed_wide_graphs=integer("PACKED_WIDE_GRAPHS"),
+            packed_wide_tokens=integer("PACKED_WIDE_TOKENS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),

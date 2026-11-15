@@ -88,7 +88,7 @@ def speculative_shapes(concurrency, widths, token_capacity=None):
                  if width == 1 or batch * width <= capacity)
 
 
-def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_budget=64):
+def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_budget=64, *, batches=None):
     """Refine physical row capacities with a bounded, nested packed graph catalog.
 
     Every eligible batch retains its smallest positive draft budget and largest
@@ -96,8 +96,13 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     gap at its integer geometric midpoint, minimizing the remaining padding ratio.
     Width-one graphs are separate and do not consume this budget. Budgets beyond
     the complete integer capacity range saturate without duplicate graphs.
+    ``batches`` restricts the catalog to a subset of the concurrency's batch capacities (default: all of them).
     """
-    batches = batch_capacities(concurrency)
+    eligible = batch_capacities(concurrency)
+    if batches is None:
+        batches = eligible
+    elif not batches or any(batch not in eligible for batch in batches):
+        raise ValueError("packed verification batches must be batch capacities of the concurrency")
     if type(width) is not int or not 2 <= width < 1 << 31:
         raise ValueError("packed verification width must be an integer from two within Int32 token lengths")
     capacity = speculative_token_capacity(concurrency, width, token_capacity)

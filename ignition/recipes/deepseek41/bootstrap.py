@@ -267,10 +267,10 @@ class PreparationConfig:
 
     @property
     def packed_speculative_shapes(self):
-        from ignition.components.capacity import packed_speculative_shapes
-
-        return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
-            self.speculative_token_capacity, self.speculative_graph_budget) if self.draft_tokens else ()
+        if not self.draft_tokens:
+            return ()
+        return packed_shapes(self.max_active, max(self.speculative_widths), self.speculative_token_capacity,
+                             self.speculative_graph_budget, self.tp3)
 
     @property
     def decode_tokens(self):
@@ -347,6 +347,31 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         add(name, forward, "speculative", batch, logical_width, packed_inputs,
             enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
     return confidence
+
+
+def packed_shapes(max_active, width, token_capacity, graph_budget, tp3):
+    """Packed verification (batch, tokens) shapes of a DS41 export.
+
+    Base (``tp3.packed_keep_batches`` 0): upstream's catalog, one graph budget spread over every batch capacity. TP3
+    fork: with ``packed_keep_batches`` = K below the export's request capacity, batches <= K get exactly the shapes of a
+    ``--max-concurrency K`` export with the same budget and token capacity, and the batches above K get
+    ``packed_wide_graphs`` graphs (geometric splits up to ``packed_wide_tokens``, or the token capacity) on top."""
+    from ignition.components.capacity import batch_capacities, packed_speculative_shapes, request_capacity
+
+    keep = tp3.packed_keep_batches
+    if not keep or request_capacity(max_active) <= keep:
+        return packed_speculative_shapes(max_active, width, token_capacity, graph_budget)
+    base = packed_speculative_shapes(keep, width, token_capacity, graph_budget)
+    wide = tuple(batch for batch in batch_capacities(max_active) if batch > keep)
+    capacity = token_capacity if token_capacity is not None else max(request_capacity(max_active), width)
+    if tp3.packed_wide_tokens:
+        if tp3.packed_wide_tokens <= max(wide):
+            raise ValueError(f"TP3 config: packed_wide_tokens must exceed the widest batch ({max(wide)})")
+        capacity = min(capacity, tp3.packed_wide_tokens)
+    endpoints = 2 * len(wide)
+    extra = packed_speculative_shapes(max_active, width, capacity, max(endpoints, tp3.packed_wide_graphs),
+                                      batches=wide)
+    return tuple(sorted({*base, *extra}))
 
 
 def vocabulary_channels(config, sample_rows):
