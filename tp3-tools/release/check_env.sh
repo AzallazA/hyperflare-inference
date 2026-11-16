@@ -3,14 +3,14 @@
 #   usage: ./check_env.sh <fork checkout dir>    the Flare clone at BASE below (EXPORT.md step 2), before or after source.patch
 #   env:   CUDA_HOME     CUDA toolkit root (default /usr/local/cuda-13.1 if present, else the nvcc on PATH)
 #          FLARE_CACHE   where packages and the kernel tuning cache go (default ~/.cache/flare)
-#          MIN_FREE_GB   free space required on the drive holding FLARE_CACHE (default 900: checkpoints ~412 GB,
-#                        package ~380 GB, tuning cache 60-80 GB; lower it if the checkpoints live on another drive)
+#          MIN_FREE_GB   free space required on the drive holding FLARE_CACHE (default 1100: DeepSeek checkpoint ~510 GB,
+#                        package ~505 GB (469 GiB), tuning cache 60-80 GB; lower it if the checkpoint lives on another drive)
 #          GPUS          GPU indices you will export and serve on (default 0,1,2)
 # Prints one PASS / WARN / FAIL line per check and exits 1 if anything FAILed. WARN lines are steps not done yet.
 set -uo pipefail
 FORK=${1:?usage: check_env.sh <fork checkout dir>}
 HERE=$(dirname "$(readlink -f "$0")")
-FLARE_CACHE=${FLARE_CACHE:-$HOME/.cache/flare}; MIN_FREE_GB=${MIN_FREE_GB:-900}; GPUS=${GPUS:-0,1,2}
+FLARE_CACHE=${FLARE_CACHE:-$HOME/.cache/flare}; MIN_FREE_GB=${MIN_FREE_GB:-1100}; GPUS=${GPUS:-0,1,2}
 # Upstream base of source.patch: Hyperflare main 70069281 since the 2026-11-14 port (releases from 20261116 on);
 # cbf21a12 for the 2026-11-10 ds41-tp3-sync builds, 972e28e4 up to 20261111.
 BASE=${BASE:-70069281cb3ace4365b86f4bfbbcb409da89434b}
