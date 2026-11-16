@@ -287,12 +287,13 @@ fn conversation(
     if tool_choice == ToolChoice::Required && tools.is_empty() {
         return Err(invalid("required tool choice needs at least one tool"));
     }
-    // Required calls are checked at completion; thinking starts before the tool block.
-    let tool_choice = if tool_choice == ToolChoice::Required && thinking_mode {
-        ToolChoice::Auto
-    } else {
-        tool_choice
-    };
+    // The official encoder forces a call by opening the tool-call block right after the generation
+    // prompt, which thinking mode cannot do. Like the reference (deepseek-recipe
+    // protocol/client_tools.rs convert_client_tools, HTTP 400), reject instead of accepting a
+    // request whose model may answer without a call. A named choice arrives here as "required".
+    if tool_choice == ToolChoice::Required && thinking_mode {
+        return Err(invalid("Thinking mode does not support this tool_choice"));
+    }
     let response_format = match options.get("response_format").filter(|v| !v.is_null()) {
         None => ResponseFormat::Text,
         Some(value) if value == "text" || value["type"] == "text" => ResponseFormat::Text,

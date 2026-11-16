@@ -219,8 +219,7 @@ pub(super) fn prepare_inference_cached(
         ToolChoice::Required => Some("required"),
         // The DeepSeek reference makes a named choice a required call of the one kept tool
         // (deepseek-recipe protocol/client_tools.rs convert_client_tools). The encoder then
-        // forces the call in chat mode; in thinking mode, as for "required", the prompt stays
-        // automatic and completion checks the call.
+        // forces the call in chat mode; in thinking mode the encoder rejects it, as "required".
         ToolChoice::Named(_) if !legacy_prompt => Some("required"),
         ToolChoice::Named(_) => Some("auto"),
     };

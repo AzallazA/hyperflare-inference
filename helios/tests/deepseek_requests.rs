@@ -195,10 +195,18 @@ fn named_selection_only_filters_tools_and_none_restores_a_text_turn() {
             {"role":"tool","tool_call_id":"prior","content":"Previous result"},
             {"role":"user","content":"Now look it up"}
         ]);
-        let named = fixture.prepare(json!({"messages":messages,"tools":tools,
-            "tool_choice":{"type":"function","function":{"name":"lookup"}}})).unwrap();
-        let selected = fixture.prepare(json!({"messages":messages,"tools":[tools[0]],
-            "tool_choice":"auto"})).unwrap();
+        // DeepSeek encoders: a named choice is "required" of the kept tool, available only with
+        // thinking off; chat templates receive the kept tool with an automatic choice.
+        let native = encoder != PromptEncoder::Jinja;
+        let request = |tools: Value, choice: Value| {
+            let mut body = json!({"messages":messages,"tools":tools,"tool_choice":choice});
+            if native {
+                body["enable_thinking"] = json!(false);
+            }
+            fixture.prepare(body).unwrap()
+        };
+        let named = request(tools.clone(), json!({"type":"function","function":{"name":"lookup"}}));
+        let selected = request(json!([tools[0]]), json!(if native {"required"} else {"auto"}));
         assert_eq!(named.rendered_prompt, selected.rendered_prompt, "{encoder:?}");
         assert_eq!(named.prompt.tokens, selected.prompt.tokens);
         assert!(named.prompt.grammar.is_none());
@@ -694,26 +702,42 @@ fn added_non_special_dsml_token_produces_tool_calls() {
 }
 
 #[test]
-fn required_and_named_tools_keep_the_thinking_prompt() {
+fn required_and_named_tools_are_rejected_in_thinking_mode() {
+    let tools = json!([
+        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+        {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
+    ]);
+    let named = json!({"type":"function","function":{"name":"lookup"}});
     for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
         let fixture = Fixture::new(encoder);
-        let tools = json!([
-            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
-            {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
-        ]);
-        for thinking in [json!({}), json!({"enable_thinking":true}), json!({"thinking_mode":"thinking"})] {
-            let required = fixture.prepare(json!({"tools":tools,"tool_choice":"required", "chat_template_kwargs":thinking})).unwrap();
-            let automatic = fixture.prepare(json!({"tools":tools,"tool_choice":"auto", "chat_template_kwargs":thinking})).unwrap();
-            assert_eq!(required.rendered_prompt, automatic.rendered_prompt, "{encoder:?} {thinking}");
-            assert_eq!(required.prompt.tokens, automatic.prompt.tokens);
-            assert_eq!(required.output.content.start, OutputStart::Reasoning);
-            assert!(required.rendered_prompt.ends_with("<｜Assistant｜><think>"));
-            let named = fixture.prepare(json!({"tools":tools,"tool_choice":{"type":"function","function":{"name":"lookup"}},"chat_template_kwargs":thinking})).unwrap();
-            assert_eq!(named.output.content.start, OutputStart::Reasoning);
-            assert_eq!(named.output.content.tools.len(), 1);
-            assert_eq!(named.output.content.tools[0]["function"]["name"], "lookup");
+        // As the reference (deepseek-recipe convert_client_tools): 400 with its message, before any
+        // generation. Request-level enable_thinking, template kwargs and the default all count.
+        for thinking in [json!({}), json!({"enable_thinking":true}),
+                         json!({"chat_template_kwargs":{"enable_thinking":true}}),
+                         json!({"chat_template_kwargs":{"thinking_mode":"thinking"}})] {
+            for choice in [json!("required"), named.clone()] {
+                let mut body = thinking.clone();
+                body["tools"] = tools.clone();
+                body["tool_choice"] = choice.clone();
+                let error = fixture.prepare(body).err().unwrap_or_else(|| panic!("{encoder:?} {thinking} {choice} accepted"));
+                assert!(matches!(error, flare_helios::Error::Admission(flare_helios::AdmissionError::Invalid(_))), "{error:?}");
+                assert!(error.to_string().contains("Thinking mode does not support this tool_choice"), "{error}");
+            }
+            let mut auto = thinking.clone();
+            auto["tools"] = tools.clone();
+            assert!(fixture.prepare(auto).is_ok());
         }
-        assert!(fixture.prepare(json!({"tool_choice":"required","tools":[]})).is_err());
+        // Thinking off still forces the call.
+        for choice in [json!("required"), named.clone()] {
+            let request = fixture.prepare(json!({"enable_thinking":false,"tools":tools,"tool_choice":choice})).unwrap();
+            assert_eq!(request.output.content.start, OutputStart::ToolBody, "{encoder:?} {choice}");
+        }
+        assert!(fixture.prepare(json!({"tool_choice":"required","tools":[],"enable_thinking":false})).is_err());
+    }
+    // Chat templates (GLM-5.3 and the other Jinja models) keep accepting both in thinking mode.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    for choice in [json!("required"), named] {
+        assert!(template.prepare(json!({"enable_thinking":true,"tools":tools,"tool_choice":choice})).is_ok());
     }
 }
 
