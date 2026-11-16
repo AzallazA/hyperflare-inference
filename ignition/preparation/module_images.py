@@ -45,6 +45,8 @@ class ModuleImages:
         self.native = NativeModuleRecorder(str(cupti_library(library)))
         self._active = False
         self._token = None
+        # cuBLAS's own pool, recorded by library_scratch.prime (export excludes it from reachability)
+        self.library_scratch = []
 
     @classmethod
     def current(cls):

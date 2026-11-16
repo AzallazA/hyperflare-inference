@@ -295,6 +295,15 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
                        for segment in storage.graph_pool.snapshot(include_traces=False))
     inactive = storage.unused_ranges()
     zero_ranges.extend((start, end - start) for start, end in inactive)
+    # cuBLAS's own pool (library_scratch.py): never addressed by a graph; not zeroed, only excluded from
+    # the exporter's conservative reachability so a coincidental value cannot retain it.
+    from .library_scratch import live_inactive
+    scratch = live_inactive(getattr(images, "library_scratch", ()), images.allocations)
+    if scratch:
+        import sys
+        print(f"rank {storage.rank}: library scratch excluded from export reachability: " + ", ".join(
+            f"{(end - start) / (1 << 20):.0f} MiB at {start:#x}" for start, end in scratch), file=sys.stderr, flush=True)
+    inactive = sorted([*inactive, *scratch])
     transports = [runtime.native_description() for runtime in storage.transports]
     for runtime in storage.transports:
         runtime.close()
