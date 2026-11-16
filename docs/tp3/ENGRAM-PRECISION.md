@@ -1,5 +1,10 @@
 # MXFP4 vs FP8 Engram tables: what we measured
 
+> **2026-11-16:** the Hyperflare-tp3-20261116 release uses DeepSeek's FP8 tables, both in host RAM (217 GiB of host
+> RAM committed by the server instead of ~148 GiB). The switch was made for precision, not speed: decode with FP8 tables
+> measured 0.99 / 1.02 / 1.03 / 0.99× of MXFP4 at c1 / c4 / c8 / c16 on the same code. That release's own quality checks
+> are in its `qualification/RESULTS.md`; this page is unchanged otherwise.
+
 DeepSeek-V4.1-Flash-1017 has two Engram n-gram tables (layers 1 and 14). DeepSeek ships them in FP8 (94.4 GiB each,
 189 GiB total). NVIDIA's [DeepSeek-V4.1-Flash-1017-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4)
 release carries them in MXFP4 (48.6 GiB each, 97 GiB total). That format is lossy: packed E2M1 values with E8M0 block
