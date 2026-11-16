@@ -440,7 +440,7 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
 }
 
 fn assert_request_effort(fixture: &Fixture, request: &PreparedRequest, score: u8) {
-    assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+    assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")), "{}", request.rendered_prompt);
     assert_eq!(request.rendered_prompt.matches("Reasoning Effort:").count(), 1);
     assert_eq!(request.prompt.tokens,
         fixture.frontend.encode(&request.rendered_prompt, false).unwrap());
@@ -613,7 +613,7 @@ fn base64_images_follow_the_rendered_placeholder_order() {
             assert_eq!(request.rendered_prompt, rendered.text);
             if encoder == PromptEncoder::DeepseekV41 {
                 let score = options["reasoning_effort"].as_u64().unwrap_or(75);
-                assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+                assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")), "{}", request.rendered_prompt);
             }
             let complete_message = native_prefix::without_generation(&f.frontend, messages.as_array().unwrap(), options.as_object().unwrap());
             let complete_message = flare_helios::model::prepare_input(&f.config, &f.frontend,
@@ -863,4 +863,34 @@ fn malformed_tool_arguments_pass_through_like_the_reference() {
         assert!(events.contains(&Event::ToolEndRaw { index: 0 }), "{events:?}");
         assert!(!events.iter().any(|event| matches!(event, Event::Content(text) if !text.trim().is_empty())));
     }
+}
+
+#[test]
+fn reasoning_effort_spellings_follow_the_reference() {
+    assert_reference_prompts("f7_");
+    let fixture = Fixture::new(PromptEncoder::DeepseekV41);
+    for (effort, score) in [("minimal", 50), ("medium", 75)] {
+        for extra in [json!({"reasoning_effort":effort}),
+                      json!({"chat_template_kwargs":{"reasoning_effort":effort}})] {
+            assert_request_effort(&fixture, &fixture.prepare(extra).unwrap(), score);
+        }
+    }
+    // `none` without a thinking setting is chat mode, even over a thinking default; an explicit
+    // thinking setting wins and renders the default effort.
+    let thinking_default = Fixture::with_defaults(PromptEncoder::DeepseekV41, json!({"enable_thinking":true}));
+    for f in [&fixture, &thinking_default] {
+        let none = f.prepare(json!({"reasoning_effort":"none"})).unwrap();
+        assert!(!none.rendered_prompt.contains("Reasoning Effort:"));
+        assert!(none.rendered_prompt.ends_with("<｜Assistant｜></think>"));
+        assert_eq!(none.output.content.start, OutputStart::Content);
+        for extra in [json!({"enable_thinking":true,"reasoning_effort":"none"}),
+                      json!({"reasoning_effort":"none","chat_template_kwargs":{"thinking_mode":"thinking"}})] {
+            assert_request_effort(f, &f.prepare(extra).unwrap(), 75);
+        }
+    }
+    let v4 = Fixture::new(PromptEncoder::DeepseekV4);
+    for effort in ["none", "minimal", "medium"] {
+        assert!(v4.prepare(json!({"reasoning_effort":effort})).is_ok(), "{effort}");
+    }
+    assert!(fixture.prepare(json!({"reasoning_effort":"ultra"})).is_err());
 }

@@ -115,6 +115,10 @@ fn conversation(
             )));
         }
     }
+    // An explicit thinking setting in the request overrides `reasoning_effort: "none"`.
+    let request_sets_thinking = ["thinking_mode", "enable_thinking"]
+        .iter()
+        .any(|key| options.get(*key).is_some_and(|v| !v.is_null()));
     let mut options = {
         let mut merged = frontend.defaults.clone();
         if options.contains_key("enable_thinking") && !options.contains_key("thinking_mode") {
@@ -178,6 +182,7 @@ fn conversation(
             "DeepSeek prompt encoding does not support documents",
         ));
     }
+    let effort_none = options.get("reasoning_effort").and_then(Json::as_str) == Some("none");
     let thinking_mode = match options.get("thinking_mode").filter(|v| !v.is_null()) {
         Some(Json::String(value)) if value == "thinking" => true,
         Some(Json::String(value)) if value == "chat" => false,
@@ -188,20 +193,25 @@ fn conversation(
             _ => return Err(invalid("enable_thinking must be a boolean")),
         },
     };
+    // As in the reference (deepseek-recipe protocol/reasoning.rs resolve_thinking_mode) and the
+    // official template, effort `none` selects chat mode unless the request sets thinking.
+    let thinking_mode = thinking_mode && !(effort_none && !request_sets_thinking);
     let effort_error = || {
         invalid(if frontend.prompt_encoder == PromptEncoder::DeepseekV41 {
-            "reasoning_effort must be an integer from 1 through 100 or low, high, xhigh, or max"
+            "reasoning_effort must be an integer from 1 through 100 or none, minimal, low, medium, high, xhigh, or max"
         } else {
-            "reasoning_effort must be low, high, xhigh, or max for DeepSeek V4"
+            "reasoning_effort must be none, minimal, low, medium, high, xhigh, or max for DeepSeek V4"
         })
     };
     let (reasoning_effort, reasoning_effort_score) =
         match options.get("reasoning_effort").filter(|v| !v.is_null()) {
             None => (Some(ReasoningEffort::High), None),
             Some(Json::String(value)) => (
+                // The reference mapping (protocol/reasoning.rs to_reasoning_effort); `none` with
+                // thinking enabled renders the default effort, as there and in the template.
                 Some(match value.as_str() {
-                    "low" => ReasoningEffort::Low,
-                    "high" => ReasoningEffort::High,
+                    "minimal" | "low" => ReasoningEffort::Low,
+                    "none" | "medium" | "high" => ReasoningEffort::High,
                     "xhigh" => ReasoningEffort::Xhigh,
                     "max" => ReasoningEffort::Max,
                     _ => return Err(effort_error()),
