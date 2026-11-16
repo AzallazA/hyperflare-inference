@@ -184,18 +184,23 @@ def _replay_and_compare(graphs, resets, observe):
 
 class SelectorProbe:
     """Wraps a functional PreparedMXFP4Indexer: copies its inputs (index query after RoPE, index weights after the
-    scaling) and, on the candidate source, its candidate outputs into persistent buffers the test observes."""
+    scaling) and, on the candidate source, its candidate outputs into persistent buffers the test observes.
+
+    Module-level (the AOT guard pickler stores it by qualified name) and holding only the wrapped selector and plain
+    tensors: the ignition reducer drops the selector's unguarded attributes (plan, cache) as it does unwrapped."""
 
     def __init__(self, inner, query_like, weights_like):
-        self.inner, self.plan, self.cache, self.write_keys = inner, inner.plan, inner.cache, inner.write_keys
-        self.layouts = inner.layouts
-        device = query_like.device
+        self.inner = inner
         self.query, self.weights = torch.empty_like(query_like), torch.empty_like(weights_like)
         self.candidates = self.counts = None
         for key, attribute in (("candidate_output", "candidates"), ("candidate_output_lengths", "counts")):
             layout = inner.layouts.get(key)
             if layout is not None:
-                setattr(self, attribute, torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=device))
+                setattr(self, attribute, torch.empty_strided(layout[0], layout[1], dtype=layout[2],
+                                                             device=query_like.device))
+
+    def write_keys(self, keys, slots):  # PreparedGlobalKV writes the index cache through selectors[0]
+        self.inner.write_keys(keys, slots)
 
     def __call__(self, query=None, weights=None, *args, **kwargs):
         self.query.copy_(query)
@@ -273,12 +278,13 @@ def test_index_side_stream_is_bit_identical(attention_weights, rows):
         # Selector probes (the selectors list is shared by each layer's serial copy: copy() is shallow).
         probes = {}
         for attention, layer in zip(side, layers):
+            first = 0
             for ordinal, selector in enumerate(list(attention.selectors)):
                 rows_here = selector.layouts["output_indices"][0][0]
-                first = sum(s.layouts["output_indices"][0][0] for s in attention.selectors[:ordinal])
                 probe = SelectorProbe(selector, scratch.index_query[first:first + rows_here],
                                       scratch.index_weights[first:first + rows_here])
                 attention.selectors[ordinal] = probe
+                first += rows_here
                 probes.update(probe.observed(f"selector.L{layer}.{ordinal}"))
         assert all(plain.selectors is attention.selectors for plain, attention in zip(serial, side))
         graphs = _capture(session, {"serial": IndexForward(serial, sources, metadata, outputs, selected),
