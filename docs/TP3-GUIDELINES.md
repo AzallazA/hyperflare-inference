@@ -291,7 +291,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    GPU queue chain `qual-chain.sh` (`~/ds41-tp3/analysis/work/flare-ds41-perf/qual-20261116/README.md`). The
    20261116 release ran `TIER=weights` (FP8 Engram tables = a quantisation change) plus `RETRIEVAL=1 LONG512=1`:
    smoke, image, tools 60, consistency, verify_fix, eval-43, tool-eval, decode 32K c1/c8/c16, 128K/512K c1, prefill 32K,
-   agent8 replay, retrieval 128K/900K, GPQA Diamond, hotel-lights and KV stress at 16 streams. Not run: LiveBench,
+   agent8 replay, retrieval 128K/900K, GPQA Diamond, hotel-lights at 16 streams; the 16-stream KV stress, post checks
+   and log scan were interrupted by a hardware fault on the test machine (15:52) and were published as pending, to be
+   added after the rerun (the same package passed that stress on the binary before prefill merge). Not run: LiveBench,
    long generation, lavd, the natural-EOS decode bench, the 8-stream stress (the 16-stream stress replaces it), the
    128K c8 cell, the vision sets. The release notes and the folder README list what was not run.
 
