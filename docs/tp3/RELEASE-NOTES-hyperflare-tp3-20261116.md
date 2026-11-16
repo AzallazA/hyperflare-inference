@@ -59,7 +59,7 @@ ranges, not single numbers.
 **Qualification (tier "weights": the FP8 tables are a quantisation change), live server, no restarts:** corruption check
 0 true corruptions (10 runs); decode-vs-prefill consistency top-1 0.951 (gate 0.95); eval-43 42/43; tool calls 60/60;
 tool-eval 90/100 (77/91 graded, TC-45 excluded as before; baseline 91); image smoke 5/5; long retrieval 128K / 900K
-pass / pass; GPQA Diamond TBD(seq235: gpqa); hotel-lights at 16 streams TBD(seq235: hotel16); KV stress at 16 streams
+pass / pass; GPQA Diamond 91.4% (181/198, one sample; WARN: 4 answers truncated, gate ≤ 3; baseline 90.4%); hotel-lights at 16 streams TBD(seq235: hotel16); KV stress at 16 streams
 TBD(seq235: stress16).
 **Not run for this release** (owner's tiered policy of 2026-11-16, to release faster): LiveBench, long generation,
 lavd, the natural-EOS decode bench, the 8-stream KV stress (the 16-stream stress replaces it), the 128K c8 cell, the
@@ -81,5 +81,5 @@ prefill merge 512, CUDA stack limit 256. KV 5,403,008.
 Decode 32K c1/c8/c16 319.5/978.8/1,331.5 tok/s (one 30 s pass; same-day spread c1 293.7-317.2, c8 989.2-1,024.4);
 128K/512K c1 320.8/292.7; prefill 32K 15,766.
 Qualification tier weights: verify 0 TRUE, consistency 0.951, eval 42/43, tools 60/60, tool-eval 90, retrieval
-pass/pass, GPQA TBD, hotel16 TBD, stress16 TBD. Not run: LiveBench, longgen, lavd, EOS bench, 8-stream stress.
+pass/pass, GPQA 91.4% (WARN 4 truncated), hotel16 TBD, stress16 TBD. Not run: LiveBench, longgen, lavd, EOS bench, 8-stream stress.
 -->
