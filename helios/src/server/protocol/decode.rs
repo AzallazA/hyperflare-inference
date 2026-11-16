@@ -342,11 +342,8 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
     } else {
         v
     };
-    if flag(definition, "strict", false)? {
-        return Err(unsupported(
-            "strict tool schemas require constrained tool generation",
-        ));
-    }
+    // Whether a frontend accepts strict schemas is decided at preparation.
+    let strict = flag(definition, "strict", false)?;
     let grammar = if custom && present(v, "format") && v["format"]["type"] != "text" {
         if v["format"]["type"] != "grammar"
             || !["lark", "regex"].contains(&field(&v["format"], "syntax")?)
@@ -390,6 +387,7 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
         parameters,
         custom,
         grammar,
+        strict,
     })
 }
 fn thinking_budget(value: &Value) -> Result<u32> {

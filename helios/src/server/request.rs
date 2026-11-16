@@ -84,6 +84,30 @@ pub(super) fn conversation_messages(
     }
 }
 
+/// Normalizes the parameters of a strict tool as the DeepSeek reference does before rendering:
+/// every object lists all of its properties as required and forbids additional properties,
+/// keywords outside the reference's typed schema are dropped, and schemas it cannot normalize
+/// are rejected with its message (deepseek-recipe protocol/validation.rs
+/// `normalize_tool_parameters`, protocol/json_schema.rs). That normalizer is crate-private, so a
+/// one-tool request goes through the reference's public Chat conversion. Flare does not constrain
+/// tool generation; `strict` changes only the rendered schema.
+fn reference_strict_parameters(parameters: &Value) -> Result<Value> {
+    use deepseek_recipe::request::{ConversionOptions, ProtocolRequest};
+    let request: deepseek_recipe::openai::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": "DeepSeek-V4.1-Flash",
+            "messages": [{"role": "user", "content": ""}],
+            "thinking": {"type": "disabled"},
+            "tools": [{"type": "function",
+                "function": {"name": "tool", "parameters": parameters, "strict": true}}],
+        }))
+        .map_err(|error| format!("invalid strict tool parameters: {error}"))?;
+    let mut converted = request
+        .convert(ConversionOptions::default())
+        .map_err(|error| Error::from(error.to_string()))?;
+    Ok(converted.conversation.tools.remove(0).parameters)
+}
+
 pub(super) struct PreparedInference {
     pub prompt: Prompt,
     pub output: Option<crate::output::OutputConfig>,
@@ -225,8 +249,17 @@ pub(super) fn prepare_inference_cached(
             let description = if let Some(grammar) = &tool.grammar {
                 format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
             } else { tool.description.clone() };
-            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
-        }).collect()));
+            let parameters = match (tool.strict, legacy_prompt) {
+                (false, _) => tool.parameters.clone(),
+                (true, false) => reference_strict_parameters(&tool.parameters)?,
+                (true, true) => {
+                    return Err(super::inference::unsupported(
+                        "strict tool schemas require constrained tool generation",
+                    ));
+                }
+            };
+            Ok(serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":parameters}}))
+        }).collect::<Result<Vec<_>>>()?));
     }
     if !options.contains_key("add_generation_prompt")
         && requests_continuation(options.get("continue_final_message"))

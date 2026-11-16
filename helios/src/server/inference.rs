@@ -60,6 +60,8 @@ pub struct Tool {
     pub parameters: Value,
     pub custom: bool,
     pub grammar: Option<ToolGrammar>,
+    /// The client asked for strict argument validation (`strict: true`).
+    pub strict: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolGrammar {

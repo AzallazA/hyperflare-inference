@@ -791,3 +791,28 @@ fn assert_reference_prompts(prefix: &str) {
 fn developer_messages_render_as_reference_system_turns_in_place() {
     assert_reference_prompts("f3_");
 }
+
+#[test]
+fn strict_tools_render_the_reference_normalized_schema() {
+    assert_reference_prompts("f5_");
+    let strict = json!({"type":"function","function":{"name":"set_flag","strict":true,
+        "parameters":{"type":"object","properties":{"on":{"type":"boolean"}}}}});
+    let plain = json!({"type":"function","function":{"name":"lookup",
+        "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}});
+    let native = Fixture::new(PromptEncoder::DeepseekV41);
+    // Strict and non-strict tools may share a request (the reference rejects that mix only
+    // because it then constrains generation, which Flare does not do).
+    let mixed = native.prepare(json!({"tools":[strict, plain]})).unwrap();
+    assert!(mixed.rendered_prompt.contains(r#"{"name": "set_flag", "description": "", "parameters": {"type": "object", "properties": {"on": {"type": "boolean"}}, "additionalProperties": false, "required": ["on"]}}"#), "{}", mixed.rendered_prompt);
+    assert!(mixed.rendered_prompt.contains(r#""parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}"#));
+    // A schema the reference cannot normalize fails with the reference's message.
+    let partial = json!({"type":"function","function":{"name":"set_flag","strict":true,
+        "parameters":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"]}}});
+    let error = native.prepare(json!({"tools":[partial]})).err().unwrap().to_string();
+    assert!(error.contains("Required properties must match all properties in the object"), "{error}");
+    // Chat templates keep rejecting strict schemas.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    let error = template.prepare(json!({"tools":[strict]})).err().unwrap().to_string();
+    assert!(error.contains("strict tool schemas require constrained tool generation"), "{error}");
+    assert!(template.prepare(json!({"tools":[plain]})).is_ok());
+}
