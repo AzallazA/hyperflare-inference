@@ -12,4 +12,4 @@ __pycache__/
 /cufile.log
 /.claude/worktrees/
 .brrr-ext/
-.b12x-overlay/
+.b12x-overlay*/

@@ -225,6 +225,19 @@ def test_decision_rule_and_records(stubs, mode, rows, parked, expect, gated):
     assert decoder._BRRR_DECISIONS == [(f"{mode}{rows}.layer{index}", index, mode, rows, expect, gated)]
 
 
+@pytest.mark.parametrize("gate,rows,expect", [
+    (24, 13, True), (24, 24, True), (24, 25, False),   # export PARKED_ROWS=24: parked layers fused up to 24 rows
+    (0, 13, True), (0, 48, True),                      # PARKED_ROWS=0: ungated, the parked layer decides like a resident one
+])
+def test_parked_row_gate_values(stubs, gate, rows, expect):
+    tp3 = _tp3(host_expert_layers=frozenset({PARKED_LAYER}), brrr_parked_max_rows=gate, hot_experts=342,
+               merged_bank=True, expert_counts_dir="/counts")
+    layer = _layer(PARKED_LAYER, tp3, rows=rows, mode="verify", hot_map=torch.arange(384, dtype=torch.int32))
+    assert (layer.brrr is not None) == expect
+    assert decoder._BRRR_DECISIONS == [(f"verify{rows}.layer{PARKED_LAYER}", PARKED_LAYER, "verify", rows, expect,
+                                        not expect)]
+
+
 @pytest.mark.parametrize("mode", ["decode", "verify"])
 def test_graph_wider_than_the_kernel_fails_at_construction(stubs, mode):
     assert _layer(LAYER, _tp3(), rows=brrr.MAX_ROWS, mode=mode).brrr is not None

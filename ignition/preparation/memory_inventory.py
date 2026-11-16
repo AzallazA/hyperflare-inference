@@ -175,6 +175,39 @@ def _size(ranges):
     return sum(end - start for start, end in merge_ranges(ranges))
 
 
+def _cublas_workspace_sizes():
+    import torch
+
+    try:
+        return {size for size in (torch._C._cuda_getCublasWorkspaceSize(),
+                                  torch._C._cuda_getCublasLtWorkspaceSize()) if size}
+    except Exception:  # noqa: BLE001 - no CUDA device (CPU inventory tests): nothing to claim
+        return set()
+
+
+def cublas_workspace_claims(segments, sizes, graph_pool):
+    """PyTorch's per-(handle, stream) cuBLAS workspaces: live blocks of exactly the workspace size outside the
+    graph pool. Captured cuBLAS kernels address them (split-K partials), so they are retained; nothing in
+    ``prepared`` holds them (PyTorch keeps them in a C++ map)."""
+    claims = []
+    for segment in segments:
+        if tuple(segment["segment_pool_id"]) == tuple(graph_pool):
+            continue
+        for block in segment["blocks"]:
+            if block["state"] == "active_allocated" and block["requested_size"] in sizes:
+                claims.append(Claim(block["address"], block["address"] + block["requested_size"],
+                                    "cuBLAS workspaces", "per-stream cuBLAS workspace (PyTorch)",
+                                    "torch cublas_handle_stream_to_workspace", 50))
+    return claims
+
+
+def unknown_spans(retained, claims, minimum=1 << 20):
+    """Retained (exported) ranges no claim covers, at least ``minimum`` bytes: the 'Unknown storage' blocks."""
+    covered = merge_ranges([(c.start, c.end) for c in claims if c.end > c.start])
+    return [(start, end - start) for start, end in subtract_ranges(merge_ranges(retained), covered)
+            if end - start >= minimum]
+
+
 def collect_inventory(prepared, storage, core, *, external=()):
     """Join Heliopause's physical snapshot to the graph-reachable core and its owners.
 
@@ -196,6 +229,13 @@ def collect_inventory(prepared, storage, core, *, external=()):
         claims.extend(Claim(start, end, "Graph I/O / persistent state", f"buffers[{name!r}]", priority=40)
                       for start, end in tensor_ranges(tensor))
     segments = [s for s in torch.cuda.memory_snapshot(include_traces=False) if s["device"] == storage.device]
+    sizes = _cublas_workspace_sizes()
+    claims.extend(cublas_workspace_claims(segments, sizes, storage.graph_pool.id))
+    owners = tuple(getattr(core, "owners", None) or ())
+    images = owners[2] if len(owners) > 2 else None
+    claims.extend(Claim(address, address + nbytes, "Library scratch (not exported)", "cuBLAS pool",
+                        "ignition/preparation/library_scratch.py", 20)
+                  for address, nbytes in getattr(images, "library_scratch", ()))
     for segment in segments:
         graph_pool = tuple(segment["segment_pool_id"]) == tuple(storage.graph_pool.id)
         for block in segment["blocks"]:
@@ -258,6 +298,7 @@ def collect_inventory(prepared, storage, core, *, external=()):
                 imported_peer_bytes=(0 if storage.peer_storage is None else sum(
                     size for parts in storage.peer_storage.imported_mappings.values() for _, size in parts)),
                 entries=attribute(retained, claims), preparation_entries=attribute(preparation_only, claims),
+                unknown_spans=unknown_spans(retained, claims),
                 graphs=len(prepared.graphs), **core.export_counts)
 
 
@@ -282,6 +323,8 @@ def format_inventory(reports):
                      f"kernel globals: {display_size(report['kernel_global_bytes'])}")
         if report['core_padding_bytes']:
             lines.append(f"  Additional mapping alignment at load: {display_size(report['core_padding_bytes'])}")
+        for address, size in report.get('unknown_spans', ()):
+            lines.append(f"  Unknown retained span: {display_size(size)} at {address:#x}")
         for title, field in (("Retained storage", "entries"), ("Preparation-only storage", "preparation_entries")):
             categories = defaultdict(list)
             for row in report[field]:

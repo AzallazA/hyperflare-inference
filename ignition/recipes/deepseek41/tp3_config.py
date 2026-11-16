@@ -17,6 +17,8 @@ from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
 ENV_PREFIX = "FLARE_DS41_"
+# b12x's own switch for programmatic dependent launch in its mHC kernels; TP3Config records it as ``mhc_pdl``.
+MHC_PDL_ENV = "B12X_MHC_PDL"
 
 # Switches whose code is not on the 2026-11-14 upstream port yet: TP3Config still parses and records them (the release
 # environment keeps its meaning), but preparation refuses a non-default value until the named stage lands
@@ -25,6 +27,19 @@ UNPORTED = {}
 
 # Routed experts per DeepSeek V4.1 MoE layer (hot_experts >= this keeps a parked layer fully resident).
 ROUTED_EXPERTS = 384
+
+# VRAM reclaim switches (2026-11-15 memory map) and their environment names. FLARE_DS41_VRAM_RECLAIM=1 is the
+# umbrella: it turns every one on unless its own variable says otherwise ("1" on, any other set value off).
+VRAM_RECLAIM = {
+    "share_engram_token_map": "SHARE_ENGRAM_TOKEN_MAP",
+    "trim_vocab_gather": "TRIM_VOCAB_GATHER",
+    "skip_draft_vocab_gather": "SKIP_DRAFT_VOCAB_GATHER",
+    "share_vocab_columns": "SHARE_VOCAB_COLUMNS",
+}
+
+# Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
+# record of a default export stays the reference's (the quick/combined chains require an identical record).
+RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm")
 
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
@@ -109,6 +124,10 @@ class TP3Config:
     """Directory of ``expert-routes-rank0-layer{L}.json`` route counts (vLLM route-monitor format)."""
     embed_host: bool = False
     """Token embedding read from device-visible host memory (only its tokens' rows are gathered per step)."""
+    embed_rows: bool = False
+    """With ``embed_host``: decode, verification and draft graphs gather the parked table's rows with one vectorised
+    Triton launch (all of a row's loads before its stores) and take DSpark's noise-token rows from a 10 KB device copy
+    (host_embedding.py; same values). False = b12x's embedding kernel everywhere (base); prefill graphs always keep it."""
     # --- vision tower (weights.py, bootstrap.py, components/vision_staging.py) ---
     vision_host: bool = False
     """Vision tower parked in device-visible host memory; images ~3 s slower each unless staged. Implied by
@@ -122,6 +141,20 @@ class TP3Config:
     # --- collectives and planning (bootstrap.py, recipe.py, planning.py) ---
     ar_rows: int = 0
     """Rows the shared TP3 all-reduce runtime is sized for (chunked prefill reductions); 0 = a whole prefill chunk."""
+    ar_part_rows: int = 0
+    """Decoder attention/MLP all-reduces of more rows than this run in parts of exactly N rows plus a remainder
+    (4096 at 768: 5 x 768 + 256) instead of halving to what the runtime accepts (4096 at 1024: 4 x 1024); 0 = halving
+    (base). Engram reductions follow ``engram_part_rows``. Export-time only (prepared graphs)."""
+    engram_part_rows: int = 0
+    """The same part cut for the Engram projection all-reduce (its (rows x 5, 5120) view: a 1024-token chunk is 5,120
+    rows, at 768: 6 x 768 + 512 instead of halving to 8 x 640); 0 = halving (base). Separate from ``ar_part_rows`` so
+    the two can be measured apart. Export-time only (prepared graphs)."""
+    mhc_pdl: bool = False
+    """Record of ``B12X_MHC_PDL`` (b12x reads it once, when its mHC kernel module is imported): programmatic dependent
+    launch in the mHC norm kernels. The value is part of every mHC tuning query and compile key, so turning it on
+    compiles new mHC programs and re-races the multi-candidate (prefill) mHC requests. Read from ``B12X_MHC_PDL`` with
+    b12x's rule (unset or "0" = off); preparation refuses a record that disagrees with the imported b12x module.
+    False = off (base)."""
     tp3_graph_gib: float | None = None
     """Override of the per-rank captured-graph estimate for world size 3 (GiB); None = the 8 GiB default."""
     tp3_vocab_parallel: bool = False
@@ -140,6 +173,54 @@ class TP3Config:
     """Declare ``engram_residual`` on ``ffn_hc.residual``'s storage (preparation memory only). In the functional
     forwards the Engram output is a value Inductor already places on dead storage, so serving graphs are the same
     either way (tp3-main's scratch alias is subsumed); False = separate declaration (base)."""
+    # --- VRAM reclaim (2026-11-15 memory map items 2, 5, 8; FLARE_DS41_VRAM_RECLAIM=1 turns all four on) ---
+    share_engram_token_map: bool = False
+    """Every Engram hash plan reads the rank's one persistent token map (``Tables.device_token_map``, which the
+    history lookups already read) instead of materializing its own 1 MiB copy (two per graph: ~152 MiB/rank).
+    Same values, read-only (b12x's mutation contract); False = one copy per plan (base). Export-time only."""
+    trim_vocab_gather: bool = False
+    """With vocabulary-parallel sampling, size the FP32 vocabulary all-gather channel for the widest graph that still
+    gathers through it (prefill heads 1 row, resume/decode heads ``max(batch_capacities)`` rows) instead of every
+    verification sample (48 rows: ~41 MiB/rank). A graph needing more rows fails the export (PreparedAllGather's row
+    check). No effect without vocabulary-parallel sampling. False = sized for the verification samples (base)."""
+    skip_draft_vocab_gather: bool = False
+    """With vocabulary-parallel sampling, do not create the BF16 draft-vocabulary all-gather channel: its only user,
+    the DSpark proposal head's gather, is local-only then (``gather=False``; ~25 MiB/rank). Without
+    vocabulary-parallel sampling the channel is created as before. False = always created (base)."""
+    share_vocab_columns: bool = False
+    """Vocabulary-parallel speculative rounds read one persistent copy of this rank's global vocabulary ids
+    (``copy_columns``, 345 KB) instead of one per round (72 per rank: ~23 MiB). Same values, compared only.
+    False = one copy per round (base)."""
+    # --- packed verification graph shapes for exports above 8 slots (bootstrap.PreparationConfig) ---
+    packed_keep_batches: int = 0
+    """Batches up to N keep exactly the packed verification shapes an export with ``--max-concurrency N`` builds (same
+    graph budget), so a 16-slot package verifies 1-8 requests with today's 8-slot shapes; the wider batches get their
+    own graphs (``packed_wide_graphs``) on top. 0 = upstream enumeration (one budget spread over every batch). A power
+    of two; no effect when the export's request capacity is not above it."""
+    packed_wide_graphs: int = 0
+    """With ``packed_keep_batches``: packed graphs for the batches above it, split by the same geometric rule; 0 = only
+    each wide batch's two endpoint shapes."""
+    packed_wide_tokens: int = 0
+    """With ``packed_keep_batches``: largest packed token capacity of the wide batches (e.g. 48: shapes only where a
+    served verification budget <= 48 can select them); 0 = the export's speculative token capacity (batch x width)."""
+    # --- side streams in decode/verify graphs (components/side_streams.py; export-time, bit-identical) ---
+    index_side_stream: bool = False
+    """Index-source layers run the indexer query chain (index_q projection, RoPE, index-weights GEMV) on a side
+    stream from right after the q/KV norm, joined before the selectors; ratio-2 KV sources also run the compressor's
+    gates GEMV there, joined before the compression kernel (attention.IndexSideChain). Decode/verify graphs only.
+    False = serial on the main stream (base)."""
+    engram_side_layers: frozenset = field(default_factory=frozenset)
+    """Engram layers (``"14"``) whose readiness wait, lookup, projection and all-reduce run on a side stream during
+    the previous layer's attention (started after its predecessor's tail, joined before its own tail), leaving only
+    the mix in place (engram.PreparedEngram.start_side). Uses the shared all-reduce runtime: no extra VRAM.
+    Decode/verify graphs only. Layer 1 is allowed but its rows are staged by the host only ~0.2 ms before layer 1
+    today (hashes are published at the start of the target forward), so starting it in layer 0 can stall.
+    Empty = in place (base)."""
+    context_side_stream: bool = False
+    """Verification rounds run DSpark's context projections (main projection, norm, context KV projection) on a
+    side stream from the end of the target forward, beside verification and commit; the per-layer norms and draft
+    ring writes stay after the accepted counts (components/dspark.PreparedContext). Draft acceptance only; the
+    rings get the same bytes. False = after verification (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -164,6 +245,27 @@ class TP3Config:
     brrr_spin_trap: bool = False
     """Test builds only: a BRRR protocol wait that has not finished after ~2^25 polls prints and traps instead of hanging
     the GPUs (compile-time define BRRR_SPIN_TRAP; never for timing or export)."""
+    brrr_spin_ns: int | None = None
+    """Kernel tuning: ns slept between polls of a BRRR wait (counter, route table, peer flag); None = the kernel default
+    (200). A non-default value is its own extension build (define BRRR_SPIN_NS) and must be exported into the package.
+    Timing only: the arithmetic is unchanged. Environment FLARE_DS41_BRRR_SPIN_NS (unset/empty = default)."""
+    brrr_two_shot_min: int | None = None
+    """Kernel tuning: rows from which the BRRR attention/FFN exchanges reduce two-shot instead of one-shot; None = the
+    kernel default (17); 1 = always two-shot, 129 = never. Same sums in the same rank order either way. Own extension
+    build (define BRRR_TWO_SHOT_MIN), exported into the package. Environment FLARE_DS41_BRRR_TWO_SHOT_MIN."""
+    brrr_ks_wob: int | None = None
+    """Kernel job layout: k32 slices of z per BRRR wo_b job; None = the kernel default (16 = 6 parts, 480 jobs at <= 16
+    rows); 24 = 4 parts, 320 jobs (one round on 376 CTAs, as TP4 had). Regroups float sums only. Own extension build
+    (define BRRR_KS_WOB). Environment FLARE_DS41_BRRR_KS_WOB."""
+    brrr_woa_small: int | None = None
+    """Kernel job layout: rows up to which BRRR wo_a jobs are 4 stages (384 jobs); None = the kernel default (16);
+    0 = always 2 stages. Define BRRR_WOA_SMALL. Environment FLARE_DS41_BRRR_WOA_SMALL."""
+    brrr_woa_uneven: int | None = None
+    """Kernel job layout: 1 = at <= 8 rows split each wo_a row block into 7 uneven k parts (336 jobs, one round);
+    None/0 = the kernel default. Define BRRR_WOA_UNEVEN. Environment FLARE_DS41_BRRR_WOA_UNEVEN."""
+    brrr_per_sm: int | None = None
+    """Diagnostic only: BRRR CTAs per SM (None = 2; 1 halves the weight reads in flight). Define BRRR_PER_SM.
+    Environment FLARE_DS41_BRRR_PER_SM."""
     # --- debug and test tooling (config.py, decoder.py, probe.py) ---
     mini: bool = False
     """Truncated real-weight checkpoint view (make_mini.py): accept 6..40 layers, no compacted prefill feedback."""
@@ -175,20 +277,24 @@ class TP3Config:
     def __post_init__(self):
         object.__setattr__(self, "host_expert_layers", frozenset(self.host_expert_layers))
         object.__setattr__(self, "brrr_layers", frozenset(self.brrr_layers))
+        object.__setattr__(self, "engram_side_layers", frozenset(self.engram_side_layers))
         for name in ("expert_counts_dir", "brrr_ckpt"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "ar_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
+        for name in ("hot_experts", "ar_rows", "ar_part_rows", "engram_part_rows", "brrr_parked_max_rows", "engram_chunk_rows",
+                     "packed_keep_batches", "packed_wide_graphs", "packed_wide_tokens"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
-        for name in ("merged_bank", "embed_host", "vision_host", "vision_stage", "tp3_vocab_parallel",
+        for name in ("merged_bank", "embed_host", "embed_rows", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
-                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual"):
+                     "brrr_spin_trap", "mini", "no_engram", "probe", "share_engram_residual", "mhc_pdl",
+                     "index_side_stream", "context_side_stream", *VRAM_RECLAIM):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
-        if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
+        if any(type(layer) is not int or layer < 0
+               for layer in (*self.host_expert_layers, *self.brrr_layers, *self.engram_side_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
         if self.engram_tables not in ENGRAM_TABLES:
             raise ValueError(f"TP3 config: engram_tables must be one of {', '.join(ENGRAM_TABLES)}, "
@@ -203,6 +309,8 @@ class TP3Config:
             raise ValueError("TP3 config: hot_experts needs expert_counts_dir (route counts pick the hot set)")
         if self.hot_experts and self.host_expert_layers and not self.merged_bank:
             raise ValueError("TP3 config: hot_experts needs merged_bank (separate hot + cold banks were not ported)")
+        if self.embed_rows and not self.embed_host:
+            raise ValueError("TP3 config: embed_rows needs embed_host (it replaces the host-parked table's lookup)")
         if self.brrr_parked_max_rows and not self.brrr_layers:
             raise ValueError("TP3 config: brrr_parked_max_rows needs brrr_layers")
         if self.brrr_parked_max_rows and not (self.brrr_layers & self.host_expert_layers
@@ -215,13 +323,25 @@ class TP3Config:
                              f"0 < hot_experts < {ROUTED_EXPERTS}")
         if self.brrr_layers and self.brrr_ckpt is None:
             raise ValueError("TP3 config: brrr_layers needs brrr_ckpt (the checkpoint view BRRR reads its dense copies from)")
-        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap"):
-            if getattr(self, name) and not self.brrr_layers:
+        for name, low, high in (("brrr_spin_ns", 0, 1_000_000), ("brrr_two_shot_min", 1, 129), ("brrr_ks_wob", 16, 24),
+                                ("brrr_woa_small", 0, 16), ("brrr_woa_uneven", 0, 1), ("brrr_per_sm", 1, 2)):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or not low <= value <= high):
+                raise ValueError(f"TP3 config: {name} must be unset or an integer in [{low}, {high}], not {value!r}")
+        if self.brrr_ks_wob not in (None, 16, 24) or self.brrr_woa_small not in (None, 0, 16):
+            raise ValueError("TP3 config: brrr_ks_wob must be 16 or 24 and brrr_woa_small 0 or 16")
+        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_spin_trap", "brrr_spin_ns",
+                     "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm"):
+            if getattr(self, name) is not None and getattr(self, name) is not False and not self.brrr_layers:
                 raise ValueError(f"TP3 config: {name} needs brrr_layers")
         if not self.brrr_dense_native and not self.brrr_layers:
             raise ValueError("TP3 config: brrr_dense_native=False needs brrr_layers")
         if self.brrr_break not in (None, "rope"):
             raise ValueError(f"TP3 config: brrr_break must be unset or 'rope', not {self.brrr_break!r}")
+        if self.packed_keep_batches & (self.packed_keep_batches - 1):
+            raise ValueError("TP3 config: packed_keep_batches must be 0 or a power of two (a batch capacity)")
+        if (self.packed_wide_graphs or self.packed_wide_tokens) and not self.packed_keep_batches:
+            raise ValueError("TP3 config: packed_wide_graphs / packed_wide_tokens need packed_keep_batches")
         if self.engram_chunk_rows % 128:
             raise ValueError("TP3 config: engram_chunk_rows must be a multiple of 128 (row-slice alignment of the "
                              "chunked Engram operands and the graph capacity ladder)")
@@ -250,6 +370,25 @@ class TP3Config:
         """Planner-side peek at FLARE_DS41_TP3_VOCAB_PARALLEL alone (no validation; generic planner code)."""
         return cls._get(os.environ if environ is None else environ, "TP3_VOCAB_PARALLEL") not in ("", "0")
 
+    @staticmethod
+    def mhc_pdl_from_environment(environ=None) -> bool:
+        """``B12X_MHC_PDL`` exactly as b12x's mHC kernel module reads it (``os.getenv(name, "0") != "0"``: unset or "0"
+        is off, any other value, even "", is on). Not a ``FLARE_DS41_*`` variable: b12x owns the switch, the TP3 record
+        only mirrors it."""
+        return (os.environ if environ is None else environ).get(MHC_PDL_ENV, "0") != "0"
+
+    def check_mhc_pdl(self, compiled=None):
+        """Raise when ``mhc_pdl`` disagrees with b12x's imported value (``compiled``; default: read from the b12x mHC
+        kernel module, importing it). A mismatch means B12X_MHC_PDL changed after b12x was imported, or the config was
+        built from another environment: the record would not describe the compiled mHC programs."""
+        if compiled is None:
+            from b12x.norm.mhc import _kernels
+            compiled = _kernels._MHC_PDL
+        if bool(compiled) != self.mhc_pdl:
+            raise ValueError(f"TP3 config: mhc_pdl={self.mhc_pdl} but b12x's mHC kernels were imported with "
+                             f"{MHC_PDL_ENV} {'on' if compiled else 'off'}; set {MHC_PDL_ENV} before starting the export")
+        return self
+
     @classmethod
     def from_environment(cls, environ=None) -> "TP3Config":
         """Build and validate the whole config from ``FLARE_DS41_*`` variables (``environ`` defaults to
@@ -268,9 +407,19 @@ class TP3Config:
         def integer(name):
             return int(get(name, "0") or 0)
 
+        def optional(name):  # unset/empty = None (the kernel default); otherwise a strict integer
+            value = get(name)
+            return None if value == "" else int(value)
+
         for name, reason in REMOVED.items():
             if env.get(name, "") != "":
                 raise ValueError(f"{name} is no longer supported: {reason}")
+        umbrella = flag("VRAM_RECLAIM")
+
+        def reclaim(name):  # per-item variable wins when set (non-empty); unset/empty follows the umbrella
+            value = get(name)
+            return umbrella if value == "" else value == "1"
+
         counts = get("EXPERT_COUNTS_DIR")
         ckpt = get("BRRR_CKPT")
         dense_native = env.get(ENV_PREFIX + "BRRR_DENSE_NATIVE")  # set-but-empty means staged copies (base semantics)
@@ -281,15 +430,26 @@ class TP3Config:
             merged_bank=flag("MERGED_BANK"),
             expert_counts_dir=None if not counts else Path(counts),
             embed_host=flag("EMBED_HOST"),
+            embed_rows=flag("EMBED_ROWS"),
             vision_host=flag("VISION_HOST"),
             vision_stage=flag("VISION_STAGE"),
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
             ar_rows=integer("AR_ROWS"),
+            ar_part_rows=integer("AR_PART_ROWS"),
+            engram_part_rows=integer("ENGRAM_PART_ROWS"),
+            mhc_pdl=cls.mhc_pdl_from_environment(env),
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
+            packed_keep_batches=integer("PACKED_KEEP_BATCHES"),
+            packed_wide_graphs=integer("PACKED_WIDE_GRAPHS"),
+            packed_wide_tokens=integer("PACKED_WIDE_TOKENS"),
             share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
+            index_side_stream=flag("INDEX_SIDE_STREAM"),
+            engram_side_layers=parse_layers(get("ENGRAM_SIDE_LAYERS")),
+            context_side_stream=flag("CONTEXT_SIDE_STREAM"),
+            **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),
             brrr_ckpt=None if not ckpt else Path(ckpt),
@@ -300,6 +460,12 @@ class TP3Config:
             brrr_break=get("BRRR_BREAK") or None,
             fused_attn_per_chunk=per_chunk is None or _atoi(per_chunk) != 0,
             brrr_spin_trap=flag("BRRR_SPIN_TRAP"),
+            brrr_spin_ns=optional("BRRR_SPIN_NS"),
+            brrr_two_shot_min=optional("BRRR_TWO_SHOT_MIN"),
+            brrr_ks_wob=optional("BRRR_KS_WOB"),
+            brrr_woa_small=optional("BRRR_WOA_SMALL"),
+            brrr_woa_uneven=optional("BRRR_WOA_UNEVEN"),
+            brrr_per_sm=optional("BRRR_PER_SM"),
             mini=flag("MINI"),
             no_engram=truthy("NO_ENGRAM"),
             probe=truthy("PROBE"),
@@ -323,10 +489,11 @@ class TP3Config:
     def check_layers(self, layers: int):
         """Raise when a layer set names a layer the model (or its mini view) does not have; preparation calls it
         with the checkpoint's layer count before loading weights."""
-        beyond = sorted(layer for layer in self.brrr_layers if layer >= layers)
-        if beyond:
-            raise ValueError(f"TP3 config: brrr_layers names layers {format_layers(beyond)} but the model has "
-                             f"{layers} layers (0-{layers - 1})")
+        for name in ("brrr_layers", "engram_side_layers"):
+            beyond = sorted(layer for layer in getattr(self, name) if layer >= layers)
+            if beyond:
+                raise ValueError(f"TP3 config: {name} names layers {format_layers(beyond)} but the model has "
+                                 f"{layers} layers (0-{layers - 1})")
         return self
 
     def shared_engram_tables(self, world: int) -> bool:
@@ -336,11 +503,13 @@ class TP3Config:
         return self.engram_tables == "auto" and world == 3
 
     def to_metadata(self) -> dict:
-        """JSON-ready record of every switch: layer sets as ``"20-33"`` strings; the two paths as basename plus a
+        """JSON-ready record of every switch (RECORDED_WHEN_SET ones only when set): layer sets as ``"20-33"`` strings; the two paths as basename plus a
         short content fingerprint (never an absolute path, so the record can live in a package or a report)."""
         record = {}
         for item in fields(self):
             value = getattr(self, item.name)
+            if item.name in RECORDED_WHEN_SET and value is None:
+                continue  # kernel default: absent, so a default export's record (tp3-config.json) is unchanged
             if isinstance(value, frozenset):
                 value = format_layers(value)
             elif item.name == "expert_counts_dir":

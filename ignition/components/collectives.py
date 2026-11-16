@@ -246,9 +246,11 @@ class PreparedChunkedAllReduce:
     for decode can also reduce prefill activations; the chunks run in order on one stream.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, max_part_rows=0):
         rows = source.shape[0]
         step = rows
+        if type(max_part_rows) is not int or max_part_rows < 0:
+            raise ValueError("max_part_rows must be a non-negative integer")
         if runtime is not None and _roce(runtime):
             row_bytes = source[0].numel() * source.element_size()
             step = min(rows, max(runtime.max_size, runtime.pipe_bytes) // row_bytes)
@@ -261,6 +263,10 @@ class PreparedChunkedAllReduce:
             accepts = (runtime.for_stream().should_allreduce
                        if not isinstance(runtime, pcie.DmaAllReduce) and runtime.algorithm == "oneshot"
                        else runtime.should_allreduce)
+            if max_part_rows:
+                # Parts of at most max_part_rows rows, cut at that size (4096 rows at 768: 5 x 768 + 256) rather
+                # than by halving (4096 at 768-row capacity: 8 x 512); halving resumes only if the runtime refuses.
+                step = min(rows, max_part_rows)
             while step > 1 and not accepts(source[:step]):
                 step = (step + 1) // 2
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]

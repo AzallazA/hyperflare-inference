@@ -22,6 +22,22 @@ from .speculation import (
 from .state import save_hidden
 
 
+def vocabulary_columns(owner, width, start, device):
+    """``arange(width) + start`` (int64) in persistent storage: this rank's global vocabulary ids.
+
+    Each vocabulary-parallel round compares copied-history token ids with it (``_apply_copied_proposals``; read
+    only). Base: one copy per round. TP3 fork: an owner with ``share_vocabulary_columns`` (DS41
+    tp3.share_vocab_columns) keeps one persistent tensor per (width, start, device) for all of its rounds: same
+    values, and persistent storage lives as long as the core storage that prepares every round."""
+    if not getattr(owner, "share_vocabulary_columns", False):
+        return persistent_copy(torch.arange(width, device=device) + start)
+    key = (int(width), int(start), torch.device(device))
+    cache = owner.vocabulary_columns
+    if key not in cache:
+        cache[key] = persistent_copy(torch.arange(width, device=device) + start)
+    return cache[key]
+
+
 def prepare_sampling_broadcasts(proposals, verification, *, collectives, session, name, result_runtime=None):
     """Synchronize proposals before dependent work and acceptance before state commits."""
     operations = [(f"proposal{index}", proposal) for index, proposal in enumerate(proposals)]
@@ -329,8 +345,8 @@ class PreparedParallelDraftRound:
         copy_start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         # A constant of the shared forwards: persistent storage, as upstream's vocabulary offsets
         # (preparation may build this inside a transient pool).
-        self.copy_columns = persistent_copy(
-            torch.arange(self.probabilities.shape[-1], device=self.probabilities.device) + copy_start)
+        self.copy_columns = vocabulary_columns(o, self.probabilities.shape[-1], copy_start,
+                                               self.probabilities.device)
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         options = dict(start=start, runtime=o.sampling_runtime, session=o.session,
@@ -545,6 +561,10 @@ class PreparedParallelDraftRound:
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        # A context that can start its projections early (DS41 tp3.context_side_stream) forks them here, beside
+        # verification; start() returns None (nothing traced) when it does not.
+        start = None if self.context is None else getattr(self.context, "start", None)
+        early = None if start is None else start(auxiliary)
         if self.vocabulary_parallel:
             target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts)
             acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
@@ -567,5 +587,8 @@ class PreparedParallelDraftRound:
         hidden = hidden.view(b, w, o.weights.config.text["hidden_size"])[rows, (counts - 1).long().clamp_min(0)]
         save_hidden(hidden, o.pool.last_hidden, metadata.state_rows, counts > 0)
         if self.context is not None:
-            self.context(auxiliary, counts, metadata)
+            if early is None:
+                self.context(auxiliary, counts, metadata)
+            else:
+                self.context(auxiliary, counts, metadata, pending=early)
         return metadata, acceptance, committed

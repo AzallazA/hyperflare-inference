@@ -85,6 +85,11 @@ class CoreStorage:
         # WDDM retains its low allocation pool; export rejects retained storage below the floor.
         if self.integrated and os.name != "nt":
             self._reserve_low_window()
+        from .library_scratch import prime
+        from .module_images import ModuleImages
+        # Exports only (recorder active), after the low window and before this storage's pools exist: PyTorch's
+        # priming blocks and workspaces are released, not kept in core storage (library_scratch.py).
+        prime(ModuleImages.current(), device)
         allocator = torch.cuda.memory.CUDAPluggableAllocator(
             native.__file__, "flare_core_allocate", "flare_core_free")
         self._allocator = allocator

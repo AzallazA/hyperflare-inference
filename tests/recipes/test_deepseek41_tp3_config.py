@@ -132,6 +132,15 @@ def test_flag_semantics_match_the_historical_parsers():
     ({"FLARE_DS41_BRRR_CSF_CHECK": "1"}, "brrr_csf_check needs brrr_layers"),
     ({"FLARE_DS41_BRRR_NATIVE_SCALES": "1"}, "brrr_native_scales needs brrr_layers"),
     ({"FLARE_DS41_BRRR_BREAK": "rope"}, "brrr_break needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_SPIN_NS": "50"}, "brrr_spin_ns needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_SPIN_NS": "0"}, "brrr_spin_ns needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_TWO_SHOT_MIN": "13"}, "brrr_two_shot_min needs brrr_layers"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_SPIN_NS": "-1"},
+     r"brrr_spin_ns must be unset or an integer in \[0, 1000000\]"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "0"},
+     r"brrr_two_shot_min must be unset or an integer in \[1, 129\]"),
+    ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "130"},
+     r"brrr_two_shot_min must be unset or an integer in \[1, 129\]"),
     ({"FLARE_DS41_BRRR_LAYERS": "3", "FLARE_DS41_BRRR_CKPT": "/c", "FLARE_DS41_BRRR_BREAK": "norm"},
      "brrr_break must be unset or 'rope'"),
     ({"FLARE_DS41_BRRR_DENSE_NATIVE": "0"}, "brrr_dense_native=False needs brrr_layers"),
@@ -234,7 +243,9 @@ def test_metadata_record_is_json_ready_and_complete():
     from dataclasses import fields
 
     record = TP3Config.from_environment(RELEASE_ENV).to_metadata()
-    assert set(record) == {item.name for item in fields(TP3Config)}
+    from ignition.recipes.deepseek41.tp3_config import RECORDED_WHEN_SET
+
+    assert set(record) == {item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET)
     assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"
     counts, counts_digest = record["expert_counts_dir"].split("#")
     assert counts == "expert-order" and (counts_digest == "missing" or len(counts_digest) == 12)
@@ -367,3 +378,73 @@ def test_layer_sets_are_checked_against_the_model():
     replace(RELEASE_CONFIG, brrr_layers=frozenset(range(8)), host_expert_layers=frozenset({3}),
             brrr_parked_max_rows=12).check_layers(8)
     TP3Config().check_layers(6)
+
+
+LAYOUT_DEFAULTS = {"KS_WOB": 16, "WOA_SMALL": 16, "WOA_UNEVEN": 0, "PER_SM": 2}  # job-layout switches (deep dive 11-15)
+
+
+def test_brrr_layout_switches_default_to_the_serving_build():
+    """Deep dive 2026-11-15: the job-layout switches (wo_b slices per job, wo_a 4-stage row limit, uneven wo_a split,
+    CTAs per SM) emit no define and no record key when unset or at the kernel default; a value is its own build."""
+    from ignition.recipes.deepseek41.brrr import kernel_defines
+
+    base = {"FLARE_DS41_BRRR_LAYERS": "0-39", "FLARE_DS41_BRRR_CKPT": "/c"}
+    plain = TP3Config.from_environment(base)
+    names = ("brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm")
+    assert all(getattr(plain, name) is None for name in names) and kernel_defines(plain) == ()
+    assert not set(names) & set(plain.to_metadata())
+    explicit = replace(plain, brrr_ks_wob=16, brrr_woa_small=16, brrr_woa_uneven=0, brrr_per_sm=2)
+    assert kernel_defines(explicit) == ()
+    env = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_KS_WOB": "24", "FLARE_DS41_BRRR_WOA_UNEVEN": "1",
+                                      "FLARE_DS41_BRRR_WOA_SMALL": "0"})
+    assert kernel_defines(env) == ("BRRR_KS_WOB=24", "BRRR_WOA_SMALL=0", "BRRR_WOA_UNEVEN=1")
+    assert env.to_metadata()["brrr_ks_wob"] == 24 and env.to_metadata()["brrr_woa_uneven"] == 1
+    assert kernel_defines(replace(plain, brrr_per_sm=1)) == ("BRRR_PER_SM=1",)
+    for bad in (dict(brrr_ks_wob=20), dict(brrr_woa_small=8), dict(brrr_woa_uneven=2), dict(brrr_per_sm=3)):
+        with pytest.raises(ValueError):
+            replace(plain, **bad)
+    with pytest.raises(ValueError):
+        TP3Config(brrr_ks_wob=24)  # needs brrr_layers
+
+
+def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
+    """ROUND2 #6: unset or the kernel default (SPIN_NS 200, TWO_SHOT_MIN 17) = no define = the plain serving build;
+    any other value = defines (spin first, then two-shot) = its own extension name."""
+    from ignition.recipes.deepseek41.brrr import _tuning, kernel_defines
+
+    base = {"FLARE_DS41_BRRR_LAYERS": "0-39", "FLARE_DS41_BRRR_CKPT": "/c"}
+    plain = TP3Config.from_environment(base)
+    assert plain.brrr_spin_ns is None and plain.brrr_two_shot_min is None
+    assert kernel_defines(plain) == () and kernel_defines(TP3Config.from_environment(RELEASE_ENV)) == ()
+    assert _tuning(plain) == {"SPIN_NS": 200, "TWO_SHOT_MIN": 17, **LAYOUT_DEFAULTS}
+    explicit = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "200", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "17"})
+    assert explicit.brrr_spin_ns == 200 and kernel_defines(explicit) == ()
+    empty = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "", "FLARE_DS41_BRRR_TWO_SHOT_MIN": ""})
+    assert empty == plain
+    both = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "0", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "129"})
+    assert kernel_defines(both) == ("BRRR_SPIN_NS=0", "BRRR_TWO_SHOT_MIN=129")
+    assert kernel_defines(replace(plain, brrr_spin_trap=True, brrr_two_shot_min=9)) == ("BRRR_SPIN_TRAP=1", "BRRR_TWO_SHOT_MIN=9")
+    # recorded only when set: a default export's record is the 151744 reference's, key for key
+    assert both.to_metadata()["brrr_spin_ns"] == 0 and both.to_metadata()["brrr_two_shot_min"] == 129
+    assert "brrr_spin_ns" not in plain.to_metadata() and "brrr_two_shot_min" not in plain.to_metadata()
+    assert "brrr_spin_ns=0" in both.describe() and "brrr_spin_ns" not in plain.describe()
+    with pytest.raises(ValueError):
+        TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "fast"})
+    with pytest.raises(ValueError):
+        replace(plain, brrr_spin_ns=True)  # a bool is not an integer value here
+
+
+def test_brrr_check_switches_compares_the_tuning_values():
+    from types import SimpleNamespace
+
+    from ignition.recipes.deepseek41.brrr import check_switches
+
+    config = TP3Config(brrr_layers=frozenset({3}), brrr_ckpt=Path("/c"), brrr_spin_ns=50)
+    check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17, **LAYOUT_DEFAULTS), config)
+    for wrong in (dict(SPIN_NS=200, TWO_SHOT_MIN=17), dict(SPIN_NS=50, TWO_SHOT_MIN=9), dict(TWO_SHOT_MIN=17)):
+        with pytest.raises(RuntimeError, match="do not match"):
+            check_switches(SimpleNamespace(SPIN_TRAP=0, **{**LAYOUT_DEFAULTS, **wrong}), config)
+    with pytest.raises(RuntimeError, match="do not match"):  # a build without the layout attributes (older extension)
+        check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17), config)
+    with pytest.raises(RuntimeError, match="do not match"):
+        check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17, **{**LAYOUT_DEFAULTS, "KS_WOB": 24}), config)

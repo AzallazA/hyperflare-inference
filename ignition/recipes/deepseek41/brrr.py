@@ -52,14 +52,32 @@ def _cuext():
     return cuext
 
 
-# Compile-time kernel switches: (TP3Config field, compile-time define, extension attribute). Only the test build's spin
-# trap is left (the item-6 split tail / fast route / counter parity experiments were not ported, 2026-11-14).
+# Compile-time kernel switches: (TP3Config field, compile-time define, extension attribute). The test build's spin trap
+# (the item-6 split tail / fast route / counter parity experiments were not ported, 2026-11-14) and, below, the two
+# tuning values (ROUND2 #6, 2026-11-15). Each non-default combination is its own extension (cuext name suffix).
 SWITCHES = (("brrr_spin_trap", "BRRR_SPIN_TRAP", "SPIN_TRAP"),)
+# Valued tuning switches: (TP3Config field, compile-time define, extension attribute, decoder.cu default). None or the
+# kernel default emits no define, so the default build (and its extension name) is the plain serving build.
+TUNING = (("brrr_spin_ns", "BRRR_SPIN_NS", "SPIN_NS", 200),
+          ("brrr_two_shot_min", "BRRR_TWO_SHOT_MIN", "TWO_SHOT_MIN", 17),
+          # Job layout (deep dive 2026-11-15): WOB slices per job, WOA 4-stage row limit, uneven WOA split, CTAs per SM.
+          ("brrr_ks_wob", "BRRR_KS_WOB", "KS_WOB", 16),
+          ("brrr_woa_small", "BRRR_WOA_SMALL", "WOA_SMALL", 16),
+          ("brrr_woa_uneven", "BRRR_WOA_UNEVEN", "WOA_UNEVEN", 0),
+          ("brrr_per_sm", "BRRR_PER_SM", "PER_SM", 2))
+
+
+def _tuning(tp3: TP3Config) -> dict:
+    """The build's tuning values for this config: {extension attribute: value}."""
+    return {attr: default if getattr(tp3, field) is None else int(getattr(tp3, field))
+            for field, _, attr, default in TUNING}
 
 
 def kernel_defines(tp3: TP3Config) -> tuple[str, ...]:
-    """Compile-time defines of the layer kernel for this config (all off = the serving build)."""
-    return tuple(f"{define}=1" for field, define, _ in SWITCHES if getattr(tp3, field))
+    """Compile-time defines of the layer kernel for this config (all off/default = the serving build)."""
+    flags = tuple(f"{define}=1" for field, define, _ in SWITCHES if getattr(tp3, field))
+    values = _tuning(tp3)
+    return flags + tuple(f"{define}={values[attr]}" for _, define, attr, default in TUNING if values[attr] != default)
 
 
 def engine_key(tp3: TP3Config):
@@ -76,6 +94,7 @@ def extension(defines: tuple[str, ...] = ()):
 def check_switches(ext, tp3: TP3Config):
     """Contract check: the loaded build's compile-time switches are the ones the config asked for."""
     want = {attr: int(bool(getattr(tp3, field))) for field, _, attr in SWITCHES}
+    want.update(_tuning(tp3))
     got = {attr: int(getattr(ext, attr, -1)) for attr in want}
     if got != want:
         raise RuntimeError(f"BRRR kernel build switches {got} do not match the TP3 config {want}")

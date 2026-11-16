@@ -43,7 +43,14 @@ constexpr float FIXED = 0x1p32f;
 constexpr int GW = 4;
 constexpr int GT = GW * 32;
 constexpr int THREADS = GT + 32;
-constexpr int PER_SM = 2;
+// Layout tuning switches (TP3Config brrr_per_sm / brrr_ks_wob / brrr_woa_small / brrr_woa_uneven -> -D, separately named
+// builds; unset = the serving build). TP3's OA 3072 gives 384 WOA and 480 WOB jobs at <= 16 rows where TP4's OA 2048 gave
+// 256 and 320: more than the 376 CTAs (2 x 188 SMs), so the last row block's WOA jobs and a quarter of the WOB jobs run
+// in a second round on the layer's critical path (deep dive 2026-11-15).
+#ifndef BRRR_PER_SM
+#define BRRR_PER_SM 2
+#endif
+constexpr int PER_SM = BRRR_PER_SM;  // diagnostic only: 1 halves the weight reads in flight
 constexpr int STAGES = 3;
 constexpr int FRAG = 512;
 constexpr int FRAGS = 16;
@@ -54,7 +61,14 @@ constexpr int CSF_CAP = 36;  // TP3 CSF: staged exception records per 64-row hal
 constexpr int CSF_REC = 200;  // byte offset of the staged records inside the stage scale area
 static_assert(CSF_REC + 2 * CSF_CAP * 4 <= SCALE_BYTES, "staged CSF records must fit the scale area");
 constexpr int OWNA_ROWS = 16;
-constexpr int TWO_SHOT_MIN = 17;
+// Tuning switches (TP3Config brrr_two_shot_min / brrr_spin_ns -> brrr.kernel_defines -> -D, a separately named
+// extension build; unset = these defaults = the serving build). TWO_SHOT_MIN: rows from which the attention and FFN
+// exchanges reduce two-shot (owner rank per chunk) instead of one-shot (every rank sums every chunk); 1 = always
+// two-shot, MAXM + 1 = never. SPIN_NS: __nanosleep between polls of a counter, route or peer flag.
+#ifndef BRRR_TWO_SHOT_MIN
+#define BRRR_TWO_SHOT_MIN 17
+#endif
+constexpr int TWO_SHOT_MIN = BRRR_TWO_SHOT_MIN;
 constexpr int BT = 16384;  // TP3: max(SPAN*KS_INTER*32 = 12288, OTOK*2*KS_WOA*64 = 16384); 2 CTAs/SM still fit
 constexpr int BS = 384;  // TP3: >= max(OTOK, SPAN) * KW_INTER(6) * 4 = 16 * 6 * 4 (TP4: 32 * 5 * 4 = 640)
 
@@ -73,7 +87,11 @@ constexpr int GATE_BLOCKS = EXPERTS / 64;
 constexpr int SH1_BLOCKS = INTER / 32;
 constexpr int SH2_BLOCKS = HID / 64;
 constexpr int KS_WOA = 8;
-constexpr int KS_WOB = 16;
+#ifndef BRRR_KS_WOB
+#define BRRR_KS_WOB 16
+#endif
+constexpr int KS_WOB = BRRR_KS_WOB;  // k32 slices of z per WOB job: 16 = 6 parts (480 jobs at <= 16 rows), 24 = 4 parts (320)
+static_assert((OA / 32) % KS_WOB == 0 && KS_WOB % 8 == 0 && (PER_SM == 1 || PER_SM == 2), "BRRR layout switch values");
 constexpr int KS_GATE = 8;
 constexpr int KS_SH1 = 16;
 constexpr int KP_WOB = OA / 32 / KS_WOB;
@@ -121,9 +139,31 @@ __host__ __device__ __forceinline__ bool split_norm(int m) { return m > XNORM_MI
 
 __host__ __device__ __forceinline__ int quads(int m) { return cdiv(m, GW); }
 
-constexpr int WOA_SMALL = 16;
+constexpr int WOA_SMALL = 16;  // token capacity of the 4-stage WOA job's staging (woa_group<2 * KS_WOA, WOA_SMALL>)
+#ifndef BRRR_WOA_SMALL
+#define BRRR_WOA_SMALL 16
+#endif
+constexpr int WOA_SMALL_MAX = BRRR_WOA_SMALL;  // rows up to which WOA jobs are 4 stages (16 slices); 0 = always 2 stages
+static_assert(WOA_SMALL_MAX >= 0 && WOA_SMALL_MAX <= WOA_SMALL, "BRRR_WOA_SMALL");
 
-__host__ __device__ __forceinline__ int woa_ks(int m) { return m <= WOA_SMALL ? 2 * KS_WOA : KS_WOA; }
+__host__ __device__ __forceinline__ int woa_ks(int m) { return m <= WOA_SMALL_MAX ? 2 * KS_WOA : KS_WOA; }
+
+// Uneven WOA split (BRRR_WOA_UNEVEN=1, rows <= WOA_UTOK): 7 jobs per 64-row block of 5,5,5,5,4,4,4 stages (the 32
+// k128 stages of OAK 4096) = 336 jobs, so every WOA job runs in the first round of 376 CTAs. Staging 8 rows x 20 slices
+// x 64 B = 10,240 B <= BT. The k split only regroups the float sums into zacc (atomic adds, unordered already).
+#ifndef BRRR_WOA_UNEVEN
+#define BRRR_WOA_UNEVEN 0
+#endif
+constexpr int WOA_UNEVEN = BRRR_WOA_UNEVEN;
+constexpr int WOA_UPARTS = 7, WOA_ULONG = 4, WOA_UKS = 20, WOA_UTOK = 8;
+static_assert(WOA_UNEVEN == 0 || WOA_UNEVEN == 1, "BRRR_WOA_UNEVEN");
+static_assert(WOA_ULONG * 5 + (WOA_UPARTS - WOA_ULONG) * 4 == OAK / 128 && WOA_UTOK * WOA_UKS * 64 <= BT && WOA_UTOK <= OTOK && WOA_UTOK % TILE == 0);
+
+__host__ __device__ __forceinline__ bool woa_uneven(int m) { return WOA_UNEVEN && m <= WOA_UTOK; }
+
+__host__ __device__ __forceinline__ int woa_ustages(int b) { return b < WOA_ULONG ? 5 : 4; }
+
+__host__ __device__ __forceinline__ int woa_ustage0(int b) { return b < WOA_ULONG ? 5 * b : 5 * WOA_ULONG + 4 * (b - WOA_ULONG); }
 
 struct Span {
   int first, count, tiles, ts;
@@ -152,7 +192,7 @@ __host__ __device__ __forceinline__ Layout layout(int m) {
   Layout l{};
   l.m = m;
   l.tg = token_groups(m);
-  l.amix = WOA_BLOCKS * (OAK / 32 / woa_ks(m)) * l.tg;
+  l.amix = woa_uneven(m) ? WOA_BLOCKS * WOA_UPARTS : WOA_BLOCKS * (OAK / 32 / woa_ks(m)) * l.tg;
   l.wob = l.amix + quads(m);
   l.owna = l.wob + CHUNKS * (2 * KP_WOB * l.tg + 1);
   l.xnorm = l.owna + SLICES * owna_spans(m);
@@ -197,7 +237,10 @@ __host__ __device__ __forceinline__ Job blocked(int type, int r, int parts, int 
 
 
 __device__ __forceinline__ Job decode(const Layout& L, int n, int j) {
-  if (j < L.amix) return blocked(J_WOA, j, OAK / 32 / woa_ks(L.m), L.tg, woa_ks(L.m) / 4);
+  if (j < L.amix) {
+    if (woa_uneven(L.m)) return {J_WOA, j / WOA_UPARTS, j % WOA_UPARTS, 0, woa_ustages(j % WOA_UPARTS)};
+    return blocked(J_WOA, j, OAK / 32 / woa_ks(L.m), L.tg, woa_ks(L.m) / 4);
+  }
   if (j < L.wob) return {J_AMIX, j - L.amix, 0, 0, 1};
   if (j < L.owna) {
     const int per = 2 * KP_WOB * L.tg;
@@ -385,7 +428,11 @@ struct Smem {
   int ready;
 };
 
-constexpr unsigned SPIN_NS = 200;
+#ifndef BRRR_SPIN_NS
+#define BRRR_SPIN_NS 200
+#endif
+constexpr unsigned SPIN_NS = BRRR_SPIN_NS;
+static_assert(TWO_SHOT_MIN >= 1 && TWO_SHOT_MIN <= MAXM + 1 && BRRR_SPIN_NS >= 0 && BRRR_SPIN_NS <= 1000000, "BRRR tuning switch values");
 
 // TP3 debug (DS41_FUSED_PROF=1 only): per-launch phase marks after the 16 x 4 accumulators, in globaltimer ns.
 // Row t < J_END (job type): [first acquire, first run start, last run end, last run start]; row PH_FIN: [first C_FIN
@@ -1048,7 +1095,55 @@ __device__ void woa_group(Ctx& c, int rb, int kp, int tg) {
   stores(c, sp, acc, [&](int rt, int tt, const float (&a)[4]) { scatter(p.s.zacc, OA, rb * 64 + rt * 16, sp, tt, a, c.lane); });
 }
 
+// BRRR_WOA_UNEVEN: one of the 7 uneven k parts of row block rb (rows <= WOA_UTOK, one token tile). Same staging and MMA
+// as woa_group; the part starts at k128 stage woa_ustage0(kp) and has `stages` stages.
+__device__ void woa_uneven_group(Ctx& c, int rb, int kp, int stages) {
+  constexpr int KS = WOA_UKS, VECS = KS * 4, PER = WOA_UTOK * VECS / GT;
+  static_assert(WOA_UTOK * VECS % GT == 0);
+  const Params& p = c.p;
+  const Span sp = group_of(p.m, 0);
+  const int k0 = woa_ustage0(kp) * 4, ks = stages * 4;  // first k32 slice, slices in this job
+  const __nv_bfloat16* o = p.o + rb / 16 * 8 * HDIM + k0 * 32;
+  uint4 v[PER];
+  long pos[PER];
+#pragma unroll
+  for (int u = 0; u < PER; ++u) {
+    const int i = c.tid + u * GT, tok = i / VECS, r = i % VECS, d = (k0 * 32 + r * 8) % HDIM;
+    const bool live = tok < sp.count && r < ks * 4;
+    const long t = sp.first + tok;
+    v[u] = live ? __ldcg(reinterpret_cast<const uint4*>(o + t * p.o_stride + r * 8)) : make_uint4(0, 0, 0, 0);
+    pos[u] = live && d >= HDIM - ROPE ? __ldg(p.positions + t) : 0;
+  }
+  c.sync();
+#pragma unroll
+  for (int u = 0; u < PER; ++u) {
+    const int i = c.tid + u * GT, tok = i / VECS, r = i % VECS, d = (k0 * 32 + r * 8) % HDIM;
+    if (tok >= sp.count || r >= ks * 4) continue;
+    v[u] = rope_freq(v[u], p.cos_sin, pos[u], d);
+    *reinterpret_cast<uint4*>(bt_row(c, tok, KS, r >> 2, 64) + (r & 3) * 16) = make_uint4(bf16x2_f16x2(v[u].x), bf16x2_f16x2(v[u].y), bf16x2_f16x2(v[u].z), bf16x2_f16x2(v[u].w));
+  }
+  c.sync();
+  float acc[GW][4];
+  gemm<4>(
+      c, sp, ks, acc, [&](int tt, int k) { return reinterpret_cast<const uint4*>(c.sm.bt + (tt * KS + k) * 512)[c.lane]; },
+      [&](float (&a)[4], const uint8_t* stage, int q, int rt, const uint4& b, int) {
+        const uint4 v = frag(stage, q * 4 + rt, c.lane);
+        float d[4] = {};
+        mma_f16(d, e4m3x2_f16x2(v.x), e4m3x2_f16x2(v.z), e4m3x2_f16x2(v.x >> 16), e4m3x2_f16x2(v.z >> 16), b.x, b.y);
+        mma_f16(d, e4m3x2_f16x2(v.y), e4m3x2_f16x2(v.w), e4m3x2_f16x2(v.y >> 16), e4m3x2_f16x2(v.w >> 16), b.z, b.w);
+        const float sw = e8m0(stage[SCALE_OFF + (rt >> 1) * 4 + q]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) a[e] += d[e] * sw;
+      });
+  stores(c, sp, acc, [&](int rt, int tt, const float (&a)[4]) { scatter(p.s.zacc, OA, rb * 64 + rt * 16, sp, tt, a, c.lane); });
+}
+
 __device__ void job_woa(Ctx& c, int rb, int kp, int tg, int stages) {
+  if (woa_uneven(c.p.m)) {
+    woa_uneven_group(c, rb, kp, stages);
+    if (c.arrive(C_ZA + rb * GROUPS + tg, WOA_UPARTS)) finish_woa(c, rb, tg);
+    return;
+  }
   if (stages * 4 == KS_WOA) woa_group<KS_WOA, OTOK>(c, rb, kp, tg);
   else woa_group<2 * KS_WOA, WOA_SMALL>(c, rb, kp, tg);
   if (!c.arrive(C_ZA + rb * GROUPS + tg, OAK / 32 / (stages * 4))) return;
@@ -1621,7 +1716,7 @@ __device__ void issue(const Params& p, const Job& job, int s, const Issue& is) {
   const Weights& w = p.w;
   switch (job.type) {
     case J_WOA: {
-      const int kg = job.b * job.stages + s;
+      const int kg = (woa_uneven(p.m) ? woa_ustage0(job.b) : job.b * job.stages) + s;
       if (w.dense_native) is.native(w.woa, w.woa_ld, job.a * 64, long(kg) * 128);
       else is.block(w.woa + (long(job.a) * KG_WOA + kg) * FRAGS * FRAG);
       is.scales(w.woa_s + long(job.a * 2) * (OAK / 32) + kg * 4, OAK / 32);
@@ -2182,6 +2277,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("HC_EPS") = double(HC_EPS);
   m.attr("NORM_EPS") = double(NORM_EPS);
   m.attr("TWO_SHOT_MIN") = TWO_SHOT_MIN;
+  m.attr("SPIN_NS") = int(SPIN_NS);
+  m.attr("PER_SM") = PER_SM;
+  m.attr("KS_WOB") = KS_WOB;
+  m.attr("WOA_SMALL") = WOA_SMALL_MAX;
+  m.attr("WOA_UNEVEN") = WOA_UNEVEN;
   // Compile-time switch of this build (brrr.kernel_defines); Engine checks it against its TP3Config.
   m.attr("SPIN_TRAP") = SPIN_TRAP;
   m.def("route_state", &route_state);
