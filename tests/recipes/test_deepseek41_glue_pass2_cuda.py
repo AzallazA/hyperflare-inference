@@ -55,7 +55,7 @@ ARMS = (("off", None), ("off", 0xFF), ("on", None), ("on", 0xFF), ("on", 0x7F))
 def _poisoned(tensor, byte):
     if tensor.numel() == 0:
         return tensor
-    if tensor.dim() > 0 and tensor.is_contiguous():
+    if tensor.dim() > 0 and tensor.is_contiguous() and tensor.stride(-1) == 1:  # size-1 dims may carry stride 0
         tensor.view(torch.uint8).fill_(byte)
     elif tensor.dtype.is_floating_point:
         tensor.fill_(float("nan"))
