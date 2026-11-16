@@ -44,6 +44,10 @@ pub struct LoadOptions {
     pub cluster_rank: Option<usize>,
     /// Drop captured mixed prefill/decode graphs, serving prompts and decoding in separate rounds.
     pub no_mixed_prefill: bool,
+    /// CUDA per-thread stack limit in bytes, replacing the one the core recorded (absent: the
+    /// `FLARE_CUDA_STACK_LIMIT` environment variable, then the recorded limit). The load refuses
+    /// a value below the largest stack of any kernel the core registers.
+    pub cuda_stack_limit: Option<usize>,
 }
 
 /// Which embedding tables one storage entry selects.

@@ -41,6 +41,20 @@ impl PrefillTailMerge {
     }
 }
 
+/// Which overdue request the TTFT guard protects first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TtftOrder {
+    /// The request that arrived first (fork behaviour through 11-15).
+    #[default]
+    Oldest,
+    /// The request with the fewest remaining prompt chunks (arrival breaks ties), so a short
+    /// request arriving while long prompts load is served by the next guarded round. Every
+    /// guarded prompt round given to a request other than the oldest overdue one is followed by
+    /// a guarded round owed to the oldest, so the oldest keeps at least every second guarded
+    /// round and no first token waits forever behind a stream of shorter requests.
+    Shortest,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PolicyConfig {
     pub output_token_value: f64,
@@ -59,6 +73,8 @@ pub struct PolicyConfig {
     pub ttft_max_chunk: usize,
     /// Rounds other work may take between two guarded rounds of one overdue request.
     pub ttft_decode_interleave: u32,
+    /// Which overdue request the guard serves: the oldest, or the one closest to its first token.
+    pub ttft_order: TtftOrder,
     /// Absorb a short final message segment into the preceding prefill chunk (upstream PR #69):
     /// always, never, or only for requests that render tools (fork default).
     pub prefill_tail_merge: PrefillTailMerge,
@@ -83,6 +99,7 @@ impl Default for PolicyConfig {
             ttft_target_ms: 0.0,
             ttft_max_chunk: 0,
             ttft_decode_interleave: 1,
+            ttft_order: TtftOrder::Oldest,
             prefill_tail_merge: PrefillTailMerge::ToolsOnly,
             eager_message_offers: true,
         }
@@ -1276,35 +1293,61 @@ impl RequestScheduler {
         }
     }
 
-    /// The oldest request past the TTFT target that has not produced its first token.
+    /// The request the guard protects among those past the TTFT target that have not produced
+    /// their first token: the oldest, or under `TtftOrder::Shortest` the one with the fewest
+    /// remaining prompt chunks unless a guarded round is owed to the oldest.
     pub(super) fn ttft_overdue(&self) -> Option<&LiveRequest> {
-        if self.policy.ttft_target_ms <= 0.0 {
-            return None;
+        if self.policy.ttft_order == TtftOrder::Oldest || self.ttft_owe_oldest {
+            return self.ttft_oldest_overdue();
         }
+        self.ttft_overdue_requests()
+            .min_by_key(|r| (self.ttft_remaining_chunks(r), r.accounting.arrival_ns, r.admission_order))
+    }
+
+    /// The oldest request past the TTFT target that has not produced its first token.
+    pub(super) fn ttft_oldest_overdue(&self) -> Option<&LiveRequest> {
+        self.ttft_overdue_requests().min_by_key(|r| (r.accounting.arrival_ns, r.admission_order))
+    }
+
+    fn ttft_overdue_requests(&self) -> impl Iterator<Item = &LiveRequest> {
         let target = (self.policy.ttft_target_ms * 1e6) as u64;
         self.slots.iter().filter_map(|s| s.request.as_ref())
-            .filter(|r| awaiting_first_token(r) && self.request_kind(r).is_some()
+            .filter(move |_| self.policy.ttft_target_ms > 0.0)
+            .filter(move |r| awaiting_first_token(r) && self.request_kind(r).is_some()
                 && self.now_ns.saturating_sub(r.accounting.arrival_ns) >= target)
-            .min_by_key(|r| (r.accounting.arrival_ns, r.admission_order))
+    }
+
+    /// Prefill chunks of the scheduler's chunk size left before `r`'s prompt is consumed; a
+    /// cached or restored prefix counts as consumed.
+    pub(super) fn ttft_remaining_chunks(&self, r: &LiveRequest) -> u64 {
+        (r.prompt_tokens as u64).saturating_sub(r.consumed_tokens)
+            .div_ceil(self.limits.prefill_chunk_size.max(1) as u64)
     }
 
     /// Rounds other work may take before the overdue request is forced again: refilled by a
     /// prompt or image chunk of it, kept by its lifecycle steps, spent by any other round, and
-    /// cleared when nothing is overdue.
+    /// cleared when nothing is overdue. Under `TtftOrder::Shortest` a prompt or image chunk of
+    /// a protected request other than the oldest overdue one owes the next guarded round to the
+    /// oldest; a chunk of the oldest repays it.
     pub(super) fn note_ttft_round(&mut self, step: &ScheduledStep) {
         if self.policy.ttft_target_ms <= 0.0 {
             return;
         }
         let Some(overdue) = self.ttft_overdue().map(|r| r.handle) else {
             self.ttft_interleave = 0;
+            self.ttft_owe_oldest = false;
             return;
         };
         let role = step.lanes.iter().position(|lane| lane.request == overdue).map(|row| step.lane_kind(row));
+        let chunk = matches!(role, Some(kind) if kind.is_prefill() || kind == GraphKind::Vision);
         self.ttft_interleave = match role {
-            Some(kind) if kind.is_prefill() || kind == GraphKind::Vision => self.policy.ttft_decode_interleave,
+            _ if chunk => self.policy.ttft_decode_interleave,
             Some(GraphKind::Decode | GraphKind::Speculative) | None => self.ttft_interleave.saturating_sub(1),
             Some(_) => self.ttft_interleave,
         };
+        if chunk && self.policy.ttft_order == TtftOrder::Shortest {
+            self.ttft_owe_oldest = self.ttft_oldest_overdue().map(|r| r.handle) != Some(overdue);
+        }
     }
 
     fn available_plan(

@@ -15,7 +15,7 @@ mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
-pub use policy::{PolicyConfig, PrefillTailMerge, RequestAccounting};
+pub use policy::{PolicyConfig, PrefillTailMerge, RequestAccounting, TtftOrder};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
@@ -705,6 +705,8 @@ pub struct RequestScheduler {
     admissions: u64,
     /// Rounds left before the TTFT guard forces the overdue request again.
     ttft_interleave: u32,
+    /// `TtftOrder::Shortest`: the next guarded round belongs to the oldest overdue request.
+    ttft_owe_oldest: bool,
 }
 
 fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
@@ -797,6 +799,7 @@ impl RequestScheduler {
             evictions_lost: false,
             admissions: 0,
             ttft_interleave: 0,
+            ttft_owe_oldest: false,
         })
     }
 

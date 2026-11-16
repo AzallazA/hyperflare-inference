@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 
 use flare_helios::runtime_core::{
-    AuthorizedCore,
+    AuthorizedCore, STACK_LIMIT_ENV, parse_stack_limit,
     plan::{
         IDLE_DEVICE_RESERVE_BYTES, MemoryPlan, PlannedDevice, device_total_memory, plan_memory,
     },
@@ -62,7 +62,26 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
         .collect();
     let plan = plan_memory(authorized, &devices, &args.load_options())?;
     print!("{}", render(&plan, assumed.is_none()));
+    let stack = match args.load_options().cuda_stack_limit {
+        Some(bytes) => Some(bytes),
+        None => std::env::var(STACK_LIMIT_ENV).ok().filter(|v| !v.trim().is_empty())
+            .map(|value| parse_stack_limit(&value).map_err(|e| format!("{STACK_LIMIT_ENV}: {e}")))
+            .transpose()?,
+    };
+    if let Some(bytes) = stack {
+        println!("{}", stack_note(bytes));
+    }
     Ok(())
+}
+
+/// The dry run does not model the CUDA stack limit: the idle reserve and per-rank base were
+/// calibrated on loads that replayed the recorded 1,024-byte limit.
+fn stack_note(bytes: usize) -> String {
+    format!(
+        "\nCUDA stack limit {bytes} B per thread (override): not modelled. The assumed reserve was \
+         calibrated with the recorded 1,024 B limit, so a smaller limit leaves the served cache \
+         budget larger than planned here; the load refuses a limit below its largest kernel stack."
+    )
 }
 
 /// The plan as aligned text: one block per rank, the cache the loader would announce, and the
