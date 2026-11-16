@@ -5,7 +5,7 @@ Each prompt is sent as token IDs; generated tokens are mapped back to IDs with t
 the first token string that maps to several IDs), so every teacher-forced prefill sees exactly the decoded IDs - no
 re-tokenization drift. Prefill always runs Flare's own path, so a decode-only change (BRRR layers) must stay within the
 floor measured on a build without it. Reports |delta logprob| of the decode top-1 token and top-1 agreement.
-  .venv/bin/python consistency.py [tokens=48] [prompts=4] [tokenizer dir]
+  .venv/bin/python consistency.py [tokens=48] [prompts=4] [tokenizer dir]   (tokenizer dir default: $CKPT, the checkpoint view)
 
 The one-token prefill reply can be empty: Flare samples at temperature 1.0 and returns no logprob record for a
 terminating end-of-sequence token (helios/src/server/runtime.rs, `terminating_eos`), so the reply's top_logprobs list
@@ -28,7 +28,7 @@ PROMPTS = ["def fibonacci(n):\n    ", "The capital of France is", "for (int i = 
 
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 48
 k = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-root = sys.argv[3] if len(sys.argv) > 3 else "/m2-2/flare-ckpt/ds41-1017-engram-mxfp4"
+root = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("CKPT") or sys.exit("pass the checkpoint view (tokenizer.json) as the third argument or set CKPT")
 tok = PreTrainedTokenizerFast(tokenizer_file=f"{root}/tokenizer.json")
 pieces = {}
 for i in range(len(tok)):
