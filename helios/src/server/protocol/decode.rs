@@ -1208,6 +1208,57 @@ mod native_prompt_tests {
     }
 
     #[test]
+    fn developer_instructions_stay_in_place_only_for_deepseek_v41() {
+        let turn = |input: Value| {
+            decode(Protocol::Responses, json!({"instructions":"System policy","input":input}), false)
+                .unwrap()
+                .request
+        };
+        let first = turn(json!([
+            {"role":"developer","content":"Repository rules"},
+            {"role":"user","content":"Do the task"}
+        ]));
+        let next = turn(json!([
+            {"role":"developer","content":"Repository rules"},
+            {"role":"user","content":"Do the task"},
+            {"role":"assistant","content":"Done"},
+            {"role":"developer","content":"Additional rules"},
+            {"role":"user","content":"Next"}
+        ]));
+        let merged = "System instructions:\nSystem policy\n\nDeveloper instructions:\nRepository rules\n\nDeveloper instructions:\nAdditional rules";
+        let glm = crate::template_fixtures::template("glm53", "chat_template");
+        for (encoder, template) in [
+            (PromptEncoder::DeepseekV41, None),
+            (PromptEncoder::DeepseekV4, None),
+            (PromptEncoder::Jinja, Some(glm.as_str())),
+        ] {
+            let (frontend, compiler, config) =
+                renderer(encoder, template, TemplateEncoding::Text);
+            let prepare = |request: &Request| {
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, request, 0, false,
+                )
+                .unwrap()
+            };
+            let (first, next) = (prepare(&first), prepare(&next));
+            if encoder == PromptEncoder::DeepseekV41 {
+                // Every instruction is its own system turn where it was sent, so the previous
+                // turn's prompt up to its last message is a prefix of the next one.
+                assert!(!next.rendered_prompt.contains("instructions:"), "{}", next.rendered_prompt);
+                assert!(next.rendered_prompt.contains("System policy<｜System｜>Repository rules<｜User｜>Do the task"));
+                assert!(next.rendered_prompt.contains("Done<｜end▁of▁sentence｜><｜System｜>Additional rules<｜User｜>Next"));
+                let last = *first.prompt.message_boundaries.last().unwrap();
+                assert_eq!(next.prompt.tokens[..last], first.prompt.tokens[..last]);
+            } else {
+                // Chat templates (GLM-5.3) and DeepSeek V4 keep one merged leading instruction.
+                assert!(next.rendered_prompt.contains(merged), "{encoder:?}: {}", next.rendered_prompt);
+                assert_eq!(next.rendered_prompt.matches("Additional rules").count(), 1);
+                assert!(next.rendered_prompt.find(merged) < next.rendered_prompt.find("Do the task"));
+            }
+        }
+    }
+
+    #[test]
     fn classifier_history_hints_survive_separator_merges_in_the_next_call() {
         for encoder in [
             PromptEncoder::DeepseekV4,

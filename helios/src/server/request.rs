@@ -64,6 +64,26 @@ fn prepare_inner(
     })
 }
 
+/// Lowers a conversation for the frontend's prompt encoder: chat templates (GLM-5.3 and the
+/// other Jinja models) merge instructions behind a developer message, DeepSeek V4.1 keeps them in
+/// place, and DeepSeek V4 keeps the merge.
+pub(super) fn conversation_messages(
+    frontend: &Frontend,
+    messages: &[super::inference::Message],
+    tool_choice: super::inference::ToolChoice,
+    hints: &[(usize, usize)],
+) -> Result<Vec<Value>> {
+    use crate::frontend::PromptEncoder;
+    match frontend.prompt_encoder() {
+        PromptEncoder::Jinja => super::inference::template_messages(messages, tool_choice, hints),
+        encoder => super::inference::native_messages(
+            messages,
+            hints,
+            encoder == PromptEncoder::DeepseekV41,
+        ),
+    }
+}
+
 pub(super) struct PreparedInference {
     pub prompt: Prompt,
     pub output: Option<crate::output::OutputConfig>,
@@ -137,13 +157,10 @@ pub(super) fn prepare_inference_cached(
     );
     let (mut normalized, raw) = match &request.input {
         Input::Conversation(messages) => (
-            super::inference::template_messages(
+            conversation_messages(
+                frontend,
                 messages,
-                if legacy_prompt {
-                    request.tool_choice.clone()
-                } else {
-                    ToolChoice::Auto
-                },
+                request.tool_choice.clone(),
                 &request.checkpoint_hints,
             )?,
             None,

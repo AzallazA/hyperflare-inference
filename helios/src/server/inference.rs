@@ -217,15 +217,45 @@ fn content(parts: &[Part]) -> Result<Value> {
 }
 
 /// Converts semantic parts to the message context consumed by prepared templates.
+///
+/// Once a developer message is present, every system and developer message merges into one
+/// labeled leading system message, because chat templates generally accept a system message only
+/// first and have no developer role.
 pub fn template_messages(
     messages: &[Message],
     tool_choice: ToolChoice,
     hints: &[(usize, usize)],
 ) -> Result<Vec<Value>> {
+    lower_messages(messages, tool_choice, hints, true)
+}
+
+/// Converts semantic parts to the message context of an official DeepSeek encoder.
+///
+/// With `instructions_in_place` (DeepSeek V4.1), system and developer messages stay where they
+/// are and a developer message becomes a system turn, as the DeepSeek reference does for the
+/// Responses API (deepseek-recipe protocol/openai/responses/request/convert.rs `push_message`);
+/// a mid-conversation instruction then leaves the earlier prompt prefix unchanged. Without it
+/// (DeepSeek V4, which has no mid-conversation system turn), instructions merge as for
+/// templates. Required tool choice is the encoder's own option, so no instruction is appended.
+pub fn native_messages(
+    messages: &[Message],
+    hints: &[(usize, usize)],
+    instructions_in_place: bool,
+) -> Result<Vec<Value>> {
+    lower_messages(messages, ToolChoice::Auto, hints, !instructions_in_place)
+}
+
+fn lower_messages(
+    messages: &[Message],
+    tool_choice: ToolChoice,
+    hints: &[(usize, usize)],
+    merge_instructions: bool,
+) -> Result<Vec<Value>> {
     let mut out = Vec::new();
-    let lower_instructions = messages
-        .iter()
-        .any(|message| message.role == Role::Developer);
+    let lower_instructions = merge_instructions
+        && messages
+            .iter()
+            .any(|message| message.role == Role::Developer);
     let instructions: Vec<_> = messages
         .iter()
         .filter(|m| lower_instructions && matches!(m.role, Role::System | Role::Developer))
@@ -266,7 +296,12 @@ pub fn template_messages(
             assistant_start = Some(out.len());
         }
         let before = out.len();
-        let mut current = json!({"role": message.role, "content": ""});
+        let role = if message.role == Role::Developer {
+            Role::System
+        } else {
+            message.role
+        };
+        let mut current = json!({"role": role, "content": ""});
         let mut ordinary = Vec::new();
         let mut ordinary_hints = Vec::new();
         let flush = |current: &mut Value,
@@ -286,7 +321,7 @@ pub fn template_messages(
             {
                 out.push(current.clone());
             }
-            *current = json!({"role": message.role, "content":""});
+            *current = json!({"role": role, "content":""});
             Ok(())
         };
         for (part_index, part) in message.parts.iter().enumerate() {
@@ -354,7 +389,7 @@ pub fn template_messages(
         }
         flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
         if before == out.len() {
-            out.push(json!({"role":message.role,"content":""}));
+            out.push(json!({"role":role,"content":""}));
         }
     }
     if let Some(start) = assistant_start {

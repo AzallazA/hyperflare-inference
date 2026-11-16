@@ -761,3 +761,33 @@ fn reasoning_prompt_marks_turns_whose_next_turn_rewrites_the_generation_prompt()
         }
     }
 }
+
+/// Prompts rendered by the DeepSeek reference (deepseek-recipe 935817c through
+/// recipe-compare/scripts/refharness) for the Chat body in each case's `request`.
+fn assert_reference_prompts(prefix: &str) {
+    let cases: Value =
+        serde_json::from_str(include_str!("fixtures/deepseek41_reference_prompts.json")).unwrap();
+    let fixture = Fixture::new(PromptEncoder::DeepseekV41);
+    let mut checked = 0;
+    for (name, case) in cases.as_object().unwrap() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let request = fixture
+            .prepare(case["request"].clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(request.rendered_prompt, case["expected"].as_str().unwrap(), "{name}");
+        assert_eq!(
+            request.prompt.tokens,
+            fixture.frontend.encode(&request.rendered_prompt, false).unwrap(),
+            "{name}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no reference cases named {prefix}*");
+}
+
+#[test]
+fn developer_messages_render_as_reference_system_turns_in_place() {
+    assert_reference_prompts("f3_");
+}
