@@ -16,6 +16,7 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | --- | --- |
 | **Main branch (since 2026-11-13)** | `tp3-main` = DS41 + GLM-5.3-Flash on one branch (merge of `ds41-tp3-sync` and `glm-hyperflare`, validated 11-13: speed level, DS41 eval 43/43, GLM probe/smoke, GLM TP2 bit-identical across binaries). Worktree `~/flare-up-main`, ONE binary `flare-cli/target/release/flare` serves both models (`serve-best.sh`, `serve-glm.sh`, `~/switch-model.sh`). Exports from it need `PYTHONPATH=~/flare-up-main` (GLM: `~/flare-up-main/.b12x-overlay:~/flare-up-main`) or `ignition` imports another worktree. Workflow: every change on its own branch (`ds41-*`, `glm-*`, `fix/*`), merged into `tp3-main` only after it is confirmed on the GPU; shared-code changes also need the other model's CPU tests + smoke/speed; upstream syncs go through a `sync-<date>` branch. Public fork gets scrubbed release snapshots only. **State 11-14:** `tp3-main` has NOT moved for the upstream port; it moves only after GLM passes on the port (user OK needed), and still serves GLM. |
 | **Upstream port (2026-11-14, in progress)** | Port of our TP3 work onto upstream 70069281 (20 commits after the v0.1.0 tag; #285 and 617ef929 reverted). Worktrees: `~/flare-up-port` (branch `port-20261114`, own venv, kernel cache `~/.cache/flare/kernels-port`, config `~/.config/flare-port`), DS41 and GLM feature branches `port-20261114-ds41` / `port-20261114-glm`, and the merge of both in `~/flare-up-port-int` (branch `port-20261114-int`, own venv, overlay, wheel and binary; GLM config `~/.config/flare-port-glm`). **The DS41 local default serves from `~/flare-up-port-int` since 11-14 19:07** (B.8). GLM has NOT been exported from the port yet: the GLM defaults are still the tp3-main packages on the tp3-main binary. A Rust rebuild in `~/flare-up-port-int` changes what the next DS41 restart serves. |
+| **State 2026-11-16 (release candidate)** | `tp3-main` = c0ff27c5 (on the port lineage: c8fb6185 = frontend reference fixes, required-thinking 400, CUDA stack limit, TTFT guard order; plus round-2 code and export KV hygiene, all round-2 switches default off in the code). The DS41 default serves from branch `perf/sched-prefill-merge-c8fb6185` (c8fb6185 + prefill merge a02548e1/593d2803, binary sha256 27864a1d79e4..., since 11-16 15:00) until that branch is merged into `tp3-main`; it merges cleanly and changes no Python, so the merge's Rust equals the serving binary's. Default package `ds41-1017-engram-fp8/gb202-tp3-202611160815` (exported from the round-2 branch 302c9b1a = `tp3-main`'s export path without the KV hygiene commit). `serve-best.sh` defaults: PCM 12G, BUDGET 32, `FLARE_CUDA_STACK_LIMIT=256`, `--scheduler-ttft-order shortest`, `FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS=512`, interactive + tail merge, private tables + fast exit; served KV 5,403,008. |
 | Fork checkout (branch `ds41-tp3-v3`, pre-merge; history only) | `~/flare-up-v3` (`.venv/`, `flare/target/release/flare`, `.brrr-ext/` compiled kernels) |
 | Other worktrees of the same repo | `~/flare-up` (old v2, its `serve-best.sh` just execs v3), `~/flare-up-base` (detached baseline), `~/flare-up-stage2` (kernel stage 2), `~/flare-up-vision` (vision staging). `git worktree list` from any of them. |
 | Recipe (the Python that defines the model for Ignition) | `ignition/recipes/deepseek41/` (`decoder.py`, `attention.py`, `weights.py`, `brrr.py`, `bootstrap.py`, `fused_qkv_norm.py`) |
@@ -29,7 +30,7 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | KV capacity without a serve | `flare run <pkg> <serve flags> --dry-run` (per-rank memory plan + KV tokens + snapshot slots; exact on 5 recorded loads; `--dry-run-free-memory` overrides the assumed free VRAM) |
 | Full qualification suite | release folder `qualification/qual_all.sh` (eval tools lavd hotel retrieval longgen eos livebench stress); needs `~/llm-inference-bench`, `~/LiveBench` |
 | Checkpoints | full view `/m2-2/flare-ckpt/ds41-1017-engram-mxfp4` (built by `release/make_checkpoint_view.sh`; the release docs' `~/ds41-1017-engram-mxfp4` is an example path, not ours); truncated test models `/m2-2/flare-ckpt/ds41-mini6` (6 layers) and `ds41-mini8` (8 layers, has native scales, use for parking/BRRR tests) |
-| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; DS41 default `...202611142139` since 11-14 (upstream port, HOT 342, served KV 5,024,384); rollback `...202611121241` (served KV 3,189,376; also serves on the port binary); each non-default package is ~4 GB on disk (shared blobs) |
+| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-fp8/gb202-tp3-<timestamp>/` (FP8 Engram view, since 11-16; DS41 default `...202611160815`, served KV 5,403,008 with stack limit 256) and `.../ds41-1017-engram-mxfp4/...` (MXFP4 view: 11-14 default `...202611142139`, upstream port, HOT 342, served KV 5,024,384; rollback `...202611121241` (served KV 3,189,376; also serves on the port binary); each non-default package is ~4 GB on disk (shared blobs) |
 | Server scripts | `~/flare-up-v3/serve-best.sh` (defaults since 11-14 19:07: `P` = pkg 142139, `FLARE_DIR` = `~/flare-up-port-int`; K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=interactive, private Engram tables + fast exit), restart via `/tmp/restart-default.sh`. Rollback: `FLARE_DIR=~/flare-up-main P=<...121241> ./serve-best.sh`. Previous script: `serve-best.sh.bak-1114-1241default` |
 | Release folder (public) | `~/rtx-recipes/DeepSeek-V4.1-Flash Hyperflare-tp3-YYYYMMDD/` from the Hyperflare release on (earlier: `... Flare-tp3-2026110x/`) (README, EXPORT, MEASUREMENTS, ENGRAM-PRECISION, export.sh, serve.sh, source.patch, qualification/) |
 | Upstream proposals | `docs/upstream-proposals/` in the fork (public with the branch, not submitted upstream); mirrored on the `proposals` branch of the private staging repo |
@@ -161,8 +162,8 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | Knob | Effect / verdict |
 | --- | --- |
 | `HOT` (hot experts per parked layer, layers 20-33) | 342 = 2.37M KV default; each expert fewer ≈ +92K KV tokens; 300 = 2.99M KV release build, ~4% slower. On the upstream port (11-14) HOT 342 serves 5,024,384 KV (1241 on tp3-main: 3,189,376) and HOT 300 8,708,992 |
-| `BUDGET` (`--mtp-max-verification-token-budget`) | 24 adopted: +1-2% at c1/c8 vs 128; also drops 13 speculative graphs (~76 MiB/rank) = +87K KV tokens |
-| `PCM` (`--prefix-cache-memory`) | 32G adopted: ~78 warm 127K prompts vs ~37 at 16G; costs ~10 MiB device headroom (-6K KV), host RAM only otherwise |
+| `BUDGET` (`--mtp-max-verification-token-budget`) | 32 since 11-15 (owner, for 16 slots): on pkg 152105 c16 1,375 vs 1,226 tok/s at 24, c12 1,234 vs 1,188, c1/c4/c8 level (315/749/1,024 vs 309/757/1,045), served KV 5,220,992 vs 5,257,344 (`ds41-exp-1115-1901` BUD rows). Before: 24 adopted for 8 slots (+1-2% at c1/c8 vs 128; drops 13 speculative graphs, ~76 MiB/rank = +87K KV tokens) |
+| `PCM` (`--prefix-cache-memory`) | 12G since the FP8 Engram tables (11-16): 32G does not fit beside them in 251 GiB (dry run 237.3 GiB committed, predicted 0.4 GiB available). Before: 32G (~78 warm 127K prompts vs ~37 at 16G; ~10 MiB device headroom, -6K KV, host RAM otherwise) |
 | `K` drafts | keep 5; coding acceptance is high; k7 was -3-6% at c4/c8 |
 | `ALPHA` 0.6/0.8/1.0, scheduler balanced/throughput | within noise; defaults 0.8 / balanced |
 | Power 350/450/600 W, core offset | 450 W ≈ +10-12% over 350 W; 600 W no gain; +100/+150 core no gain |
@@ -173,12 +174,41 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | BRRR stage 2 (OTOK/SPAN 48 wide rows, worktree `~/flare-up-stage2`) | REGRESSION: c4 -5%, c1 -3% (11-08, real export); closed |
 | Extra PDL trigger at the end of `layer_kernel` | cost ~2% at c8 (11-08 bisect); removed. Only the original trigger remains |
 | `FLARE_DS41_VISION_STAGE=1` (vision tower weights staged through VRAM slots; implies `VISION_HOST=1`) | cold image 0.11 s vs 1.70 s (11-08); 190 MiB of activation-pool slots, KV unchanged |
-| Engram: `FLARE_ENGRAM_RAM_TABLES=0` vs `--embedding-table-storage disk` | disk = -90 GiB RAM, -3-4% decode; MXFP4 vs FP8 tables: wiki ppl +2.6%, benchmarks within noise |
+| Engram: `FLARE_ENGRAM_RAM_TABLES=0` vs `--embedding-table-storage disk` | MXFP4 era: disk = -90 GiB RAM, -3-4% decode; MXFP4 vs FP8 tables: wiki ppl +2.6%, benchmarks within noise |
+| FP8 Engram tables, both in host RAM (view `ds41-1017-engram-fp8`, default since 11-16 00:55) | DeepSeek's own shards 47-48 (189 GiB) instead of NVIDIA's MXFP4 (97 GiB). Host RAM committed (dry run) 217.3 GiB at PCM 12G vs 145.7 GiB for MXFP4 pkg 152105; lowest MemAvailable 21.0 GiB at boot (seq202 arm b), 10.7 GiB in the 16-stream stress (seq214): 256 GB is the minimum. vs 152105 at budget 32: c1 0.989, c4 1.019, c8 1.027, c16 0.989 tok/s, served KV -1.8% (seq202 `ds41-fp8-1115-2224`). Layer 1 in RAM + layer 14 on disk with a 32 GiB row cache (`FLARE_ENGRAM_RAM_LAYERS=0`, release `serve.sh` `ENGRAM_RAM=layer1`): 177.8 vs 237.3 GiB committed at PCM 32G, decode c1-c16 level, agent8 output tok/s x0.821. Both on disk: not measured with FP8 |
 | `FLARE_DS41_EMBED_HOST=1`, `FLARE_DS41_VISION_HOST=1` | embeddings/vision in host RAM; images ~3 s slower each |
 | `FLARE_DS41_AR_ROWS=1024` | chunked all-reduce sizing for prefill |
 | `FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1` | graph scratch, default on in `export.sh`: Engram projection/reduce/mix in 1024-row chunks (-300 MiB/rank) and `engram_residual` on `ffn_hc.residual` (-165 MiB/rank); KV 2.46M -> 3.01M at HOT 342, decode level. On the port there is no graph scratch pool: chunk rows act on the functional forwards (planned prefill4096 pool 560 MiB unchunked vs 428 MiB chunked) and the shared residual is only a declaration alias (the planner already reuses it) |
-| `MAXC` (`--max-concurrency` at export) | 8 default; 16 = c16 package: its graphs cost ~650K KV vs c8 (dry run) |
+| `MAXC` (`--max-concurrency` at export) | 16 in the release `export.sh` since 20261116 (DS41 default since 11-15 16:25, pkg 152105 and later; with the VRAM reclaim switches the 16-slot package had more KV than the 8-slot 151744). Before: 8; 16 then cost ~650K KV (dry run, pre-port) |
+| `FLARE_CUDA_STACK_LIMIT` / `flare run --cuda-stack-limit` (bytes) | 256 adopted 11-16: +247,552 KV tokens on 160815 (5,155,456 -> 5,403,008, seq214 `ds41-integration-1116-0614`). Packages replay the exporting context's stack limit (driver default 1,024 B); the load refuses an override below the largest stack of any registered kernel (DS41: 192 B, the BRRR layer kernel) or when one cannot be bounded. The dry run does not model it. Unset = recorded limit |
+| `--scheduler-ttft-order oldest\|shortest` | which overdue request the interactive guard serves: `oldest` (default, the 20261111 behaviour) or `shortest` (fewest remaining prompt chunks; the oldest keeps at least every second guarded round). Adopted `shortest` 11-16 with the c8fb6185 binary. Simulation (8 agents, 0.8K-14K new tokens per turn): mean TTFT 2,312 -> 2,142 ms, p50 2,249 -> 1,772, p90 3,883 -> 4,118, max 5,210 -> 5,825, turns 147 -> 145 (commit 1e22ffc3) |
+| `FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS` / `--scheduler-prefill-merge-min-rows` | a chunk starting at the request's own checkpoint runs past message boundaries closer than N tokens (0 = off, code default). 512 adopted by the owner 11-16 14:45 although the A/B rule said HOLD: 8-stream standard replay turns x1.086 against an 11.8% same-flag band (the 8-stream WNT fit came out negative); 16 streams WNT x1.157 (band 4.6%); TTFT p50 x0.75-0.83; prefill launches per turn 3.15 -> 1.00; decode c1 x1.023, c8 x1.011 (seq227 `ds41-pmerge-c8fb-1116-1252`, AB.md and AB-recomputed.md) |
+| `tool_choice` required / named function with thinking on | HTTP 400 "Thinking mode does not support this tool_choice" since c8fb6185 (was: quietly automatic, then 500 when the model answered without a call), as DeepSeek's reference. tool-eval TC-45 probes in thinking mode, so it stays excluded (91 graded) |
+| `FLARE_EXPORT_LIBRARY_SCRATCH` (export KV hygiene, 4b4bb69f) | on by default in the code (0 = off): cuBLAS's own 64 MiB pool no longer retained by a coincidental 8-byte value. Package 160815 predates it. On 161317 (same switches + Engram side stream 14): dry and served KV unchanged (4,996,096 / 5,155,456), one 44 MiB unclaimed span per rank still reported, so the chain said HOLD (seq217 `ds41-exp-fp8kv-1116-0655`) |
+
 | BRRR item 6: `FLARE_DS41_BRRR_SPLIT_TAIL`, `_FAST_ROUTE`, `_COUNTER_PARITY` | default off, not adopted (11-09): split tail and counter parity slower in the layer A/B; fast route -0.5/-1.9/-2.0 µs/layer at m 1/6/12 but end to end level (c1 1.004x, c4 0.989x, c8 0.998x) |
+
+**Round-2 and 11-15 export switches: what the release export sets.** All are default off in the code (`TP3Config`,
+B12X environment); `tp3-tools/release/export.sh` turns on the ones marked ON (package 160815 = these values,
+`tp3-config.json`). Measured as one combined export (seq209 `ds41-exp-fp8-1116-0241`, 160815 vs 160407 = the same FP8 package
+without the round-2 switches, budget 32): c1 x1.076, c4 x1.011, c8 x0.992, prefill 8K x1.046, 32K x1.042; dry KV +0.6%.
+
+| Switch | Release export | Note |
+| --- | --- | --- |
+| `FLARE_DS41_INDEX_SIDE_STREAM` | ON | indexer query chain on a side stream (bit-identical, GPU proof in the chain) |
+| `FLARE_DS41_CONTEXT_SIDE_STREAM` | ON | DSpark context projection beside verification |
+| `FLARE_DS41_AR_PART_ROWS`, `FLARE_DS41_ENGRAM_PART_ROWS` | 768, 768 | prefill all-reduce parts: 5 x 768 + 256 per 4096-row chunk |
+| `B12X_MHC_PDL` | ON | PDL in the mHC norm kernels (20 prefill mHC races re-run) |
+| `FLARE_DS41_BRRR_WOA_UNEVEN` / `_WOA_SMALL` | 1 / 0 | BRRR job layout at <= 8 rows (own extension build) |
+| `FLARE_DS41_EMBED_ROWS` | ON | host-row embedding gather (11-15, pkg 151744) |
+| `FLARE_DS41_VRAM_RECLAIM` | ON | four reclaim items (11-15, pkg 152105) |
+| `B12X_PCIE_TWOSHOT_PULL` (overlay) | ON | needs `B12X_OVERLAY` with `tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch` |
+| `B12X_MLA_DECODE_REMAINDER_STREAM` | ON | attention 16 + 8-head grids on two streams (ignition hook) |
+| `PARKED_ROWS` (`FLARE_DS41_BRRR_PARKED_MAX_ROWS`) | 0 | BRRR at every width in the parked layers |
+| `MAXC` | 16 | request slots |
+| `FLARE_DS41_ENGRAM_SIDE_LAYERS` | off | `14` measured level on 161317 (seq217), not adopted |
+| `FLARE_DS41_BRRR_SPIN_NS`, `_TWO_SHOT_MIN`, `_KS_WOB`, `_PER_SM` | off (kernel defaults) | build-time tuning switches, not adopted |
+| `FLARE_DS41_PACKED_KEEP_BATCHES` / `_WIDE_GRAPHS` / `_WIDE_TOKENS` | off | packed verification shapes above 8 slots, not adopted |
 
 Ideas already closed (do not re-run without a new angle): FP8 LM head, fused layer L2 prefetch, EP all-reduce over
 b12x, CPU-side expert compute, DCP3, dynamic expert cache (0.40% cold routes at H342), route reuse, sparse decode at
@@ -238,7 +268,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 
 ### B.5 Publishing a release
 
-1. Validate the state (B.1/B.2), commit on `ds41-tp3-v3`, push to Gitea.
+1. Validate the state (B.1/B.2), merge every branch the release serves into `tp3-main` (since the 2026-11-14 port the
+   release branch; `ds41-tp3-v3` is history), push to Gitea. *2026-11-16:* the serving binary came from
+   `perf/sched-prefill-merge-c8fb6185`, not yet in `tp3-main` c0ff27c5; the tag must contain it.
 2. Tag it `hyperflare-tp3-YYYYMMDD` (from the 2026-11 Hyperflare release on; the published `flare-tp3-*` tags stay) (annotated: settings and measurements in the message), push branch and tag to `public`,
    and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
 3. The recipes folder is dated by the day the change was made (release convention): a new
@@ -246,9 +278,22 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    folders stay as published. Its README describes the changes **since the previous folder** (not since the first
    one): intro list, "Coming from <previous>" migration notes, headline table labelled with the builds it holds; the
    cumulative feature description stays as "What this build contains". *Incident:* the 20261108 folder shipped for an
-   hour with the 20261107 intro ("supersedes 20261105, +6-8%"). Regenerate its `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify
+   hour with the 20261107 intro ("supersedes 20261105, +6-8%"). Regenerate its `source.patch` from the tag (`git diff --binary 70069281 <tag>` since the port; `972e28e44` up to 20261111), verify
    on a clean upstream worktree (tree-identical), cite the tag in the folder docs, add the row to the top-level
    README, run the hygiene grep, commit, push `origin` (GitHub) and `gitea`. The folder and the tag must always agree.
+4. **Public branch after the port (open, owner decision, 2026-11-16).** The public default branch `ds41-tp3-v3`
+   (618d3ee7 = tag `hyperflare-tp3-20261111`) is not an ancestor of `tp3-main`: the port rebuilt the history on
+   upstream 70069281. Publishing needs either a force-push of `ds41-tp3-v3` (history rewrite: explicit OK and a
+   force-push warning, D.4.6) or a new public branch (for example `tp3-main`) made the default. Published tags stay.
+   Check first that no upstream PR is open from a public branch that would be rewritten.
+5. **Qualification policy for a release (changed 2026-11-16 by the owner: "minimum, to release faster").** A release is
+   qualified by tier, by what changed since the last fully qualified package (binary, export, weights, full), with the
+   GPU queue chain `qual-chain.sh` (`~/ds41-tp3/analysis/work/flare-ds41-perf/qual-20261116/README.md`). The
+   20261116 release ran `TIER=weights` (FP8 Engram tables = a quantisation change) plus `RETRIEVAL=1 LONG512=1`:
+   smoke, image, tools 60, consistency, verify_fix, eval-43, tool-eval, decode 32K c1/c8/c16, 128K/512K c1, prefill 32K,
+   agent8 replay, retrieval 128K/900K, GPQA Diamond, hotel-lights and KV stress at 16 streams. Not run: LiveBench,
+   long generation, lavd, the natural-EOS decode bench, the 8-stream stress (the 16-stream stress replaces it), the
+   128K c8 cell, the vision sets. The release notes and the folder README list what was not run.
 
 ### B.6 Sync from upstream (deliberate, never automatic)
 
@@ -729,7 +774,7 @@ combined build is found by exporting with switches toggled, not by reverting cod
    add hotel-lights and lavd at c8 (lavd is a long structured CSV context; it exercises prefill and long-context
    consistency, which hotel-lights does not).
 4. **Memory, KV or graph-layout changes:** add the c8 KV stress test, where they fail.
-5. **Before a public release:** the full `qual_all.sh` suite (eval, tools, lavd and hotel at c8, retrieval 128K and
+5. **Before a public release:** the tier of the release chain (B.5.5, owner policy since 2026-11-16). *Until 2026-11-16:* the full `qual_all.sh` suite (eval, tools, lavd and hotel at c8, retrieval 128K and
    900K, long generation, EOS, LiveBench, stress) on the package being published.
 6. **Full suite on a single change before it becomes the default** when it touches sampling or verification math, the
    chat template or tool parsing, or when any quick check flagged it even once.
