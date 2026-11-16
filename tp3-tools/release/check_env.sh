@@ -11,8 +11,9 @@ set -uo pipefail
 FORK=${1:?usage: check_env.sh <fork checkout dir>}
 HERE=$(dirname "$(readlink -f "$0")")
 FLARE_CACHE=${FLARE_CACHE:-$HOME/.cache/flare}; MIN_FREE_GB=${MIN_FREE_GB:-900}; GPUS=${GPUS:-0,1,2}
-# Upstream base of source.patch: Hyperflare main cbf21a12 (2026-11-10) since the ds41-tp3-sync merge; 972e28e4 before.
-BASE=${BASE:-cbf21a12d118217b8ad4e6bfa565562a90addeec}
+# Upstream base of source.patch: Hyperflare main 70069281 since the 2026-11-14 port (releases from 20261116 on);
+# cbf21a12 for the 2026-11-10 ds41-tp3-sync builds, 972e28e4 up to 20261111.
+BASE=${BASE:-70069281cb3ace4365b86f4bfbbcb409da89434b}
 fails=0
 pass(){ echo "PASS  $*"; }; warn(){ echo "WARN  $*"; }; fail(){ echo "FAIL  $*"; fails=$((fails+1)); }
 vge(){ [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }   # vge A B: version A >= B
@@ -83,6 +84,11 @@ if [ -x "$VENV/bin/python" ]; then
       elif patch --dry-run -f -s -p1 -d "$SP" < "$p" >/dev/null 2>&1; then fail "$b not applied (applies cleanly): patch -p1 -d $SP < $p"
       else fail "$b neither applied nor applicable to the installed FlashInfer (wrong version? re-run uv sync --locked, then re-apply)"; fi
     done
+    # The b12x two-shot overlay patch is not applied to the venv: export.sh needs a separate overlay built from it
+    # (tp3-tools/make-b12x-overlay.sh, B12X_OVERLAY) while TWOSHOT=1, the export default.
+    OV=$PATCHES/overlay/flashinfer-pcie-twoshot-pull-world3.patch
+    if [ -f "$OV" ]; then pass "overlay patch present: $(basename "$OV") (build B12X_OVERLAY with tp3-tools/make-b12x-overlay.sh)"
+    else warn "overlay patch $OV missing: export.sh then needs TWOSHOT=0 (upstream all-reduce candidates)"; fi
   fi
   # Upstream replaced `python -m ignition.patches` (on-disk edits of torch/Triton, re-run after every uv sync) with
   # ignition.runtime_patches: version-checked in-memory fixes that ignition export applies itself. Nothing to run;

@@ -1,36 +1,44 @@
 #!/bin/bash
-# Build the checkpoint this release exports from: DeepSeek's original shards 1-46 plus NVIDIA's shards 47-48 (the two
-# Engram tables in MXFP4), with this release's config.json and model.safetensors.index.json. Uses symlinks only.
-#   usage: make_checkpoint_view.sh <deepseek snapshot dir> <nvidia NVFP4 snapshot dir> <output dir>
-# Download first, for example:
-#   hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --revision 1bae0e1088993b9b82de08f59de5be5a34e42170
-#   hf download nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 --include "model-0004[78]-of-00048.safetensors" LICENSE README.md
+# FP8-Engram checkpoint view for DeepSeek-V4.1-Flash-1017: symlinks to EVERY file of DeepSeek's original snapshot
+# (shards 1-48, config.json, model.safetensors.index.json, tokenizer, ...). Shards 47-48 hold DeepSeek's FP8 Engram tables
+# (F8_E4M3 [rows, 256] + F8_E8M0 [rows, 8] scales, 189 GiB); DeepSeek's own config.json and index are used unchanged.
+# No NVIDIA download is needed (the 20261111 folder's MXFP4 view took shards 47-48 from nvidia/DeepSeek-V4.1-Flash-1017-NVFP4).
+# The output directory's name becomes the model name of the package (serve.sh default: ds41-1017-engram-fp8).
+#   usage: make_checkpoint_view.sh <deepseek snapshot dir> <output dir (must not exist)>
+#   expect: two "Engram table F8_E4M3 ... ok" lines and "96085 tensors in 48 shards, missing 0; payload 510286023000 vs index total_size 510286023000"
 set -euo pipefail
-DS=$(readlink -f "$1"); NV=$(readlink -f "$2"); OUT=$3; HERE=$(dirname "$(readlink -f "$0")")
+[ $# -eq 2 ] || { echo "usage: $0 <deepseek snapshot dir> <output dir>" >&2; exit 2; }
+DS=$(readlink -f "$1"); OUT=$2
+[ -e "$OUT" ] && { echo "refuse: $OUT exists" >&2; exit 2; }
 mkdir -p "$OUT"
-for f in "$DS"/*; do
-  b=$(basename "$f")
-  case "$b" in config.json|model.safetensors.index.json|model-00047-of-00048.safetensors|model-00048-of-00048.safetensors) ;;
-    *) ln -sfn "$(readlink -f "$f")" "$OUT/$b" ;;
-  esac
-done
-for s in 00047 00048; do ln -sfn "$(readlink -f "$NV/model-$s-of-00048.safetensors")" "$OUT/model-$s-of-00048.safetensors"; done
-cp "$HERE/checkpoint/config.json" "$HERE/checkpoint/model.safetensors.index.json" "$OUT/"
-python3 - "$OUT" <<'EOF'
-import json, struct, sys
+for f in "$DS"/*; do ln -s "$(readlink -f "$f")" "$OUT/$(basename "$f")"; done
+cd "$OUT"
+/usr/bin/python3 -I - "$OUT" <<'PY'
+import json, os, struct, sys
 out = sys.argv[1]
 idx = json.load(open(f"{out}/model.safetensors.index.json"))
-seen, missing = {}, []
+seen, missing, total = {}, [], 0
 for name, shard in idx["weight_map"].items():
     if shard not in seen:
         with open(f"{out}/{shard}", "rb") as h:
             n = struct.unpack("<Q", h.read(8))[0]
             seen[shard] = json.loads(h.read(n))
+            end = max(v["data_offsets"][1] for k, v in seen[shard].items() if k != "__metadata__")
+            if 8 + n + end != os.path.getsize(f"{out}/{shard}"):
+                sys.exit(f"{shard}: size {os.path.getsize(f'{out}/{shard}')} != header end {8 + n + end}")
     if name not in seen[shard]:
         missing.append(name)
-e = seen["model-00047-of-00048.safetensors"].get("layers.1.engram.embed.weight", {})
-print(f"{len(idx['weight_map'])} tensors in {len(seen)} shards, missing {len(missing)}; "
-      f"layer-1 Engram table {e.get('dtype')} {e.get('shape')} (expect U8 [384006168, 128])")
-sys.exit(1 if missing or e.get("dtype") != "U8" else 0)
-EOF
-echo "checkpoint view ready: $OUT"
+    else:
+        o = seen[shard][name]["data_offsets"]; total += o[1] - o[0]
+bad = []
+for layer, shard in ((1, "model-00047-of-00048.safetensors"), (14, "model-00048-of-00048.safetensors")):
+    w = seen[shard].get(f"layers.{layer}.engram.embed.weight", {}); s = seen[shard].get(f"layers.{layer}.engram.embed.scale", {})
+    ok = w.get("dtype") == "F8_E4M3" and len(w.get("shape", [])) == 2 and w["shape"][1] == 256 \
+         and s.get("dtype") == "F8_E8M0" and s.get("shape") == [w["shape"][0], 8]
+    print(f"layer-{layer} Engram table {w.get('dtype')} {w.get('shape')} scales {s.get('dtype')} {s.get('shape')} {'ok' if ok else 'BAD'}")
+    bad += [] if ok else [layer]
+ts = idx.get("metadata", {}).get("total_size")
+print(f"{len(idx['weight_map'])} tensors in {len(seen)} shards, missing {len(missing)}; payload {total} vs index total_size {ts}")
+sys.exit(1 if missing or bad or ts != total else 0)
+PY
+echo "FP8 checkpoint view ready: $OUT"
