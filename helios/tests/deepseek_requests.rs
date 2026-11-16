@@ -816,3 +816,51 @@ fn strict_tools_render_the_reference_normalized_schema() {
     assert!(error.contains("strict tool schemas require constrained tool generation"), "{error}");
     assert!(template.prepare(json!({"tools":[plain]})).is_ok());
 }
+
+/// Malformed tool-argument markup passes through as the DeepSeek reference returns it. The
+/// expected arguments are the reference StreamProcessor's output for the same completions
+/// (recipe-compare out/rust_parse.json, cases o09, o10, o12).
+#[test]
+fn malformed_tool_arguments_pass_through_like_the_reference() {
+    let f = Fixture::new(PromptEncoder::DeepseekV41);
+    let call = |params: &str| {
+        format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{params}</｜DSML｜ invoke>\n</｜DSML｜ calls>")
+    };
+    for (completion, expected) in [
+        // string="false" with a value that is not JSON
+        (call("<｜DSML｜ parameter name=\"city\" string=\"false\">Paris</｜DSML｜ parameter>\n"),
+         r#"{"city": Paris}"#),
+        // parameter without its string attribute
+        (call("<｜DSML｜ parameter name=\"city\">Paris</｜DSML｜ parameter>\n"),
+         "{\"city\">Paris</｜DSML｜: "),
+        // duplicate parameter name
+        (call("<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"),
+         r#"{"city": "Paris", "city": "Rome"}"#),
+    ] {
+        let request = f.prepare(json!({"enable_thinking":false,"messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]})).unwrap();
+        let mut output = flare_helios::output::OutputPipeline::new(request.output);
+        let mut decoder = f.frontend.incremental_decoder(false);
+        let mut events = Vec::new();
+        for id in f.frontend.encode(&completion, false).unwrap() {
+            events.extend(output.push(flare_helios::output::Input::Token(id)).unwrap());
+            if let Some(text) = decoder.push(&[id]).unwrap() {
+                events.extend(output.push(flare_helios::output::Input::Text(&text)).unwrap());
+            }
+        }
+        let rest = decoder.finish().unwrap();
+        if !rest.is_empty() {
+            events.extend(output.push(flare_helios::output::Input::Text(&rest)).unwrap());
+        }
+        events.extend(output.finish(flare_helios::output::Termination::Eos).unwrap());
+        use flare_helios::output::Event;
+        let calls: Vec<_> = events.iter().filter_map(|event| match event {
+            Event::ToolArguments { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(calls, [expected], "{completion}");
+        assert!(events.iter().any(|event| matches!(event, Event::ToolBegin { name, .. } if name == "get_weather")));
+        assert!(events.contains(&Event::ToolEndRaw { index: 0 }), "{events:?}");
+        assert!(!events.iter().any(|event| matches!(event, Event::Content(text) if !text.trim().is_empty())));
+    }
+}

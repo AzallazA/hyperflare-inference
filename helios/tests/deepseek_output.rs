@@ -38,7 +38,7 @@ impl Parsed {
                 self.calls.push((name, String::new()));
             }
             Event::ToolArguments { index, text } => self.calls[index].1.push_str(&text),
-            Event::ToolEnd { index } => {
+            Event::ToolEnd { index } | Event::ToolEndRaw { index } => {
                 assert_eq!(index, self.ended);
                 self.ended += 1;
             }
@@ -308,46 +308,41 @@ async fn json_literals_keep_markup_as_content_and_tool_blocks_end_output() {
 }
 
 #[test]
-fn complete_calls_validate_nonempty_names_and_json_arguments() {
+fn complete_calls_require_nonempty_names_and_pass_invalid_arguments_through() {
     for spaced in [false, true] {
         let (open, body, close) = block(spaced);
-        for invalid in [
-            body.replace("name=\"lookup\"", "name=\"\""),
-            body.replace(">3</", ">not-json</"),
-        ] {
-            let text = format!("{open}{invalid}{close}");
-            assert!(
-                actual(
-                    &[&text],
-                    spaced,
-                    OutputStart::Content,
-                    false,
-                    Termination::Eos
-                )
-                .is_err(),
-                "{text}"
-            );
-        }
+        let text = format!("{open}{}{close}", body.replace("name=\"lookup\"", "name=\"\""));
+        assert!(
+            actual(&[&text], spaced, OutputStart::Content, false, Termination::Eos).is_err(),
+            "{text}"
+        );
+        // The DeepSeek reference returns arguments that are not JSON unchanged.
+        let text = format!("{open}{}{close}", body.replace(">3</", ">not-json</"));
+        let parsed =
+            actual(&[&text], spaced, OutputStart::Content, false, Termination::Eos).unwrap();
+        assert_eq!(parsed.ended, parsed.calls.len());
+        let invalid: Vec<_> = parsed.calls.iter().filter(|(_, args)| serde_json::from_str::<Value>(args).is_err()).collect();
+        assert_eq!(invalid.len(), 1, "{:?}", parsed.calls);
+        assert!(invalid[0].1.contains(": not-json"), "{:?}", parsed.calls);
     }
 }
 
 #[test]
-fn incomplete_calls_do_not_finish_on_eos_and_can_be_cancelled_or_truncated() {
+fn incomplete_calls_end_raw_on_eos_and_can_be_cancelled_or_truncated() {
     for spaced in [false, true] {
         let (open, _, _) = block(spaced);
         let s = if spaced { " " } else { "" };
         let text = format!(
             "{open}<｜DSML｜{s}invoke name=\"lookup\"><｜DSML｜{s}parameter name=\"x\" string=\"true\">partial🙂"
         );
+        // Like the reference, EOS returns the open call with the arguments written so far.
+        let parsed =
+            actual(&[&text], spaced, OutputStart::Content, false, Termination::Eos).unwrap();
+        assert_eq!(parsed.calls, [("lookup".to_owned(), "{\"x\": \"partial🙂".to_owned())]);
+        assert_eq!(parsed.ended, 1);
+        let unnamed = format!("{open}<｜DSML｜{s}invoke name=\"look");
         assert!(
-            actual(
-                &[&text],
-                spaced,
-                OutputStart::Content,
-                false,
-                Termination::Eos
-            )
-            .is_err()
+            actual(&[&unnamed], spaced, OutputStart::Content, false, Termination::Eos).is_err()
         );
         for end in [
             Termination::OutputLimit,
@@ -421,7 +416,7 @@ fn structured_scalars_lark_and_markup_literals_remain_verbatim_after_answer_star
 }
 
 #[test]
-fn empty_and_duplicate_top_level_parameter_names_are_rejected() {
+fn empty_and_duplicate_top_level_parameter_names_pass_through() {
     for spaced in [false, true] {
         let (open, _, close) = block(spaced);
         let s = if spaced { " " } else { "" };
@@ -430,9 +425,9 @@ fn empty_and_duplicate_top_level_parameter_names_are_rejected() {
                 "<｜DSML｜{s}parameter name=\"{name}\" string=\"false\">{value}</｜DSML｜{s}parameter>"
             )
         };
-        for parameters in [
-            parameter("", "1"),
-            format!("{}{}", parameter("x", "1"), parameter("x", "2")),
+        for (parameters, expected) in [
+            (parameter("", "1"), r#"{"": 1}"#),
+            (format!("{}{}", parameter("x", "1"), parameter("x", "2")), r#"{"x": 1, "x": 2}"#),
         ] {
             let text = format!(
                 "{open}<｜DSML｜{s}invoke name=\"lookup\">{parameters}</｜DSML｜{s}invoke>{close}"
@@ -445,18 +440,12 @@ fn empty_and_duplicate_top_level_parameter_names_are_rejected() {
             ] {
                 let mut output = pipeline(spaced, OutputStart::Content, false);
                 let mut published = vec![];
-                let mut error = None;
                 for chunk in chunks {
-                    match output.push(Input::Text(chunk)) {
-                        Ok(events) => published.extend(events),
-                        Err(failure) => {
-                            error = Some(failure);
-                            break;
-                        }
-                    }
+                    published.extend(output.push(Input::Text(chunk)).unwrap());
                 }
-                assert!(error.unwrap().to_string().contains("nonempty and unique"));
-                assert!(published.is_empty());
+                published.extend(output.finish(Termination::Eos).unwrap());
+                assert!(published.contains(&Event::ToolArguments { index: 0, text: expected.into() }), "{published:?}");
+                assert!(published.contains(&Event::ToolEndRaw { index: 0 }));
             }
         }
         let nested = parameter("object", "{\"x\":1,\"x\":2}");

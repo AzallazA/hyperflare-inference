@@ -24,6 +24,8 @@ const BUFFER_LIMIT: usize = 1024 * 1024;
 #[derive(Default)]
 struct Call {
     name: String,
+    /// The name is complete and arguments may follow.
+    named: bool,
     arguments: String,
 }
 
@@ -91,14 +93,14 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         .push_str(source);
                 }
                 OutputAction::ToolNameEnd if !repeated => {
-                    let name = &self
+                    let call = self
                         .call
-                        .as_ref()
-                        .ok_or("DeepSeek tool name has no call")?
-                        .name;
-                    if name.is_empty() {
+                        .as_mut()
+                        .ok_or("DeepSeek tool name has no call")?;
+                    if call.name.is_empty() {
                         return Err("tool function name is empty".into());
                     }
+                    call.named = true;
                 }
                 OutputAction::LabelToolCallArguments(label) if !repeated => {
                     self.call
@@ -129,8 +131,12 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         .take()
                         .ok_or("DeepSeek tool arguments have no call")?;
                     call.arguments.push_str(closing_text);
-                    validate_arguments(&call.arguments)?;
                     let index = self.calls;
+                    let end = if validate_arguments(&call.arguments).is_ok() {
+                        Event::ToolEnd { index }
+                    } else {
+                        Event::ToolEndRaw { index }
+                    };
                     events.extend([
                         Event::ToolBegin {
                             index,
@@ -141,7 +147,7 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                             index,
                             text: call.arguments,
                         },
-                        Event::ToolEnd { index },
+                        end,
                     ]);
                     self.calls += 1;
                 }
@@ -324,8 +330,26 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
         if !self.verbatim {
             self.apply(machine.finish(), &mut events)?;
         }
-        if self.call.take().is_some() && cause == Termination::Eos {
-            return Err("incomplete DeepSeek tool call at end of response".into());
+        if let Some(call) = self.call.take().filter(|_| cause == Termination::Eos) {
+            // The reference returns a call that the model left open, such as one whose parameter
+            // lacks its string attribute, with the arguments written so far.
+            if !call.named {
+                return Err("incomplete DeepSeek tool call at end of response".into());
+            }
+            let index = self.calls;
+            events.extend([
+                Event::ToolBegin {
+                    index,
+                    name: call.name,
+                    id: None,
+                },
+                Event::ToolArguments {
+                    index,
+                    text: call.arguments,
+                },
+                Event::ToolEndRaw { index },
+            ]);
+            self.calls += 1;
         }
         Ok(events)
     }
@@ -402,6 +426,39 @@ mod deepseek41_syntax_tests {
                 "{\"n\": 3}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_argument_tests {
+    use super::*;
+    use crate::output::tagged::{OutputConfig, OutputStart};
+    use crate::output::{Input, ModelOutput, Termination};
+    use crate::server::output::Accumulator;
+    use serde_json::json;
+
+    /// What a Chat client receives for arguments the reference passes through: one streamed
+    /// tool-call delta with the name and the raw text, and the same text in the final message.
+    #[test]
+    fn invalid_arguments_reach_chat_clients_verbatim() {
+        let text = "</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">three</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let mut parser = DsmlOutput::<true>::new(OutputConfig {
+            structured: false,
+            start: OutputStart::Reasoning,
+            tools: vec![json!({"type":"function", "function":{"name":"lookup"}})],
+        });
+        let mut output = Accumulator::new("request".into());
+        let mut events = parser.push(Input::Text(text)).unwrap();
+        events.extend(parser.finish(Termination::Eos).unwrap());
+        assert_eq!(events.last(), Some(&Event::ToolEndRaw { index: 0 }));
+        let deltas = output.apply(events).unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            deltas,
+            [json!({"tool_calls":[{"index":0,"id":"call_request_0","type":"function",
+                "function":{"name":"lookup","arguments":"{\"n\": three}"}}]})]
+        );
+        assert_eq!(output.message()["tool_calls"][0]["function"]["arguments"], "{\"n\": three}");
     }
 }
 
