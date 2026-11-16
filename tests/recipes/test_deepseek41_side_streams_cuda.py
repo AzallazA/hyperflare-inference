@@ -3,13 +3,23 @@
 
 """DS41 TP3 side streams on one GPU with real checkpoint weights: switch off vs on write the same bytes.
 
-Each test captures the serial forward and the side-stream forward of the same prepared operators in one session,
-replays both on the same inputs (rows 1/6/12/21/43; three repeat replays of the side graph) and compares outputs and
-every cache byte. FLARE_STREAMS_TIMING=1 also times FLARE_STREAMS_REPS (default 300) replays of each graph and prints
+Each test captures the serial forward and the side-stream forward of the same prepared operators in one session and
+replays both on two data sets A and B (rows 1/6/12/21/43): serial A and serial B are the references, then side A,
+side B, side A, side B, serial A, serial B, so every side replay follows a replay on the other data set (a missing or
+misplaced join would read the previous replay's intermediates, which then hold the other data set's values instead
+of identical ones). Every replay must write its data set's reference bytes: outputs, every cache byte, and the values
+the side stream produces as their consumers read them. FLARE_STREAMS_TIMING=1 also times FLARE_STREAMS_REPS (default 300) replays of each graph and prints
 ``STREAMS item=<index|engram|context> rows=N serial_us=.. side_us=.. saved_us=..``.
 
 - index: index-source attention layers 2 (ratio-2 KV source: gates GEMV + query chain on the side), 20 (ratio-1 KV
-  and candidate source) and 24 (index-only), TP3 rank-0 geometry (24 heads, BF16 MLA as served); when the native extension
+  and candidate source) and 24 (index-only), TP3 rank-0 geometry (24 heads, BF16 MLA as served). Observed: attention
+  outputs, selections, the state backing, every pool page (the compressed KV / index caches the ratio-2 compressor
+  writes from the side stream's gates), and each selector's inputs (index query after RoPE, index weights after the
+  scaling: the query chain's results) plus layer 20's candidate outputs. History: random index keys written through
+  the indexer's own cache writer, positions INDEX_START.. (compressed lengths <= 506 <= the 512 top-k), so every
+  selection keeps every live position: no top-k cut, so no tie-break can change it (11-15 seq201: with all-zero
+  history keys and lengths 601-605 the ratio-1 layers chose 511 of 600 exact zero-score ties by shared-atomic arrival
+  order, which differed between replays while the attention outputs were bit-identical). When the native extension
   has the qualification replay worker (PreparedGraphBundle), it replays both graphs too (else a STREAMS-NOTE line).
 - engram: layer 14's Engram (TP3 rank-0 projection columns, synthetic staged rows) started before layer 13's
   attention and joined after it; the all-reduce is a single-rank copy here (one GPU), so the timing leaves out the
@@ -47,7 +57,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1"
 ROWS = (1, 6, 12, 21, 43)
 WORLD = 3  # the served geometry: TP3 rank 0, 24 query heads, BF16 MLA arithmetic (recipe.py mla_compute_mode)
 MLA = "bf16"
-START = 600  # positions 600..605: 5 pages of 128 tokens per request, compressed lengths below the 512 top-k
+START = 600  # positions 600..605 (engram/context): 5 pages of 128 tokens per request
+# index test: positions 500..505, so ratio-1 lengths are 501..506 and ratio-2 lengths 250..253, all <= the 512 top-k
+# (every live position is selected: the selection cannot depend on tie-breaking among equal scores)
+INDEX_START = 500
 
 
 def _shape(rows):
@@ -57,12 +70,12 @@ def _shape(rows):
     return "verify", (6,) * (rows // 6) + ((rows % 6,) if rows % 6 else ())
 
 
-def _metadata(rows, device):
+def _metadata(rows, device, start=START):
     mode, lengths = _shape(rows)
     batch, width = len(lengths), max(lengths)
     metadata = Metadata.allocate(rows, batch, 5, device, max_query_tokens=width)
     counts = torch.tensor(lengths, dtype=torch.int32, device=device)
-    starts = torch.full((batch,), START, dtype=torch.int64, device=device)
+    starts = torch.full((batch,), start, dtype=torch.int64, device=device)
     states = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
     pages = torch.arange(1, batch * 5 + 1, dtype=torch.int32, device=device).view(batch, 5)
     inputs = torch.zeros((batch, width), dtype=torch.int64, device=device)
@@ -143,20 +156,61 @@ def _capture(session, forwards, owners):
     return graphs
 
 
-def _replay_and_compare(graphs, reset, observe, order=("serial", "side", "side", "side", "side", "serial")):
-    """Replay in ``order`` from the same state (``reset``); every replay must write the first one's bytes."""
-    expected = None
-    for name in order:
-        reset()
+def _replay_and_compare(graphs, resets, observe):
+    """References: serial once per data set (``resets[i]`` installs data set i). Then side replays cycling the data
+    sets (each follows a replay on another data set), then serial again; every replay must write the bytes of its data
+    set's reference. ``observe`` returns {name: tensor}."""
+    resets = tuple(resets)
+
+    def run(name, which):
+        resets[which]()
         torch.cuda.synchronize()
         graphs[name].replay()
         torch.cuda.synchronize()
-        actual = tuple(value.clone() for value in observe())
-        if expected is None:
-            expected = actual
-            continue
-        for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
-            assert torch.equal(value.view(torch.uint8), reference.view(torch.uint8)), (name, index)
+        return {key: value.clone() for key, value in observe().items()}
+
+    expected = [run("serial", which) for which in range(len(resets))]
+    cycle = [("side", which % len(resets)) for which in range(max(4, 2 * len(resets)))]
+    cycle += [("serial", which) for which in range(len(resets))]
+    for step, (name, which) in enumerate(cycle):
+        actual = run(name, which)
+        for key, value in actual.items():
+            reference = expected[which][key]
+            same = torch.equal(value.view(torch.uint8), reference.view(torch.uint8))
+            assert same, (name, step, "ABCDEFGH"[which], key,
+                          int((value.view(torch.uint8) != reference.view(torch.uint8)).sum()), value.numel())
+    return expected
+
+
+class SelectorProbe:
+    """Wraps a functional PreparedMXFP4Indexer: copies its inputs (index query after RoPE, index weights after the
+    scaling) and, on the candidate source, its candidate outputs into persistent buffers the test observes."""
+
+    def __init__(self, inner, query_like, weights_like):
+        self.inner, self.plan, self.cache, self.write_keys = inner, inner.plan, inner.cache, inner.write_keys
+        self.layouts = inner.layouts
+        device = query_like.device
+        self.query, self.weights = torch.empty_like(query_like), torch.empty_like(weights_like)
+        self.candidates = self.counts = None
+        for key, attribute in (("candidate_output", "candidates"), ("candidate_output_lengths", "counts")):
+            layout = inner.layouts.get(key)
+            if layout is not None:
+                setattr(self, attribute, torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=device))
+
+    def __call__(self, query=None, weights=None, *args, **kwargs):
+        self.query.copy_(query)
+        self.weights.copy_(weights)
+        result = self.inner(query, weights, *args, **kwargs)
+        if isinstance(result, tuple) and self.candidates is not None:
+            self.candidates.copy_(result[1])
+            self.counts.copy_(result[2])
+        return result
+
+    def observed(self, prefix):
+        out = {f"{prefix}.query": self.query, f"{prefix}.weights": self.weights}
+        if self.candidates is not None:
+            out[f"{prefix}.candidates"], out[f"{prefix}.candidate_counts"] = self.candidates, self.counts
+        return out
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -189,10 +243,15 @@ def test_index_side_stream_is_bit_identical(attention_weights, rows):
     weights, config = attention_weights
     device = torch.device("cuda:0")
     torch.manual_seed(41152 + rows)
-    mode, batch, metadata, _ = _metadata(rows, device)
+    layers = (2, 20, 24)
+    ratios = {layer: config.text["compress_ratios"][layer] for layer in layers}
+    mode, batch, metadata, _ = _metadata(rows, device, start=INDEX_START)
+    # no top-k cut: every compressed length (history + this forward's rows) fits the 512 selection
+    assert all((INDEX_START + 6) // ratio <= 512 for ratio in ratios.values())
     pool = ContinuationPool.allocate(config, batch + 1, batch * 5 + 1, device)
     scratch = AttentionScratch.allocate(rows, WORLD, device)
     sources = [torch.randn((rows, 5120), dtype=torch.bfloat16, device=device) * .1 for _ in range(3)]
+    data_sources = [[torch.randn_like(source) * .1 for source in sources] for _ in range(2)]  # data sets A, B
     outputs = [torch.empty((rows, 5120), dtype=torch.bfloat16, device=device) for _ in range(3)]
     selected = [torch.empty((rows, 512), dtype=torch.int32, device=device) for _ in range(3)]
     arena = ScratchArena(device, overlap=True)
@@ -202,7 +261,7 @@ def test_index_side_stream_is_bit_identical(attention_weights, rows):
         session.register_scratch(arena)
         side = [PreparedAttention(layer, weights[layer], sources[i], scratch, metadata, pool, Rotary(config, device),
                     mode=mode, world=WORLD, session=session, name=f"layer{layer}", workspace=arena,
-                    mla_compute_mode=MLA, index_side_stream=True) for i, layer in enumerate((2, 20, 24))]
+                    mla_compute_mode=MLA, index_side_stream=True) for i, layer in enumerate(layers)]
         assert all(attention.index_side is not None for attention in side)
         assert side[0].index_side.gates_task is not None and side[1].index_side.gates_task is None
         serial = []
@@ -211,44 +270,88 @@ def test_index_side_stream_is_bit_identical(attention_weights, rows):
             plain.index_side = None
             serial.append(plain)
         session.tune(show_progress=False)
+        # Selector probes (the selectors list is shared by each layer's serial copy: copy() is shallow).
+        probes = {}
+        for attention, layer in zip(side, layers):
+            for ordinal, selector in enumerate(list(attention.selectors)):
+                rows_here = selector.layouts["output_indices"][0][0]
+                first = sum(s.layouts["output_indices"][0][0] for s in attention.selectors[:ordinal])
+                probe = SelectorProbe(selector, scratch.index_query[first:first + rows_here],
+                                      scratch.index_weights[first:first + rows_here])
+                attention.selectors[ordinal] = probe
+                probes.update(probe.observed(f"selector.L{layer}.{ordinal}"))
+        assert all(plain.selectors is attention.selectors for plain, attention in zip(serial, side))
         graphs = _capture(session, {"serial": IndexForward(serial, sources, metadata, outputs, selected),
                                     "side": IndexForward(side, sources, metadata, outputs, selected)}, owners)
         session.freeze()
-        saved = pool.backing.clone()
 
-        def reset():
-            pool.backing.copy_(saved)
-            arena.tensor.fill_(0xA5)
-            for value in (*outputs, *selected):
-                value.fill_(-1)
+        # Tie-free history per data set: random index keys for every history position of the index caches (layer 2's
+        # ratio-2 cache and layer 20's ratio-1 cache, which layer 24 reads), through the indexer's own cache writer.
+        pages = torch.arange(1, batch * 5 + 1, dtype=torch.int64, device=device).view(batch, 5)
+        saved = []
+        for _ in range(2):
+            for attention, layer in zip(side, layers):
+                if attention.global_kv is None:
+                    continue
+                ratio, count = ratios[layer], INDEX_START // ratios[layer]
+                index = torch.arange(count, dtype=torch.int64, device=device)
+                slots = torch.cat([pages[request, index * ratio // 128] * (128 // ratio) + index * ratio % 128 // ratio
+                                   for request in range(batch)])
+                keys = torch.randn((slots.numel(), 128), dtype=torch.bfloat16, device=device)
+                for first in range(0, slots.numel(), rows):  # the forward's own write shape: [rows, 128], -1 = skip
+                    part = torch.full((rows,), -1, dtype=torch.int64, device=device)
+                    chunk = torch.zeros((rows, 128), dtype=torch.bfloat16, device=device)
+                    last = min(slots.numel(), first + rows)
+                    part[:last - first], chunk[:last - first] = slots[first:last], keys[first:last]
+                    attention.selectors[0].write_keys(chunk, part)
+            torch.cuda.synchronize()
+            saved.append((pool.backing.clone(), {key: value.clone() for key, value in pool.pages.items()}))
 
+        def install(which):
+            def reset():
+                backing, pages_saved = saved[which]
+                pool.backing.copy_(backing)
+                for key, value in pool.pages.items():
+                    value.copy_(pages_saved[key])
+                for source, value in zip(sources, data_sources[which], strict=True):
+                    source.copy_(value)
+                arena.tensor.fill_(0xA5)
+                for value in (*outputs, *selected, *probes.values()):
+                    value.view(torch.uint8).fill_(0xFF)
+            return reset
+
+        def observe():
+            return {**{f"output.L{layer}": outputs[i] for i, layer in enumerate(layers)},
+                    **{f"selected.L{layer}": selected[i] for i, layer in enumerate(layers)},
+                    "pool.backing": pool.backing, **{f"pages.{key}": value for key, value in pool.pages.items()},
+                    **probes}
+
+        resets = [install(0), install(1)]
         try:
-            _replay_and_compare(graphs, reset, lambda: (*outputs, *selected, pool.backing))
+            expected = _replay_and_compare(graphs, resets, observe)
             import flare_heliopause
             if not hasattr(flare_heliopause, "GraphReplayWorker"):
                 # The venv's extension is built without the qualification feature: torch replay only.
                 print(f"\nSTREAMS-NOTE rows={rows} native replay worker not built (qualification feature): skipped")
-                reset()
+                resets[0]()
                 _timing("index", rows, graphs)
                 return
             bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={"source": sources[0]},
                 resources=(weights, pool, scratch, metadata, arena, session, owners))
             worker = bundle.start_worker()
-            try:  # native replay (the served runtime's path) writes the same bytes
-                results = []
-                for name in ("serial", "side", "side"):
-                    reset()
+            try:  # native replay (the served runtime's path) writes the torch replays' bytes, data sets alternating
+                for name, which in (("serial", 1), ("side", 0), ("side", 1), ("serial", 0)):
+                    resets[which]()
                     torch.cuda.synchronize()
                     ticket = worker.submit(bundle.graph_indices[name])
                     result = worker.poll(timeout_ms=120000)
                     assert result is not None and result.ticket == ticket and result.error is None
-                    results.append(tuple(value.clone() for value in (*outputs, *selected, pool.backing)))
-                for other in results[1:]:
-                    for value, reference in zip(other, results[0], strict=True):
-                        assert torch.equal(value.view(torch.uint8), reference.view(torch.uint8))
+                    for key, value in observe().items():
+                        assert torch.equal(value.view(torch.uint8), expected[which][key].view(torch.uint8)), (
+                            "native", name, "AB"[which], key)
             finally:
                 worker.close()
-            reset()
+            resets[0]()
             _timing("index", rows, graphs)
         finally:
             for graph in graphs.values():
@@ -336,16 +439,30 @@ def test_engram_side_stream_is_bit_identical(attention_weights, checkpoint, rows
             owners)
         session.freeze()
         saved = pool.backing.clone()
+        # data sets A, B: the side stream's inputs (staged Engram rows), the layer-14 residual and the layer-13 input
+        data = []
+        for _ in range(2):
+            rows_staged = torch.randint(0, 0x77, inputs.weights.shape, dtype=torch.uint8, device=device)
+            data.append((rows_staged | (torch.randint(0, 2, rows_staged.shape, device=device, dtype=torch.uint8) << 7),
+                         torch.randn_like(source13) * .1, torch.randn_like(residual14) * .1))
 
-        def reset():
-            pool.backing.copy_(saved)
-            arena.tensor.fill_(0xA5)
-            attended.fill_(float("nan"))
-            mixed.fill_(float("nan"))
+        def install(which):
+            def reset():
+                pool.backing.copy_(saved)
+                inputs.weights.copy_(data[which][0])
+                source13.copy_(data[which][1])
+                residual14.copy_(data[which][2])
+                arena.tensor.fill_(0xA5)
+                attended.fill_(float("nan"))
+                mixed.fill_(float("nan"))
+            return reset
 
         try:
-            _replay_and_compare(graphs, reset, lambda: (attended, mixed, pool.backing))
+            _replay_and_compare(graphs, [install(0), install(1)],
+                                lambda: {"attended": attended, "mixed": mixed, "pool.backing": pool.backing})
             assert torch.isfinite(mixed).all()
+            reset = install(0)
+            reset()
             _timing("engram", rows, graphs)
         finally:
             for graph in graphs.values():
@@ -412,16 +529,23 @@ def test_context_side_stream_is_bit_identical(checkpoint, rows):
                                     "side": ContextForward(context, auxiliary, counts, metadata, tail, True)}, owners)
         session.freeze()
         saved = pool.backing.clone()
+        data = [torch.randn_like(auxiliary) * .1 for _ in range(2)]  # data sets A, B: the side stream's input
+        saved_reserved = pool.reserved_backing.clone()  # the draft rings live in the reserved extent
 
-        def reset():
-            pool.backing.copy_(saved)
-            arena.tensor.fill_(0xA5)
-            tail.fill_(1)
+        def install(which):
+            def reset():
+                pool.backing.copy_(saved)
+                pool.reserved_backing.copy_(saved_reserved)
+                auxiliary.copy_(data[which])
+                arena.tensor.fill_(0xA5)
+                tail.fill_(1)
+            return reset
 
         try:
-            windows = lambda: (*(pool.window(i, draft=True) for i in range(3)), tail)
-            _replay_and_compare(graphs, reset, windows)
-            assert any(bool((window != 0).any()) for window in windows()[:3])  # the rings were written
+            windows = lambda: {**{f"draft{i}.window": pool.window(i, draft=True) for i in range(3)}, "tail": tail}
+            _replay_and_compare(graphs, [install(0), install(1)], windows)
+            assert any(bool((window != 0).any()) for window in list(windows().values())[:3])  # the rings were written
+            install(0)()
             _timing("context", rows, graphs)
         finally:
             for graph in graphs.values():
