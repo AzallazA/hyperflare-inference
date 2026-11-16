@@ -192,6 +192,10 @@ def test_mma_pad_once_is_bit_identical(attention_weights, rows):
                     expected = actual
                     continue
                 for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
+                    if len(outputs) <= index < len(outputs) + len(selected):
+                        # Selections are index sets: the MXFP4 indexer does not fix their order (its own tests
+                        # compare sort().values); the layer outputs that consume them and the pool stay byte-exact.
+                        value, reference = value.sort(dim=-1).values, reference.sort(dim=-1).values
                     assert torch.equal(value.view(torch.uint8), reference.view(torch.uint8)), (name, index)
             if os.environ.get("FLARE_LAUNCHMERGE_TIMING") == "1":
                 reps = int(os.environ.get("FLARE_LAUNCHMERGE_REPS", "300"))
