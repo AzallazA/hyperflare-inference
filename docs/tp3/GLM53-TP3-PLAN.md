@@ -178,7 +178,7 @@ split: `tp3-tools/glm53-gpu-validate.sh` from step 03b.
 
 FP4-Local, language model only, 450 W, `--prefix-cache-memory 32G`, adaptive verification on, 32K context, 3 rounds
 per variant (`~/bench-results/glm-compare-k-1108-1735`; TP2 baseline repeated in `glm-compare-1108-1610`). Full write-up:
-`$HOME/ds41-tp3/analysis/GLM53-TP2-vs-TP3-20261108.md`.
+`~/ds41-tp3/analysis/GLM53-TP2-vs-TP3-20261108.md`.
 
 | Package (5 drafts) | KV tokens | c1 tok/s (steps/s) | c4 tok/s | c8 tok/s |
 | --- | --- | --- | --- | --- |
