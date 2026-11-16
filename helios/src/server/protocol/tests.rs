@@ -21,6 +21,7 @@ fn tools() -> Vec<inference::Tool> {
         description: "Find a value".into(),
         parameters: json!({"type":"object"}),
         custom: false,
+        strict: false,
         grammar: None,
     }]
 }
@@ -1050,7 +1051,6 @@ fn unsupported_controls_are_rejected_before_generation() {
         json!({"background":true}),
         json!({"tool_choice":{"type":"function","name":"lookup"}}),
         json!({"truncation":"auto"}),
-        json!({"tools":[{"type":"function","name":"f","strict":true}]}),
         json!({"tools":[{"type":"web_search"}]}),
         json!({"audio":{"voice":"alloy"}}),
     ] {

@@ -440,7 +440,7 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
 }
 
 fn assert_request_effort(fixture: &Fixture, request: &PreparedRequest, score: u8) {
-    assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+    assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")), "{}", request.rendered_prompt);
     assert_eq!(request.rendered_prompt.matches("Reasoning Effort:").count(), 1);
     assert_eq!(request.prompt.tokens,
         fixture.frontend.encode(&request.rendered_prompt, false).unwrap());
@@ -613,7 +613,7 @@ fn base64_images_follow_the_rendered_placeholder_order() {
             assert_eq!(request.rendered_prompt, rendered.text);
             if encoder == PromptEncoder::DeepseekV41 {
                 let score = options["reasoning_effort"].as_u64().unwrap_or(75);
-                assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+                assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")), "{}", request.rendered_prompt);
             }
             let complete_message = native_prefix::without_generation(&f.frontend, messages.as_array().unwrap(), options.as_object().unwrap());
             let complete_message = flare_helios::model::prepare_input(&f.config, &f.frontend,
@@ -760,4 +760,180 @@ fn reasoning_prompt_marks_turns_whose_next_turn_rewrites_the_generation_prompt()
             assert_eq!(next.prompt.tokens[..last], first.prompt.tokens[..last], "{case}");
         }
     }
+}
+
+/// Prompts rendered by the DeepSeek reference (deepseek-recipe 935817c through
+/// recipe-compare/scripts/refharness) for the Chat body in each case's `request`.
+fn assert_reference_prompts(prefix: &str) {
+    let cases: Value =
+        serde_json::from_str(include_str!("fixtures/deepseek41_reference_prompts.json")).unwrap();
+    let fixture = Fixture::new(PromptEncoder::DeepseekV41);
+    let mut checked = 0;
+    for (name, case) in cases.as_object().unwrap() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let request = fixture
+            .prepare(case["request"].clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(request.rendered_prompt, case["expected"].as_str().unwrap(), "{name}");
+        assert_eq!(
+            request.prompt.tokens,
+            fixture.frontend.encode(&request.rendered_prompt, false).unwrap(),
+            "{name}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no reference cases named {prefix}*");
+}
+
+#[test]
+fn developer_messages_render_as_reference_system_turns_in_place() {
+    assert_reference_prompts("f3_");
+}
+
+#[test]
+fn strict_tools_render_the_reference_normalized_schema() {
+    assert_reference_prompts("f5_");
+    let strict = json!({"type":"function","function":{"name":"set_flag","strict":true,
+        "parameters":{"type":"object","properties":{"on":{"type":"boolean"}}}}});
+    let plain = json!({"type":"function","function":{"name":"lookup",
+        "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}});
+    let native = Fixture::new(PromptEncoder::DeepseekV41);
+    // Strict and non-strict tools may share a request (the reference rejects that mix only
+    // because it then constrains generation, which Flare does not do).
+    let mixed = native.prepare(json!({"tools":[strict, plain]})).unwrap();
+    assert!(mixed.rendered_prompt.contains(r#"{"name": "set_flag", "description": "", "parameters": {"type": "object", "properties": {"on": {"type": "boolean"}}, "additionalProperties": false, "required": ["on"]}}"#), "{}", mixed.rendered_prompt);
+    assert!(mixed.rendered_prompt.contains(r#""parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}"#));
+    // A schema the reference cannot normalize fails with the reference's message.
+    let partial = json!({"type":"function","function":{"name":"set_flag","strict":true,
+        "parameters":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"]}}});
+    let error = native.prepare(json!({"tools":[partial]})).err().unwrap().to_string();
+    assert!(error.contains("Required properties must match all properties in the object"), "{error}");
+    // Chat templates keep rejecting strict schemas.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    let error = template.prepare(json!({"tools":[strict]})).err().unwrap().to_string();
+    assert!(error.contains("strict tool schemas require constrained tool generation"), "{error}");
+    assert!(template.prepare(json!({"tools":[plain]})).is_ok());
+}
+
+/// Malformed tool-argument markup passes through as the DeepSeek reference returns it. The
+/// expected arguments are the reference StreamProcessor's output for the same completions
+/// (recipe-compare out/rust_parse.json, cases o09, o10, o12).
+#[test]
+fn malformed_tool_arguments_pass_through_like_the_reference() {
+    let f = Fixture::new(PromptEncoder::DeepseekV41);
+    let call = |params: &str| {
+        format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{params}</｜DSML｜ invoke>\n</｜DSML｜ calls>")
+    };
+    for (completion, expected) in [
+        // string="false" with a value that is not JSON
+        (call("<｜DSML｜ parameter name=\"city\" string=\"false\">Paris</｜DSML｜ parameter>\n"),
+         r#"{"city": Paris}"#),
+        // parameter without its string attribute
+        (call("<｜DSML｜ parameter name=\"city\">Paris</｜DSML｜ parameter>\n"),
+         "{\"city\">Paris</｜DSML｜: "),
+        // duplicate parameter name
+        (call("<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"),
+         r#"{"city": "Paris", "city": "Rome"}"#),
+    ] {
+        let request = f.prepare(json!({"enable_thinking":false,"messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]})).unwrap();
+        let mut output = flare_helios::output::OutputPipeline::new(request.output);
+        let mut decoder = f.frontend.incremental_decoder(false);
+        let mut events = Vec::new();
+        for id in f.frontend.encode(&completion, false).unwrap() {
+            events.extend(output.push(flare_helios::output::Input::Token(id)).unwrap());
+            if let Some(text) = decoder.push(&[id]).unwrap() {
+                events.extend(output.push(flare_helios::output::Input::Text(&text)).unwrap());
+            }
+        }
+        let rest = decoder.finish().unwrap();
+        if !rest.is_empty() {
+            events.extend(output.push(flare_helios::output::Input::Text(&rest)).unwrap());
+        }
+        events.extend(output.finish(flare_helios::output::Termination::Eos).unwrap());
+        use flare_helios::output::Event;
+        let calls: Vec<_> = events.iter().filter_map(|event| match event {
+            Event::ToolArguments { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(calls, [expected], "{completion}");
+        assert!(events.iter().any(|event| matches!(event, Event::ToolBegin { name, .. } if name == "get_weather")));
+        assert!(events.contains(&Event::ToolEndRaw { index: 0 }), "{events:?}");
+        assert!(!events.iter().any(|event| matches!(event, Event::Content(text) if !text.trim().is_empty())));
+    }
+}
+
+#[test]
+fn reasoning_effort_spellings_follow_the_reference() {
+    assert_reference_prompts("f7_");
+    let fixture = Fixture::new(PromptEncoder::DeepseekV41);
+    for (effort, score) in [("minimal", 50), ("medium", 75)] {
+        for extra in [json!({"reasoning_effort":effort}),
+                      json!({"chat_template_kwargs":{"reasoning_effort":effort}})] {
+            assert_request_effort(&fixture, &fixture.prepare(extra).unwrap(), score);
+        }
+    }
+    // `none` without a thinking setting is chat mode, even over a thinking default; an explicit
+    // thinking setting wins and renders the default effort.
+    let thinking_default = Fixture::with_defaults(PromptEncoder::DeepseekV41, json!({"enable_thinking":true}));
+    for f in [&fixture, &thinking_default] {
+        let none = f.prepare(json!({"reasoning_effort":"none"})).unwrap();
+        assert!(!none.rendered_prompt.contains("Reasoning Effort:"));
+        assert!(none.rendered_prompt.ends_with("<｜Assistant｜></think>"));
+        assert_eq!(none.output.content.start, OutputStart::Content);
+        for extra in [json!({"enable_thinking":true,"reasoning_effort":"none"}),
+                      json!({"reasoning_effort":"none","chat_template_kwargs":{"thinking_mode":"thinking"}})] {
+            assert_request_effort(f, &f.prepare(extra).unwrap(), 75);
+        }
+    }
+    let v4 = Fixture::new(PromptEncoder::DeepseekV4);
+    for effort in ["none", "minimal", "medium"] {
+        assert!(v4.prepare(json!({"reasoning_effort":effort})).is_ok(), "{effort}");
+    }
+    assert!(fixture.prepare(json!({"reasoning_effort":"ultra"})).is_err());
+}
+
+#[test]
+fn history_arguments_that_are_not_objects_render_as_the_reference_does() {
+    assert_reference_prompts("f9_");
+    let history = |arguments: &str| json!({"messages":[
+        {"role":"user","content":"go"},
+        {"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":arguments}}]},
+        {"role":"tool","tool_call_id":"c1","content":"err"}],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]});
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let rendered = f.prepare(history("{city: Paris")).unwrap().rendered_prompt;
+        assert!(rendered.contains(r#"name="arguments" string="true">{city: Paris</"#), "{encoder:?}: {rendered}");
+    }
+    // Chat templates still require an object.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    for invalid in ["{city: Paris", "[1, 2]", "\"Paris\""] {
+        assert!(template.prepare(history(invalid)).is_err(), "{invalid}");
+    }
+    assert!(template.prepare(history("{\"city\":\"Paris\"}")).is_ok());
+}
+
+#[test]
+fn named_tool_choice_forces_the_call_in_chat_mode() {
+    assert_reference_prompts("f10_");
+    let tools = json!([
+        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+        {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
+    ]);
+    let named = json!({"type":"function","function":{"name":"lookup"}});
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let request = f.prepare(json!({"enable_thinking":false,"tools":tools,"tool_choice":named})).unwrap();
+        let required = f.prepare(json!({"enable_thinking":false,"tools":[tools[0]],"tool_choice":"required"})).unwrap();
+        assert_eq!(request.rendered_prompt, required.rendered_prompt, "{encoder:?}");
+        assert_eq!(request.output.content.start, OutputStart::ToolBody);
+        assert_eq!(request.output.content.tools.len(), 1);
+    }
+    // Chat templates keep receiving the filtered tools with an automatic choice.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    let request = template.prepare(json!({"tools":tools,"tool_choice":named})).unwrap();
+    assert!(request.rendered_prompt.trim_end().ends_with("auto"), "{}", request.rendered_prompt);
 }

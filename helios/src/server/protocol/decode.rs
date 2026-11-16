@@ -61,16 +61,16 @@ fn strings(v: Option<&Value>) -> Result<Vec<String>> {
         _ => Err("stops must be a string or an array of strings".into()),
     }
 }
+/// History arguments: a JSON object, or text that does not encode one, kept as a string. Each
+/// encoder decides what such text means (see `inference::object_arguments`).
 fn arguments(v: &Value) -> Result<Value> {
-    let value = if let Some(text) = v.as_str() {
-        serde_json::from_str(text).map_err(|e| format!("invalid tool arguments JSON: {e}"))?
-    } else {
-        v.clone()
-    };
-    if !value.is_object() {
-        return Err("tool arguments must be a JSON object".into());
+    match v.as_str() {
+        Some(text) => Ok(serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| v.clone())),
+        None => object_arguments(v),
     }
-    Ok(value)
 }
 fn qualified(name: &str, namespace: Option<&str>) -> String {
     namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}__{name}"))
@@ -342,11 +342,8 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
     } else {
         v
     };
-    if flag(definition, "strict", false)? {
-        return Err(unsupported(
-            "strict tool schemas require constrained tool generation",
-        ));
-    }
+    // Whether a frontend accepts strict schemas is decided at preparation.
+    let strict = flag(definition, "strict", false)?;
     let grammar = if custom && present(v, "format") && v["format"]["type"] != "text" {
         if v["format"]["type"] != "grammar"
             || !["lark", "regex"].contains(&field(&v["format"], "syntax")?)
@@ -390,6 +387,7 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
         parameters,
         custom,
         grammar,
+        strict,
     })
 }
 fn thinking_budget(value: &Value) -> Result<u32> {
@@ -1070,7 +1068,13 @@ mod native_prompt_tests {
                     _ => unreachable!(),
                 };
                 *malformed.pointer_mut(pointer).unwrap() = json!(invalid);
-                let error = decode(protocol, malformed, false).err().unwrap().to_string();
+                // Decoding keeps the text; chat templates still reject it at preparation.
+                let decoded = decode(protocol, malformed, false).unwrap();
+                let Input::Conversation(messages) = &decoded.request.input else { panic!() };
+                assert!(matches!(&messages[0].parts[0], Part::ToolCall { arguments, .. } if arguments == &json!(invalid)));
+                let error = crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                ).err().unwrap().to_string();
                 assert!(error.contains("invalid tool arguments JSON") || error.contains("tool arguments must be a JSON object"), "{error}");
             }
             let decoded = decode(protocol, body, false).unwrap();
@@ -1204,6 +1208,57 @@ mod native_prompt_tests {
                     .iter()
                     .all(|image| *end <= image.token_span.start || *end >= image.token_span.end)
             }));
+        }
+    }
+
+    #[test]
+    fn developer_instructions_stay_in_place_only_for_deepseek_v41() {
+        let turn = |input: Value| {
+            decode(Protocol::Responses, json!({"instructions":"System policy","input":input}), false)
+                .unwrap()
+                .request
+        };
+        let first = turn(json!([
+            {"role":"developer","content":"Repository rules"},
+            {"role":"user","content":"Do the task"}
+        ]));
+        let next = turn(json!([
+            {"role":"developer","content":"Repository rules"},
+            {"role":"user","content":"Do the task"},
+            {"role":"assistant","content":"Done"},
+            {"role":"developer","content":"Additional rules"},
+            {"role":"user","content":"Next"}
+        ]));
+        let merged = "System instructions:\nSystem policy\n\nDeveloper instructions:\nRepository rules\n\nDeveloper instructions:\nAdditional rules";
+        let glm = crate::template_fixtures::template("glm53", "chat_template");
+        for (encoder, template) in [
+            (PromptEncoder::DeepseekV41, None),
+            (PromptEncoder::DeepseekV4, None),
+            (PromptEncoder::Jinja, Some(glm.as_str())),
+        ] {
+            let (frontend, compiler, config) =
+                renderer(encoder, template, TemplateEncoding::Text);
+            let prepare = |request: &Request| {
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, request, 0, false,
+                )
+                .unwrap()
+            };
+            let (first, next) = (prepare(&first), prepare(&next));
+            if encoder == PromptEncoder::DeepseekV41 {
+                // Every instruction is its own system turn where it was sent, so the previous
+                // turn's prompt up to its last message is a prefix of the next one.
+                assert!(!next.rendered_prompt.contains("instructions:"), "{}", next.rendered_prompt);
+                assert!(next.rendered_prompt.contains("System policy<｜System｜>Repository rules<｜User｜>Do the task"));
+                assert!(next.rendered_prompt.contains("Done<｜end▁of▁sentence｜><｜System｜>Additional rules<｜User｜>Next"));
+                let last = *first.prompt.message_boundaries.last().unwrap();
+                assert_eq!(next.prompt.tokens[..last], first.prompt.tokens[..last]);
+            } else {
+                // Chat templates (GLM-5.3) and DeepSeek V4 keep one merged leading instruction.
+                assert!(next.rendered_prompt.contains(merged), "{encoder:?}: {}", next.rendered_prompt);
+                assert_eq!(next.rendered_prompt.matches("Additional rules").count(), 1);
+                assert!(next.rendered_prompt.find(merged) < next.rendered_prompt.find("Do the task"));
+            }
         }
     }
 

@@ -75,6 +75,12 @@ pub enum Event {
     ToolEnd {
         index: usize,
     },
+    /// Ends a call whose arguments are not a JSON object with unique, nonempty keys. The text
+    /// passes through unchanged, as the DeepSeek reference returns malformed tool-argument
+    /// markup instead of failing the response.
+    ToolEndRaw {
+        index: usize,
+    },
 }
 
 /// An active protocol frame may end within a decoded span. Its composer owns

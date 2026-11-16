@@ -64,6 +64,50 @@ fn prepare_inner(
     })
 }
 
+/// Lowers a conversation for the frontend's prompt encoder: chat templates (GLM-5.3 and the
+/// other Jinja models) merge instructions behind a developer message, DeepSeek V4.1 keeps them in
+/// place, and DeepSeek V4 keeps the merge.
+pub(super) fn conversation_messages(
+    frontend: &Frontend,
+    messages: &[super::inference::Message],
+    tool_choice: super::inference::ToolChoice,
+    hints: &[(usize, usize)],
+) -> Result<Vec<Value>> {
+    use crate::frontend::PromptEncoder;
+    match frontend.prompt_encoder() {
+        PromptEncoder::Jinja => super::inference::template_messages(messages, tool_choice, hints),
+        encoder => super::inference::native_messages(
+            messages,
+            hints,
+            encoder == PromptEncoder::DeepseekV41,
+        ),
+    }
+}
+
+/// Normalizes the parameters of a strict tool as the DeepSeek reference does before rendering:
+/// every object lists all of its properties as required and forbids additional properties,
+/// keywords outside the reference's typed schema are dropped, and schemas it cannot normalize
+/// are rejected with its message (deepseek-recipe protocol/validation.rs
+/// `normalize_tool_parameters`, protocol/json_schema.rs). That normalizer is crate-private, so a
+/// one-tool request goes through the reference's public Chat conversion. Flare does not constrain
+/// tool generation; `strict` changes only the rendered schema.
+fn reference_strict_parameters(parameters: &Value) -> Result<Value> {
+    use deepseek_recipe::request::{ConversionOptions, ProtocolRequest};
+    let request: deepseek_recipe::openai::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": "DeepSeek-V4.1-Flash",
+            "messages": [{"role": "user", "content": ""}],
+            "thinking": {"type": "disabled"},
+            "tools": [{"type": "function",
+                "function": {"name": "tool", "parameters": parameters, "strict": true}}],
+        }))
+        .map_err(|error| format!("invalid strict tool parameters: {error}"))?;
+    let mut converted = request
+        .convert(ConversionOptions::default())
+        .map_err(|error| Error::from(error.to_string()))?;
+    Ok(converted.conversation.tools.remove(0).parameters)
+}
+
 pub(super) struct PreparedInference {
     pub prompt: Prompt,
     pub output: Option<crate::output::OutputConfig>,
@@ -137,13 +181,10 @@ pub(super) fn prepare_inference_cached(
     );
     let (mut normalized, raw) = match &request.input {
         Input::Conversation(messages) => (
-            super::inference::template_messages(
+            conversation_messages(
+                frontend,
                 messages,
-                if legacy_prompt {
-                    request.tool_choice.clone()
-                } else {
-                    ToolChoice::Auto
-                },
+                request.tool_choice.clone(),
                 &request.checkpoint_hints,
             )?,
             None,
@@ -176,6 +217,11 @@ pub(super) fn prepare_inference_cached(
         ToolChoice::Auto => None,
         ToolChoice::None => Some("none"),
         ToolChoice::Required => Some("required"),
+        // The DeepSeek reference makes a named choice a required call of the one kept tool
+        // (deepseek-recipe protocol/client_tools.rs convert_client_tools). The encoder then
+        // forces the call in chat mode; in thinking mode, as for "required", the prompt stays
+        // automatic and completion checks the call.
+        ToolChoice::Named(_) if !legacy_prompt => Some("required"),
         ToolChoice::Named(_) => Some("auto"),
     };
     if let Some(choice) = tool_choice {
@@ -208,8 +254,17 @@ pub(super) fn prepare_inference_cached(
             let description = if let Some(grammar) = &tool.grammar {
                 format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
             } else { tool.description.clone() };
-            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
-        }).collect()));
+            let parameters = match (tool.strict, legacy_prompt) {
+                (false, _) => tool.parameters.clone(),
+                (true, false) => reference_strict_parameters(&tool.parameters)?,
+                (true, true) => {
+                    return Err(super::inference::unsupported(
+                        "strict tool schemas require constrained tool generation",
+                    ));
+                }
+            };
+            Ok(serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":parameters}}))
+        }).collect::<Result<Vec<_>>>()?));
     }
     if !options.contains_key("add_generation_prompt")
         && requests_continuation(options.get("continue_final_message"))

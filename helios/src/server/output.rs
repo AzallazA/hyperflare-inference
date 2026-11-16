@@ -104,6 +104,13 @@ impl Accumulator {
                         );
                     }
                 }
+                Event::ToolEndRaw { index } => {
+                    self.calls
+                        .get_mut(index)
+                        .filter(|call| !call.ended)
+                        .ok_or("tool end requires an open call")?
+                        .ended = true;
+                }
                 Event::ToolEnd { index } => {
                     let call = self
                         .calls
@@ -1359,7 +1366,7 @@ impl ResponseOutput {
                 arguments.push_str(&text);
                 changes.push(Change::Delta(i, text));
             }
-            Event::ToolEnd { index } => {
+            Event::ToolEnd { index } | Event::ToolEndRaw { index } => {
                 let i = *self
                     .calls
                     .get(index)
@@ -1373,10 +1380,12 @@ impl ResponseOutput {
                 if *ended {
                     return Err("tool already ended".into());
                 }
-                let value: Value = serde_json::from_str(arguments)
-                    .map_err(|e| format!("invalid tool arguments: {e}"))?;
-                if !value.is_object() {
-                    return Err("tool arguments must encode a JSON object".into());
+                if matches!(event, Event::ToolEnd { .. }) {
+                    let value: Value = serde_json::from_str(arguments)
+                        .map_err(|e| format!("invalid tool arguments: {e}"))?;
+                    if !value.is_object() {
+                        return Err("tool arguments must encode a JSON object".into());
+                    }
                 }
                 *ended = true;
                 self.close(&mut changes)?;
