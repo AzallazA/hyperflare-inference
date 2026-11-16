@@ -915,3 +915,25 @@ fn history_arguments_that_are_not_objects_render_as_the_reference_does() {
     }
     assert!(template.prepare(history("{\"city\":\"Paris\"}")).is_ok());
 }
+
+#[test]
+fn named_tool_choice_forces_the_call_in_chat_mode() {
+    assert_reference_prompts("f10_");
+    let tools = json!([
+        {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+        {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
+    ]);
+    let named = json!({"type":"function","function":{"name":"lookup"}});
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let request = f.prepare(json!({"enable_thinking":false,"tools":tools,"tool_choice":named})).unwrap();
+        let required = f.prepare(json!({"enable_thinking":false,"tools":[tools[0]],"tool_choice":"required"})).unwrap();
+        assert_eq!(request.rendered_prompt, required.rendered_prompt, "{encoder:?}");
+        assert_eq!(request.output.content.start, OutputStart::ToolBody);
+        assert_eq!(request.output.content.tools.len(), 1);
+    }
+    // Chat templates keep receiving the filtered tools with an automatic choice.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    let request = template.prepare(json!({"tools":tools,"tool_choice":named})).unwrap();
+    assert!(request.rendered_prompt.trim_end().ends_with("auto"), "{}", request.rendered_prompt);
+}
