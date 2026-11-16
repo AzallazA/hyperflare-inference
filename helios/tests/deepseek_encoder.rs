@@ -435,14 +435,19 @@ fn canonical_tool_order_controls_image_sources_and_placeholder_ids() {
             .text,
         prompt.text
     );
-    for invalid in [json!("[]"), json!("not JSON"), json!([])] {
-        object_arguments[1]["tool_calls"][0]["function"]["arguments"] = invalid;
-        assert!(
-            frontend
-                .render_chat(&object_arguments, &Map::new())
-                .is_err()
-        );
+    // Text that is not a JSON object renders as one `arguments` string parameter, as in the
+    // official encoder; a JSON value that is not an object is still rejected.
+    for text in ["[]", "not JSON"] {
+        object_arguments[1]["tool_calls"][0]["function"]["arguments"] = json!(text);
+        let rendered = frontend.render_chat(&object_arguments, &Map::new()).unwrap().text;
+        assert!(rendered.contains(&format!("name=\"arguments\" string=\"true\">{text}<")), "{rendered}");
     }
+    object_arguments[1]["tool_calls"][0]["function"]["arguments"] = json!([]);
+    assert!(
+        frontend
+            .render_chat(&object_arguments, &Map::new())
+            .is_err()
+    );
     assert_eq!(
         prompt.image_sources,
         [

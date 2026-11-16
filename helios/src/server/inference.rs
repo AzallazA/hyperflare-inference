@@ -218,6 +218,19 @@ fn content(parts: &[Part]) -> Result<Value> {
     }
 }
 
+/// Requires history tool-call arguments to be a JSON object, or text that encodes one.
+pub fn object_arguments(v: &Value) -> Result<Value> {
+    let value = if let Some(text) = v.as_str() {
+        serde_json::from_str(text).map_err(|e| format!("invalid tool arguments JSON: {e}"))?
+    } else {
+        v.clone()
+    };
+    if !value.is_object() {
+        return Err("tool arguments must be a JSON object".into());
+    }
+    Ok(value)
+}
+
 /// Converts semantic parts to the message context consumed by prepared templates.
 ///
 /// Once a developer message is present, every system and developer message merges into one
@@ -228,7 +241,7 @@ pub fn template_messages(
     tool_choice: ToolChoice,
     hints: &[(usize, usize)],
 ) -> Result<Vec<Value>> {
-    lower_messages(messages, tool_choice, hints, true)
+    lower_messages(messages, tool_choice, hints, true, false)
 }
 
 /// Converts semantic parts to the message context of an official DeepSeek encoder.
@@ -239,12 +252,14 @@ pub fn template_messages(
 /// a mid-conversation instruction then leaves the earlier prompt prefix unchanged. Without it
 /// (DeepSeek V4, which has no mid-conversation system turn), instructions merge as for
 /// templates. Required tool choice is the encoder's own option, so no instruction is appended.
+/// History arguments that are not a JSON object stay text; the encoder renders them as one
+/// `arguments` string parameter, as the reference does.
 pub fn native_messages(
     messages: &[Message],
     hints: &[(usize, usize)],
     instructions_in_place: bool,
 ) -> Result<Vec<Value>> {
-    lower_messages(messages, ToolChoice::Auto, hints, !instructions_in_place)
+    lower_messages(messages, ToolChoice::Auto, hints, !instructions_in_place, true)
 }
 
 fn lower_messages(
@@ -252,6 +267,7 @@ fn lower_messages(
     tool_choice: ToolChoice,
     hints: &[(usize, usize)],
     merge_instructions: bool,
+    text_arguments: bool,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     let lower_instructions = merge_instructions
@@ -356,6 +372,11 @@ fn lower_messages(
                     if current.get("tool_calls").is_none() {
                         current["tool_calls"] = json!([]);
                     }
+                    let arguments = if text_arguments {
+                        arguments.clone()
+                    } else {
+                        object_arguments(arguments)?
+                    };
                     let mut call =
                         json!({"type":"function","function":{"name":name,"arguments":arguments}});
                     if let Some(source) = arguments_source {

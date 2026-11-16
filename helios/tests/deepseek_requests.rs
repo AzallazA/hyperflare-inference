@@ -894,3 +894,24 @@ fn reasoning_effort_spellings_follow_the_reference() {
     }
     assert!(fixture.prepare(json!({"reasoning_effort":"ultra"})).is_err());
 }
+
+#[test]
+fn history_arguments_that_are_not_objects_render_as_the_reference_does() {
+    assert_reference_prompts("f9_");
+    let history = |arguments: &str| json!({"messages":[
+        {"role":"user","content":"go"},
+        {"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":arguments}}]},
+        {"role":"tool","tool_call_id":"c1","content":"err"}],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]});
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let rendered = f.prepare(history("{city: Paris")).unwrap().rendered_prompt;
+        assert!(rendered.contains(r#"name="arguments" string="true">{city: Paris</"#), "{encoder:?}: {rendered}");
+    }
+    // Chat templates still require an object.
+    let template = Fixture::new(PromptEncoder::Jinja);
+    for invalid in ["{city: Paris", "[1, 2]", "\"Paris\""] {
+        assert!(template.prepare(history(invalid)).is_err(), "{invalid}");
+    }
+    assert!(template.prepare(history("{\"city\":\"Paris\"}")).is_ok());
+}

@@ -77,10 +77,15 @@ fn content(value: &Json, hints: &[Json]) -> Result<(Prompt, Vec<ImageSource>)> {
     Ok((prompt, images))
 }
 
+/// Text that does not encode a JSON object passes through unchanged; the official encoder renders
+/// it as one `arguments` string parameter (deepseek-recipe-encoding v4/mod.rs
+/// `parse_tool_call_arguments`).
 fn tool_arguments(value: &Json) -> Result<String> {
     let parsed = if let Some(text) = value.as_str() {
-        serde_json::from_str::<Json>(text)
-            .map_err(|_| invalid("tool arguments must contain a JSON object"))?
+        match serde_json::from_str::<Json>(text) {
+            Ok(parsed) if parsed.is_object() => parsed,
+            _ => return Ok(text.to_owned()),
+        }
     } else {
         value.clone()
     };
