@@ -2,6 +2,11 @@
   <img src="docs/images/hyperflare.png" alt="Flare — ASCII wordmark above a supermassive solar flare" width="912">
 </p>
 
+> **Personal fork.** The binary, CLI and cache paths of Hyperflare (formerly Flare) are still called `flare`. This fork
+> adds DeepSeek-V4.1-Flash at TP3 (3 x RTX PRO 6000) and GLM-5.3-Flash at TP3/TP2: [docs/TP3-GUIDELINES.md](docs/TP3-GUIDELINES.md),
+> [docs/tp3/](docs/tp3/). Release folders with export and serve scripts:
+> https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes
+
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
 Hyperflare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
