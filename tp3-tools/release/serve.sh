@@ -4,7 +4,11 @@
 #   FLARE         path to this fork's flare binary   (default: flare-cli/target/release/flare in the fork checkout)
 #   PACKAGE       model name (= the checkpoint directory name the package was exported from) or a package path
 #                 (default ds41-1017-engram-fp8 = the view name in EXPORT.md; Hyperflare picks its default version)
-#   ENGRAM_RAM=0  read both Engram tables from disk instead (not measured with the FP8 tables, see README)
+#   ENGRAM_RAM    1 (default) = both Engram tables in host RAM
+#                 layer1 = layer 1's table in RAM, layer 14's read from disk through a row cache of ENGRAM_CACHE (default
+#                 32GiB): ~60 GiB less committed host RAM at the same prefix cache (177.8 vs 237.3 GiB at 32G), decode
+#                 level, 8-stream agent replay output -18% (README "Memory"); allows PREFIX_CACHE=32G
+#                 0 = both tables from disk (not measured with the FP8 tables)
 #   PREFIX_CACHE  host RAM for reusable prompt KV (default 12G; 32G does not fit beside the FP8 tables in 256 GB)
 #   BUDGET        max verification rows per step (default 32)
 #   DRAFTS        DSpark drafts (default 5); must equal the DRAFTS the package was exported with
@@ -24,7 +28,12 @@ set -euo pipefail
 FLARE=${FLARE:-flare-cli/target/release/flare}
 PACKAGE=${PACKAGE:-ds41-1017-engram-fp8}
 ENV=() STORAGE=() EXTRA=()
-if [ "${ENGRAM_RAM:-1}" = 1 ]; then ENV+=(FLARE_ENGRAM_RAM_TABLES=0); else STORAGE=(--embedding-table-storage disk); fi
+case ${ENGRAM_RAM:-1} in
+  1) ENV+=(FLARE_ENGRAM_RAM_TABLES=0) ;;
+  layer1) ENV+=(FLARE_ENGRAM_RAM_LAYERS=0); STORAGE=(--embedding-table-cache-size "${ENGRAM_CACHE:-32GiB}") ;;
+  0) STORAGE=(--embedding-table-storage disk) ;;
+  *) echo "ENGRAM_RAM must be 1, layer1 or 0" >&2; exit 2 ;;
+esac
 [ "${FAST:-1}" = 1 ] && ENV+=(FLARE_ENGRAM_PRIVATE_TABLES=1 FLARE_FAST_EXIT=1)
 SL=${STACK_LIMIT-256}; PM=${PREFILL_MERGE-512}; TO=${TTFT_ORDER-shortest}
 [ -n "$SL" ] && ENV+=(FLARE_CUDA_STACK_LIMIT=$SL)
