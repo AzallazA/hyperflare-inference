@@ -55,7 +55,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1"
     or not os.environ.get("FLARE_TEST_DS41_CHECKPOINT"), reason="requires an assigned GPU and a DS41 checkpoint")
 
 ROWS = (1, 6, 12, 21, 43)
-WORLD = 3  # the served geometry: TP3 rank 0, 24 query heads, BF16 MLA arithmetic (recipe.py mla_compute_mode)
+# the served geometry: TP3 rank 0, 24 query heads, BF16 MLA arithmetic (recipe.py mla_compute_mode);
+# FLARE_STREAMS_WORLD=2 runs the TP2 rank-0 geometry (32 query heads) of exp/ds41-exl3
+WORLD = int(os.environ.get("FLARE_STREAMS_WORLD", "3"))
 MLA = "bf16"
 START = 600  # positions 600..605 (engram/context): 5 pages of 128 tokens per request
 # index test: positions 500..505, so ratio-1 lengths are 501..506 and ratio-2 lengths 250..253, all <= the 512 top-k

@@ -38,6 +38,8 @@ class Tables:
     readiness_runtime: object = None
     # TP3 fork: packed MXFP4 E2M1 rows (128 bytes + 8 scale bytes per row) instead of FP8 E4M3 rows (256 + 8).
     packed_fp4: bool = False
+    # exp/ds41-exl3: diffbot int4 rows (128 nibble bytes + eight FP16 scales = 16 bytes per row).
+    int4: bool = False
     # TP3 fork: every rank keeps the whole tables (TP3Config.engram_tables); False = upstream #220's per-rank head
     # partitions. Each rank projects only its own heads' columns either way.
     shared: bool = False
@@ -65,6 +67,7 @@ class Tables:
             raise ValueError("Engram hash geometry differs from checkpoint tables")
         sources, inputs, mailboxes, row_mapping = {}, {}, {}, {}
         packed_fp4 = None
+        int4 = None
         timings = ReadinessTimings.allocate(frame, len(geometry.layer_ids))
         with phase(progress, "Prepare embedding tables") as stage:
             for index, layer in enumerate(geometry.layer_ids):
@@ -73,36 +76,39 @@ class Tables:
                 # FP8 E4M3 rows (stock checkpoint) or packed MXFP4 E2M1 rows (engram-nvidia checkpoint).
                 weight = manifest.tensors[f"layers.{layer}.engram.embed.weight"]
                 packed = weight.dtype == "U8" and weight.shape == (rows, 128)
+                # exp/ds41-exl3: int4 rows carry FP16 scales (diffbot int4_fp16s32); MXFP4 rows carry E8M0 bytes.
+                quarter = packed and manifest.tensors[f"layers.{layer}.engram.embed.scale"].dtype == "F16"
                 if packed_fp4 is None:
-                    packed_fp4 = packed
-                elif packed_fp4 != packed:
-                    raise ValueError("Engram tables mix FP8 and MXFP4 rows")
+                    packed_fp4, int4 = packed, quarter
+                elif packed_fp4 != packed or int4 != quarter:
+                    raise ValueError("Engram tables mix FP8 and MXFP4 rows (or MXFP4 and int4 rows)")
                 for suffix, columns, dtype in (("weight", 128 if packed else 256, "U8" if packed else "F8_E4M3"),
-                                               ("scale", 8, "F8_E8M0")):
+                                               ("scale", 8, "F16" if quarter else "F8_E8M0")):
                     name = f"layers.{layer}.engram.embed.{suffix}"
                     metadata = manifest.tensors[name]
                     if metadata.shape != (rows, columns) or metadata.dtype != dtype:
                         raise ValueError(f"{name}: invalid Engram table geometry or dtype")
-                    pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * columns))
+                    width = columns * (2 if dtype == "F16" else 1)
+                    pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * width))
                 sources[layer] = tuple(pair)
                 # Shared tables keep canonical rows: no request remapping (the pre-#220 request path).
                 row_mapping[layer] = None if shared else torch.tensor(EmbeddingHeadPartition.for_rank(
                     geometry.offsets[index], rows, shard.rank, shard.world_size).row_mapping,
                     dtype=torch.int64, device=device)
                 inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index,
-                                                      packed_fp4=packed)
+                                                      packed_fp4=packed, **({"scale_bytes": 16} if quarter else {}))
                 mailboxes[layer] = host_allocator(f"engram_{layer}_requests", (tokens * 24 + 1,), torch.int64)
                 mailboxes[layer].host_view.zero_()
             stage.update(f"{sum(source.nbytes for pair in sources.values() for source in pair) / (1 << 30):.1f} GiB in checkpoint spans")
         columns = persistent_copy(torch.tensor([head * 256 + column for head in range(shard.rank, 24, shard.world_size)
                                 for column in range(256)], dtype=torch.int64, device=device))
         return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns,
-                   packed_fp4=bool(packed_fp4), shared=shared)
+                   packed_fp4=bool(packed_fp4), int4=bool(int4), shared=shared)
 
     @property
     def row_bytes(self):
         """Bytes of one stored row in the weight and scale planes."""
-        return (128 if self.packed_fp4 else 256), 8
+        return (128 if self.packed_fp4 else 256), (16 if self.int4 else 8)
 
     @cached_property
     def device_token_map(self):
@@ -155,7 +161,7 @@ class Tables:
         for ordinal, layer in enumerate(self.geometry.layer_ids):
             table = dict(layer=layer, rows=self.geometry.num_embeddings[ordinal],
                 embedding_width=256, scale_block=32,
-                encoding="MXFP4_E2M1_E8M0" if self.packed_fp4 else "FP8_E4M3_E8M0",
+                encoding=("INT4_FP16_BLOCK32" if self.int4 else "MXFP4_E2M1_E8M0") if self.packed_fp4 else "FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
                 request_buffer=f"engram_{layer}_requests")
@@ -282,7 +288,11 @@ class PreparedEngram:
                 (projected, (chunk, 25600), torch.bfloat16)):
             if tensor.shape != shape or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous():
                 raise ValueError("Engram scratch must match the contiguous lookup and projection geometry")
-        self.lookup = PreparedEngramLookup(tables.inputs[layer], gathered, metadata.live_counts[:1],
+        if getattr(tables, "int4", False):
+            from .exl3.engram_lookup import PreparedEngramLookupInt4 as lookup_class  # exp/ds41-exl3 int4 rows
+        else:
+            lookup_class = PreparedEngramLookup
+        self.lookup = lookup_class(tables.inputs[layer], gathered, metadata.live_counts[:1],
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
             session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
         # One projection and one reduction per distinct chunk height. A shorter tail chunk gets its own pair and its

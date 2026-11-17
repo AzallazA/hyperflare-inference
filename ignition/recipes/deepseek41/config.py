@@ -80,7 +80,19 @@ class ModelConfig:
                 continue  # TP3 test tooling: truncated real-weight views (make_mini.py) keep full-width layers
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
-        if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
+        if quant.get("quant_method") == "exl3":
+            # exp/ds41-exl3: diffbot's pack (EXL3 3-bit MUL1 routed experts, 3-bit MCG drafter experts, DeepSeek's
+            # FP8 everything else, int4 Engram rows). The non-routed tensors keep DeepSeek's FP8 contract.
+            base = quant.get("non_routed_quantization") or {}
+            layer_bits = quant.get("layer_bits") or {}
+            if (quant.get("bits") != 3 or quant.get("codebook") != "mul1" or quant.get("mtp_experts") != "exl3"
+                    or any(int(v) != 3 for v in layer_bits.values())
+                    or base.get("weight_block_size") != [32, 32] or base.get("scale_fmt") != "ue8m0"
+                    or base.get("activation_scheme") != "dynamic"
+                    or quant.get("engram_embed_format") not in (None, "int4_fp16s32")):
+                raise ValueError("DeepSeek V4.1 EXL3 requires 3-bit MUL1 experts, EXL3 drafter experts and block-32 "
+                                 "FP8 non-routed weights")
+        elif (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
                 or quant.get("scale_fmt") != "ue8m0" or quant.get("expert_dtype") != "fp4"
                 or quant.get("activation_scheme") != "dynamic"):
             raise ValueError("DeepSeek V4.1 requires block-32 FP8 weights and native MXFP4 experts")
@@ -121,6 +133,11 @@ class ModelConfig:
     @property
     def layers(self):
         return self.text["num_hidden_layers"]
+
+    @property
+    def exl3(self) -> bool:
+        """exp/ds41-exl3: routed (and drafter) experts are EXL3 trellis tensors (diffbot pack)."""
+        return self.quantization.get("quant_method") == "exl3"
 
     @property
     def draft(self):

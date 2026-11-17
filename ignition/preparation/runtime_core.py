@@ -189,6 +189,19 @@ class RecordedExportGraph:
         self.owners = ()
 
 
+
+def mixed_device_bytes(region) -> int:
+    """VRAM prefix a mixed region's package allocation declares: its mapped prefix, or a recipe's larger declared
+    prefix (``declared_device_bytes``, whole granules, within the extent)."""
+    declared = getattr(region, "declared_device_bytes", None)
+    if declared is None:
+        return region.device_bytes
+    declared = int(declared)
+    if not region.device_bytes <= declared <= region.extent or declared % region.granularity:
+        raise ValueError(f"mixed region {getattr(region, 'name', '?')}: declared VRAM prefix {declared} must be whole "
+                         f"granules between the mapped {region.device_bytes} and the extent {region.extent} bytes")
+    return declared
+
 def record_export_graph(graph, storage, *, owners=()):
     """Retain a captured template, its executable and external export resources.
 
@@ -322,8 +335,10 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         if not region.closed)
     # TP3 merged expert banks: one allocation per bank; Helios maps its first <device bytes> as VRAM
     # and the rest as pinned host-NUMA memory, so the bank stays one contiguous range.
+    # A recipe may declare a larger VRAM prefix than it mapped during the export (exp/ds41-exl3: hot rows promoted
+    # after tuning headroom; the content is the same virtual range either way).
     for index, region in enumerate(r for r in getattr(storage, "mixed_regions", ()) if not r.closed):
-        allocations.append(Allocation(f"mixed-{index}-{region.device_bytes}", region.address, region.extent,
+        allocations.append(Allocation(f"mixed-{index}-{mixed_device_bytes(region)}", region.address, region.extent,
             alignment=storage.granularity, preserve_address=True))
     allocations.extend(Allocation(region.name, region.address, region.extent, alignment=storage.granularity,
         initialize="zero", preserve_address=True, sizing=dict(capacity=region.group,

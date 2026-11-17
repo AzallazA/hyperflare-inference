@@ -246,7 +246,33 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         parked = not draft and layer in self._host_layers
         hot = hot_expert_ids(layer, count, self.tp3) if parked else None
         hot_map = hot_rows = None
-        if hot is None or len(hot) == count:
+        if getattr(self.config, "exl3", False):
+            # exp/ds41-exl3: stacked EXL3 banks, rank slices of the intermediate axis; parked layers keep their hot
+            # experts in the VRAM rows of mixed banks (hot first, like the MXFP4 merged bank).
+            from .exl3.experts import load_exl3_experts
+            order = list(range(count))
+            mixed = None
+            if parked:
+                storage = getattr(self._host_allocator, "__self__", None)
+                if storage is None or not hasattr(storage, "mixed_allocate"):
+                    raise ValueError("EXL3 parking needs CoreStorage.host_allocate as the host allocator")
+                from .exl3.experts import layer_hot_count
+                per_layer = layer_hot_count(layer, self.tp3.hot_experts)
+                if per_layer != self.tp3.hot_experts:          # FLARE_DS41_EXL3_HOT_LAYERS override for this layer
+                    from dataclasses import replace
+                    hot = hot_expert_ids(layer, count, replace(self.tp3, hot_experts=per_layer))
+                hot = [] if hot is None else list(hot)
+                hot_set = set(hot)
+                order = hot + [e for e in range(count) if e not in hot_set]
+                mixed = storage.mixed_allocate
+                slots = torch.empty((count,), dtype=torch.int32)
+                slots[order] = torch.arange(count, dtype=torch.int32)
+                hot_map = persistent_copy(slots.to(self.device))
+                hot_rows = len(hot)
+            experts = load_exl3_experts(self, [f"{ffn}.experts.{i}" for i in order], rank=shard.rank,
+                                        world=shard.world_size, hot_rows=hot_rows, mixed_allocate=mixed,
+                                        codebook="mcg" if draft else "mul1")
+        elif hot is None or len(hot) == count:
             experts = self.load_experts([f"{ffn}.experts.{i}" for i in range(count)], interval,
                                         host=parked and hot is None)
         else:

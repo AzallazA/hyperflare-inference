@@ -26,6 +26,8 @@ from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 from .host_embedding import HostRowGather
 from .probe import Probe
+from .routecapture import RouteCapture
+from .routecount import RouteCounter
 from .tp3_config import TP3Config
 
 
@@ -199,6 +201,10 @@ class PreparedLayer:
     # side stream (started before this layer's attention, joined before its tail); None = none (base).
     engram_side = None
     probe, probe_index, probe_mode = Probe(), None, None
+    route_counter, route_experts = RouteCounter(enabled=False), 0
+    # Debug-serve only (FLARE_DS41_EXL3_ROUTE_CAPTURE, routecapture.py): per-round routes + prefetch predictors.
+    # route_capture_next = (router weight, correction bias) of the next layer, set by PreparedDecoder; None = last.
+    route_capture, route_capture_own, route_capture_next, route_capture_score = RouteCapture(enabled=False), None, None, None
 
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
@@ -212,6 +218,16 @@ class PreparedLayer:
         self.probe = Probe(tp3.probe) if probe is None else probe
         self.probe_index, self.probe_mode = index, mode
         self.probe.allocate(s.residual.device)  # eager, outside traced forwards (no-op unless enabled)
+        self.route_capture = RouteCapture()
+        if self.route_capture.active(mode):
+            self.route_capture_own = (weights.experts.router, weights.experts.correction)
+            self.route_capture_score = text["scoring_func"]
+            self.route_capture.allocate(s.residual.device, mode, index, weights.experts.hot_map, weights.experts.hot_rows)
+        # Debug-serve only (FLARE_DS41_ROUTE_COUNTS, routecount.py): live-row route counts per layer; off = untraced.
+        self.route_counter = RouteCounter()
+        self.route_experts = text["n_routed_experts"] if self.route_counter.enabled else 0
+        if mode in ("prefill", "decode", "verify"):
+            self.route_counter.allocate(s.residual.device, self.route_experts)
         self.no_engram = tp3.no_engram
         self.metadata = metadata
         self.image_mask = (torch.zeros(metadata.token_ids.shape, dtype=torch.bool, device=metadata.token_ids.device)
@@ -254,14 +270,30 @@ class PreparedLayer:
         # TP3 merged bank: router IDs map to the bank's hot-first slots inside the forward (``_run``); the
         # declaration example has the router IDs' shape and dtype.
         self.hot_map = getattr(weights.experts, "hot_map", None)
-        self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
+        from .exl3.experts import Exl3Experts, PreparedExl3Experts
+        exl3 = isinstance(weights.experts.experts, Exl3Experts)  # exp/ds41-exl3: diffbot EXL3 pack
+        expert_class = PreparedExl3Experts if exl3 else PreparedRoutedExperts
+        self.experts = expert_class(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
             s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
             router_plan=self.router.plan)
         self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
             s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
             swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
         self.concurrent_shared = None
-        if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
+        self.shared_joins_before_experts = False
+        # exp/ds41-exl3: no shared-expert overlap with the xmoe kernels (their grid barriers need every block resident).
+        # FLARE_DS41_EXL3_SHARED_SIDE=1: the shared expert overlaps the router projection + top-k only and joins before
+        # the xmoe call (ds41_exl3_moe_after orders it after the join).
+        from .exl3.experts import shared_side
+        if (exl3 and shared_side() and mode in ("decode", "verify", "draft")
+                and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap):
+            self.concurrent_shared = ConcurrentSharedExpert(self.shared,
+                parallel_plans=(self.router_projection.plan, self.router.plan),
+                session=session, workspace=workspace,
+                defer_launch=s.ffn_hc.normalized.shape[0] > 4)
+            self.shared_joins_before_experts = True
+        if (mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap
+                and not exl3):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
@@ -275,6 +307,8 @@ class PreparedLayer:
         # (TP3Config.brrr_layers). tp3.brrr_parked_max_rows = N: parked (host-expert) layers use it only in graphs of at
         # most N rows; wide verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300,
         # BRRR-26 level). Flare's tail operators above are still declared and tuned (as on tp3-main); _run skips them.
+        if tp3.brrr_layers and exl3:
+            raise ValueError("BRRR (TP3Config.brrr_layers) runs MXFP4 experts only; leave it off for EXL3 checkpoints")
         if tp3.brrr_layers:
             rows = metadata.positions.numel()
             # A layer counts as parked only if it has a merged bank with a host tail (hot_map). TP3Config refuses
@@ -373,15 +407,27 @@ class PreparedLayer:
         router_logits = self.router_projection(normalized)
         route = self.router(router_logits, image_mask=image_mask)
         probe.router(route.ids, route.weights, layer, mode)
+        if self.route_counter.enabled:
+            self.route_counter.record(route.ids, metadata.positions, layer, mode, self.route_experts)
+        if self.route_capture.enabled:
+            self.route_capture.record(route.ids, normalized, attention_normalized, layer, mode,
+                                      self.route_capture_own, self.route_capture_next, self.route_capture_score)
         probe.full(normalized, layer, "in", mode)
         ids = route.ids
         if self.hot_map is not None:
             ids = torch.index_select(self.hot_map, 0, ids.reshape(-1)).view(ids.shape)
-        routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
-                              selected_logits=route.selected_logits, image_mask=image_mask)
+        joins_early = getattr(self, "shared_joins_before_experts", False)
+        if joins_early:
+            shared = self.concurrent_shared.finish(pending, ids)
+            routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
+                                  selected_logits=route.selected_logits, image_mask=image_mask, after=shared)
+        else:
+            routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
+                                  selected_logits=route.selected_logits, image_mask=image_mask)
         probe.full(routed, layer, "out", mode)
-        shared = (self.shared(normalized) if self.concurrent_shared is None
-                  else self.concurrent_shared.finish(pending, routed))
+        if not joins_early:
+            shared = (self.shared(normalized) if self.concurrent_shared is None
+                      else self.concurrent_shared.finish(pending, routed))
         probe.record(routed, layer, 3, mode)
         probe.record(shared, layer, 4, mode)
         partial = routed + shared
@@ -511,6 +557,12 @@ class PreparedDecoder:
                 examples=examples, tp3=tp3, probe=self.probe))
             carry = defer
         configure_engram_side(self.layers, tp3.engram_side_layers, mode)
+        self.route_capture = RouteCapture()
+        if self.route_capture.active(mode):   # debug-serve only: each layer's predictor uses the next layer's router
+            self.route_capture.allocate(metadata.positions.device, mode)
+            for index, layer in enumerate(self.layers[:-1]):
+                following = weights.layers[index + 1].experts
+                layer.route_capture_next = (following.router, following.correction)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
             logits_dtype=torch.float32)
@@ -550,6 +602,8 @@ class PreparedDecoder:
         source_metadata = metadata
         self.probe.step(metadata.positions.device, self.mode)
         self.probe.positions(metadata.positions, self.mode)
+        if self.route_capture.enabled:
+            self.route_capture.step(metadata.positions, self.mode)
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
                   if self.vision is not None else metadata.token_ids)

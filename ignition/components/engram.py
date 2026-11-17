@@ -44,12 +44,13 @@ class EngramInputs:
     interval: int
 
     @classmethod
-    def allocate(cls, tokens, device, *, timings, interval=0, packed_fp4=False):
+    def allocate(cls, tokens, device, *, timings, interval=0, packed_fp4=False, scale_bytes=8):
         ready = torch.cuda.Event(external=True)
         ready.record(torch.cuda.current_stream(device))
-        # Staged rows: 256 FP8 bytes, or 128 bytes of packed MXFP4 pairs.
+        # Staged rows: 256 FP8 bytes, or 128 bytes of packed MXFP4 / int4 pairs; scales: 8 E8M0 bytes, or 16 bytes of
+        # eight FP16 scales (exp/ds41-exl3 int4 rows).
         return cls(torch.zeros((tokens * 24, 128 if packed_fp4 else 256), dtype=torch.uint8, device=device),
-                   torch.zeros((tokens * 24, 8), dtype=torch.uint8, device=device),
+                   torch.zeros((tokens * 24, scale_bytes), dtype=torch.uint8, device=device),
                    torch.full((tokens, 24), -1, dtype=torch.int64, device=device), ready, timings, interval)
 
     def buffers(self, layer):

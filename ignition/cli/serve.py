@@ -5,6 +5,7 @@
 """Prepare one checkpoint for native serving or runtime-core export."""
 
 import ipaddress
+import os
 import json
 import socket
 import sys
@@ -557,6 +558,10 @@ def _serve_prepared(prepared, bind, options):
                  for rank in prepared.memory_report.get("ranks", (prepared.memory_report,))]
         print(json.dumps({"memory": ranks}, default=str), file=sys.stderr, flush=True)
         limited = _diagnostic_options(prepared, options)
+        extra = os.environ.get("FLARE_DEBUG_SERVE_SERVER_JSON", "").strip()
+        if extra:   # exp/ds41-exl3-s1 debug-serve: native server settings `flare run` sets from its flags
+            limited = {**limited, **json.loads(extra)}
+            print(json.dumps({"server_overrides": json.loads(extra)}), file=sys.stderr, flush=True)
         print(json.dumps({"diagnostic_capacity": {key: limited[key] for key in ("pages", "snapshots")}}),
               file=sys.stderr, flush=True)
         server = prepared.start_server(bind=bind, options=limited)

@@ -149,3 +149,43 @@ def test_prepare_detects_mxfp4_rows_and_applies_the_layout_switch(monkeypatch, t
     with pytest.raises(ValueError, match="mix FP8 and MXFP4"):
         Tables.prepare(manifest, SimpleNamespace(text=text), tokens=4, device="cpu", sequence=None, frame=None,
                        host_allocator=host, shard=TensorParallelShard(1, 3), shared=shared)
+
+
+def test_prepare_detects_int4_rows(monkeypatch, tmp_path):
+    """exp/ds41-exl3: U8 [rows,128] weights with F16 [rows,8] scales are diffbot int4 rows: 16 scale bytes per row,
+    staged scale buffers of 16 bytes, encoding INT4_FP16_BLOCK32, int4 lookup class."""
+    geometry = engram.build_geometry(layer_ids=(1, 2), base_table_size=101, compressed_vocab_size=32)
+    text = dict(engram_compressed_vocab_size=32, engram_layer_ids=[1, 2], engram_vocab_size=101,
+                engram_num_embeddings=list(geometry.num_embeddings))
+    tensors = {}
+    for layer, rows in zip((1, 2), geometry.num_embeddings):
+        tensors[f"layers.{layer}.engram.embed.weight"] = SimpleNamespace(shape=(rows, 128), dtype="U8", shard="w",
+                                                                          offset=0)
+        tensors[f"layers.{layer}.engram.embed.scale"] = SimpleNamespace(shape=(rows, 8), dtype="F16", shard="s",
+                                                                         offset=0)
+    for name in ("w", "s"):
+        (tmp_path / name).write_bytes(bytes(sum(geometry.num_embeddings) * 256))
+    manifest = SimpleNamespace(metadata_path=tmp_path, snapshot=tmp_path, tensors=tensors)
+    import transformers
+
+    monkeypatch.setattr(transformers, "PreTrainedTokenizerFast", lambda tokenizer_file: None)
+    monkeypatch.setattr(recipe_engram.engram, "build_compressed_token_map", lambda tokenizer: (list(range(32)), 32))
+    monkeypatch.setattr(recipe_engram.engram, "build_geometry", lambda **kwargs: geometry)
+    monkeypatch.setattr(recipe_engram.ReadinessTimings, "allocate", lambda frame, count: None)
+    allocated = []
+    monkeypatch.setattr(recipe_engram.EngramInputs, "allocate",
+                        lambda tokens, device, *, timings, interval, packed_fp4=False, scale_bytes=8:
+                        allocated.append((packed_fp4, scale_bytes)) or _Inputs(packed_fp4))
+    host = lambda name, shape, dtype: SimpleNamespace(host_view=torch.zeros(shape, dtype=dtype))
+    tables = Tables.prepare(manifest, SimpleNamespace(text=text), tokens=4, device="cpu", sequence=None, frame=None,
+                            host_allocator=host, shard=TensorParallelShard(0, 2), shared=True)
+    assert tables.packed_fp4 and tables.int4 and tables.row_bytes == (128, 16)
+    assert allocated == [(True, 16), (True, 16)]
+    meta = tables.export_metadata() if hasattr(tables, "export_metadata") else None
+    if meta is not None:
+        assert "INT4_FP16_BLOCK32" in repr(meta)
+    tensors["layers.2.engram.embed.scale"] = SimpleNamespace(shape=(geometry.num_embeddings[1], 8), dtype="F8_E8M0",
+                                                              shard="s", offset=0)
+    with pytest.raises(ValueError, match="int4"):
+        Tables.prepare(manifest, SimpleNamespace(text=text), tokens=4, device="cpu", sequence=None, frame=None,
+                       host_allocator=host, shard=TensorParallelShard(0, 2), shared=True)

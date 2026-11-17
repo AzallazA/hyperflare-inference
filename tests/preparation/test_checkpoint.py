@@ -260,3 +260,27 @@ def test_inspection_accepts_semantically_identical_config(snapshot, tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config, sort_keys=True))
     manifest = inspect_qwen38_checkpoint(tmp_path)
     assert manifest.tensors["lm_head.weight"].shape == (248320, 2560)
+
+
+@pytest.mark.parametrize("dtype,shape", [("F16", [3]), ("I16", [2, 2, 3])])
+def test_half_width_dtypes_accepted_with_exact_ranges(tmp_path, dtype, shape):
+    """exp/ds41-exl3: EXL3 trellis (I16) and Hadamard scales (F16) read like any other dtype; ranges stay exact."""
+    path = tmp_path / "exl3.safetensors"
+    nbytes = 2
+    for d in shape:
+        nbytes *= d
+    _write_header(path, {"weight": {"dtype": dtype, "shape": shape, "data_offsets": [0, nbytes]}}, b"\0" * nbytes)
+    _, tensors = _read_header(path, path.name)
+    assert tensors["weight"].nbytes == nbytes and tensors["weight"].dtype == dtype
+    bad = tmp_path / "bad.safetensors"
+    _write_header(bad, {"weight": {"dtype": dtype, "shape": shape, "data_offsets": [0, nbytes + 2]}}, b"\0" * (nbytes + 2))
+    with pytest.raises(CheckpointError, match="weight"):
+        _read_header(bad, bad.name)
+
+
+@pytest.mark.parametrize("dtype", ["F64", "C64", "I4", "F8_E5M2"])
+def test_unlisted_dtypes_still_rejected(tmp_path, dtype):
+    path = tmp_path / "bad.safetensors"
+    _write_header(path, {"weight": {"dtype": dtype, "shape": [1], "data_offsets": [0, 4]}})
+    with pytest.raises(CheckpointError, match="invalid shape, dtype, or offsets"):
+        _read_header(path, path.name)

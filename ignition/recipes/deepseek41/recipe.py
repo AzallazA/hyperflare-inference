@@ -4,6 +4,7 @@
 
 """DeepSeek V4.1 Flash checkpoint and tensor-parallel memory geometry."""
 
+import os
 from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
@@ -64,6 +65,8 @@ def _parked_bytes(world: int, tp3: TP3Config | None = None) -> int:
         return 0
     local = -(-2304 // world)  # routed-expert intermediate width per rank
     per_expert = 2 * local * 5120 // 2 + 5120 * local // 2           # MXFP4 w13 + w2 bytes (scales stay on GPU)
+    if os.environ.get("FLARE_DS41_EXL3", "") not in ("", "0"):
+        per_expert = 3 * 5120 * local * 3 // 8                        # exp/ds41-exl3: three 3-bit trellis planes
     cold = 384 - min(tp3.hot_experts, 384)
     return len(tp3.host_expert_layers) * cold * per_expert
 
@@ -78,7 +81,7 @@ def _graph_bytes(world: int, tp3: TP3Config | None = None) -> int:
     declaration (every ignition command imports every recipe), so without a config it peeks at the one variable it
     needs and never validates the rest of the environment."""
     gib = TP3Config.graph_gib_from_environment() if tp3 is None else tp3.tp3_graph_gib
-    if world == 3 and gib is not None:
+    if world in (2, 3) and gib is not None:   # exp/ds41-exl3: the override applies at TP2 too
         return int(gib * (1 << 30))
     return 8 << 30
 
@@ -105,6 +108,8 @@ RECIPE = Recipe(
     host_offload_bytes=_parked_bytes,
     # TP3 on 96 GB SM120: the shared 8 GiB graph estimate leaves no room for 92.5 GiB of TP3 weights;
     # TP3Config.tp3_graph_gib (FLARE_DS41_TP3_GRAPH_GIB) overrides the TP3 graph estimate (see _graph_bytes).
-    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, _graph_bytes(world)) for world in (3, 4, 6)}),
-    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, _graph_bytes(world)) for world in (3, 4, 6)}),
+    # exp/ds41-exl3: world 2 for the EXL3 pack (fits two 96 GB GPUs with parked experts); the per-rank row and page
+    # costs are world-independent (replicated KV latent pages).
+    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, _graph_bytes(world)) for world in (2, 3, 4, 6)}),
+    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, _graph_bytes(world)) for world in (2, 3, 4, 6)}),
 )

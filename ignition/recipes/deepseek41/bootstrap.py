@@ -7,6 +7,7 @@
 import contextlib
 import hashlib
 import json
+import os
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -221,11 +222,11 @@ class PreparationConfig:
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (2, 3, 4, 6)
                 or len(set(placements)) != len(self.devices)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("DeepSeek V4.1 Flash preparation requires three, four, or six distinct GPUs")
+            raise ValueError("DeepSeek V4.1 Flash preparation requires two (EXL3 pack), three, four, or six distinct GPUs")
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -785,6 +786,22 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     release_unused()
+    # exp/ds41-exl3-s1 debug-serve only (FLARE_DS41_DEBUG_KV_PAGES=<pages>; the export script refuses it outside
+    # DEBUG_SERVE=1): preparation backs only ceil(prefill/128) + 2*slots pages (48 at 4096/8 = 6,144 tokens) and the
+    # diagnostic server is limited to that backing (cli/serve.py _diagnostic_options). `flare run` grows KV_PAGES
+    # natively at load; do the same here, after every capture: the page regions are views of the full virtual extent
+    # (maximum_pages), kernels bound page ids by memory_capacity[1] at run time, so captured graphs stay valid.
+    debug_pages = os.environ.get("FLARE_DS41_DEBUG_KV_PAGES", "").strip()
+    if debug_pages:
+        debug_pages = int(debug_pages)
+        if debug_pages > pages:
+            core_storage.grow("KV_PAGES", debug_pages)
+            pool.memory_capacity[1] = debug_pages
+            pages = debug_pages
+            torch.cuda.synchronize(device)
+            if progress is not None:
+                progress(f"debug-serve KV pages grown to {pages} ({pages * PAGE_TOKENS:,} tokens, "
+                         f"{pages * bytes_per_page >> 20} MiB per rank)")
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
