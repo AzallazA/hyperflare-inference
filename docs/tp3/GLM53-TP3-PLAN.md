@@ -226,9 +226,10 @@ steps/s >= 0.98x AND tok/s >= 0.96x). Quick checks: eval-43 43/43, tools-60 60/6
 corruptions, 0 server errors. Needs a binary with the `mtp_only` field (this branch since [unpublished]).
 
 **TTFT guard** (`--scheduler-policy interactive` = balanced + `--scheduler-ttft-target-ms 50`; Helios [unpublished], same
-code as DS41). Merged here (fast-forward to [unpublished]) but `serve-glm.sh` keeps `SCHED=balanced`: with the target at 0
+code as DS41). Merged here (fast-forward to [unpublished]) but the 11-11 local serve script kept `SCHED=balanced`: with the target at 0
 the guard path is inert (trace test: identical plan sequence), so no quality run is needed for the default.
-`SCHED=interactive ./serve-glm.sh` turns it on. Measured on 202611112036 (bench-results/ttft-ab-glm-1111-1615, decode
+`SCHED=interactive` turned it on. (Superseded: the release scripts `tp3-tools/release/glm/serve-glm-tp{3,2}.sh`
+default to `SCHEDULER=interactive` since 20261116.) Measured on 202611112036 (bench-results/ttft-ab-glm-1111-1615, decode
 "off" = glm-tp3-newbench-1111-1540, both 3 rounds, 32K 60 s):
 
 | | guard off (`balanced`) | guard on (`interactive`) |
@@ -258,6 +259,10 @@ the default: same-session alternating decode A/B (3x3) + the guard quality run (
 - **Serve:** `tp3-tools/release/glm/serve-glm-tp{3,2}.sh` (interactive, TTFT order shortest, stack limit 256). On the
   release binary (one boot each, PASS): TP3 14,929,920 KV, decode c1 / c8 / c32 290.3 / 878.8 / 1,827.6 tok/s; TP2
   3,113,472 KV, c1 / c8 245.4 / 750.2 (single 30 s passes).
+- **Branch (2026-11-17):** the GLM work is on `tp3-main` = public `main` (036cde24 at the time of writing), one line with
+  DS41 TP3 and DS41 EXL3 TP2; one binary built from `main` serves both GLM packages (checked 2026-11-17: TP3 14,929,920 KV,
+  TP2 3,113,472 KV, smoke ok). Old GLM side branches sit on the pre-clean-up history and need a cherry-pick onto `main`
+  before anything from them is published.
 - **Open:** tier "export" qualification of both packages (hotel-lights, KV stress, consistency, eval-43, tool-eval,
-  128K, retrieval); `FLARE_GLM53_AR_ROWS=1024` at TP3 (+~191K KV, needs a prefill A/B); prefill merge on GLM (agent A/B);
+  128K, retrieval), still not run as of 2026-11-17 (the owner is deciding on a minimal run); `FLARE_GLM53_AR_ROWS=1024` at TP3 (+~191K KV, needs a prefill A/B); prefill merge on GLM (agent A/B);
   BF16 pixel upload (~73.5 MiB per GPU).
