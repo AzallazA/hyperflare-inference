@@ -384,15 +384,19 @@ const DS41_REPLAY: Agents = Agents { engine: ds41_agent_engine, agents: 8, secon
     reasoning: false, shape: REPLAY };
 
 /// Flag off reproduces the rounds of the scheduler before the prefill merge existed (digests
-/// recorded on 498d0ab6 with this file's scenarios and the policy code unchanged).
+/// recorded on 498d0ab6 with this file's scenarios and the policy code unchanged). The DS41
+/// entries were re-recorded with the acceptance population (#306): new requests start from the
+/// acceptance of earlier ones instead of the fixed prior, which changes their first draft widths.
+/// Before it: replay and tools 477 rounds, digest 6826759491390006074; thinking 470 rounds,
+/// digest 4936267365442837913. GLM tools did not change.
 #[test]
 fn golden_agent_rounds_without_prefill_merge() {
     let short = |a: Agents| Agents { seconds: 20, ..a };
     for (name, a, tail, rounds, digest) in [
-        ("ds41 replay", short(DS41_REPLAY), PrefillTailMerge::On, 477, 6826759491390006074u64),
-        ("ds41 thinking", short(Agents { reasoning: true, ..DS41_REPLAY }), PrefillTailMerge::On, 470, 4936267365442837913),
-        ("ds41 tools", short(Agents { tools: true, reasoning: true, ..DS41_REPLAY }), PrefillTailMerge::ToolsOnly, 477,
-            6826759491390006074),
+        ("ds41 replay", short(DS41_REPLAY), PrefillTailMerge::On, 480, 4172790986037816443u64),
+        ("ds41 thinking", short(Agents { reasoning: true, ..DS41_REPLAY }), PrefillTailMerge::On, 471, 16995297670789752731),
+        ("ds41 tools", short(Agents { tools: true, reasoning: true, ..DS41_REPLAY }), PrefillTailMerge::ToolsOnly, 480,
+            4172790986037816443),
         ("glm tools", short(Agents { engine: glm_engine, agents: 16, tools: true, ..DS41_REPLAY }), PrefillTailMerge::ToolsOnly,
             173, 9133372263739486257),
     ] {
