@@ -198,6 +198,7 @@ class PreparationConfig:
                     vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
+        self.prefill_capacities
         drafting = self.dspark and self.draft_tokens > 0
         for name in ("packed_verification",):
             value = getattr(self, name)
@@ -252,7 +253,15 @@ class PreparationConfig:
 
     @property
     def prefill_capacities(self):
-        return prefill_capacities(self.prefill_chunk_size)
+        ladder = prefill_capacities(self.prefill_chunk_size)
+        kept = self.tp3.prefill_graphs
+        if kept is None:
+            return ladder
+        # TP3Config.prefill_graphs (FLARE_DS41_PREFILL_GRAPHS): a subset of the ladder that keeps 128 and the chunk
+        if not set(kept) <= set(ladder) or kept[-1] != self.prefill_chunk_size:
+            raise ValueError(f"FLARE_DS41_PREFILL_GRAPHS {','.join(map(str, kept))}: must be a subset of the prefill "
+                             f"ladder {','.join(map(str, ladder))} ending at the chunk {self.prefill_chunk_size}")
+        return kept
 
     @property
     def batch_capacities(self):

@@ -25,10 +25,46 @@
 #   EXL3_SPEED  extra exp/ds41-exl3-speed switches, each default off: FLARE_DS41_EXL3_HOT_LAYERS (per-layer hot counts),
 #          FLARE_DS41_EXL3_COLD_SIDE (cold launch on a side stream with k SMs), FLARE_DS41_EXL3_SHARED_SIDE (shared expert
 #          beside the router, joined before xmoe) are passed through from the environment as set
+#   FLARE_DS41_EXL3_WOA_SINGLE  1 = keep one WO-A layout (exp/ds41-exl3-final-woa; default off until GPU-confirmed,
+#          passed through from the environment, export-baked): at TP2 b12x also packs a tile-major WO-A copy
+#          (values_tiled, 16 MiB per attention layer = 688 MiB per GPU over 40 + 3 drafter layers) that the WO plan
+#          never reads (it declares no wo_a_tiled, so the decode WO-A GEMM reads `values` with or without it); on = the
+#          copy is not kept. --plan-only prints "WO tile-major copies kept N of 43" and fails if any remain when on.
+#   PREFILL SCRATCH (exp/ds41-exl3-final-scratch, default off, passed through as set; --plan-only prints the xmoe
+#          scratch per GPU against the defaults): FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS=<n> routes per decode-once pass
+#          (multiple of 128; unset = the chunk's 24,576 routes = 588 MiB at TP2), FLARE_DS41_EXL3_PREFILL_GROUPS=<g>
+#          prefill group-kernel groups (default 4 = 392 MiB of group views at chunk 4096; each group keeps the chunk's
+#          rows), FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 (needs MOE_PREFILL=do) runs a parked layer's cold prefill launch
+#          on a side stream beside the decode-once kernels (scratch = group views + one pass, side by side). Scratch per
+#          GPU: groups x 4096 x 25,088 B + pass routes x 25,088 B with the side stream, the max of the two without.
+#          E.g. G=2 + 8192 routes = 196 MiB (-392); G=2 + 4096 routes + side = 294 MiB (-294). The export's KV
+#          grows by the saving.
+#   MERGES exp/ds41-exl3-final-merges (ignition/recipes/deepseek41/exl3/merges.py), each default off until GPU-confirmed
+#          (GPU microtest: bit-exact against the paths they replace), passed through as set:
+#          FLARE_DS41_EXL3_MERGE_TOPK=1 (needs FUSED_PREP=1; graphs within FUSED_PREP_MAX_ROWS): hot_map lookup folded
+#            into the fused routing prep, which runs right after top-k, before the shared-expert join (the b12x top-k
+#            itself is not merged: off the critical path); FLARE_DS41_EXL3_MERGE_ROPEQ=1: inverse RoPE + WO-A input
+#            quantization in one Triton kernel (decode/verify attention, b12x WO GEMMs unchanged);
+#            FLARE_DS41_EXL3_MERGE_EPILOGUE=1 (needs SHARED_SIDE=1): the MoE op writes routed + shared (its acc->bf16
+#            copy and the graph's add in one kernel). All bit-exact vs the paths they replace; the merged CUDA kernels
+#            build as their own extension (ds41_exl3_merges_<digest>, no --use_fast_math), the xmoe extension is unchanged
 #   IMAGE_CONCURRENCY  --image-concurrency n image feature slots (unset = recipe default min(4, MAXC) = 4 x 40 MiB
 #          VisionState.arena per GPU; 1 = 40 MiB, -120 MiB per GPU). A second concurrent image request then waits in the
 #          scheduler (Capacity -> back to pending, text requests still admitted) until the first one's slot retires
+#   COLD WIDTH  FLARE_DS41_EXL3_COLD_WIDTH defaults to 16 here (exp/ds41-exl3-final-bulk; s1 cw2: one decode cold launch
+#          241 us at width 16 vs 292 us at the kernel default 8, k16 side stream); set FLARE_DS41_EXL3_COLD_WIDTH=0 for
+#          170303's value
+#   BULK   FLARE_DS41_EXL3_BULK_MIN_ROWS (xmoe_bulk hot loop for decode/verify graphs with >= N rows; 0/unset = off) is
+#          passed through from the environment as set
+#   PREFILL_GRAPHS  FLARE_DS41_PREFILL_GRAPHS: comma list of prefill graph capacities, a subset of the ladder
+#          128,256,512,...,PREFILL that keeps 128 and PREFILL (unset = the full ladder, as 170303)
 #   CONFIG optional Flare config (--config)
+# Serving these packages: FLARE_CUDA_STACK_LIMIT=128 (bytes per thread; 170303 used 256, the recorded default is 1024).
+#   Every EXL3 TP2 serve so far logs "largest kernel stack 120 B" for the registered kernels (m3..s1 logs, incl.
+#   package 170303); the xmoe_bulk kernel needs 0 B (cuobjdump: STACK 0). 170303's kernel modules also hold functions
+#   with 128-384 B stacks (xmoe n256 group kernels, torch radixSortKVInPlace variants) that no graph registers; Helios refuses a
+#   limit below the largest registered kernel at load ("CUDA stack limit ... is below rank N's largest kernel stack"),
+#   so a wrong value fails the boot instead of corrupting a run (fall back to 256). 256 -> 128 B: ~+41K KV tokens.
 # Format-independent switches of the TP3 default package 160815, on here: embed_rows (host-row embedding gather),
 # VRAM reclaim (shared Engram token map, trimmed vocabulary gather, no draft-vocabulary channel, shared vocabulary
 # columns), B12X_MHC_PDL=1, index + context side streams (SIDE_STREAMS), scratch preference 0.05 / 16 MiB.
@@ -50,6 +86,8 @@ cd "$ROOT"
 python3 -I -c "import json,sys; q=json.load(open(sys.argv[1]))['quantization_config']; sys.exit(q.get('quant_method') != 'exl3')" \
   "$CKPT/config.json" || { echo "$CKPT is not an EXL3 pack" >&2; exit 2; }
 for v in $(compgen -e | grep -E '^FLARE_DS41_BRRR' || true); do echo "refusing: $v is set (BRRR is MXFP4-only)" >&2; exit 2; done
+if [ "${FLARE_DS41_EXL3_PREFILL_COLD_SIDE:-0}" = 1 ] && [ "${MOE_PREFILL:-${FLARE_DS41_EXL3_PREFILL:-group}}" != do ]; then
+  echo "refusing: FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 needs MOE_PREFILL=do" >&2; exit 2; fi
 if [ "${DEBUG_SERVE:-0}" != 1 ]; then   # s1: FLARE_DS41_EXL3_ROUTE_CAPTURE (routecapture.py) and the debug-serve
   # server overrides (FLARE_DEBUG_SERVE_SERVER_JSON, merged into debug-serve's native server options) are debug-serve only too
   for v in FLARE_DS41_ROUTE_COUNTS FLARE_DS41_EXL3_ROUTE_CAPTURE FLARE_DEBUG_SERVE_SERVER_JSON FLARE_DS41_DEBUG_KV_PAGES; do
@@ -65,7 +103,9 @@ export PYTHONPATH="$ROOT${HELIOPAUSE_PATH:+:$HELIOPAUSE_PATH}" CUDA_HOME="${CUDA
        FLARE_DS41_VISION_HOST="${FLARE_DS41_VISION_HOST:-1}" \
        FLARE_DS41_VISION_STAGE="${FLARE_DS41_VISION_STAGE:-1}" \
        FLARE_DS41_ENGRAM_CHUNK_ROWS="${FLARE_DS41_ENGRAM_CHUNK_ROWS:-1024}" \
-       FLARE_DS41_SHARE_ENGRAM_RESIDUAL="${FLARE_DS41_SHARE_ENGRAM_RESIDUAL:-1}"
+       FLARE_DS41_SHARE_ENGRAM_RESIDUAL="${FLARE_DS41_SHARE_ENGRAM_RESIDUAL:-1}" \
+       FLARE_DS41_EXL3_COLD_WIDTH="${FLARE_DS41_EXL3_COLD_WIDTH:-16}"
+[ -n "${PREFILL_GRAPHS:-}" ] && export FLARE_DS41_PREFILL_GRAPHS="$PREFILL_GRAPHS"
 [ "${MINI:-0}" = 1 ] && export FLARE_DS41_MINI=1
 if [ "${SIDE_STREAMS:-1}" = 1 ]; then export FLARE_DS41_INDEX_SIDE_STREAM=1 FLARE_DS41_CONTEXT_SIDE_STREAM=1; fi
 export FLARE_TUNE_SCRATCH_TOLERANCE="${FLARE_TUNE_SCRATCH_TOLERANCE:-0.05}" \

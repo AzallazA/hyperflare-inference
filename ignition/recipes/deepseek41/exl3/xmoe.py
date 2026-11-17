@@ -41,7 +41,8 @@ def sources() -> list[Path]:
     return [KERNELS / "bindings.cpp", quant / "exl3_moe.cu", quant / "exl3_devctx.cu",
             *sorted((quant / "comp_units").glob("exl3_moe_inst_*.cu")), quant / "exl3_dense_flat.cu",
             quant / "exl3_do.cu",    # exp/ds41-exl3: decode-once prefill (diffbot xmoe_do, ported)
-            quant / "exl3_prep.cu"]  # exp/ds41-exl3-next: fused decode routing prep
+            quant / "exl3_prep.cu",   # exp/ds41-exl3-next: fused decode routing prep
+            quant / "exl3_moe_transfer.cu"]  # exp/ds41-exl3-final-bulk: diffbot xmoe_bulk hot loop (MIT)
 
 
 def digest_files() -> list[Path]:

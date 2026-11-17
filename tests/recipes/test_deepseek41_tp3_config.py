@@ -496,3 +496,25 @@ def test_brrr_check_switches_compares_the_tuning_values():
         check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17), config)
     with pytest.raises(RuntimeError, match="do not match"):
         check_switches(SimpleNamespace(SPIN_TRAP=0, SPIN_NS=50, TWO_SHOT_MIN=17, **{**LAYOUT_DEFAULTS, "KS_WOB": 24}), config)
+
+
+def test_prefill_graph_subset_switch():
+    """FLARE_DS41_PREFILL_GRAPHS (exp/ds41-exl3-final-bulk): unset = the full ladder and no record entry; set = that
+    subset of the ladder, which must keep 128 and the chunk."""
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    plain = TP3Config.from_environment({})
+    assert plain.prefill_graphs is None and "prefill_graphs" not in plain.to_metadata()
+    assert PreparationConfig(max_active=4, tp3=plain).prefill_capacities == (
+        128, 256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096)
+    kept = TP3Config.from_environment({"FLARE_DS41_PREFILL_GRAPHS": "128,256,512,1024,2048,3072,4096"})
+    assert kept.prefill_graphs == (128, 256, 512, 1024, 2048, 3072, 4096)
+    assert kept.to_metadata()["prefill_graphs"] == (128, 256, 512, 1024, 2048, 3072, 4096)
+    assert PreparationConfig(max_active=4, tp3=kept).prefill_capacities == (128, 256, 512, 1024, 2048, 3072, 4096)
+    for bad in ("256,4096", "128,128,4096", "4096,128", "128,100,4096", "x"):
+        with pytest.raises(ValueError, match="PREFILL_GRAPHS|prefill_graphs"):
+            TP3Config.from_environment({"FLARE_DS41_PREFILL_GRAPHS": bad})
+    for off_ladder in ("128,768,4096", "128,2048"):   # not on the ladder / does not end at the chunk
+        config = TP3Config.from_environment({"FLARE_DS41_PREFILL_GRAPHS": off_ladder})
+        with pytest.raises(ValueError, match="PREFILL_GRAPHS"):
+            PreparationConfig(max_active=4, tp3=config)

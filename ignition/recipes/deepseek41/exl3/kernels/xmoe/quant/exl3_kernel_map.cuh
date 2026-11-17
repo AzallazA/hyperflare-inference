@@ -79,7 +79,9 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
+#ifndef EXL3_GEMM_BASE_THREADS
 #define EXL3_GEMM_BASE_THREADS 256
+#endif
 
 // Instance arrays are indexed by shape and defined per (K, cb) so each codebook compiles as a separate
 // translation unit (see comp_units/exl3_comp_unit_K_cbX.cu)

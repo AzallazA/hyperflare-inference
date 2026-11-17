@@ -253,7 +253,37 @@ def summarize(weights, host, rank):
           f"local intermediate {exl3[0].local_intermediate if exl3 else '-'}, host regions {len(host)}")
     if len(exl3) != len(banks) or any(not isinstance(d, Exl3Experts) or d.codebook != "mcg" for d in draft):
         raise ValueError("not every routed/drafter expert bank is EXL3 with the expected codebook")
+    check_wo_layouts(weights, rank)
     check_declared_layout(weights, host, rank)
+
+
+def wo_tiled_copies(weights):
+    """(attention layers, [(name, bytes)] of b12x tile-major WO copies kept) over target + drafter layers."""
+    layers = [(f"layers.{i}", layer) for i, layer in enumerate(weights.layers)]
+    if weights.draft is not None:
+        layers += [(f"mtp.{i}", layer) for i, layer in enumerate(weights.draft.layers)]
+    kept = []
+    for name, layer in layers:
+        output = layer.attention["output"]
+        for matrix in ("wo_a", "wo_b"):
+            tiled = getattr(output, matrix).values_tiled
+            if tiled is not None:
+                kept.append((f"{name}.{matrix}", tiled.numel() * tiled.element_size()))
+    return len(layers), kept
+
+
+def check_wo_layouts(weights, rank):
+    """FLARE_DS41_EXL3_WOA_SINGLE: on = no tile-major WO copy is kept; off = b12x's copies as packed (TP2: WO-A of every
+    attention layer). The WO plan never declares wo_a_tiled/wo_b_tiled, so a kept copy is never read."""
+    from ignition.recipes.deepseek41.weights import woa_single
+
+    count, kept = wo_tiled_copies(weights)
+    nbytes = sum(n for _, n in kept)
+    single = woa_single()
+    print(f"  rank {rank}: WO tile-major copies kept {len(kept)} of {count} attention layers "
+          f"({nbytes / 2**20:.0f} MiB){'; FLARE_DS41_EXL3_WOA_SINGLE=1' if single else ''}")
+    if single and kept:
+        raise ValueError(f"FLARE_DS41_EXL3_WOA_SINGLE=1 but tile-major WO copies remain: {[n for n, _ in kept][:4]}")
 
 
 def check_declared_layout(weights, host, rank):
@@ -330,6 +360,22 @@ def check_engram(manifest, config, world):
         raise ValueError("Engram tables are not the expected int4 rows")
 
 
+def xmoe_scratch_line(chunk, world, decode_rows):
+    """exp/ds41-exl3-final-scratch: the shared xmoe scratch per GPU (core storage, persistent; the export's KV comes from
+    the VRAM left after it, so a smaller scratch shows up as KV) for the FLARE_DS41_EXL3_PREFILL* switches as set,
+    against the defaults; refuses the cold side stream outside the decode-once mode."""
+    from ignition.recipes.deepseek41.exl3 import xmoe
+    from ignition.recipes.deepseek41.exl3.experts import scratch_report
+
+    r = scratch_report(chunk, xmoe.INTERMEDIATE // world, decode_rows)
+    if os.environ.get("FLARE_DS41_EXL3_PREFILL_COLD_SIDE", "").strip() == "1" and r["mode"] != "do":
+        raise ValueError("FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 needs FLARE_DS41_EXL3_PREFILL=do (MOE_PREFILL=do)")
+    mib = lambda b: f"{b / 2**20:,.1f} MiB"   # noqa: E731
+    return (f"xmoe scratch per GPU: {mib(r['bytes'])} (defaults {mib(r['default_bytes'])}, saved {mib(r['saved_bytes'])}; "
+            f"prefill {r['mode']}, chunk {chunk}, groups {r['groups']}, decode-once pass {r['pass_routes']} routes, "
+            f"cold side stream {'on' if r['cold_side'] else 'off'})")
+
+
 RTX_PRO_6000 = 102_641_893_376   # NVML total bytes of one RTX PRO 6000 Blackwell (96 GB class)
 
 
@@ -380,6 +426,7 @@ def check_plan(export_argv):
           f"verification rows up to {config.request_capacity * max(widths)} (flat xmoe kernel <= 64: "
           f"{'yes' if config.request_capacity * max(widths) <= 64 else 'NO'})")
     print(f"  VRAM reclaim: {vram_reclaim_report(config, config.request_capacity * config.draft_tokens)}")
+    print(f"  {xmoe_scratch_line(plan.prefill_chunk, plan.world_size, config.request_capacity * max(widths))}")
     if config.request_capacity * max(widths) > 64:
         raise ValueError("verification rows exceed the flat xmoe kernel's 64 rows (decode would take the group path)")
     return plan

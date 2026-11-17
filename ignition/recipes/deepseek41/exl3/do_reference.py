@@ -40,10 +40,19 @@ def build_jobs(counts, hot_rows: int, capacity: int, *, job_rows: int = JOB_ROWS
     return row0, rows, exp, job
 
 
+def pass_counts(counts, start: int, stop: int) -> np.ndarray:
+    """Mirror of ``experts.pass_counts``: per-expert counts clipped to the sorted-route range [start, stop)."""
+    size = np.abs(np.asarray(counts, dtype=np.int64))
+    ends = np.cumsum(size)
+    return np.maximum(np.minimum(ends, stop) - np.maximum(ends - size, start), 0)
+
+
 def do_moe_reference(x, topk_ids, topk_weights, mats: dict, *, hot_rows: int, limit: float = 10.0,
-                     job_rows: int = JOB_ROWS) -> np.ndarray:
+                     job_rows: int = JOB_ROWS, pass_routes: int = 0) -> np.ndarray:
     """``out`` of the decode-once launch alone (hot experts only). ``mats[e] = {"w1"|"w3"|"w2": (w_hat, suh, svh)}``
-    with ``w_hat [in, out]`` the decoded (rotated-domain) weight, as ``reference.apply`` takes it."""
+    with ``w_hat [in, out]`` the decoded (rotated-domain) weight, as ``reference.apply`` takes it. ``pass_routes``:
+    FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS -- one launch per range of the sorted routes, each with its clipped counts,
+    its own job table and range-local row offsets (as ``experts`` passes slices of the sorted arrays)."""
     x = np.asarray(x, dtype=np.float64)
     rows_n, top_k = topk_ids.shape
     flat = np.asarray(topk_ids).reshape(-1)
@@ -55,21 +64,27 @@ def do_moe_reference(x, topk_ids, topk_weights, mats: dict, *, hot_rows: int, li
     sorted_ids = flat[order]
     row_exp = np.where(sorted_ids < hot_rows, sorted_ids, -1)
     capacity = -(-flat.size // job_rows) + experts
-    row0, nrows, exp, njobs = build_jobs(counts, hot_rows, capacity, job_rows=job_rows)
+    step = pass_routes if 0 < pass_routes < flat.size else max(flat.size, 1)
     out = np.zeros((rows_n, x.shape[1]))
     covered = np.zeros(flat.size, bool)
-    for j in range(njobs):
-        lo, hi, e = row0[j], row0[j] + nrows[j], exp[j]
-        if not np.all(row_exp[lo:hi] == e):
-            raise AssertionError(f"job {j} rows {lo}:{hi} are not all expert {e}")
-        covered[lo:hi] = True
-        xs = x[token_sorted[lo:hi]]
-        m = mats[int(e)]
-        gate = ref.apply(xs, *m["w1"])
-        up = ref.apply(xs, *m["w3"])
-        act = ref.swiglu(gate, up, limit, order="xmoe")
-        down = ref.apply(act, *m["w2"])
-        np.add.at(out, token_sorted[lo:hi], down * weight_sorted[lo:hi, None])
+    for start in range(0, flat.size, step):
+        stop = min(flat.size, start + step)
+        part = counts if (start, stop) == (0, flat.size) else pass_counts(counts, start, stop)
+        row0, nrows, exp, njobs = build_jobs(part, hot_rows, capacity, job_rows=job_rows)
+        for j in range(njobs):
+            lo, hi, e = start + row0[j], start + row0[j] + nrows[j], exp[j]
+            if not np.all(row_exp[lo:hi] == e):
+                raise AssertionError(f"job {j} rows {lo}:{hi} are not all expert {e}")
+            if covered[lo:hi].any():
+                raise AssertionError(f"job {j} rows {lo}:{hi} covered twice")
+            covered[lo:hi] = True
+            xs = x[token_sorted[lo:hi]]
+            m = mats[int(e)]
+            gate = ref.apply(xs, *m["w1"])
+            up = ref.apply(xs, *m["w3"])
+            act = ref.swiglu(gate, up, limit, order="xmoe")
+            down = ref.apply(act, *m["w2"])
+            np.add.at(out, token_sorted[lo:hi], down * weight_sorted[lo:hi, None])
     if not np.array_equal(covered, row_exp >= 0):
         raise AssertionError("the jobs do not cover exactly the hot rows")
     return out

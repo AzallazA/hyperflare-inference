@@ -292,6 +292,13 @@ class PreparedLayer:
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
             self.shared_joins_before_experts = True
+        # exp/ds41-exl3-final-merges (exl3/merges.py), each default off: MERGE_TOPK = the hot_map lookup folded into
+        # the fused prep, which runs as its own op before the shared join; MERGE_EPILOGUE = routed + shared folded
+        # into the MoE op's last copy (needs the early join; off while the probe records routed alone).
+        self.exl3_merge_prep = exl3 and getattr(self.experts, "merge_prep", False)
+        from .exl3 import merges
+        self.exl3_merge_epilogue = (exl3 and merges.MERGE_EPILOGUE and self.shared_joins_before_experts
+                                    and not self.probe.enabled)
         if (mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap
                 and not exl3):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
@@ -414,13 +421,22 @@ class PreparedLayer:
                                       self.route_capture_own, self.route_capture_next, self.route_capture_score)
         probe.full(normalized, layer, "in", mode)
         ids = route.ids
-        if self.hot_map is not None:
+        prepped = None
+        if getattr(self, "exl3_merge_prep", False):
+            prepped = self.experts.prep(normalized, ids, route.weights, self.hot_map)
+            order = prepped.token_sorted    # the join (and with it the xmoe launches) after the prep
+        elif self.hot_map is not None:
             ids = torch.index_select(self.hot_map, 0, ids.reshape(-1)).view(ids.shape)
         joins_early = getattr(self, "shared_joins_before_experts", False)
+        summed = getattr(self, "exl3_merge_epilogue", False)
         if joins_early:
-            shared = self.concurrent_shared.finish(pending, ids)
+            shared = self.concurrent_shared.finish(pending, ids if prepped is None else order)
+            extra = {} if prepped is None and not summed else {"prepped": prepped, "add_after": summed}
             routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
-                                  selected_logits=route.selected_logits, image_mask=image_mask, after=shared)
+                                  selected_logits=route.selected_logits, image_mask=image_mask, after=shared, **extra)
+        elif prepped is not None:
+            routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
+                                  selected_logits=route.selected_logits, image_mask=image_mask, prepped=prepped)
         else:
             routed = self.experts(normalized, ids, route.weights, router_logits=router_logits,
                                   selected_logits=route.selected_logits, image_mask=image_mask)
@@ -430,7 +446,7 @@ class PreparedLayer:
                       else self.concurrent_shared.finish(pending, routed))
         probe.record(routed, layer, 3, mode)
         probe.record(shared, layer, 4, mode)
-        partial = routed + shared
+        partial = routed if summed else routed + shared    # MERGE_EPILOGUE: routed already holds routed + shared
         probe.record(partial, layer, 5, mode)
         output = self.mlp_reduce(partial)
         probe.record(output, layer, 2, mode)

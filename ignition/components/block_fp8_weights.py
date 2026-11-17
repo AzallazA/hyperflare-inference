@@ -4,6 +4,8 @@
 
 """Lossless expansion of square-block UE8M0 scales into native MXFP8 rows."""
 
+from dataclasses import replace
+
 import torch
 
 from ignition.components.weights import DirectWeightLoader, _aligned_range
@@ -81,14 +83,20 @@ class BlockFP8WeightLoader(DirectWeightLoader):
                                              c0 // block:c0 // block + sc].view(torch.uint8))
         return values, scales
 
-    def load_attention_output(self, prefix, groups, *, pad=False):
+    def load_attention_output(self, prefix, groups, *, pad=False, tiled=True):
+        """Pack WO-A/WO-B. ``tiled=False`` drops b12x's extra tile-major copies (``values_tiled``): b12x packs one for
+        the production shapes ((4, 1024, 4096) WO-A, (1, 4096, 4096) WO-B, e.g. DS41 TP2 WO-A, 16 MiB per layer), but
+        a WO plan reads it only when its invocation declares ``wo_a_tiled`` / ``wo_b_tiled``; without that
+        declaration (PreparedGroupedOutputProjection declares none) every WO GEMM reads ``values`` and the copy is
+        retained but never read. The copy is then built in a transient allocation and dropped, so no persistent
+        storage holds it."""
         from b12x.gemm import wo_projection
 
         a, sa = self._dense_blocks(prefix + ".wo_a", rows=groups, pad=pad, temporary=False)
         b, sb = self._dense_blocks(prefix + ".wo_b", columns=groups, pad=pad, temporary=False)
         self._session.flush()
         c = self.config.text
-        return wo_projection.pack_weights(
+        packed = wo_projection.pack_weights(
             a,
             sa.view(torch.float8_e8m0fnu),
             b,
@@ -98,5 +106,20 @@ class BlockFP8WeightLoader(DirectWeightLoader):
             rank=c["o_lora_rank"],
             hidden=c["hidden_size"],
             block_size=(self.block_size, self.block_size),
-            allocate=persistent_empty,
+            allocate=persistent_empty if tiled else _untiled_allocate,
         )
+        if tiled:
+            return packed
+        return replace(packed, wo_a=replace(packed.wo_a, values_tiled=None),
+                       wo_b=replace(packed.wo_b, values_tiled=None))
+
+
+# b12x's tile-major WO copies ([L, N/tile, K/128, tile, 128], wo_mxfp8.pack_fp8_block_scaled_weight_mxfp8); every other
+# packing allocation (values, scale rows, MMA scales) keeps the persistent destination.
+WO_TILED_SHAPES = ((4, 16, 32, 64, 128), (1, 32, 32, 128, 128))
+
+
+def _untiled_allocate(shape, dtype, device, **kwargs):
+    if tuple(shape) in WO_TILED_SHAPES and dtype == torch.float8_e4m3fn:
+        return torch.empty(tuple(shape), dtype=dtype, device=device)   # transient: dropped right after packing
+    return persistent_empty(shape, dtype, device, **kwargs)

@@ -4,6 +4,7 @@
 
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
@@ -174,6 +175,18 @@ def hot_expert_ids(layer: int, experts: int, tp3: TP3Config) -> list | None:
     return sorted(order[:hot])
 
 
+# FLARE_DS41_EXL3_WOA_SINGLE=1 (exp/ds41-exl3-final-woa, default off): keep one WO-A layout. At TP2 the per-rank WO-A
+# is (4 groups, 1024, 4096), a shape for which b12x also packs a tile-major copy (values_tiled, 16 MiB per attention
+# layer incl. the drafter's); the WO plan (PreparedGroupedOutputProjection) never declares wo_a_tiled, so the decode
+# WO-A GEMM reads `values` either way and the copy is retained but unread. On = the copy is not kept (export-baked:
+# the packed storage is smaller, the graphs the same). TP3's padded 3-group WO-A never gets a copy (no-op there).
+def woa_single() -> bool:
+    value = os.environ.get("FLARE_DS41_EXL3_WOA_SINGLE", "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"FLARE_DS41_EXL3_WOA_SINGLE={value!r}: expected 0 or 1")
+    return value == "1"
+
+
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
                  expert_scale_compression=None, host_allocator=None, tp3=None):
@@ -221,7 +234,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         result = {
             "qkv_a": self.load_linear_group((attn + ".wq_a", attn + ".wkv")),
             "q_b": self.load_linear_group((attn + ".wq_b",), row_ranges=(heads,), pad=True),
-            "output": self.load_attention_output(attn, groups, pad=True),
+            "output": self.load_attention_output(attn, groups, pad=True, tiled=not woa_single()),
             "q_norm": self.load_tensor(attn + ".q_norm.weight"),
             "kv_norm": self.load_tensor(attn + ".kv_norm.weight"),
             "sink": self.load_padded_tensor(attn + ".attn_sink", rows=(first * 8, last * 8)),

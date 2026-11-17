@@ -39,7 +39,8 @@ VRAM_RECLAIM = {
 
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
-RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm")
+RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
+                     "prefill_graphs")
 
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
@@ -110,6 +111,17 @@ def format_layers(layers) -> str:
     return ",".join(parts)
 
 
+def parse_capacities(text: str) -> tuple[int, ...] | None:
+    """``"128,256,1024"`` -> (128, 256, 1024); "" -> None. Order and range are checked by the config."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return tuple(int(part) for part in text.split(","))
+    except ValueError:
+        raise ValueError(f"FLARE_DS41_PREFILL_GRAPHS={text!r}: expected comma-separated token capacities") from None
+
+
 @dataclass(frozen=True)
 class TP3Config:
     # --- expert placement (weights.py, recipe.py) ---
@@ -158,6 +170,12 @@ class TP3Config:
     tp3_graph_gib: float | None = None
     """Override of the per-rank captured-graph estimate for world size 3 (GiB); None = the 8 GiB default."""
     tp3_vocab_parallel: bool = False
+    prefill_graphs: tuple[int, ...] | None = None
+    """FLARE_DS41_PREFILL_GRAPHS="128,256,...": the prefill graph capacities to capture, a subset of the default ladder
+    (``capacity.prefill_capacities(chunk)``: 128, 256, then steps of 512 to the chunk) that keeps 128 and the chunk;
+    the server reads the catalog from the package's graphs, so a prompt chunk pads to the next kept size. Each dropped
+    size saves its graph's device memory (~10-14 MiB per GPU per prefill graph in the 170303 export's capture deltas;
+    the graph pool is sized by the largest graph and does not shrink). None = the full ladder (base). Export-time only."""
     """Admit vocabulary-parallel sampling at TP3 (b12x gathers enabled for world 3)."""
     # --- Engram tables (engram.py Tables) ---
     engram_tables: str = "auto"
@@ -345,6 +363,12 @@ class TP3Config:
         if self.engram_chunk_rows % 128:
             raise ValueError("TP3 config: engram_chunk_rows must be a multiple of 128 (row-slice alignment of the "
                              "chunked Engram operands and the graph capacity ladder)")
+        if self.prefill_graphs is not None and (
+                not isinstance(self.prefill_graphs, tuple) or not self.prefill_graphs
+                or any(type(c) is not int or c <= 0 or c % 64 for c in self.prefill_graphs)
+                or tuple(sorted(set(self.prefill_graphs))) != self.prefill_graphs or self.prefill_graphs[0] != 128):
+            raise ValueError("TP3 config: prefill_graphs must be distinct increasing multiples of 64 starting at 128 "
+                             f"(got {self.prefill_graphs!r})")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
             raise ValueError("TP3 config: tp3_graph_gib must be positive")
 
@@ -440,6 +464,7 @@ class TP3Config:
             mhc_pdl=cls.mhc_pdl_from_environment(env),
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
+            prefill_graphs=parse_capacities(get("PREFILL_GRAPHS")),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             packed_keep_batches=integer("PACKED_KEEP_BATCHES"),

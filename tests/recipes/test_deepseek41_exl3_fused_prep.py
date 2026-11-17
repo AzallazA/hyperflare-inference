@@ -38,8 +38,9 @@ class PrepExt:
     """FakeExt + xmoe_decode_prep implemented by the mirror (writes into the given outputs like the kernel)."""
 
     def __init__(self):
-        self.launches, self.preps = [], 0
+        self.launches, self.preps, self.bulk = [], 0, 0
 
+    def xmoe_set_flat_bulk(self, v): self.bulk = v
     def xmoe_set_force_group(self, v): self.force = v
     def xmoe_set_group_width(self, v): self.width = v
     def xmoe_set_sm_budget(self, v): self.budget = v
@@ -54,7 +55,7 @@ class PrepExt:
     def exl3_moe(self, hidden, out, counts, token_sorted, weight_sorted, sg, su, ig, iu, act, kg, ku, kd, *rest):
         self.launches.append(dict(hidden=hidden.clone(), counts=counts.clone(), tokens=token_sorted.clone(),
                                   weights=weight_sorted.clone(), force=self.force, width=self.width, budget=self.budget,
-                                  slot=self.slot, groups=sg.shape[0], acc=out.clone()))
+                                  slot=self.slot, groups=sg.shape[0], acc=out.clone(), bulk=self.bulk))
 
 
 def _routes(rows, experts, seed, top_k=6):

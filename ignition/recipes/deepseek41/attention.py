@@ -375,6 +375,7 @@ class PreparedAttention:
     # TP3 BRRR (decoder.PreparedLayer sets it for BRRR layers): the fused layer kernel applies inverse RoPE and the
     # o-projection itself, so _run returns the attention output as the kernel reads it.
     external_tail = False
+    inv_rope_output = None  # exl3/merges.py FLARE_DS41_EXL3_MERGE_ROPEQ (set in __init__ when on)
     index_side = None  # TP3 tp3.index_side_stream: IndexSideChain (decode/verify index layers); None = serial
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
@@ -455,6 +456,14 @@ class PreparedAttention:
             eps=self.eps, session=session, name=name + ".kv_norm") if self.norm_quant is None else None)
         self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
             weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
+        # exp/ds41-exl3-final-merges FLARE_DS41_EXL3_MERGE_ROPEQ (exl3/merges.py, default off): inverse RoPE and the
+        # WO-A input quantizer in one kernel (decode/verify); same projection plan, scratch and GEMMs.
+        self.inv_rope_output = None
+        from .exl3 import merges
+        if merges.MERGE_ROPEQ and mode in ("decode", "verify"):
+            self.inv_rope_output = merges.PreparedInvRopeOutput(self.output_projection,
+                rotary.frequencies[bool(self.ratio)], head_dim=scratch.attended.shape[-1], session=session,
+                warm_example=(scratch.attended, torch.zeros_like(metadata.positions)))
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
             self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
@@ -643,8 +652,11 @@ class PreparedAttention:
                                 window_values=window_values, qkv_encoded_bases=qkv_encoded_bases,
                                 query_encoded_bases=encoded_bases, selected=selected, attended=attended)
             return attended, (window_cache, records), (selected, candidates, candidate_counts), observations
-        self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
-        output = self.output_projection(attended.view(source.shape[0], -1, 4096))
+        if self.inv_rope_output is not None:
+            output = self.inv_rope_output(attended, position)
+        else:
+            self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
+            output = self.output_projection(attended.view(source.shape[0], -1, 4096))
         record = window_cache, records
         if self.mode == "prefill":
             self.commit(m.lengths, record, m)

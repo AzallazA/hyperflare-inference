@@ -14,8 +14,14 @@ Call: ``flare::ds41_exl3_moe`` writes the routed partial sum (BF16 ``[rows, 5120
 (the flat decode kernel up to 64 rows, the group kernel above). Parked layers take two: hot slots with cold counts
 negated, then cold slots on the group kernel (``xmoe_set_force_group``; the flat kernel reads host memory badly) with
 hot counts negated; both accumulate into one FP32 output. Rows per expert are bounded by the scratch: decode/verify
-graphs use every group at the graph's row count, prefill graphs use 4 wide groups at the chunk size, so no expert is
-ever dropped (the kernel skips experts above ``max_tokens_per_expert``).
+graphs use every group at the graph's row count, prefill graphs use PREFILL_GROUPS (default 4) wide groups at the chunk
+size, so no expert is ever dropped (the kernel skips experts above ``max_tokens_per_expert``).
+
+Prefill scratch (exp/ds41-exl3-final-scratch, both switches default off): FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS runs the
+decode-once pass over ranges of the expert-sorted routes (it accumulates into the FP32 output), so its scratch holds one
+range instead of the chunk's rows x top_k routes; FLARE_DS41_EXL3_PREFILL_GROUPS sets the prefill group count;
+FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 runs a parked layer's cold prefill launch on a side stream beside the decode-once
+kernels (disjoint scratch regions, one shared FP32 output, joined before the BF16 copy).
 """
 
 from __future__ import annotations
@@ -29,7 +35,6 @@ import torch
 from . import xmoe
 
 MATRICES = ("w1", "w3", "w2")
-PREFILL_GROUPS = 4
 PREFILL_GROUP_WIDTH = 32
 # Prefill MoE path (FLARE_DS41_EXL3_PREFILL): "group" = the fused group kernel (default), "do" = diffbot's decode-once
 # kernel (quant/exl3_do.cu) for the VRAM experts of graphs with >= DO_MIN_ROWS rows; cold (host) experts of parked layers
@@ -52,12 +57,91 @@ def do_job_capacity(routed_rows: int, experts: int) -> int:
     return -(-routed_rows // DO_JOB_ROWS) + experts
 
 
-def scratch_halfs(rows: int, local: int, groups: int, *, top_k: int = 6, decode_once: bool = False) -> int:
+# ---- prefill scratch and cold side stream (exp/ds41-exl3-final-scratch; read at import, baked into captured graphs) ----
+# FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS=<n>: routed rows (routes) per decode-once pass, a multiple of 128. The decode-once
+#   kernels take any contiguous range of the expert-sorted routes: the pass gets per-expert counts clipped to its range
+#   (``pass_counts``), so its job table, gathers and scatter-adds cover exactly those routes. Per route every value up to
+#   the FP32 scatter-add is computed by the same instructions as in one pass (a GEMM row does not depend on the other
+#   rows of its 128-row job); only the order of the FP32 atomics into the output changes (they are unordered within one
+#   pass too). 0/unset = the whole chunk in one pass (rows x top_k routes: 588 MiB at 4096 rows, TP2).
+# FLARE_DS41_EXL3_PREFILL_GROUPS=<g>: expert groups of prefill group-kernel launches (cold launches of parked layers in
+#   the decode-once mode; every prefill launch in the group mode). Default 4. Each group keeps the chunk's rows, so no
+#   expert is dropped and the cold kernel's read-once stage copy still fits; fewer groups = fewer SMs reading host
+#   experts at once (32 per group).
+# FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 (decode-once mode only): the cold group launch of a parked layer runs on a side
+#   stream (alternate lock buffer) while the decode-once kernels run on the main stream. The decode-once kernels have no
+#   grid barriers or locks, so the cold kernel's group barriers only wait for its own blocks, which become resident as
+#   decode-once blocks retire. Both add into the one FP32 accumulator with atomics (as the decode cold side stream does),
+#   so no second accumulator is needed; the scratch holds the group views and one decode-once range side by side.
+PREFILL_GROUPS_MAX = 4
+
+
+def prefill_groups() -> int:
+    value = os.environ.get("FLARE_DS41_EXL3_PREFILL_GROUPS", "").strip()
+    groups = int(value) if value else 4
+    if not 1 <= groups <= PREFILL_GROUPS_MAX:
+        raise ValueError(f"FLARE_DS41_EXL3_PREFILL_GROUPS={value!r}: expected 1..{PREFILL_GROUPS_MAX}")
+    return groups
+
+
+def prefill_pass_routes() -> int:
+    value = os.environ.get("FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS", "").strip()
+    routes = int(value) if value else 0
+    if routes < 0 or routes % DO_JOB_ROWS:
+        raise ValueError(f"FLARE_DS41_EXL3_PREFILL_SCRATCH_ROWS={value!r}: expected 0 or a multiple of {DO_JOB_ROWS}")
+    return routes
+
+
+def prefill_cold_side() -> bool:
+    value = os.environ.get("FLARE_DS41_EXL3_PREFILL_COLD_SIDE", "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"FLARE_DS41_EXL3_PREFILL_COLD_SIDE={value!r}: expected 0 or 1")
+    return value == "1"
+
+
+def do_passes(routed: int, pass_routes: int) -> list[tuple[int, int]]:
+    """[start, stop) ranges of the expert-sorted routes, one per decode-once pass (one range when pass_routes is 0)."""
+    step = pass_routes if 0 < pass_routes < routed else routed
+    return [(start, min(routed, start + step)) for start in range(0, routed, step)] if routed else [(0, 0)]
+
+
+def pass_counts(counts, start: int, stop: int):
+    """Per-expert route counts clipped to the sorted-route range [start, stop) (the experts' routes are contiguous in
+    the sorted order: expert e owns [sum(|c| below e), + |c_e|)); sums to stop - start. Fixed shapes, capture-safe."""
+    size = counts.abs()
+    ends = torch.cumsum(size, 0)
+    return (ends.clamp(max=stop) - (ends - size).clamp(min=start)).clamp(min=0)
+
+
+def scratch_halfs(rows: int, local: int, groups: int, *, top_k: int = 6, decode_once: bool = False,
+                  pass_routes: int = 0, cold_side: bool = False) -> int:
     """fp16 elements of the shared per-device scratch: the group kernel's [groups, rows, ...] views, or for the
-    decode-once path [rows * top_k, ...] (xg, xu over hidden; cg, cu over the local intermediate)."""
+    decode-once path [routes, ...] (xg, xu over hidden; cg, cu over the local intermediate) with routes = rows * top_k
+    or one pass's range. ``cold_side``: the cold group launch runs beside the decode-once pass, so both regions are
+    held side by side (group views first) instead of overlapping."""
     per_row = 2 * xmoe.HIDDEN + 2 * local
     need = groups * rows * per_row
-    return max(need, rows * top_k * per_row) if decode_once else need
+    if not decode_once:
+        return need
+    routed = rows * top_k
+    do = (min(routed, pass_routes) if pass_routes else routed) * per_row
+    return need + do if cold_side else max(need, do)
+
+
+def scratch_report(chunk: int, local: int, decode_rows: int, num_sms: int = 188, *, groups: int | None = None,
+                   pass_routes: int | None = None, cold_side: bool | None = None, mode: str | None = None) -> dict:
+    """Bytes of the shared xmoe scratch per device (the largest graph's need: the prefill chunk or decode rows), for
+    the configured switches and for the defaults, as the plan check prints it."""
+    groups = PREFILL_GROUPS if groups is None else groups
+    pass_routes = PREFILL_PASS_ROUTES if pass_routes is None else pass_routes
+    cold_side = PREFILL_COLD_SIDE if cold_side is None else cold_side
+    mode = PREFILL_MODE if mode is None else mode
+    decode = scratch_halfs(decode_rows, local, max(1, num_sms // xmoe.MOE_SMS_PER_EXPERT))
+    do = mode == "do" and chunk >= DO_MIN_ROWS
+    now = max(decode, scratch_halfs(chunk, local, groups, decode_once=do, pass_routes=pass_routes, cold_side=cold_side))
+    base = max(decode, scratch_halfs(chunk, local, 4, decode_once=do))
+    return {"bytes": 2 * now, "default_bytes": 2 * base, "saved_bytes": 2 * (base - now), "groups": groups,
+            "pass_routes": pass_routes or chunk * xmoe.TOP_K, "cold_side": bool(cold_side and do), "mode": mode}
 
 
 # Declared device rows (FLARE_DS41_EXL3_EXPORT_HOT=<n>, second TP2 export): a parked bank's mixed region is mapped with
@@ -170,6 +254,26 @@ def fused_prep_max_rows() -> int:
     if not 1 <= rows <= 64:
         raise ValueError(f"FLARE_DS41_EXL3_FUSED_PREP_MAX_ROWS={value!r}: expected 1..64")
     return rows
+
+
+# FLARE_DS41_EXL3_BULK_MIN_ROWS (exp/ds41-exl3-final-bulk): decode/verify graphs with >= this many rows run their hot
+# (flat) launch on diffbot's xmoe_bulk loop (quant/exl3_moe_transfer.cu: a producer warp bulk-copies weight tiles into
+# three stage buffers, 8 warps compute with the flat loop's arithmetic). s1 microbench seq296 (layer 20, HOT 320): rows 6
+# +4.5% / +0.6% (cold 0 / cold 2 + side 16), 14 +7.5% / +3.8%, 24 +9.8% / +15.0%. Not bit-identical: both kernels
+# atomicAdd the expert contributions into the FP32 accumulator, so the summation order (and the BF16 rounding of the
+# output) varies run to run for either kernel; outputs agree within 1 BF16 ulp per element (final/bulk_microtest.py). Default 0 = off (the regular flat kernel everywhere); 14 = the planned value
+# once GPU-confirmed in the serve path. K=3 MUL1 only, rows <= 64. Read at import (baked into captured graphs).
+def bulk_min_rows() -> int:
+    value = os.environ.get("FLARE_DS41_EXL3_BULK_MIN_ROWS", "").strip()
+    rows = int(value) if value.lstrip("-").isdigit() else (0 if not value else -1)
+    if not 0 <= rows <= 64:
+        raise ValueError(f"FLARE_DS41_EXL3_BULK_MIN_ROWS={value!r}: expected 0 (off) or 1..64")
+    return rows
+
+
+def use_bulk(rows: int) -> bool:
+    """The hot launch of a graph with ``rows`` rows takes the xmoe_bulk loop (decode/verify rows only)."""
+    return 0 < BULK_MIN_ROWS <= rows <= 64
 
 
 def torch_prep(ids, weights, hidden, num_experts: int, hot_rows: int):
@@ -334,9 +438,13 @@ def load_exl3_experts(loader, prefixes, *, rank, world, hot_rows=None, mixed_all
 # ---- the routed-expert call -------------------------------------------------------------------------------------
 
 PREFILL_MODE = prefill_mode()
+PREFILL_GROUPS = prefill_groups()
+PREFILL_PASS_ROUTES = prefill_pass_routes()
+PREFILL_COLD_SIDE = prefill_cold_side()
 COLD_WIDTH = cold_width()
 FUSED_PREP = fused_prep()
 FUSED_PREP_MAX_ROWS = fused_prep_max_rows()
+BULK_MIN_ROWS = bulk_min_rows()
 _BANKS: list = []
 _SIDE: dict = {}       # device index -> (side stream, hot SMs, cold SMs) when FLARE_DS41_EXL3_COLD_SIDE is set
 
@@ -351,6 +459,28 @@ def _ensure_side(device, experts, rows, groups):
         hot_sms, cold_sms = side_budgets(num_sms, k)
         _SIDE[device.index] = (torch.cuda.Stream(device=device), hot_sms, cold_sms)
     _scratch(device, rows, experts.local_intermediate, groups, side=True)
+
+
+_PREFILL_SIDE: dict = {}   # device index -> side stream of the cold prefill launch (FLARE_DS41_EXL3_PREFILL_COLD_SIDE)
+
+
+def _uses_prefill_side(experts, rows) -> bool:
+    return PREFILL_COLD_SIDE and experts.parked and _decode_once(rows)
+
+
+def _decode_once(rows) -> bool:
+    return rows > 64 and rows >= DO_MIN_ROWS and PREFILL_MODE == "do"
+
+
+def _ensure_prefill_side(device, experts, rows):
+    """Create the cold prefill side stream before capture (parked banks, decode-once prefill graphs)."""
+    if PREFILL_COLD_SIDE and PREFILL_MODE != "do":
+        raise ValueError("FLARE_DS41_EXL3_PREFILL_COLD_SIDE=1 needs FLARE_DS41_EXL3_PREFILL=do (two group kernels "
+                         "beside each other could hold each other's SMs in their group barriers)")
+    if _uses_prefill_side(experts, rows) and device.index not in _PREFILL_SIDE:
+        _PREFILL_SIDE[device.index] = torch.cuda.Stream(device=device)
+
+
 _SCRATCH: dict = {}
 _LOCKS: dict = {}
 
@@ -373,10 +503,12 @@ def _ensure_locks(device):
     _LOCKS[device.index] = buffers
 
 
-def _scratch(device, rows, local, groups, *, decode_once=False, side=False):
+def _scratch(device, rows, local, groups, *, decode_once=False, side=False, cold_side=False):
     """One shared scratch per device, grown to the largest need; graphs run one at a time per rank. ``side``: the cold
-    side stream's own scratch (decode rows only)."""
-    need = scratch_halfs(rows, local, groups, decode_once=decode_once)
+    side stream's own scratch (decode rows only). ``cold_side``: a prefill graph whose cold launch runs beside the
+    decode-once passes (group views and one decode-once range side by side)."""
+    need = scratch_halfs(rows, local, groups, decode_once=decode_once,
+                         pass_routes=PREFILL_PASS_ROUTES if decode_once else 0, cold_side=cold_side)
     key = (device.index, local, side)
     buffer = _SCRATCH.get(key)
     if buffer is None or buffer.numel() < need:
@@ -429,9 +561,10 @@ def _views(buffer, groups, rows, local):
 
 
 def _launch(ext, bank, hidden, out, counts, token_sorted, weight_sorted, views, limit, *, force_group, width,
-            sm_budget=0, lock_slot=0):
+            sm_budget=0, lock_slot=0, bulk=False):
     mul1 = bank.codebook == "mul1"
     p = bank.pointers
+    ext.xmoe_set_flat_bulk(int(bulk and not force_group))
     ext.xmoe_set_force_group(int(force_group))
     ext.xmoe_set_group_width(int(width))
     ext.xmoe_set_sm_budget(int(sm_budget))
@@ -444,6 +577,7 @@ def _launch(ext, bank, hidden, out, counts, token_sorted, weight_sorted, views, 
                      p["w2", "trellis"], p["w2", "suh"], p["w2", "svh"],
                      not mul1, mul1, not mul1, mul1, not mul1, mul1, float(limit), -1)
     finally:
+        ext.xmoe_set_flat_bulk(0)
         ext.xmoe_set_force_group(0)
         ext.xmoe_set_group_width(0)
         ext.xmoe_set_sm_budget(0)
@@ -453,12 +587,27 @@ def _launch(ext, bank, hidden, out, counts, token_sorted, weight_sorted, views, 
 @torch.library.custom_op("flare::ds41_exl3_moe", mutates_args=("out",))
 def ds41_exl3_moe(handle: int, hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
                   out: torch.Tensor, limit: float) -> None:
+    _moe(handle, hidden, ids, weights, out, limit)
+
+
+def _finish(acc, out, add):
+    """The op's last step: ``out.copy_(acc)``, or with FLARE_DS41_EXL3_MERGE_EPILOGUE (``add`` = the shared expert's
+    output) out = bf16(acc) + add in one kernel (merges.py)."""
+    if add is None:
+        out.copy_(acc)
+    else:
+        from . import merges
+
+        merges.extension().xmoe_epilogue_add(acc, add.contiguous(), out)
+
+
+def _moe(handle, hidden, ids, weights, out, limit, add=None):
     bank, groups = _BANKS[handle]
     ext = xmoe.extension()
     rows, top_k = ids.shape
     prefill = rows > 64
     if FUSED_PREP and not prefill and rows <= FUSED_PREP_MAX_ROWS:
-        _fused_moe(ext, bank, groups, hidden, ids, weights, out, limit)
+        _fused_moe(ext, bank, groups, hidden, ids, weights, out, limit, add=add)
         return
     flat = ids.reshape(-1).to(torch.int64)
     order = torch.argsort(flat, stable=True)
@@ -466,31 +615,50 @@ def ds41_exl3_moe(handle: int, hidden: torch.Tensor, ids: torch.Tensor, weights:
     weight_sorted = weights.reshape(-1).index_select(0, order).to(torch.float16)
     counts = torch.zeros(bank.num_experts + 1, dtype=torch.int64, device=hidden.device)
     counts.scatter_add_(0, flat, torch.ones_like(flat))
-    decode_once = prefill and rows >= DO_MIN_ROWS and PREFILL_MODE == "do"
+    decode_once = _decode_once(rows)
     g = PREFILL_GROUPS if prefill else groups
-    buffer = _scratch(hidden.device, rows, bank.local_intermediate, g, decode_once=decode_once)
+    cold_side = _uses_prefill_side(bank, rows)
+    buffer = _scratch(hidden.device, rows, bank.local_intermediate, g, decode_once=decode_once, cold_side=cold_side)
     views = _views(buffer, g, rows, bank.local_intermediate)
     width = PREFILL_GROUP_WIDTH if prefill else 0
     cold_w = width if prefill else COLD_WIDTH
+    bulk = not prefill and use_bulk(rows)
     acc = torch.zeros((rows, xmoe.HIDDEN), dtype=torch.float32, device=hidden.device)
     x = hidden.to(torch.float16).contiguous()
     if decode_once:
         sorted_ids = flat.index_select(0, order)
         row_exp = torch.where(sorted_ids < bank.hot_rows, sorted_ids, torch.full_like(sorted_ids, -1)).to(torch.int32)
-        _launch_do(ext, bank, x, acc, counts, token_sorted, weight_sorted, row_exp, buffer, limit)
+        side = None
         if bank.parked:
             slots = torch.arange(bank.num_experts + 1, device=hidden.device)
             cold = torch.where(slots < bank.hot_rows, -counts, counts)
+            if cold_side:
+                side, main = _PREFILL_SIDE[hidden.device.index], torch.cuda.current_stream(hidden.device)
+                side.wait_stream(main)              # x, acc (zeroed), cold counts, sorted routes ready
+                with torch.cuda.stream(side):
+                    _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, views, limit, force_group=True,
+                            width=width, lock_slot=1)
+        do_buffer = buffer[g * rows * (2 * xmoe.HIDDEN + 2 * bank.local_intermediate):] if cold_side else buffer
+        routed = token_sorted.shape[0]
+        for start, stop in do_passes(routed, PREFILL_PASS_ROUTES):
+            part = counts if (start, stop) == (0, routed) else pass_counts(counts, start, stop)
+            _launch_do(ext, bank, x, acc, part, token_sorted[start:stop], weight_sorted[start:stop],
+                       row_exp[start:stop], do_buffer, limit)
+        if side is not None:
+            main.wait_stream(side)                  # joined before the BF16 copy and before x/acc/cold are reused
+        elif bank.parked:
             _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, views, limit, force_group=True, width=width)
     elif not bank.parked:
-        _launch(ext, bank, x, acc, counts, token_sorted, weight_sorted, views, limit, force_group=False, width=width)
+        _launch(ext, bank, x, acc, counts, token_sorted, weight_sorted, views, limit, force_group=False, width=width,
+                bulk=bulk)
     else:
         slots = torch.arange(bank.num_experts + 1, device=hidden.device)
         hot = torch.where(slots < bank.hot_rows, counts, -counts)
         cold = torch.where(slots < bank.hot_rows, -counts, counts)
         side = _SIDE.get(hidden.device.index) if not prefill else None
         if side is None:
-            _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=width)
+            _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=width,
+                    bulk=bulk)
             _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, views, limit, force_group=True, width=cold_w)
         else:
             stream, hot_sms, cold_sms = side
@@ -502,23 +670,28 @@ def ds41_exl3_moe(handle: int, hidden: torch.Tensor, ids: torch.Tensor, weights:
                 _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, side_views, limit, force_group=True,
                         width=cold_w, sm_budget=cold_sms, lock_slot=1)
             _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=width,
-                    sm_budget=hot_sms)
+                    sm_budget=hot_sms, bulk=bulk)
             main.wait_stream(stream)    # joined before anything on main can reuse x/acc/cold's memory
-    out.copy_(acc)
+    _finish(acc, out, add)
 
 
-def _fused_moe(ext, bank, groups, hidden, ids, weights, out, limit):
-    """Decode path with the fused prep: same launches as the torch path below, fed by xmoe_decode_prep's outputs."""
-    rows = ids.shape[0]
-    hot_rows = bank.hot_rows if bank.parked else bank.num_experts + 1
-    token_sorted, weight_sorted, hot, cold, x, acc = fused_prep_outputs(ext, ids, weights, hidden, bank.num_experts, hot_rows)
+def _fused_moe(ext, bank, groups, hidden, ids, weights, out, limit, *, add=None, prepped=None):
+    """Decode path with the fused prep: same launches as the torch path below, fed by xmoe_decode_prep's outputs
+    (``prepped``: those outputs already written by flare::ds41_exl3_moe_prep, FLARE_DS41_EXL3_MERGE_TOPK)."""
+    rows = hidden.shape[0]
+    if prepped is None:
+        hot_rows = bank.hot_rows if bank.parked else bank.num_experts + 1
+        prepped = fused_prep_outputs(ext, ids, weights, hidden, bank.num_experts, hot_rows)
+    token_sorted, weight_sorted, hot, cold, x, acc = prepped
     views = _views(_scratch(hidden.device, rows, bank.local_intermediate, groups), groups, rows, bank.local_intermediate)
+    bulk = use_bulk(rows)
     if not bank.parked:
-        _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=0)
+        _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=0, bulk=bulk)
     else:
         side = _SIDE.get(hidden.device.index)
         if side is None:
-            _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=0)
+            _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=0,
+                    bulk=bulk)
             _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, views, limit, force_group=True, width=COLD_WIDTH)
         else:
             stream, hot_sms, cold_sms = side
@@ -530,9 +703,9 @@ def _fused_moe(ext, bank, groups, hidden, ids, weights, out, limit):
                 _launch(ext, bank, x, acc, cold, token_sorted, weight_sorted, side_views, limit, force_group=True,
                         width=COLD_WIDTH, sm_budget=cold_sms, lock_slot=1)
             _launch(ext, bank, x, acc, hot, token_sorted, weight_sorted, views, limit, force_group=False, width=0,
-                    sm_budget=hot_sms)
+                    sm_budget=hot_sms, bulk=bulk)
             main.wait_stream(stream)
-    out.copy_(acc)
+    _finish(acc, out, add)
 
 
 @ds41_exl3_moe.register_fake
@@ -562,6 +735,78 @@ def _ds41_exl3_moe_after_fake(handle, hidden, ids, weights, after, out, limit):
     pass
 
 
+# ---- exp/ds41-exl3-final-merges (merges.py): MERGE_TOPK prep op, prepped MoE op, MERGE_EPILOGUE --------------------
+
+def merge_prep_rows(rows: int) -> bool:
+    """FLARE_DS41_EXL3_MERGE_TOPK applies to graphs that take the fused prep (decode rows within its limit)."""
+    from . import merges
+
+    return merges.MERGE_TOPK and FUSED_PREP and rows <= min(64, FUSED_PREP_MAX_ROWS)
+
+
+# ds41_exl3_moe_after with out = bf16(acc) + after (the graph's routed + shared folded into the op's last copy).
+@torch.library.custom_op("flare::ds41_exl3_moe_after_sum", mutates_args=("out",))
+def ds41_exl3_moe_after_sum(handle: int, hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
+                            after: torch.Tensor, out: torch.Tensor, limit: float) -> None:
+    _moe(handle, hidden, ids, weights, out, limit, add=after)
+
+
+@ds41_exl3_moe_after_sum.register_fake
+def _ds41_exl3_moe_after_sum_fake(handle, hidden, ids, weights, after, out, limit):
+    pass
+
+
+@torch.library.custom_op("flare::ds41_exl3_moe_prep",
+                         mutates_args=("token_sorted", "weight_sorted", "hot", "cold", "x16", "acc"))
+def ds41_exl3_moe_prep(handle: int, hidden: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
+                       hot_map: torch.Tensor | None, token_sorted: torch.Tensor, weight_sorted: torch.Tensor,
+                       hot: torch.Tensor, cold: torch.Tensor, x16: torch.Tensor, acc: torch.Tensor) -> None:
+    """The fused prep on raw router IDs with the hot_map lookup folded in (xmoe_decode_prep_mapped)."""
+    from . import merges
+
+    bank, _ = _BANKS[handle]
+    hot_rows = bank.hot_rows if bank.parked else bank.num_experts + 1
+    table = hot_map if hot_map is not None else torch.empty(0, dtype=torch.int32, device=ids.device)
+    merges.extension().xmoe_decode_prep_mapped(ids.contiguous(), table, weights.contiguous(), hidden.contiguous(),
+                                               int(hot_rows), token_sorted, weight_sorted, hot, cold, x16, acc)
+
+
+@ds41_exl3_moe_prep.register_fake
+def _ds41_exl3_moe_prep_fake(handle, hidden, ids, weights, hot_map, token_sorted, weight_sorted, hot, cold, x16, acc):
+    pass
+
+
+@torch.library.custom_op("flare::ds41_exl3_moe_prepped", mutates_args=("acc", "out"))
+def ds41_exl3_moe_prepped(handle: int, token_sorted: torch.Tensor, weight_sorted: torch.Tensor, hot: torch.Tensor,
+                          cold: torch.Tensor, x16: torch.Tensor, acc: torch.Tensor, after: torch.Tensor | None,
+                          add_after: bool, out: torch.Tensor, limit: float) -> None:
+    """The MoE launches of the fused path on prep outputs written earlier; ``after`` orders them after the shared
+    expert's join, ``add_after`` folds routed + after into the final copy."""
+    bank, groups = _BANKS[handle]
+    _fused_moe(xmoe.extension(), bank, groups, x16, None, None, out, limit,
+               add=after if add_after else None, prepped=(token_sorted, weight_sorted, hot, cold, x16, acc))
+
+
+@ds41_exl3_moe_prepped.register_fake
+def _ds41_exl3_moe_prepped_fake(handle, token_sorted, weight_sorted, hot, cold, x16, acc, after, add_after, out, limit):
+    pass
+
+
+@dataclass(frozen=True)
+class Exl3Prep:
+    """Prep outputs allocated in the forward and written by flare::ds41_exl3_moe_prep."""
+
+    token_sorted: torch.Tensor
+    weight_sorted: torch.Tensor
+    hot: torch.Tensor
+    cold: torch.Tensor
+    x16: torch.Tensor
+    acc: torch.Tensor
+
+    def tensors(self):
+        return self.token_sorted, self.weight_sorted, self.hot, self.cold, self.x16, self.acc
+
+
 class PreparedExl3Experts:
     """Drop-in for ``PreparedRoutedExperts`` in ``PreparedLayer`` when the layer's experts are ``Exl3Experts``."""
 
@@ -578,21 +823,53 @@ class PreparedExl3Experts:
         _BANKS.append((experts, groups))
         rows = source.shape[0]
         g = PREFILL_GROUPS if rows > 64 else groups
-        decode_once = rows > 64 and rows >= DO_MIN_ROWS and PREFILL_MODE == "do"
-        _scratch(source.device, rows, experts.local_intermediate, g, decode_once=decode_once)   # grow before capture
+        decode_once = _decode_once(rows)
+        _scratch(source.device, rows, experts.local_intermediate, g, decode_once=decode_once,
+                 cold_side=_uses_prefill_side(experts, rows))   # grow before capture
         _ensure_side(source.device, experts, rows, g)
+        _ensure_prefill_side(source.device, experts, rows)
         if decode_once:
             _do_jobs(source.device, do_job_capacity(rows * ids.shape[-1], experts.num_experts))
         self.output_layout = tuple(output.shape), output.dtype
+        # exp/ds41-exl3-final-merges (merges.py): decided per graph at preparation (static row count)
+        self.merge_prep = merge_prep_rows(rows)
+        self.top_k = ids.shape[-1]
+        if self.merge_prep:
+            from . import merges
+
+            merges.extension()      # built/loaded eagerly, outside traced forwards
+
+    def prep(self, normalized, ids, weights, hot_map=None) -> Exl3Prep:
+        """FLARE_DS41_EXL3_MERGE_TOPK: the fused prep on raw router IDs (hot_map folded in), as its own op so it can
+        run before the shared-expert join."""
+        rows, dev = normalized.shape[0], normalized.device
+        routes, bins = rows * self.top_k, self.experts.num_experts + 1
+        prep = Exl3Prep(torch.empty(routes, dtype=torch.int64, device=dev),
+                        torch.empty(routes, dtype=torch.float16, device=dev),
+                        torch.empty(bins, dtype=torch.int64, device=dev), torch.empty(bins, dtype=torch.int64, device=dev),
+                        torch.empty((rows, xmoe.HIDDEN), dtype=torch.float16, device=dev),
+                        torch.empty((rows, xmoe.HIDDEN), dtype=torch.float32, device=dev))
+        ds41_exl3_moe_prep(self.handle, normalized, ids, weights, hot_map, *prep.tensors())
+        return prep
 
     def functional(self, *, session=None):
         self.output = None
         return self
 
     def __call__(self, normalized, ids, weights, *, router_logits=None, selected_logits=None, image_mask=None,
-                 after=None):
+                 after=None, prepped: Exl3Prep | None = None, add_after=False):
+        """``prepped``: the outputs of ``prep`` (MERGE_TOPK; ids/weights then unused); ``add_after``: return routed +
+        after (MERGE_EPILOGUE; ``after`` = the shared expert's output)."""
         shape, dtype = self.output_layout
         out = torch.empty(shape, dtype=dtype, device=normalized.device)
+        if add_after and after is None:
+            raise ValueError("the merged epilogue adds the shared expert's output: pass it as after")
+        if prepped is not None:
+            ds41_exl3_moe_prepped(self.handle, *prepped.tensors(), after, bool(add_after), out, self.limit)
+            return out
+        if add_after:
+            ds41_exl3_moe_after_sum(self.handle, normalized, ids, weights, after, out, self.limit)
+            return out
         if after is not None:
             ds41_exl3_moe_after(self.handle, normalized, ids, weights, after, out, self.limit)
             return out

@@ -50,6 +50,7 @@ void xmoe_set_force_group(int v);
 void xmoe_set_lock_slot(int v);
 void xmoe_set_sm_budget(int v);
 void xmoe_set_group_width(int v);
+void xmoe_set_flat_bulk(int v);
 #include <vector>
 void xmoe_pb_set(int stages, int stage, int hot);
 std::vector<int64_t> xmoe_pb_get();

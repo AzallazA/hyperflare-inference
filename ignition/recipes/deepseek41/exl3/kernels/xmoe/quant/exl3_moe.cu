@@ -64,6 +64,18 @@ static int xmoe_lock_slot = 0;
 void xmoe_set_lock_slot(int v) { xmoe_lock_slot = v; }
 static int xmoe_sm_budget = 0;  // 0 = all SMs
 void xmoe_set_sm_budget(int v) { xmoe_sm_budget = v; }
+// exp/ds41-exl3-final-bulk (2026-11-17): diffbot's xmoe_bulk hot-expert flat loop (quant/exl3_moe_transfer.cu, MIT; a
+// producer warp bulk-copies weight tiles into three stage buffers while 8 warps run the flat loop's arithmetic). Host flag,
+// read at launch time like force_group (so a captured graph keeps the kernel it was captured with); set by the caller
+// around the hot launch of graphs with >= FLARE_DS41_EXL3_BULK_MIN_ROWS rows. Only K=3 MUL1 (cb_idx 1) launches with
+// rows x top-k <= its 384-pair table; if the kernel does not fit one block per SM the regular flat kernel runs.
+fp_exl3_moe_kernel exl3_moe_transfer_k3_cb2();
+int exl3_moe_transfer_smem();
+int exl3_moe_transfer_threads();
+int exl3_moe_transfer_max_pairs();
+static int xmoe_flat_bulk = 0;
+void xmoe_set_flat_bulk(int v) { xmoe_flat_bulk = v; }
+static int xmoe_bulk_ok[MAX_DEVICES] = {};  // 0 unknown, 1 ok, -1 unusable (occupancy)
 static int xmoe_group_width = 0;  // group kernel: SMs per expert group when the active count is unknown (0 = MOE_SMS_PER_EXPERT)
 void xmoe_set_group_width(int v) { xmoe_group_width = v; }
 static int xmoe_flat_ok_k[2][4][MAX_DEVICES] = {};  // [cb_idx][K][device] (3f: K=3 MUL1 = cb_idx 1): 0 unknown, 1 ok, -1 unusable (occupancy); K=2,3 built
@@ -395,7 +407,26 @@ void exl3_moe
         fp_exl3_moe_kernel fk = K == 3 ? (cb_idx ? exl3_moe_flat_kernel_k3_n128_cb2() : exl3_moe_flat_kernel_k3_n128_cb1())
                                        : exl3_moe_flat_kernel_k2_n128_cb1();
         int fsmem = K == 3 ? exl3_moe_flat_smem_k3_n128() : exl3_moe_flat_smem_k2_n128();
-        if (xmoe_flat_ok[device] == 0)
+        int flat_threads = block_dim;
+        bool use_bulk = false;
+        if (xmoe_flat_bulk && K == 3 && cb_idx == 1 && bsz * num_experts_per_tok <= exl3_moe_transfer_max_pairs() &&
+            xmoe_bulk_ok[device] >= 0)
+        {
+            fp_exl3_moe_kernel bk = exl3_moe_transfer_k3_cb2();
+            int bsmem = exl3_moe_transfer_smem(), bthreads = exl3_moe_transfer_threads();
+            if (xmoe_bulk_ok[device] == 0)
+            {
+                cudaFuncSetAttribute(bk, cudaFuncAttributeMaxDynamicSharedMemorySize, bsmem);
+                int per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, bk, bthreads, bsmem);
+                cuda_check(cudaPeekAtLastError());
+                xmoe_bulk_ok[device] = per_sm >= 1 ? 1 : -1;
+                fprintf(stderr, "xmoe bulk: %s (threads %d, smem %d, blocks/SM %d)\n", per_sm >= 1 ? "active" : "does not fit one block per SM, regular flat kernel",
+                        bthreads, bsmem, per_sm);
+            }
+            if (xmoe_bulk_ok[device] > 0) { fk = bk; fsmem = bsmem; flat_threads = bthreads; use_bulk = true; }
+        }
+        if (xmoe_flat_ok[device] == 0 && !use_bulk)
         {
             cudaFuncSetAttribute(fk, cudaFuncAttributeMaxDynamicSharedMemorySize, fsmem);
             int per_sm = 0;
@@ -404,12 +435,12 @@ void exl3_moe
             xmoe_flat_ok[device] = per_sm >= 1 ? 1 : -1;
             if (per_sm < 1) fprintf(stderr, "xmoe flat: kernel does not fit one block per SM, using group kernel\n");
         }
-        if (xmoe_flat_ok[device] > 0)
+        if (xmoe_flat_ok[device] > 0 || use_bulk)
         {
             int fgrid = xmoe_flat_grid_env() > 0 ? MIN(xmoe_flat_grid_env(), budget) : budget;
             static bool announced = false;
             if (!announced) { announced = true; fprintf(stderr, "xmoe flat: active (K %d, grid %d, smem %d, max bsz %d)\n", K, fgrid, fsmem, xmoe_flat_max_bsz()); }
-            cudaLaunchKernel((void*) fk, dim3(fgrid, 1, 1), block_dim, kernelArgs, fsmem, stream);
+            cudaLaunchKernel((void*) fk, dim3(fgrid, 1, 1), flat_threads, kernelArgs, fsmem, stream);
             cuda_check(cudaPeekAtLastError());
             return;
         }

@@ -74,6 +74,10 @@ def test_parked_bank_uses_mixed_rows_and_checks_codebook():
 class FakeExt:
     def __init__(self):
         self.launches = []
+        self.bulk = 0
+
+    def xmoe_set_flat_bulk(self, v):
+        self.bulk = v
 
     def xmoe_set_force_group(self, v):
         self.force = v
@@ -90,7 +94,7 @@ class FakeExt:
     def exl3_moe(self, hidden, out, counts, token_sorted, weight_sorted, sg, su, ig, iu, act, kg, ku, kd, *rest):
         self.launches.append(dict(counts=counts.clone(), tokens=token_sorted.clone(), weights=weight_sorted.clone(),
                                   force=self.force, width=self.width, groups=sg.shape[0], per=sg.shape[1],
-                                  budget=self.budget, slot=self.slot,
+                                  budget=self.budget, slot=self.slot, bulk=self.bulk,
                                   mcg=rest[9], mul1=rest[10], limit=rest[15], active=rest[16]))
 
 
@@ -301,9 +305,12 @@ def test_launch_resets_budget_and_lock_slot():
     ex._launch(Ext(), bank, None, None, None, None, None, (None,) * 4, 10.0, force_group=True, width=0,
                sm_budget=16, lock_slot=1)
     names = [c[0] for c in calls]
-    assert names[:4] == ["xmoe_set_force_group", "xmoe_set_group_width", "xmoe_set_sm_budget", "xmoe_set_lock_slot"]
-    assert calls[2][1] == (16,) and calls[3][1] == (1,) and names[4] == "exl3_moe"
+    assert names[:5] == ["xmoe_set_flat_bulk", "xmoe_set_force_group", "xmoe_set_group_width", "xmoe_set_sm_budget",
+                         "xmoe_set_lock_slot"]
+    assert calls[0][1] == (0,)      # cold (forced group) launch never requests the bulk loop
+    assert calls[3][1] == (16,) and calls[4][1] == (1,) and names[5] == "exl3_moe"
     assert calls[-2:] == [("xmoe_set_sm_budget", (0,)), ("xmoe_set_lock_slot", (0,))]
+    assert ("xmoe_set_flat_bulk", (0,)) in calls[6:]   # reset after the launch
 
 
 def test_shared_side_switch_and_ordering_op(monkeypatch):

@@ -25,6 +25,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("xmoe_set_lock_slot", &xmoe_set_lock_slot, "1 = alternate lock buffer (side-stream launch)");
     m.def("xmoe_set_sm_budget", &xmoe_set_sm_budget, "cap the SMs a launch may occupy (0 = all)");
     m.def("xmoe_set_group_width", &xmoe_set_group_width, "group-kernel SMs per expert when the active count is unknown (0 = 8)");
+    m.def("xmoe_set_flat_bulk", &xmoe_set_flat_bulk, "exp/ds41-exl3-final-bulk: 1 = K3 MUL1 flat launches (rows x top-k <= 384) take diffbot's xmoe_bulk hot loop");
     m.def("xmoe_set_force_group", &xmoe_set_force_group, "force the group (non-flat) kernel for subsequent exl3_moe calls");
     m.def("xmoe_pb_set", &xmoe_pb_set, "prefillbw: (stages 0=off/3/4/6/8, stage copy 0/1, hot 0/1); -1 keeps a field");
     m.def("xmoe_set_lock_buffers", &xmoe_set_lock_buffers, "exp/ds41-exl3: use caller-owned zeroed lock buffers (device, main, alt)");
