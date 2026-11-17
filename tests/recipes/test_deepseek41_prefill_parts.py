@@ -302,10 +302,10 @@ def test_check_mhc_pdl_reads_the_imported_b12x_module(monkeypatch):
         TP3Config(mhc_pdl=expected).check_mhc_pdl()
 
 
-def test_release_export_leaves_the_three_switches_off():
+def test_release_export_turns_the_three_switches_on():
     from tests.recipes.test_deepseek41_tp3_config import RELEASE_ENV, export_environment
     config = TP3Config.from_environment(RELEASE_ENV)
-    assert (config.ar_part_rows, config.engram_part_rows, config.mhc_pdl) == (0, 0, False)
-    # export.sh passes the caller's FLARE_DS41_ENGRAM_PART_ROWS through (it does not set or override it)
-    passed = export_environment(FLARE_DS41_ENGRAM_PART_ROWS="768", FLARE_DS41_AR_PART_ROWS="768")
-    assert passed["FLARE_DS41_ENGRAM_PART_ROWS"] == "768" and passed["FLARE_DS41_AR_PART_ROWS"] == "768"
+    assert (config.ar_part_rows, config.engram_part_rows, config.mhc_pdl) == (768, 768, True)
+    # each one has its own off switch in export.sh (0 = the 20261111 layout)
+    off = TP3Config.from_environment(export_environment(AR_PART_ROWS="0", ENGRAM_PART_ROWS="0", MHC_PDL="0"))
+    assert (off.ar_part_rows, off.engram_part_rows, off.mhc_pdl) == (0, 0, False)

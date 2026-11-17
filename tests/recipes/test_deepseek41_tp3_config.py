@@ -10,42 +10,79 @@ from ignition.recipes.deepseek41.tp3_config import (TP3Config, describe_checkpoi
                                                     format_layers, parse_layers)
 
 # The release environment as tp3-tools/release/export.sh really exports it with its defaults (HOT=342, COUNTS=
-# $HERE/expert-order, VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1): the script's
-# environment block runs in bash (everything before ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE values are read
-# back, so a change to the script's defaults reaches these tests.
+# $HERE/expert-order, VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1, and since the
+# 20261116 release PARKED_ROWS 0, 768-row prefill all-reduce parts, index/context side streams, uneven wo_a split,
+# host-row embedding gather, VRAM reclaim, mHC PDL): the script's environment block runs in bash (everything before
+# ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE / B12X_* values are read back, so a change to the script's defaults
+# reaches these tests. The default two-shot pull needs B12X_OVERLAY (a directory with ``b12x_tree``): a stub is passed.
 EXPORT_SH = Path(__file__).resolve().parents[2] / "tp3-tools" / "release" / "export.sh"
-RELEASE_CKPT = "/m2-2/flare-ckpt/ds41-1017-engram-mxfp4"
+RELEASE_CKPT = "/models/ds41-1017-engram-fp8"
+
+
+def _overlay_stub():
+    import atexit
+    import shutil
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="b12x-overlay-stub-"))
+    (root / "b12x_tree").mkdir()
+    atexit.register(shutil.rmtree, root, True)
+    return str(root)
+
+
+OVERLAY_STUB = _overlay_stub()
 
 
 def export_environment(**variables):
+    """The script's FLARE_DS41_* and HF_HUB_OFFLINE values plus B12X_MHC_PDL (TP3Config mirrors b12x's switch)."""
+    return {key: value for key, value in export_variables(**variables).items()
+            if key.startswith("FLARE_DS41_") or key in ("HF_HUB_OFFLINE", "B12X_MHC_PDL")}
+
+
+def export_variables(**variables):
     import os
     import subprocess
 
     script = EXPORT_SH.read_text()
     body = script[:script.index("\nexec ")]
-    dump = '\nfor name in ${!FLARE_DS41_@} HF_HUB_OFFLINE; do printf "%s=%s\\0" "$name" "${!name}"; done'
+    dump = '\nfor name in ${!FLARE_DS41_@} ${!B12X_@} HF_HUB_OFFLINE; do printf "%s=%s\\0" "$name" "${!name}"; done'
     output = subprocess.run(["bash", "-c", body + dump, str(EXPORT_SH)], check=True, capture_output=True,
-                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT, **variables})
+                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT,
+                                 "B12X_OVERLAY": OVERLAY_STUB, **variables})
     pairs = (item.split("=", 1) for item in output.stdout.decode().split("\0") if "=" in item)
-    return {key: value for key, value in pairs if key.startswith("FLARE_DS41_") or key == "HF_HUB_OFFLINE"}
+    return {key: value for key, value in pairs
+            if key.startswith(("FLARE_DS41_", "B12X_")) or key == "HF_HUB_OFFLINE"}
 
 
 RELEASE_ENV = export_environment()
 
 RELEASE_CONFIG = TP3Config(
     host_expert_layers=frozenset(range(20, 34)), hot_experts=342, merged_bank=True,
-    expert_counts_dir=EXPORT_SH.parent / "expert-order", embed_host=True, vision_host=True, vision_stage=True,
-    ar_rows=1024, tp3_graph_gib=1.0, tp3_vocab_parallel=True,
-    brrr_layers=frozenset(range(40)), brrr_parked_max_rows=12, brrr_ckpt=Path(RELEASE_CKPT),
-    engram_chunk_rows=1024, share_engram_residual=True)
+    expert_counts_dir=EXPORT_SH.parent / "expert-order", embed_host=True, embed_rows=True, vision_host=True,
+    vision_stage=True, ar_rows=1024, ar_part_rows=768, engram_part_rows=768, mhc_pdl=True, tp3_graph_gib=1.0,
+    tp3_vocab_parallel=True, index_side_stream=True, context_side_stream=True,
+    share_engram_token_map=True, trim_vocab_gather=True, skip_draft_vocab_gather=True, share_vocab_columns=True,
+    brrr_layers=frozenset(range(40)), brrr_parked_max_rows=0, brrr_ckpt=Path(RELEASE_CKPT),
+    brrr_woa_uneven=1, brrr_woa_small=0, engram_chunk_rows=1024, share_engram_residual=True)
+
+
+def test_export_script_sets_the_b12x_switches_of_the_release():
+    variables = export_variables()
+    assert {key: variables.get(key) for key in ("B12X_PCIE_TWOSHOT_PULL", "B12X_MLA_DECODE_REMAINDER_STREAM",
+                                                 "B12X_MHC_PDL", "B12X_PCIE_DCP_GATHER_PULL")} == \
+        {"B12X_PCIE_TWOSHOT_PULL": "1", "B12X_MLA_DECODE_REMAINDER_STREAM": "1", "B12X_MHC_PDL": "1",
+         "B12X_PCIE_DCP_GATHER_PULL": "0"}
+    off = export_variables(TWOSHOT="0", ATTN="0", MHC_PDL="0", B12X_OVERLAY="")
+    assert (off["B12X_PCIE_TWOSHOT_PULL"], off["B12X_MLA_DECODE_REMAINDER_STREAM"], off["B12X_MHC_PDL"]) == ("0",) * 3
+    assert "B12X_PCIE_DCP_GATHER_PULL" not in off
 
 
 def test_export_script_environment_is_parsed_not_copied():
     assert RELEASE_ENV["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "1024" and RELEASE_ENV["FLARE_DS41_HOT_EXPERTS"] == "342"
     assert RELEASE_ENV["FLARE_DS41_EXPERT_COUNTS_DIR"] == str(EXPORT_SH.parent / "expert-order")
     # The script's overrides reach the parsed environment (it is the script, not a copy).
-    overridden = export_environment(HOT="300", FLARE_DS41_ENGRAM_CHUNK_ROWS="0")
-    assert overridden["FLARE_DS41_HOT_EXPERTS"] == "300" and overridden["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "0"
+    overridden = export_environment(HOT="300", PARKED_ROWS="12")
+    assert overridden["FLARE_DS41_HOT_EXPERTS"] == "300" and overridden["FLARE_DS41_BRRR_PARKED_MAX_ROWS"] == "12"
 
 
 def test_release_environment_parses_to_the_expected_config():
@@ -72,7 +109,7 @@ def test_defaults_are_the_bare_upstream_behaviour():
 
 
 def test_empty_values_count_as_unset_and_or_zero_integers():
-    env = {key: "" for key in RELEASE_ENV}
+    env = {key: "" for key in RELEASE_ENV if key != "B12X_MHC_PDL"}  # b12x reads a set-but-empty B12X_MHC_PDL as on
     assert TP3Config.from_environment(env) == TP3Config()
     assert TP3Config.from_environment({"FLARE_DS41_HOT_EXPERTS": "", "FLARE_DS41_AR_ROWS": ""}).hot_experts == 0
     # Two switches keep the base parsers' set-but-empty meaning instead (documented on the fields).
@@ -245,16 +282,19 @@ def test_metadata_record_is_json_ready_and_complete():
     record = TP3Config.from_environment(RELEASE_ENV).to_metadata()
     from ignition.recipes.deepseek41.tp3_config import RECORDED_WHEN_SET
 
-    assert set(record) == {item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET)
+    # the release export sets the two wo_a switches (recorded when set), the other tuning switches stay unset
+    assert set(record) == ({item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET)
+                           | {"brrr_woa_small", "brrr_woa_uneven"})
+    assert (record["brrr_woa_small"], record["brrr_woa_uneven"]) == (0, 1)
     assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"
     counts, counts_digest = record["expert_counts_dir"].split("#")
     assert counts == "expert-order" and (counts_digest == "missing" or len(counts_digest) == 12)
     assert record["tp3_graph_gib"] == 1.0
     # The release view may exist on the build host, so only the shape is fixed: basename#12-hex-or-missing.
     name, digest = record["brrr_ckpt"].split("#")
-    assert name == "ds41-1017-engram-mxfp4" and (digest == "missing" or len(digest) == 12)
+    assert name == "ds41-1017-engram-fp8" and (digest == "missing" or len(digest) == 12)
     assert "/" not in json_text(record)
-    assert record["brrr_parked_max_rows"] == 12 and record["vision_stage"] is True and record["brrr_break"] is None
+    assert record["brrr_parked_max_rows"] == 0 and record["vision_stage"] is True and record["brrr_break"] is None
     json.dumps(record)  # every value serializes
     assert TP3Config().to_metadata()["host_expert_layers"] == ""
     described = TP3Config.from_environment(RELEASE_ENV).describe()
@@ -270,8 +310,13 @@ def test_config_is_frozen_and_hashable():
 
 # The 2026-11-14 base port: the release config minus the features the port stages brought back (BRRR = S6, Engram
 # chunk rows and the shared residual = S5, vision staging = S7). The tower stays host-parked (vision_host).
+# The round-2 and reclaim switches of the 20261116 release came later and are off as well.
 BASE_PORT_CONFIG = replace(RELEASE_CONFIG, brrr_layers=frozenset(), brrr_parked_max_rows=0, brrr_ckpt=None,
-                           vision_stage=False, engram_chunk_rows=0, share_engram_residual=False)
+                           vision_stage=False, engram_chunk_rows=0, share_engram_residual=False, embed_rows=False,
+                           ar_part_rows=0, engram_part_rows=0, mhc_pdl=False, index_side_stream=False,
+                           context_side_stream=False, share_engram_token_map=False, trim_vocab_gather=False,
+                           skip_draft_vocab_gather=False, share_vocab_columns=False, brrr_woa_uneven=None,
+                           brrr_woa_small=None)
 
 
 def test_preparation_config_carries_the_tp3_config():
@@ -295,7 +340,7 @@ def test_every_switch_is_ported_and_the_full_release_environment_prepares():
     assert PreparationConfig(max_active=4, tp3=full).tp3 is full
     assert BASE_PORT_CONFIG.unported() == {} and BASE_PORT_CONFIG.require_ported() is BASE_PORT_CONFIG
     for off in (dict(FLARE_DS41_ENGRAM_CHUNK_ROWS="0"), dict(FLARE_DS41_SHARE_ENGRAM_RESIDUAL="0")):
-        config = TP3Config.from_environment(export_environment(**off))
+        config = TP3Config.from_environment({**RELEASE_ENV, **off})
         assert config.require_ported() is config and PreparationConfig(max_active=4, tp3=config).tp3 is config
 
 
@@ -365,10 +410,11 @@ def test_planner_helpers_read_the_environment_through_the_config(monkeypatch, tm
     dict(hot_experts=384),                                                            # fully resident: nothing parked
 ])
 def test_parked_row_gate_is_refused_where_it_would_gate_nothing(changes):
-    assert RELEASE_CONFIG.brrr_parked_max_rows == 12  # the release config (BRRR 0-39, H342 merged) keeps the gate
+    assert RELEASE_CONFIG.brrr_parked_max_rows == 0  # the 20261116 release runs BRRR at every width on parked layers
+    gated = replace(RELEASE_CONFIG, brrr_parked_max_rows=12)  # the 20261111 gate (BRRR 0-39, H342 merged) is accepted
     with pytest.raises(ValueError, match="brrr_parked_max_rows gates BRRR layers parked with a merged bank"):
-        replace(RELEASE_CONFIG, **changes)
-    replace(RELEASE_CONFIG, brrr_parked_max_rows=0, **changes)  # ungated: accepted
+        replace(gated, **changes)
+    replace(gated, brrr_parked_max_rows=0, **changes)  # ungated: accepted
 
 
 def test_layer_sets_are_checked_against_the_model():
@@ -415,7 +461,9 @@ def test_brrr_tuning_switches_select_a_separate_build_only_when_not_default():
     base = {"FLARE_DS41_BRRR_LAYERS": "0-39", "FLARE_DS41_BRRR_CKPT": "/c"}
     plain = TP3Config.from_environment(base)
     assert plain.brrr_spin_ns is None and plain.brrr_two_shot_min is None
-    assert kernel_defines(plain) == () and kernel_defines(TP3Config.from_environment(RELEASE_ENV)) == ()
+    assert kernel_defines(plain) == ()
+    # the release export pins the wo_a split (WOA_UNEVEN 1, WOA_SMALL 0): its own build, as package 160815 recorded
+    assert kernel_defines(TP3Config.from_environment(RELEASE_ENV)) == ("BRRR_WOA_SMALL=0", "BRRR_WOA_UNEVEN=1")
     assert _tuning(plain) == {"SPIN_NS": 200, "TWO_SHOT_MIN": 17, **LAYOUT_DEFAULTS}
     explicit = TP3Config.from_environment({**base, "FLARE_DS41_BRRR_SPIN_NS": "200", "FLARE_DS41_BRRR_TWO_SHOT_MIN": "17"})
     assert explicit.brrr_spin_ns == 200 and kernel_defines(explicit) == ()
