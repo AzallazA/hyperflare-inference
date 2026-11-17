@@ -303,6 +303,14 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    settings, and passed (32/32 long requests, 212/212 pings, lowest free VRAM 64 MiB, post checks and log scan clean). Not run: LiveBench,
    long generation, lavd, the natural-EOS decode bench, the 8-stream stress (the 16-stream stress replaces it), the
    128K c8 cell, the vision sets. The release notes and the folder README list what was not run.
+   *2026-11-16 (GLM):* `hyperflare-glm-20261116` = this tag line plus the GLM VRAM reclaim commit (`7a4c4b21`) and
+   the GLM release scripts (`tp3-tools/release/glm/`, single source for the recipes folder). It was published after the
+   two exports and their chain quick checks passed (served KV, probes, image smoke, prefill probe, one speed pass;
+   TP2 also corruption check and tool calls), plus one boot of each package on the release binary. Those chain checks
+   ran on an earlier port binary (`67c691d29041`); the release texts say which check ran on which binary. The tier
+   "export" qualification (hotel-lights, KV stress, consistency, eval-43, tool-eval, 128K, retrieval) is listed as
+   not yet run. The branch was a cherry-pick of the reclaim commit onto the scrubbed release line (`release/main-20261116`),
+   not a merge of the old-history branch, so no old commit enters the public history (B.5.4).
 
 ### B.6 Sync from upstream (deliberate, never automatic)
 

@@ -244,3 +244,20 @@ Why off by default on GLM (DS41 has it on): the c32 package serves more batch-st
 steps/s dip (~3%, not yet confirmed by a same-session alternating A/B) and the 6% lower output at 16 agent streams
 matter more than first-token latency. For chat or agents, `interactive` finishes 17-70% more turns. Before making it
 the default: same-session alternating decode A/B (3x3) + the guard quality run (`ttft-quality-glm.sh`).
+
+## Status 2026-11-16: release `hyperflare-glm-20261116` on the upstream 70069281 port
+
+- **Port.** The GLM work runs on upstream `70069281` since the 2026-11-14 port (`3e64a3d4` base port for three and two
+  ranks on compiler-owned storage, `50b35f7e` speed options, `9cb32266` / `ac53079f` vision block and tail staging,
+  `f23ab9ab` Inductor gather fix, `b9b59ee7` cuBLAS containment `FLARE_BF16_BMM_CUBLAS=0`, GLM decode glue cleanup).
+  Same settings as 20261112 on the port: TP3 13,833,984 served KV (+5.4%), TP2 2,518,016 (+12.8%), decode level.
+- **VRAM reclaim** (`7a4c4b21`, export-time, default off): TP3 `FLARE_GLM53_TRIAL_POOL=separate` +
+  `FLARE_GLM53_SLAB_SEGMENT=1`, TP2 `FLARE_GLM53_TRIAL_POOL=separate` + `FLARE_GLM53_ONESHOT_FIT=1`. Release packages:
+  TP3 `gb202-tp3-202611170053` 14,834,688 served KV (+1,000,704 over the same settings without reclaim), TP2
+  `gb202-tp2-202611170201` 3,049,984 (+531,968). Decode and prefill passes level with the packages without reclaim.
+- **Serve:** `tp3-tools/release/glm/serve-glm-tp{3,2}.sh` (interactive, TTFT order shortest, stack limit 256). On the
+  release binary (one boot each, PASS): TP3 14,929,920 KV, decode c1 / c8 / c32 290.3 / 878.8 / 1,827.6 tok/s; TP2
+  3,113,472 KV, c1 / c8 245.4 / 750.2 (single 30 s passes).
+- **Open:** tier "export" qualification of both packages (hotel-lights, KV stress, consistency, eval-43, tool-eval,
+  128K, retrieval); `FLARE_GLM53_AR_ROWS=1024` at TP3 (+~191K KV, needs a prefill A/B); prefill merge on GLM (agent A/B);
+  BF16 pixel upload (~73.5 MiB per GPU).
