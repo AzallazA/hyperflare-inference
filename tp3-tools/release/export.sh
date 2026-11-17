@@ -8,6 +8,9 @@
 #            VENV=$PWD/.venv B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch \
 #              tp3-tools/make-b12x-overlay.sh $PWD/.b12x-overlay-twoshot
 #   HOT      hot experts per parked layer (default 342; each expert fewer adds ~92K KV tokens, see README)
+#   PARK     parked (host-expert) layers (default 20-33). Prefill runs layers 20-39 on the last 128 rows of a chunk only, so
+#            only those are candidates; e.g. PARK=20-39 HOT=354 keeps the release's host-expert rows (14 x 42 = 588) spread
+#            over 20 layers (20 x 30 = 600; perf/ds41-tp3-park, not measured on the GPU yet)
 #   MAXC     request slots the package captures graphs for (default 16; 8 = fewer graphs, not measured on this build)
 #   PREFILL  prefill chunk size (default 4096)
 #   DRAFTS   DSpark drafts (default 5); serve with the same DRAFTS (serve.sh)
@@ -47,7 +50,7 @@ if [ -n "${B12X_OVERLAY:-}" ]; then
     [ -d "$B12X_OVERLAY/b12x_tree" ] || { echo "B12X_OVERLAY=$B12X_OVERLAY has no b12x_tree" >&2; exit 1; }
     export PYTHONPATH="$B12X_OVERLAY${PYTHONPATH:+:$PYTHONPATH}" B12X_PCIE_DCP_GATHER_PULL=0
 fi
-export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=20-33 FLARE_DS41_HOT_EXPERTS=${HOT:-342} \
+export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} FLARE_DS41_HOT_EXPERTS=${HOT:-342} \
        FLARE_DS41_MERGED_BANK=1 FLARE_DS41_TP3_VOCAB_PARALLEL=1 \
        FLARE_DS41_EXPERT_COUNTS_DIR=${COUNTS:-$HERE/expert-order} HF_HUB_OFFLINE=1 \
        FLARE_DS41_BRRR_LAYERS=0-39 FLARE_DS41_BRRR_CKPT="$CKPT" FLARE_DS41_BRRR_PARKED_MAX_ROWS=${PARKED_ROWS:-0} \
