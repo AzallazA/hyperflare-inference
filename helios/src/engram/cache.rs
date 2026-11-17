@@ -225,6 +225,26 @@ mod tests {
     }
 
     #[test]
+    fn int4_rows_keep_weights_and_fp16_scales_in_one_144_byte_entry() {
+        // exp/ds41-exl3: diffbot int4 rows = 128 nibble bytes + eight FP16 scales (16 bytes).
+        let budget = 1 << 20;
+        let mut cache = RowCache::new(budget, 1_000_000, 144).unwrap();
+        assert!(cache.bytes() <= budget);
+        assert_eq!(cache.capacity() % WAYS, 0);
+        let weights: Vec<u8> = (0..128).map(|i| (i * 7 + 3) as u8).collect();
+        let scales: Vec<u8> = (0..16).map(|i| (0xA0 + i) as u8).collect();
+        for id in [5_i64, 5 + 4096, 77_777] {
+            let inserted = cache.insert(id, &weights, &scales);
+            assert!(inserted.added && !inserted.evicted);
+            let row = cache.get(id).unwrap();
+            assert_eq!(row.len(), 144);
+            assert_eq!(&row[..128], weights.as_slice());
+            assert_eq!(&row[128..], scales.as_slice());
+        }
+        assert!(cache.get(6).is_none());
+    }
+
+    #[test]
     fn payload_and_index_stay_within_the_budget() {
         for budget in [1024, 4096, 65536] {
             let cache = RowCache::new(budget, 100000, 90).unwrap();

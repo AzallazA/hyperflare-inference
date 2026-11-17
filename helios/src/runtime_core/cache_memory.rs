@@ -78,6 +78,7 @@ impl Layout {
         let row_end = (geometry.row_capacity * row_bytes).div_ceil(row_alignment) * row_alignment;
         let snapshots = geometry.row_capacity - execution;
         let mut aliases = vec![u32::MAX..0; snapshots as usize];
+        let mut padding = vec![false; snapshots as usize];
         let mut cursor = fixed_bytes;
         let mut chunks = Vec::new();
         let largest = geometry.planes.iter().map(|p| p.unit_bytes).max().unwrap();
@@ -144,11 +145,17 @@ impl Layout {
                     for row in first_row..last_row {
                         let start = offset + (row * row_bytes).saturating_sub(cursor);
                         let end = offset + ((row + 1) * row_bytes).min(cursor + mapped) - cursor;
+                        let first_page = start / p.unit_bytes;
+                        let end_page = end.div_ceil(p.unit_bytes).min(geometry.page_capacity);
+                        if first_page >= end_page {
+                            // The piece lies wholly in the granule padding past the last
+                            // page: it shares bytes with no KV page, so it adds no conflict.
+                            padding[(row - execution) as usize] = true;
+                            continue;
+                        }
                         let range = &mut aliases[(row - execution) as usize];
-                        range.start = range.start.min((start / p.unit_bytes) as u32);
-                        range.end = range
-                            .end
-                            .max(end.div_ceil(p.unit_bytes).min(geometry.page_capacity) as u32);
+                        range.start = range.start.min(first_page as u32);
+                        range.end = range.end.max(end_page as u32);
                     }
                 }
                 chunks.push(Chunk {
@@ -184,6 +191,9 @@ impl Layout {
         }
         for (snapshot, range) in aliases.iter_mut().enumerate() {
             if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+                *range = 0..0;
+            } else if range.start >= range.end && padding[snapshot] {
+                // Backed only by padding past the last page: no KV page conflicts.
                 *range = 0..0;
             } else if range.start >= range.end {
                 return Err(invalid("continuation alias lacks a KV conflict range"));
@@ -902,6 +912,34 @@ mod tests {
                 .all(|&b| b == 0x5A),
             "live snapshot row changed"
         );
+    }
+
+    #[test]
+    fn rows_backed_only_by_granule_padding_have_no_conflict() {
+        // TP2 mini8 (EXL3): rows smaller than the 2 MiB granule and a single
+        // alias-eligible plane, so rows can map wholly past the last page.
+        let alignment = 2 << 20;
+        let mut padded = 0;
+        for pages in (3_000_000u64..3_000_200).chain(4_479_768..4_479_868) {
+            for execution in [8u64, 9, 16, 17] {
+                let rows = execution + 200;
+                let geometry = geometry(781_312, &[18_432, 4_352], pages, rows);
+                let layout = Layout::new(&geometry, execution, &[alignment; 2], alignment)
+                    .unwrap_or_else(|e| panic!("pages {pages} execution {execution}: {e:?}"));
+                for row in execution..rows {
+                    let range = &layout.aliases[(row - execution) as usize];
+                    let pages = conflicts(&layout, &geometry, row);
+                    if pages.is_empty() {
+                        padded += u64::from(range.is_empty());
+                        assert_eq!(*range, 0..0, "row {row}");
+                    } else {
+                        assert!(range.start as u64 <= *pages.first().unwrap(), "row {row}");
+                        assert!(range.end as u64 > *pages.last().unwrap(), "row {row}");
+                    }
+                }
+            }
+        }
+        assert!(padded > 0, "sweep never produced a padding-only row");
     }
 
     #[test]

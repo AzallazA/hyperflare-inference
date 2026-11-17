@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn resident_scales_preserve_bytes_and_cache_hits_without_reading_the_scale_file() {
-        for (weight_row_bytes, scale_row_bytes) in [(256, 8), (80, 10)] {
+        for (weight_row_bytes, scale_row_bytes) in [(256, 8), (80, 10), (128, 8), (128, 16)] {
             check_resident_scale_rows(weight_row_bytes, scale_row_bytes);
         }
     }

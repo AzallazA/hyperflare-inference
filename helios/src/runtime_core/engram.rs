@@ -119,6 +119,8 @@ pub(super) fn decode<F: super::payload::Files>(
             wire::engram_table::Encoding::Fp8E4m3E8m0 => (256, 32, 256, 8),
             // TP3: DeepSeek Engram tables as packed MXFP4 (E2M1 pairs) with E8M0 scales per 32 columns.
             wire::engram_table::Encoding::Mxfp4E2m1E8m0 => (256, 32, 128, 8),
+            // exp/ds41-exl3: diffbot int4 rows (nibble pairs, q + 8) with eight FP16 scales per row (16 bytes).
+            wire::engram_table::Encoding::Int4Fp16Block32 => (256, 32, 128, 16),
             wire::engram_table::Encoding::Nvfp4E4m3Global
                 if table.global_scale.is_finite() && table.global_scale > 0.0 =>
             {
@@ -324,6 +326,16 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn int4_encoding_is_wire_value_16() {
+        // exp/ds41-exl3: Python publishes the encoding by name; the number is part of the package format.
+        assert_eq!(wire::engram_table::Encoding::Int4Fp16Block32 as i32, 16);
+        assert_eq!(
+            wire::engram_table::Encoding::from_str_name("INT4_FP16_BLOCK32"),
+            Some(wire::engram_table::Encoding::Int4Fp16Block32)
+        );
     }
 
     #[test]
