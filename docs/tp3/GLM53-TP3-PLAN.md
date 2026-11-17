@@ -263,6 +263,9 @@ the default: same-session alternating decode A/B (3x3) + the guard quality run (
   DS41 TP3 and DS41 EXL3 TP2; one binary built from `main` serves both GLM packages (checked 2026-11-17: TP3 14,929,920 KV,
   TP2 3,113,472 KV, smoke ok). Old GLM side branches sit on the pre-clean-up history and need a cherry-pick onto `main`
   before anything from them is published.
-- **Open:** tier "export" qualification of both packages (hotel-lights, KV stress, consistency, eval-43, tool-eval,
-  128K, retrieval), still not run as of 2026-11-17 (the owner is deciding on a minimal run); `FLARE_GLM53_AR_ROWS=1024` at TP3 (+~191K KV, needs a prefill A/B); prefill merge on GLM (agent A/B);
+- **Qualification:** tier "export" ran on both packages on 2026-11-17 (build of `main` `036cde24`), minimal form:
+  TP3 eval-43 43/43, retrieval 128K / 900K pass, 128K c1 287 tok/s, tool-eval 93, hotel-lights at 32 streams 26 / 2
+  wrong / 2 truncated; TP2 eval-43 42/43, retrieval pass, hotel-lights 29 / 1 wrong, KV stress at 8 streams PASS. Done
+  except the TP3 KV stress at 32 streams (not run, owner decision).
+- **Open:** the TP3 KV stress at 32 streams; `FLARE_GLM53_AR_ROWS=1024` at TP3 (+~191K KV, needs a prefill A/B); prefill merge on GLM (agent A/B);
   BF16 pixel upload (~73.5 MiB per GPU).

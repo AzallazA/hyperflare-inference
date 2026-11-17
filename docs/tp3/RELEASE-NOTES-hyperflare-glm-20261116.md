@@ -8,8 +8,9 @@ GLM VRAM reclaim switches (one commit) and the GLM release scripts and texts. Re
 `GLM-5.3-Flash Hyperflare-tp3-20261116` in https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes
 (`source.patch` against `70069281`, regenerated from this tag).
 
-**Published after the exports and their quick checks passed; the tiered qualification of these packages has not run
-yet.** What ran, and on which binary, is listed below.
+**Published after the exports and their quick checks passed; a minimal tier "export" qualification followed on
+2026-11-17** (eval-43 43/43 TP3 and 42/43 TP2, long retrieval 128K / 900K pass, TP2 KV stress at 8 streams PASS;
+**the TP3 KV stress at 32 streams was not run**). What ran, and on which binary, is listed below.
 
 Changes for GLM-5.3-Flash since `hyperflare-glm-20261112`:
 
@@ -74,13 +75,22 @@ concurrency 8, prefill probe PASS (no marginal case), one decode and prefill pas
 repeat 12/12, decode and prefill pass as above, server and kernel log scans clean. TP2: up in 29 s, KV 3,113,472
 (largest kernel stack 48 B), the same checks PASS.
 
-**Not run yet for these packages:** the tiered qualification (tier "export": same weights, new
-export) on the release binary: boots with and without the stack limit (KV), request checks (13 requests), first-token
-probe, image latency and smoke, tool calls 60, corruption check, prefill probe, one decode and prefill pass, prefill
-merge arm (TP3), hotel-lights (TP3 at 32 streams, TP2 at 8), KV stress at full concurrency (TP3 32, TP2 8),
-decode-vs-prefill consistency, eval-43, tool-eval (TP3), 128K decode (TP3), long retrieval 128K / 900K.
-On the 20261112 packages TP2 hotel-lights was 26/30 (unparseable or truncated answers, one wrong) and the TP2 KV stress
-passed (16/16).
+**Tier "export" qualification, 2026-11-17** (binary `1bdcce7378e4`, built from fork `main` `036cde24`, a later
+commit than this tag: its Rust changes are DeepSeek Engram code and a KV-layout fix, and the GLM packages serve the
+same KV; `serve-glm-tp*.sh` settings; temperature 1.0, top-p 0.95). TP3 at 32 streams: served KV 14,929,920 (14,834,688
+without the stack limit), first-token probe 24/24 with repeat 12/12, decode-vs-prefill consistency top-1 0.953 (info),
+eval-43 **43/43**, 128K decode c1 287 tok/s, tool-eval-bench 93/100 (info, no earlier GLM run to compare), long
+retrieval 128K / 900K pass / pass, hotel-lights 30 runs: 26 exact, 2 wrong, 2 truncated. **The TP3 KV stress at 32
+streams was not run.** TP2 at 8 streams: served KV 3,113,472 (3,049,984 without), probe 24/24 with repeat 12/12,
+consistency 0.958, eval-43 **42/43**, long retrieval pass / pass, hotel-lights 29 exact, 1 wrong, **KV stress PASS**
+(16/16 long requests, 92/92 pings), KV unchanged after the run, server and kernel log scans clean. Hotel-lights: earlier
+GLM runs ranged from 26 to 30 exact out of 30 (20261112 TP2: 26/30); one miss in each run here is "expected 48, got
+49", an item an earlier run also missed. Results:
+[`qualification/RESULTS.md`](https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes/blob/main/GLM-5.3-Flash%20Hyperflare-tp3-20261116/qualification/RESULTS.md).
+
+**Not run for these packages:** the TP3 KV stress at 32 streams, request checks (13 requests), tool calls at TP3,
+corruption check at TP3, image latency at TP2, the prefill-merge arm (TP3), GPQA Diamond (same weights and
+quantisation), long generation, the image question sets.
 
 **Not adopted:** `FLARE_GLM53_AR_ROWS=1024` at TP3 (about +191K KV, prefill A/B not run); token embedding in host
 memory at TP3 (read every decode step); prefill merge for GLM (one pass measured only).

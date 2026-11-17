@@ -307,8 +307,11 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    two exports and their chain quick checks passed (served KV, probes, image smoke, prefill probe, one speed pass;
    TP2 also corruption check and tool calls), plus one boot of each package on the release binary. Those chain checks
    ran on an earlier port binary (`67c691d29041`); the release texts say which check ran on which binary. The tier
-   "export" qualification (hotel-lights, KV stress, consistency, eval-43, tool-eval, 128K, retrieval) is listed as
-   not yet run, and is still open as of 2026-11-17 (the owner is deciding on a minimal run). The branch was a cherry-pick of the reclaim commit onto the scrubbed release line (`release/main-20261116`),
+   "export" qualification ran in a minimal form on 2026-11-17, on a build of `main` `036cde24` (same packages; GLM KV
+   unchanged): TP3 eval-43 43/43, retrieval 128K / 900K pass, 128K c1 287 tok/s, tool-eval 93, hotel-lights at 32
+   streams 26 exact / 2 wrong / 2 truncated; TP2 eval-43 42/43, retrieval pass, hotel-lights 29 / 1 wrong, KV stress
+   at 8 streams PASS 16/16. The TP3 KV stress at 32 streams was not run (owner decision). The results were added to
+   the recipes folder and the release texts afterwards (no re-tag). The branch was a cherry-pick of the reclaim commit onto the scrubbed release line (`release/main-20261116`),
    not a merge of the old-history branch, so no old commit enters the public history (B.5.4).
    *2026-11-17 (DS41 EXL3 TP2):* the EXL3 3-bit TP2 package (diffbot's pack, two GPUs) was developed on an
    old-history branch, so the release branch `release/main-ds41-exl3-tp2` is built on the scrubbed `main` as a
@@ -711,6 +714,12 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     that "did not evaluate" because its tool crashed is neither a pass nor a fail: rerun it, with the reference in
     the same session. *Incident (11-14):* the G2 consistency gate crashed (IndexError) on both the new package and
     1241; the rerun with the fixed tool gave 0.962 vs 0.963 top-1 with 0 retries and 0 skips.
+19. **Never start a server with an empty `CUDA_VISIBLE_DEVICES`.** `flare` binaries built from `main` since the
+    2026-11-14 port refuse it at boot ("CUDA_VISIBLE_DEVICES must list device indices or GPU UUIDs"); older binaries
+    read an empty value as "all GPUs". Launch servers with `env -u CUDA_VISIBLE_DEVICES` (or an explicit list) and set
+    it empty only on the client or CPU-test command (C.14), never in a shell that later starts a server. *Incident
+    (11-17):* a qualification chain exported an empty value for its client tools; its server boots and then its
+    restore of the default inherited it and failed at boot.
 
 ### D.3 Kernel and runtime code
 
