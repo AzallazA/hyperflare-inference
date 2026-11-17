@@ -46,7 +46,8 @@ Changes since `hyperflare-tp3-20261111`:
 **Package `ds41-1017-engram-fp8@gb202-tp3-202611160815`** (`export.sh` defaults: HOT 342, MAXC 16, PARKED_ROWS 0,
 round-2 switches as above; served at 450 W, k5, alpha 0.8, budget 32, prefix cache 12G, interactive scheduler, TTFT
 order shortest, prefill merge 512, stack limit 256): **KV 5,403,008 tokens** (20261111: 3,014,656 at 8 slots, budget 24,
-32G prefix cache).
+32G prefix cache). `export.sh` pins the package's Engram chunk setting (`FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`); a
+value set by the caller is not passed through.
 
 Decode 32K (`llm_decode_bench`, ignore-EOS, one 30 s pass per cell): c1 / c8 / c16 **319.5 / 978.8 / 1,331.5 tok/s**.
 Single passes vary: four passes of the same binary and package earlier the same day gave c1 293.7-317.2 and c8
