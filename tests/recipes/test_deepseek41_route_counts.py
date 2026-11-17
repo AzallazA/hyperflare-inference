@@ -96,3 +96,10 @@ def test_debug_serve_argv_matches_export_argv():
     env_a = [line for line in export.stdout.splitlines() if line.startswith(("FLARE_DS41_", "FLARE_TUNE_", "B12X_"))]
     env_b = [line for line in serve.stdout.splitlines() if line.startswith(("FLARE_DS41_", "FLARE_TUNE_", "B12X_"))]
     assert [line for line in env_b if not line.startswith("FLARE_DS41_ROUTE_COUNTS=")] == env_a
+
+
+def test_route_order_builder_selftest():
+    """tp3-tools/ds41_route_order.py: snapshots -> blended expert order in the export's format (synthetic data)."""
+    out = subprocess.run(["python3", "-I", str(ROOT / "tp3-tools" / "ds41_route_order.py"), "selftest"],
+                         capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0 and out.stdout.strip().endswith("SELFTEST OK"), out.stderr

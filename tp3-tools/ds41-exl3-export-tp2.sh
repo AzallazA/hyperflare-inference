@@ -73,7 +73,8 @@
 #   DEBUG_SERVE  1 = `ignition debug-serve` (prepare in this process and serve HTTP on HOST:PORT, default
 #          127.0.0.1:15015) with exactly the export's environment and preparation flags, instead of `ignition export`;
 #          needs heliopause's qualification build on HELIOPAUSE_PATH (a directory placed after this tree on PYTHONPATH).
-#          The only use is FLARE_DS41_ROUTE_COUNTS=<dir> (routecount.py, expert-order calibration), which an export
+#          The use is FLARE_DS41_ROUTE_COUNTS=<dir> (routecount.py, expert-order calibration on your own traffic;
+#          snapshots and the order builder: tp3-tools/ds41_route_order.py --help), which an export
 #          refuses.
 #   --dry-run  print the environment and the exact export argv, run nothing (CPU only)
 #   --plan-only  CPU plan check (tp3-tools/ds41_exl3_plan_check.py) with the same environment; stops before any GPU work
