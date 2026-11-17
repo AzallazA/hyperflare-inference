@@ -1,8 +1,10 @@
 # GLM-5.3-Flash on Flare at TP3: plan and status (2026-11-08)
 
+> Commit ids shown as [unpublished] belong to the local history before the 2026-11-14 port and are not in the public repository.
+
 Goal: run upstream Flare's `glm53` recipe on three RTX PRO 6000 Blackwell (GB202, 96 GB each) at tensor-parallel 3,
 with the full 1M-token context, speculation and images, then qualify and release it the same way as the DeepSeek
-V4.1 Flash TP3 build. Worktree `~/flare-up-glm`, branch `glm53-tp3` (on `ds41-tp3-v3` at 6c3aef27). Nothing committed
+V4.1 Flash TP3 build. Worktree `~/flare-up-glm`, branch `glm53-tp3` (on `ds41-tp3-v3` at [unpublished]). Nothing committed
 yet. Checkpoints on disk, both SHA-256 verified against the Hub:
 
 | Checkpoint | Path | Role |
@@ -72,7 +74,7 @@ export/serve/qualification scripts in `tp3-tools/release/`, the handbook rules.
 | 8 | QAD checkpoint as a second declaration: `w8a16` KDA projections (or BF16) need a projection path the recipe lacks; declare the checkpoint, add the path, export, run the suite plus a long-context recall test like LIL's 516K lookup, compare with FP4-Local | 3 GPUs, 2-4 days | numbers for both checkpoints |
 | 9 | DCP at TP3 (optional): 3-way candidate merge kernel (the Triton merge assumes a power-of-two candidate count) and the 72-head exchange (24 per rank incl. rank 2's 8 zero heads; b12x needs equal shards). CPU stage done 2026-11-09 on `glm53-tp3-dcp3`: masked 2048-key merge, 768-token pages with ceil page counts (Python and Helios), opt-in `FLARE_GLM53_DCP3`, interpreter tests at W=2/3/4, Helios 768-page tests; GPU stages in `tp3-tools/glm-dcp3-gpu.sh` (not run) | 3 GPUs, 2 days | KV capacity x3 (estimate 12.3M vs 4.21M) |
 | 10 | Follow-ups: port `ar_rows` chunking to the GLM prefill all-reduce (32 MiB per layer call at a 4096 chunk today); `expand_expert_scales` on at TP3 if the ~6.5 GB per rank is affordable after KV sizing; `collective_ladder.py` word-exchange validation at TP3 |
-| 11 | Draft-layer `kv_b_proj` back on MXFP8 at TP3 (commit b135bb16 decodes the layer-45 MXFP8 weights exactly to BF16 because b12x qualifies its BF16 x MXFP8 BMM for 8/16/32 heads only and TP3 holds 24; cost ~+6 MiB/rank and ~4 us per draft pass, ~0.2 % of a c1 round). Options: (a) three 8-head calls per BMM, qualified shapes, two extra launches per pass; (b) one 32-head call with 8 zero heads, a third wasted work; (c) qualify batch 24 in b12x `_QUALIFIED_BATCHES` with its numerical tests (cleanest, a b12x change). Also extend the TP3 runtime collective ladder past 24 MiB (export uses static tuning since 442a7f86) | 3 GPUs, profile first | only if a c1 trace shows the draft absorb/expand BMMs taking real time; otherwise close |
+| 11 | Draft-layer `kv_b_proj` back on MXFP8 at TP3 (commit [unpublished] decodes the layer-45 MXFP8 weights exactly to BF16 because b12x qualifies its BF16 x MXFP8 BMM for 8/16/32 heads only and TP3 holds 24; cost ~+6 MiB/rank and ~4 us per draft pass, ~0.2 % of a c1 round). Options: (a) three 8-head calls per BMM, qualified shapes, two extra launches per pass; (b) one 32-head call with 8 zero heads, a third wasted work; (c) qualify batch 24 in b12x `_QUALIFIED_BATCHES` with its numerical tests (cleanest, a b12x change). Also extend the TP3 runtime collective ladder past 24 MiB (export uses static tuning since [unpublished]) | 3 GPUs, profile first | only if a c1 trace shows the draft absorb/expand BMMs taking real time; otherwise close |
 
 ## Risks
 
@@ -192,7 +194,7 @@ per variant (`~/bench-results/glm-compare-k-1108-1735`; TP2 baseline repeated in
   offers about 1.8 drafts per round. Keep 5 until the fixed-width sweep reports.
 - Smoke ("17 x 23") returns "391" on all 12 server starts; no bench loop detections. The quality suite is still to run.
 - TP3 export 39 min (TP2 33 min) after three failed attempts: runtime collective ladder stops at 24 MiB (static tuning,
-  442a7f86), MXFP8 BMM qualified for 8/16/32 heads only (draft kv_b_proj decoded to BF16, b135bb16), and a
+  [unpublished]), MXFP8 BMM qualified for 8/16/32 heads only (draft kv_b_proj decoded to BF16, [unpublished]), and a
   variable-shadowing bug in the first version of that fix.
 - vLLM Kraken TP3 (dec48abd, MTP3, 350 W) is 13-21% faster at c1 and 7-10% at c8 at equal c1 steps/s; the gap is
   tokens/step (2.16 vs 2.48), confounded by checkpoint, power and draft width. Next: draft sweep (running), a4 +
@@ -215,16 +217,16 @@ Decision: GLM default = **FP4-Local a16** (package gb202-tp3-202611082232). Full
 
 ## Decision 2026-11-11: c32 default = PR #253 + `--mtp-only` package; TTFT guard shipped, off by default
 
-**Package.** `gb202-tp3-202611112036` (`glm53-pr253` d3c27126: upstream PR #253 dead-prefill-storage reuse +
+**Package.** `gb202-tp3-202611112036` (`glm53-pr253` [unpublished]: upstream PR #253 dead-prefill-storage reuse +
 port of upstream `--mtp-only`, same switches as 202611110835: DCP=1 a16 KDA side chain, 704 expert columns, CONC=32).
 68 CUDA graphs instead of 108 (no no-draft graphs; the package refuses `--mtp-draft-tokens 0`), KV 13,416,960 served
 (+2.0% over 13,154,304). Decode vs 110835 (3 rounds vs the c32 sweep rounds at alpha 0.8): steps/s 1.025 / 1.013 /
 1.022 / 1.006 / 1.005x at c1 / c4 / c8 / c16 / c32; tok/s 0.970-1.008x (draft-acceptance swing; gate since 11-11 =
 steps/s >= 0.98x AND tok/s >= 0.96x). Quick checks: eval-43 43/43, tools-60 60/60 at c32, verify_fix 0 TRUE
-corruptions, 0 server errors. Needs a binary with the `mtp_only` field (this branch since 7e4a1cd0).
+corruptions, 0 server errors. Needs a binary with the `mtp_only` field (this branch since [unpublished]).
 
-**TTFT guard** (`--scheduler-policy interactive` = balanced + `--scheduler-ttft-target-ms 50`; Helios f1135624, same
-code as DS41). Merged here (fast-forward to 7e4a1cd0) but `serve-glm.sh` keeps `SCHED=balanced`: with the target at 0
+**TTFT guard** (`--scheduler-policy interactive` = balanced + `--scheduler-ttft-target-ms 50`; Helios [unpublished], same
+code as DS41). Merged here (fast-forward to [unpublished]) but `serve-glm.sh` keeps `SCHED=balanced`: with the target at 0
 the guard path is inert (trace test: identical plan sequence), so no quality run is needed for the default.
 `SCHED=interactive ./serve-glm.sh` turns it on. Measured on 202611112036 (bench-results/ttft-ab-glm-1111-1615, decode
 "off" = glm-tp3-newbench-1111-1540, both 3 rounds, 32K 60 s):

@@ -12,7 +12,7 @@ Patches applied only to the b12x overlay (`tp3-tools/make-b12x-overlay.sh` -> `.
   `_gather_push_tp2`). `auto` is unchanged (world 3 only), so TP2 exports stay on push unless `PULL=1` is exported.
   CPU check: world-2 push PTX identical to the unpatched venv, world-3 auto PTX identical to the 11-09 overlay; world-2
   pull compiles for both ranks and slot modes. Not measured on GPU yet (glm-tp2 chain stage G).
-- (removed) `b12x-mla-decode-remainder-stream.patch` (cc3e8764): editing b12x `attention/_shared/mla/kernel.py`
+- (removed) `b12x-mla-decode-remainder-stream.patch` (85f8c501): editing b12x `attention/_shared/mla/kernel.py`
   changes the source fingerprint (`b12x/_lib/source_dependencies.py`) of 32 MLA modules even with its switch off, so
   every MLA program recompiles and all `compressed_sparse_mla` tuning races re-run. Replaced by the ignition-side
   wrapper `ignition/components/mla_remainder_stream.py` (same switch `B12X_MLA_DECODE_REMAINDER_STREAM=1`, no b12x

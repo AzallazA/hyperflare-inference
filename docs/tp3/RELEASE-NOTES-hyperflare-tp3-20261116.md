@@ -1,6 +1,5 @@
 <!-- GitHub Release note for tag hyperflare-tp3-20261116. Title: "Hyperflare TP3 2026-11-16: upstream port, FP8 Engram, 16 slots, 5.40M KV"
-     The annotated tag message is the commented block at the end of this file. The 16-stream KV stress result is
-     pending (see the Qualification paragraph); this file is updated on tp3-main when it exists. -->
+     The annotated tag message is the commented block at the end of this file. -->
 
 **Flare = Hyperflare.** The binary, CLI and cache paths are still `flare`. **New base:** this release is built on
 upstream Hyperflare `70069281` (2026-11-14), not `972e28e4`. The fork's history was rebuilt on that base, so this tag
@@ -57,14 +56,16 @@ first token p50 0.42 s / p90 0.72 s. 20261111 published 301 / 734 / 988 at c1 / 
 60 s cells), 289 / 271 at 128K / 512K, prefill 32K 14,547: different method (single 30 s passes here), so compare the
 ranges, not single numbers.
 
-**Qualification (tier "weights": the FP8 tables are a quantisation change), live server, no restarts:** corruption check
-0 true corruptions (10 runs); decode-vs-prefill consistency top-1 0.951 (gate 0.95); eval-43 42/43; tool calls 60/60;
-tool-eval 90/100 (77/91 graded, TC-45 excluded as before; baseline 91); image smoke 5/5; long retrieval 128K / 900K
-pass / pass; GPQA Diamond 91.4% (181/198, one sample; WARN: 4 answers truncated, gate ≤ 3; baseline 90.4%); hotel-lights at 16 streams 30/30.
-**Pending: the 16-stream KV stress, the post-run checks and the log scan.** Their first run was interrupted 0.8 min
-into the stress by a hardware fault on the test machine; the result will be added here when the rerun is done. The
-same package passed the 16-stream stress earlier the same day on the binary before the prefill-merge switch (32/32
-long requests, 207/207 pings, lowest free VRAM 80 MiB); that is not a result for this tag's binary.
+**Qualification (tier "weights": the FP8 tables are a quantisation change):** corruption check 0 true corruptions (10
+runs); decode-vs-prefill consistency top-1 0.951 (gate 0.95); eval-43 42/43; tool calls 60/60; tool-eval 90/100 (77/91
+graded, TC-45 excluded as before; baseline 91); image smoke 5/5; long retrieval 128K / 900K pass / pass; GPQA Diamond
+91.4% (181/198, one sample; WARN: 4 answers truncated, gate ≤ 3; baseline 90.4%); hotel-lights at 16 streams 30/30.
+During qualification, a hardware fault on one GPU (Xid 79, the card dropped off the PCIe bus) interrupted the first
+16-stream KV stress attempt after 42 seconds; the stress was rerun on the same build and settings, and its result
+follows: **16-stream KV stress PASS** (2 waves, 32/32 long requests, 212/212 pings, 0 bad log lines, lowest free VRAM
+64 MiB: above the 16 MiB gate, below the kit's 480 MiB margin; 25.6 min); post-run smoke 2/2, served KV unchanged, 0
+true corruptions; server and kernel log scan clean.
+
 **Not run for this release** (owner's tiered policy of 2026-11-16, to release faster): LiveBench, long generation,
 lavd, the natural-EOS decode bench, the 8-stream KV stress (the 16-stream stress replaces it), the 128K c8 cell, the
 vision image sets.
@@ -72,7 +73,7 @@ vision image sets.
 **Not adopted:** Engram side stream on layer 14 (level); BRRR build-time tuning switches (spin, two-shot crossover,
 wo_b slices, CTAs per SM); packed verification shapes above 8 slots.
 
-<!-- Annotated tag message draft (git tag -a hyperflare-tp3-20261116 <tag commit> -F <file>):
+<!-- Annotated tag message (git tag -a hyperflare-tp3-20261116 <tag commit> -F <file>):
 
 hyperflare-tp3-20261116: DeepSeek-V4.1-Flash-1017 at TP3 on Hyperflare 70069281
 
@@ -85,7 +86,7 @@ prefill merge 512, CUDA stack limit 256. KV 5,403,008.
 Decode 32K c1/c8/c16 319.5/978.8/1,331.5 tok/s (one 30 s pass; same-day spread c1 293.7-317.2, c8 989.2-1,024.4);
 128K/512K c1 320.8/292.7; prefill 32K 15,766.
 Qualification tier weights: verify 0 TRUE, consistency 0.951, eval 42/43, tools 60/60, tool-eval 90, retrieval
-pass/pass, GPQA 91.4% (WARN 4 truncated), hotel16 30/30. Pending: stress16, post checks, log scan (first run interrupted by a hardware fault on the
-test machine; rerun result to be added; the same package passed stress16 on the binary before prefill merge:
-32/32, 207/207, 80 MiB). Not run: LiveBench, longgen, lavd, EOS bench, 8-stream stress.
+pass/pass, GPQA 91.4% (WARN 4 truncated), hotel16 30/30, stress16 PASS (rerun after a GPU hardware fault, Xid 79,
+interrupted the first attempt: 32/32, 212/212, lowest free VRAM 64 MiB), post checks and log scan PASS.
+Not run: LiveBench, longgen, lavd, EOS bench, 8-stream stress.
 -->

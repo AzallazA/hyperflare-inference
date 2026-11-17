@@ -1,6 +1,8 @@
 # Tail merge `true` without the thinking regression, on tp3-main (2026-11-13)
 
-Branch `ds41-tailmerge-thinking` (worktree `~/flare-up-tmfix`) on `ds41-upstream-285-286` (d15e2389 = tp3-main + #286,
+> Commit ids shown as [unpublished] belong to the local history before the 2026-11-14 port and are not in the public repository.
+
+Branch `ds41-tailmerge-thinking` (worktree `~/flare-up-tmfix`) on `ds41-upstream-285-286` ([unpublished] = tp3-main + #286,
 GPU-validated 11-13). Local and Gitea only. Not merged: needs the GPU check
 `~/ds41-tp3/analysis/work/tmfix/val-c.sh` (waiter `/tmp/gpuq-seq95.sh`).
 
@@ -14,7 +16,7 @@ runs the chunk that would stop at the last message straight to the prompt end, s
 captured and the next turn falls back to the previous selected boundary: it re-prefills the whole last user message
 (val-b base arm: thinking 8K/32K follow-up gaps 14359 / 57898 on turn 2, ~370-430 later; refoff/tools-only: 2).
 
-## What is ported from `sched-617-tailmerge` (1763f050, the final form of 7d5ffabe)
+## What is ported from `sched-617-tailmerge` ([unpublished], the final form of [unpublished])
 
 - `RequestSpec::reasoning_prompt` / `Prompt::reasoning_prompt`: the generation prompt opens a reasoning block, set in
   `server/request.rs` from the prepared output's start state (`OutputStart::Reasoning`).
