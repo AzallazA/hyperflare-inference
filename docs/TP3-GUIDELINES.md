@@ -311,6 +311,18 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    "export" qualification (hotel-lights, KV stress, consistency, eval-43, tool-eval, 128K, retrieval) is listed as
    not yet run. The branch was a cherry-pick of the reclaim commit onto the scrubbed release line (`release/main-20261116`),
    not a merge of the old-history branch, so no old commit enters the public history (B.5.4).
+   *2026-11-17 (DS41 EXL3 TP2):* the EXL3 3-bit TP2 package (diffbot's pack, two GPUs) was developed on an
+   old-history branch, so the release branch `release/main-ds41-exl3-tp2` is built on the scrubbed `main` as a
+   three-way tree merge (base = the old-history commit equal to the round-2 merge of `main`), split by area: Helios
+   int4 Engram encoding + padding-only KV rows; the EXL3 recipe (`ignition/recipes/deepseek41/exl3/`, xmoe kernels
+   under MIT with `THIRD_PARTY.md`, export script `tp3-tools/ds41-exl3-export-tp2.sh`, CPU plan check, debug-serve
+   route counter); the release export's levers (each default off in the recipe); the expert-order builder
+   `tp3-tools/ds41_route_order.py` (orders from route counts on the user's own traffic); this entry. Checks before
+   the push: the Rust tree is identical to the development branch's (a rebuild at the same checkout path gives the
+   same binary; the sha256 depends on the checkout path, which is part of the crate hashes), the `--plan-only`
+   output of the release `export.sh` matches the development branch's, the DS41/xmoe/tp3_config CPU tests match,
+   and the hygiene grep covers `public/main..<tag>` in history. diffbot's vLLM patches (AGPL-3.0-only) are never
+   copied into the fork. Serving: `FLARE_CUDA_STACK_LIMIT=128`.
 
 ### B.6 Sync from upstream (deliberate, never automatic)
 
