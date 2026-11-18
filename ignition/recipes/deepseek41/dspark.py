@@ -22,6 +22,7 @@ DRAFT_FILL = -1e30
 class PreparedDraft:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
     mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
+    draft_columns = None  # TP3 tp3.draft_vocab: local columns of the trimmed draft head; None = full head
 
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
                  coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False, examples=None,
