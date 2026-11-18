@@ -273,15 +273,18 @@ A node is evictable only when its store's policy allows it: the memory store sta
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Disk drops a non-root record's row once its only child commits, keeping the
-pages. DRAM retains these redundant rows while its free retention space exceeds
-two continuation rows. Reserved transfer intake does not count as retention
-headroom. When that threshold is reached, or an incoming record needs more
-space than is free, DRAM reclaims eligible redundant rows before evicting other
-records. It reclaims them in least-recently-used order and stops once the
-headroom is restored: a single child does not show that its parent's row is
-unused, because a request that branches from the parent leaves that row as the
-only resume point of the conversation it branched from. Readers and spills
+DRAM and disk retain redundant non-root rows while the tier's free retention
+space exceeds two continuation rows. Disk counts only committed children when
+deciding whether a row is redundant. Reserved transfer intake does not count
+as retention headroom. When that threshold is reached, or an incoming record
+needs more space than is free, the tier reclaims eligible redundant rows before
+evicting other records. It reclaims them in least-recently-used order and stops
+once the headroom is restored: a single child does not show that its parent's
+row is unused, because a request that branches from the parent leaves that row
+as the only resume point of the conversation it branched from. With a pool
+configured, disk maintenance reclaims redundant rows before it hands leaves to
+the pool. A composite spill keeps the row, so the disk tier writes the row of
+every spilled parent and truncates it later under pressure. Readers and spills
 delay row removal until their pins are released.
 DRAM releases row slots, disk truncates at the row segment, and later spills
 omit removed rows. A rewind or later fork restores its retained endpoint when
