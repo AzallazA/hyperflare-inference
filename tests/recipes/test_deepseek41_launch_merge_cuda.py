@@ -208,8 +208,8 @@ def test_mma_pad_once_is_bit_identical(attention_weights, rows):
                 value.fill_(-1)
 
         try:
-            expected = None
-            for name in ("base", "pads", "pads", "pads", "base-side", "pads-side", "pads-side", "base"):
+            expected, ties = None, []
+            for replay, name in enumerate(("base", "pads", "pads", "pads", "base-side", "pads-side", "pads-side", "base")):
                 reset()
                 torch.cuda.synchronize()
                 graphs[name].replay()
@@ -222,9 +222,27 @@ def test_mma_pad_once_is_bit_identical(attention_weights, rows):
                     if len(outputs) <= index < len(outputs) + len(selected):
                         # Index sets, equal up to zero-history ties (module doc); outputs, pool rows and pages
                         # stay byte-exact.
+                        # tie witness: rows whose exact sets differ (a non-zero count on the last plain 'base' replay
+                        # shows the picks vary with no pad-once in either graph)
+                        differ = int((value.sort(dim=-1).values != reference.sort(dim=-1).values).any(dim=-1).sum())
+                        if differ:
+                            ties.append(f"{replay}:{name}:L{LAYERS[index - len(outputs)]}={differ}")
                         assert_same_selection(value, reference, history[index - len(outputs)], (name, index))
                         continue
                     assert torch.equal(value.view(torch.uint8), reference.view(torch.uint8)), (name, index)
+            print(f"\nLAUNCHMERGE ties rows={rows} {' '.join(ties) or 'none'}")
+            # negative control (handbook D.3.8): one real row's first 32 activations x2 (what a one-exponent MMA-scale
+            # error on that row and K group does to qkv_a's input) must change that layer's output bytes
+            for index in range(len(LAYERS)):
+                kept = sources[index][-1, :32].clone()
+                sources[index][-1, :32] = kept * 2
+                reset()
+                torch.cuda.synchronize()
+                graphs["pads"].replay()
+                torch.cuda.synchronize()
+                changed = not torch.equal(outputs[index].view(torch.uint8), expected[index].view(torch.uint8))
+                sources[index][-1, :32] = kept
+                assert changed, ("negative control", index)
             if os.environ.get("FLARE_LAUNCHMERGE_TIMING") == "1":
                 reps = int(os.environ.get("FLARE_LAUNCHMERGE_REPS", "300"))
                 for graph in graphs.values():
