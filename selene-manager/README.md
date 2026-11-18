@@ -71,7 +71,10 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
 See [address forms and startup warnings](docs/network-operations.md#addresses-and-startup-warnings)
-for network connection settings and diagnostics.
+for network connection settings and diagnostics. A configured pool must attach
+at instance startup; timeouts, registration failures and memory-budget rejection
+stop startup with corrective actions. Start the manager before its instances, or
+remove `--prefix-cache-pool` to run local-only.
 
 The arena and staging are preallocated files under `/dev/shm/selene/<name>-<hash>`, where the hash
 is 32 hex digits derived from the absolute socket path, so the shared-memory mount must hold at

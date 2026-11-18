@@ -995,14 +995,20 @@ sees no export requests. Local and pooled instances use the same copy-at-publish
 and GPU eviction policy from section 2.10. A pooled instance reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
-The loader attaches once before sizing and allocating GPU caches. The
-`Wait for prefix cache pool` startup phase waits up to ten seconds for the
-manager's first Hello. HTTP admission opens after loading and worker readiness;
-if the manager is absent, the instance starts on local tiers and never attaches
-later. Connection retries during that startup window are silent. At the deadline,
-one warning says the manager did not answer, local tiers will be used, and the
-instance will not attach later. An instance that attached at startup retries
-its attachment after a lost connection.
+The loader checks the connection and `Hello` in `Reach prefix cache pool` before
+loading weights, then attaches once before sizing and allocating GPU caches. The
+`Wait for prefix cache pool` startup phase waits up to 30 seconds for the
+manager's first Hello, matching the manager operating guide's 30 one-second
+readiness probes. Registration time grows with the manager's `--memory` and
+`--staging` sizes and does not count against the startup wait; session opening
+has a separate 40-second allowance. Configuring a pool makes attachment required:
+a timeout, refused connection, registration failure or rejected memory budget fails startup with
+the cause and corrective action. Start the manager before the instance when
+recovery exceeds that window, or remove `--prefix-cache-pool` to run with local
+tiers only. HTTP admission opens after loading and worker readiness. CUDA
+registration consumes device memory, so the client cannot attach for the first
+time after cache sizing or request admission. An instance that attached at
+startup retries its existing attachment after a lost connection.
 
 Before any CUDA registration, the complete Hello plan must fit both budgets:
 the manager's arena plus staging on this host, or the client's data staging for
@@ -1013,9 +1019,10 @@ rounded up separately for each region, as for local registered tiers. Integrated
 GPUs also share the host-byte charge once per host. The check preserves runtime
 headroom, explicit memory limits and minimum execution/KV capacity; accepted
 charges reduce the remaining cache budget. A plan exceeding either budget
-registers nothing and produces one warning naming its sizes and the reason,
-then serving uses local tiers. Failure to observe host supply also refuses the
-pool with that reason.
+registers nothing and fails startup, naming the region sizes and required versus
+available bytes. Free host/device memory or reduce the manager's `--memory` and
+`--staging` sizes. Failure to observe host supply also fails startup with that
+reason.
 
 The startup registrar requires identical CUDA and host addresses. Its owning
 registrations survive a manager restart when the region generation, paths and
