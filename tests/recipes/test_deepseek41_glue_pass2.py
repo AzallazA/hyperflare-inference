@@ -40,7 +40,7 @@ def test_switch_is_off_by_default_parsed_and_recorded():
     assert TP3Config.from_environment({"FLARE_DS41_GLUE_PASS2": "0"}).glue_pass2 is False
     config = TP3Config.from_environment({"FLARE_DS41_GLUE_PASS2": "1"})
     assert config.glue_pass2 is True
-    assert config.to_metadata()["glue_pass2"] is True and TP3Config().to_metadata()["glue_pass2"] is False
+    assert config.to_metadata()["glue_pass2"] is True and "glue_pass2" not in TP3Config().to_metadata()  # recorded only when on
     assert "glue_pass2=True" in config.describe()
     with pytest.raises(TypeError):
         TP3Config(glue_pass2=1)

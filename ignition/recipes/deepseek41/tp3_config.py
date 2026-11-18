@@ -44,7 +44,7 @@ RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_w
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
-RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host")
+RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2")
 
 # FLARE_DS41_PREFILL_SKIP_SUFFIX=1: the prefill capacities that get an encoder-only twin (the sizes that end the
 # non-final chunks of long cold prompts at the 4096 chunk); a comma list names them explicitly.
