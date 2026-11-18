@@ -358,7 +358,8 @@ class PreparedParallelDraftRound:
             self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head,
-                pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts)
+                pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
+                stage_rows=getattr(o, "stage_markov_rows", False))
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None

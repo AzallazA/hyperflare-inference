@@ -68,6 +68,7 @@ def _score_tiles(
     SAMPLE: tl.constexpr,
     STEP: tl.constexpr,
     BLOCK: tl.constexpr,
+    STAGED: tl.constexpr,
 ):
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
@@ -79,9 +80,15 @@ def _score_tiles(
         Logits + request_row * logit_row_stride + position * logit_step_stride + local_id, present, other=0
     ).to(tl.float32)
     if MARKOV:
-        predecessor = tl.load(Pending + request_row) if STEP == 0 else tl.load(Drafts + request_row * DRAFTS + STEP - 1)
-        predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
-        value += _transition_bias(Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8)
+        if STAGED:
+            # TP3 fork (stage_rows): ``Embedding`` is the [rows, RANK] copy _stage_markov_rows made of each request's
+            # predecessor row for this step; same BF16 values, read from VRAM instead of once per tile from the table.
+            value += _transition_bias(Embedding, Head, HeadScale, request_row, local_id, present, RANK, 64, BLOCK, FP8)
+        else:
+            predecessor = (tl.load(Pending + request_row) if STEP == 0
+                           else tl.load(Drafts + request_row * DRAFTS + STEP - 1))
+            predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
+            value += _transition_bias(Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8)
     slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
     temperature = tl.load(Params + slot * 6)
     repeat = tl.load(Params + slot * 6 + 3)
@@ -123,6 +130,21 @@ def _score_tiles(
     tl.store(partial + 2 * BLOCKS, tl.max(choice, 0))
     tl.store(partial + 3 * BLOCKS, (tl.load(VocabularyOffset) + tile * BLOCK + winner).to(tl.float32))
     tl.store(partial + 4 * BLOCKS, invalid.to(tl.float32))
+
+
+@triton.jit
+def _stage_markov_rows(Embedding, Pending, Drafts, Staged, DRAFTS: tl.constexpr, VOCAB: tl.constexpr,
+                       RANK: tl.constexpr, RANK_PAD: tl.constexpr, STEP: tl.constexpr):
+    """TP3 fork (PreparedVocabularySoftmax stage_rows): copy each request's Markov predecessor row (the predecessor
+    _score_tiles would pick for this step, clamped the same way) from the embedding table into ``Staged`` [rows, RANK].
+    One program per request row: the table (host memory when parked) is read once per row and step instead of once per
+    vocabulary tile (169 x per row on a TP3 shard)."""
+    row = tl.program_id(0)
+    predecessor = tl.load(Pending + row) if STEP == 0 else tl.load(Drafts + row * DRAFTS + STEP - 1)
+    predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1).to(tl.int64)
+    column = tl.arange(0, RANK_PAD)
+    inside = column < RANK
+    tl.store(Staged + row * RANK + column, tl.load(Embedding + predecessor * RANK + column, inside), inside)
 
 
 @triton.jit
@@ -481,6 +503,7 @@ class PreparedVocabularySoftmax:
         seeds=None,
         offsets=None,
         tokens=None,
+        stage_rows=False,
     ):
         if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
             raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
@@ -532,6 +555,14 @@ class PreparedVocabularySoftmax:
                     record_numeric_tensor(scale)
         elif self.markov:
             raise ValueError("target softmax cannot attach proposal Markov weights")
+        # TP3 fork: ``stage_rows`` copies each request's predecessor embedding row into a [b, rank] VRAM buffer once per
+        # draft step (_stage_markov_rows) and the score tiles read that copy. For an embedding in device-visible host
+        # memory (DS41 tp3.markov_embed_host); same values. False = the tiles read the table directly (base).
+        if type(stage_rows) is not bool:
+            raise TypeError("stage_rows must be a boolean")
+        if stage_rows and not (sample and self.markov):
+            raise ValueError("stage_rows needs Markov proposals")
+        self.stage_rows = stage_rows
         self.logits, self.probabilities, self.valid = logits, probabilities, valid
         self.state, self.slots, self.generations, self.live_rows = requests, slots, generations, live_rows
         self.candidates, self.start, self.world, self.batch, self.width, self.local = (
@@ -553,6 +584,7 @@ class PreparedVocabularySoftmax:
                 partials=((summary_rows, 5, triton.cdiv(local, 256)), torch.float32),
                 summary=((summary_rows, SUMMARY_WORDS), torch.float32),
                 gathered=((summary_rows, world * SUMMARY_WORDS), torch.float32),
+                **({"staged": ((b, embedding.shape[1]), torch.bfloat16)} if stage_rows else {}),
             ),
             device=device,
             workspace=workspace,
@@ -581,7 +613,7 @@ class PreparedVocabularySoftmax:
                     self.logits,
                     self.probabilities,
                     s["partials"],
-                    self.embedding,
+                    s["staged"] if self.stage_rows else self.embedding,
                     self.head,
                     self.scale,
                     self.pending,
@@ -619,8 +651,20 @@ class PreparedVocabularySoftmax:
                 SAMPLE=self.sample,
                 STEP=step,
                 BLOCK=256,
+                STAGED=self.stage_rows,
                 num_warps=4,
                 enable_fp_fusion=False,
+            )
+            stage = None if not self.stage_rows else prepare_triton(
+                _stage_markov_rows,
+                (self.embedding, self.pending, self.candidates, s["staged"]),
+                (b, 1, 1),
+                DRAFTS=self.candidates.shape[1],
+                VOCAB=state.vocab_size,
+                RANK=self.head.shape[1],
+                RANK_PAD=triton.next_power_of_2(self.head.shape[1]),
+                STEP=step,
+                num_warps=1,
             )
             summary = prepare_triton(
                 _softmax_records,
@@ -660,7 +704,8 @@ class PreparedVocabularySoftmax:
                 num_warps=4,
                 enable_fp_fusion=False,
             )
-            steps.append((score, summary, normalize))
+            # (score, summary, normalize) as upstream; stage_rows appends the step's row copy (run before score).
+            steps.append((score, summary, normalize) if stage is None else (score, summary, normalize, stage))
         self.steps = tuple(steps)
 
     def functional(self, *, session):
@@ -691,8 +736,8 @@ class PreparedVocabularySoftmax:
         for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens)):
             if value is not None:
                 local[name] = value
-        for score, summary, normalize in self.steps:
-            for operation in (score, summary):
+        for score, summary, normalize, *stage in self.steps:
+            for operation in (*stage, score, summary):
                 args = list(operation.args)
                 for index, name in operation.local_slots:
                     args[index] = local[name]
@@ -707,7 +752,9 @@ class PreparedVocabularySoftmax:
     def __call__(self):
         if self.steps is None:
             raise RuntimeError("vocabulary distributions require preparation")
-        for score, summary, normalize in self.steps:
+        for score, summary, normalize, *stage in self.steps:
+            for operation in stage:
+                operation()
             score()
             summary()
             self.gather(self.scratch["summary"])

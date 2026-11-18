@@ -44,7 +44,7 @@ RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_w
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
-RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2")
+RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2", "markov_stage_rows")
 
 # FLARE_DS41_PREFILL_SKIP_SUFFIX=1: the prefill capacities that get an encoder-only twin (the sizes that end the
 # non-final chunks of long cold prompts at the 4096 chunk); a comma list names them explicitly.
@@ -172,6 +172,13 @@ class TP3Config:
     the drafter's embedding lookup and the fused Markov transition bias read only the pending tokens' rows (<= one per
     request and draft step) through the mapping. Same values. False = VRAM (base). Export-time only (2026-11-15 memory
     map item 6)."""
+    markov_stage_rows: bool = False
+    """With ``markov_embed_host``: each draft step first copies every request's predecessor row of the parked Markov
+    embedding into a [rows, 256] BF16 VRAM buffer (one small launch per step), and the fused transition bias reads that
+    copy instead of the host row once per vocabulary tile (169 tiles per row on a TP3 shard; the cause of the 180256
+    decode regression, ab-regression-180256/DIAG.md). Same values (CPU proof: tests/components/
+    test_markov_stage_rows_interpret.py). Needs vocabulary-parallel sampling. False = tiles read the table (base).
+    Export-time only (2026-11-18)."""
     embed_rows: bool = False
     """With ``embed_host``: decode, verification and draft graphs gather the parked table's rows with one vectorised
     Triton launch (all of a row's loads before its stores) and take DSpark's noise-token rows from a 10 KB device copy
@@ -381,9 +388,12 @@ class TP3Config:
             raise TypeError("TP3 config: mma_pad_once must be a boolean")
         if self.draft_vocab is not None and not isinstance(self.draft_vocab, Path):
             raise TypeError("TP3 config: draft_vocab must be a Path or None")
-        for name in ("vision_arena_host", "markov_embed_host"):  # own line, as mma_pad_once's
+        for name in ("vision_arena_host", "markov_embed_host", "markov_stage_rows"):  # own line, as mma_pad_once's
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
+        if self.markov_stage_rows and not self.markov_embed_host:
+            raise ValueError("TP3 config: markov_stage_rows stages rows of the parked Markov embedding; it needs "
+                             "markov_embed_host (FLARE_DS41_MARKOV_EMBED_HOST=1)")
         if any(type(layer) is not int or layer < 0
                for layer in (*self.host_expert_layers, *self.brrr_layers, *self.engram_side_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
@@ -539,6 +549,7 @@ class TP3Config:
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
             vision_arena_host=flag("VISION_ARENA_HOST"),
             markov_embed_host=flag("MARKOV_EMBED_HOST"),
+            markov_stage_rows=flag("MARKOV_STAGE_ROWS"),
             draft_vocab=None if not get("DRAFT_VOCAB") else Path(get("DRAFT_VOCAB")),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),

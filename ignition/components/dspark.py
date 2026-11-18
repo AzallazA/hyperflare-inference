@@ -62,8 +62,12 @@ class SpeculativePreparation:
         sampling_runtime=None,
         logprob_runtime=None,
         share_vocabulary_columns=False,
+        stage_markov_rows=False,
     ):
         self.forwards = forwards
+        # TP3 fork (DS41 tp3.markov_stage_rows): vocabulary-parallel proposals copy each request's Markov predecessor
+        # row into VRAM once per draft step (vocabulary_sampling._stage_markov_rows); False = tiles read the table.
+        self.stage_markov_rows = stage_markov_rows
         # TP3 fork (DS41 tp3.share_vocab_columns): vocabulary-parallel rounds read one persistent copy of this rank's
         # global vocabulary ids (parallel_draft.vocabulary_columns) instead of one per round; False = one per round.
         self.share_vocabulary_columns = share_vocabulary_columns
