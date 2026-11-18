@@ -168,11 +168,122 @@ def _finish(Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Ga
             tl.store(out + (1 + k) * PAIR_FIELDS + 1, values.to(tl.int32, bitcast=True), k < TOP)
 
 
+# --- TP3 fork (DS41 tp3.logprob_single_exchange): one statistic exchange instead of two ---------------------------
+# The two-exchange path needs the global normalizer before it ranks candidates (``_candidates`` sorts x - lse). The
+# single-exchange path ranks each rank's candidates by the raw logit instead (``_raw_candidates``; same tiles, same
+# 32-per-tile and 32-per-rank cuts, same key encoding), ships them with the chosen/requested raw scores and the local
+# (max, mass) pair in ONE summary row (max/mass in the last two words, which the packed keys and the requested scores
+# never reach), and ``_finish_single`` computes the global normalizer from the gathered pairs with
+# ``_global_normalization``'s exact expression, subtracts it from the gathered raw candidates, re-keys them with the
+# subtracted value and sorts. Chosen and requested logprobs are the same FP32 operations on the same values. The top
+# alternatives are the same set whenever every rank's 32 raw candidates contain its tokens of the true top 20; the
+# subtraction is monotone, so the only exception is >= 13 distinct raw logits on one rank collapsing to one FP32
+# value at the top-20 boundary, where the reported VALUES are still identical and only the ids among exactly tied
+# values can differ (tests/components/test_logprob_single_exchange_interpret.py proves both on the CPU interpreter).
+_STAT_WORD = _SUMMARY - 2
+
+
+@triton.jit
+def _local_normalization_at(Records, Frame, Requested, Slots, Epochs, Live, Stats, Summary,
+                            WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
+                            FIELDS: tl.constexpr, BLOCK: tl.constexpr, WORDS: tl.constexpr, AT: tl.constexpr):
+    """``_local_normalization`` storing (max, mass) at words AT, AT + 1 of the row's summary."""
+    row, col = tl.program_id(0), tl.program_id(1)
+    _, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
+    maximum = -float("inf")
+    mass = 0.
+    if valid:
+        tiles = tl.arange(0, BLOCK)
+        base = ((row * WIDTH + col) * TILES + tiles) * 2
+        maxima = tl.load(Stats + base, tiles < TILES, other=-float("inf"))
+        masses = tl.load(Stats + base + 1, tiles < TILES, other=0.)
+        maximum = tl.max(maxima, 0)
+        mass = tl.sum(masses * tl.exp(maxima - tl.where(maximum == -float("inf"), 0., maximum)), 0)
+    tl.store(Summary + (row * WIDTH + col) * WORDS + AT, maximum)
+    tl.store(Summary + (row * WIDTH + col) * WORDS + AT + 1, mass)
+
+
+@triton.jit
+def _raw_candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, Keys,
+                    LOCAL: tl.constexpr, V: tl.constexpr, Offset,
+                    WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
+                    FIELDS: tl.constexpr, BLOCK: tl.constexpr, CANDIDATES: tl.constexpr):
+    """``_candidates`` ranking the raw logits (no normalizer yet)."""
+    row, col, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    offset = tl.load(Offset)
+    slot, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
+    if valid:
+        if tl.load(Counts + slot) == 0:
+            ids = tile * BLOCK + tl.arange(0, BLOCK)
+            inside = (ids < LOCAL) & (ids + offset < V)
+            x = tl.load(Logits + (row * WIDTH + col) * LOCAL + ids, inside, other=-float("inf")).to(tl.float32)
+            keys = tl.sort(tl.where(inside, _sort_key(x, ids + offset), 0), descending=True)
+            index = (row * WIDTH + col) * TILES + tile
+            k = tl.arange(0, BLOCK)
+            tl.store(Keys + index * CANDIDATES + k, keys, k < CANDIDATES)
+
+
+@triton.jit
+def _finish_single(Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Gathered, Output,
+                   LOCAL: tl.constexpr, V: tl.constexpr, WIDTH: tl.constexpr, SLOTS: tl.constexpr,
+                   FIELDS: tl.constexpr, WORLD: tl.constexpr, WORLD_BLOCK: tl.constexpr, WORDS: tl.constexpr,
+                   AT: tl.constexpr, CANDIDATES: tl.constexpr, BLOCK: tl.constexpr, TOP: tl.constexpr,
+                   IDS: tl.constexpr, CHOSEN: tl.constexpr, REQUESTED: tl.constexpr, OUTPUT_TOKENS: tl.constexpr,
+                   OUTPUT_FIELDS: tl.constexpr, PAIR_FIELDS: tl.constexpr):
+    """``_global_normalization`` + ``_finish`` from one gathered summary whose candidates carry raw logits."""
+    row, col = tl.program_id(0), tl.program_id(1)
+    slot, token, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
+    if valid:
+        index = row * WIDTH + col
+        ranks = tl.arange(0, WORLD_BLOCK)
+        base = (index * WORLD + ranks) * WORDS + AT
+        maxima = tl.load(Gathered + base, ranks < WORLD, other=-float("inf"))
+        masses = tl.load(Gathered + base + 1, ranks < WORLD, other=0.)
+        maximum = tl.max(maxima, 0)
+        lse = maximum + tl.log(tl.sum(masses * tl.exp(maxima - maximum), 0))
+        owner = token // LOCAL
+        chosen = tl.load(Gathered + (index * WORLD + owner) * WORDS + CHOSEN)
+        out = Output + ((tl.load(Frame) * SLOTS + slot) * OUTPUT_TOKENS + col) * OUTPUT_FIELDS
+        tl.store(out, token.to(tl.int32))
+        tl.store(out + 1, (chosen - lse).to(tl.int32, bitcast=True))
+        count = tl.load(Counts + slot)
+        if count > 0:
+            requested_lane = tl.arange(0, IDS)
+            queried_ids = tl.load(TokenIds + slot * IDS + requested_lane, requested_lane < count, other=-1)
+            owners = queried_ids // LOCAL
+            queried_values = tl.load(Gathered + (index * WORLD + owners) * WORDS + REQUESTED + requested_lane,
+                (requested_lane < count) & (queried_ids >= 0) & (queried_ids < V), other=float("nan"))
+            tl.store(out + (1 + requested_lane) * PAIR_FIELDS, queried_ids, requested_lane < count)
+            tl.store(out + (1 + requested_lane) * PAIR_FIELDS + 1,
+                     (queried_values - lse).to(tl.int32, bitcast=True), requested_lane < count)
+        else:
+            k = tl.arange(0, BLOCK)
+            rank, local = k // CANDIDATES, k % CANDIDATES
+            packed = Gathered.to(tl.pointer_type(tl.uint64))
+            raw = tl.load(packed + (index * WORLD + rank) * (WORDS // 2) + local, rank < WORLD, other=0)
+            raw_ids, raw_values = _sort_pair(raw)
+            keys = tl.where(raw != 0, _sort_key(raw_values - lse, raw_ids), 0)
+            keys = tl.sort(keys, descending=True)
+            ids, values = _sort_pair(keys)
+            tl.store(out + (1 + k) * PAIR_FIELDS, ids, k < TOP)
+            tl.store(out + (1 + k) * PAIR_FIELDS + 1, values.to(tl.int32, bitcast=True), k < TOP)
+
+
 class PreparedVocabularyParallelLogprobs:
     """Exchange raw normalizers and requested scores while retaining vocabulary shards."""
 
     def __init__(self, logits, completion, slots, epochs, live, frame, *, vocabulary,
-                 offset, runtime, session, coordinator, name):
+                 offset, runtime, session, coordinator, name, single_exchange=False):
+        # TP3 fork (DS41 tp3.logprob_single_exchange): one summary exchange per call instead of two (see
+        # ``_finish_single``); False = the two-exchange reduction (base).
+        self.single_exchange = bool(single_exchange)
+        # TP3 fork (DS41 tp3.no_generation_logprobs): a completion without generation logprob storage gets an inert
+        # reduction (no kernels, no exchange channel use); Helios then answers logprob requests with HTTP 400.
+        self.inert = completion.logprobs is None
+        self.operations = ()
+        if self.inert:
+            self._preparation = ()
+            return
         validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
@@ -201,6 +312,25 @@ class PreparedVocabularyParallelLogprobs:
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         geometry = (local, vocabulary, self.offset, width, tiles, completion.records.shape[1], completion.records.shape[2])
         rows = (batch, width, 1)
+        if self.single_exchange:
+            if _STAT_WORD < _REQUESTED + MAX_LOGPROB_TOKEN_IDS or _STAT_WORD < 2 * _CANDIDATES:
+                raise ValueError("single-exchange logprob statistics would overlap the packed summary")
+            self._preparation = (
+                (_statistics, (*common, self.stats, *geometry, _TILE), (batch, width, tiles), 4),
+                (_local_normalization_at, (*common[1:], self.stats, self.summary, *geometry[3:],
+                    triton.next_power_of_2(tiles), _SUMMARY, _STAT_WORD), rows, 4),
+                (_raw_candidates, (*common, completion.token_id_counts, self.keys, *geometry,
+                    _TILE, _CANDIDATES), (batch, width, tiles), 4),
+                (_pack, (*common, completion.token_id_counts, completion.token_ids, self.keys, self.summary,
+                    *geometry, triton.next_power_of_2(tiles * _CANDIDATES), _CANDIDATES,
+                    MAX_LOGPROB_TOKEN_IDS, _SUMMARY, _CHOSEN, _REQUESTED), rows, 8),
+                (_finish_single, (*common[1:], completion.token_id_counts, completion.token_ids,
+                    self.gathered, completion.logprobs, local, vocabulary, width,
+                    *geometry[5:], world, triton.next_power_of_2(world), _SUMMARY, _STAT_WORD, _CANDIDATES,
+                    triton.next_power_of_2(world * _CANDIDATES), MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS,
+                    _CHOSEN, _REQUESTED, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
+            )
+            return
         self._preparation = (
             (_statistics, (*common, self.stats, *geometry, _TILE), (batch, width, tiles), 4),
             (_local_normalization, (*common[1:], self.stats, self.summary, *geometry[3:],
@@ -220,13 +350,22 @@ class PreparedVocabularyParallelLogprobs:
         )
         self.operations = ()
 
+    # Operation indices that read ``gathered``: the exchange runs right before each.
+    @property
+    def _exchange_before(self):
+        return (4,) if self.single_exchange else (2, 5)
+
     def prepare(self):
+        if self.inert:
+            return
         if not self.operations:
             self.operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
                                     for kernel, args, grid, warps in self._preparation)
             self._preparation = ()
 
     def functional(self, *, session, dynamic_inputs=False):
+        if self.inert:
+            return self
         if not self.operations:
             raise RuntimeError("vocabulary logprobs require preparation before functional conversion")
         values = {name: getattr(self, name) for name in ("logits", "stats", "lse", "keys", "summary", "gathered")}
@@ -244,6 +383,8 @@ class PreparedVocabularyParallelLogprobs:
         return self
 
     def run(self, logits, *, slots=None, generations=None, live_rows=None):
+        if self.inert:
+            return
         if logits.ndim == 2:
             logits = logits[:, None, :]
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
@@ -254,7 +395,7 @@ class PreparedVocabularyParallelLogprobs:
             if local[name] is None:
                 raise ValueError("vocabulary logprobs require runtime row operands")
         for index, operation in enumerate(self.operations):
-            if index in (2, 5):
+            if index in self._exchange_before:
                 local["gathered"] = self.exchange(local["summary"].view(torch.bfloat16)).view(torch.float32)
             args = list(operation.args)
             for slot, name in operation.local_slots:
@@ -262,8 +403,19 @@ class PreparedVocabularyParallelLogprobs:
             launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
 
     def __call__(self):
+        if self.inert:
+            return
         if not self.operations:
             raise RuntimeError("vocabulary-parallel logprob preparation must finish before capture")
+        if self.single_exchange:
+            stats, local, candidates, pack, finish = self.operations
+            stats()
+            local()
+            candidates()
+            pack()
+            self.exchange(self.summary_bits)
+            finish()
+            return
         stats, local, global_lse, candidates, pack, finish = self.operations
         stats()
         local()

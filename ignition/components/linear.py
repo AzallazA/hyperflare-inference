@@ -236,6 +236,22 @@ def mxfp8_dense_bases(layout, device):
             mma(mma_shape, dtype=mma_dtype, device=device))
 
 
+def _overridden(factory, query, payload):
+    """TP3 fork: ``factory(query)``, or with ``payload`` (a config mapping) the same declaration with that config as
+    an explicit override (``Plan.same_declaration_except_override`` holds; the selection source is "override")."""
+    plan = factory(query)
+    if payload is None:
+        return plan
+    from collections.abc import Mapping
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("a projection plan override is a launch-config mapping")
+    override = factory(query, override=plan.contract.decode_config(dict(payload)))
+    if not plan.same_declaration_except_override(override):
+        raise ValueError("a projection plan override must not change the operator declaration")
+    return override
+
+
 class QuantizedProjection:
     def __init__(
         self,
@@ -256,7 +272,11 @@ class QuantizedProjection:
         buffers=None,
         examples=None,
         example_role=None,
+        plan_override=None,
     ) -> None:
+        """``plan_override`` (TP3 fork): a launch-config payload (mapping) that the projection's plan takes as an
+        explicit override instead of a tuning selection, decoded by the plan's own contract (b12x validates it at
+        preparation); None = tuned (base)."""
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight, _validate_bias
 
@@ -342,7 +362,7 @@ class QuantizedProjection:
                 allow_bf16_atomic_reduction=allow_bf16_atomic_reduction)
             if isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
-            self.plan = blockscaled.plan(query)
+            self.plan = _overridden(blockscaled.plan, query, plan_override)
 
             def selected_workspace(nbytes=None):
                 if nbytes is None:
@@ -416,7 +436,7 @@ class QuantizedProjection:
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
-            self.plan = blockscaled.plan(query)
+            self.plan = _overridden(blockscaled.plan, query, plan_override)
         values, scales, gain, _ = _weight_parts(weight)
         if self.sm103 and scales.dtype == torch.float8_e8m0fnu:
             # Operators receive UE8M0 scales as bytes, as b12x's own packed operators do.

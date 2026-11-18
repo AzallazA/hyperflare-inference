@@ -28,7 +28,8 @@ class PreparedVocabularyProjection:
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, workspace=None, gather=True):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, workspace=None, gather=True,
+                 plan_override=None):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -41,8 +42,10 @@ class PreparedVocabularyProjection:
             self.projection = UnquantizedProjection(source, weight, local_output,
                 session=session, name=f"{name}.projection")
         else:
+            # plan_override (TP3 fork, DS41 tp3.draft_head_plans): explicit projection config; None = tuned (base).
             self.projection = QuantizedProjection(source, weight, local_output,
-                session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
+                session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace,
+                plan_override=plan_override)
         self.local_only = not gather
         if self.local_only:
             self.output = local_output if row_indices is None else output

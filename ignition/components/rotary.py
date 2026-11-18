@@ -74,6 +74,22 @@ class PreparedRotaryAngles:
             -1 if inverse else 1, values, True)
 
 
+def apply_shared_angles(tensor, angles, frequencies, *, inverse=False):
+    """Rotate the last 64 values of each row (and head) of ``tensor`` in place from a precomputed ``[rows, 32, 2]``
+    FP32 (cos, sin) table (``_angles``), as ``PreparedRotaryAngles.apply`` does. ``frequencies`` only fills the unused
+    pointer argument. Same arithmetic as ``CompressedRotary.apply`` for a row whose position is the one the table was
+    computed from: ``_rotate`` evaluates ``cos/sin(float32(position) * frequency)`` either way, here once per table."""
+    if (tensor.ndim not in (2, 3) or angles.ndim != 3 or tensor.shape[0] != angles.shape[0]
+            or tuple(angles.shape[1:]) != (32, 2) or angles.dtype != torch.float32
+            or tensor.stride(-1) != 1 or tensor.shape[-1] < 64):
+        raise ValueError("shared rotary angles require matching rows and unit-column-stride heads")
+    heads = tensor.shape[1] if tensor.ndim == 3 else 1
+    torch.library.wrap_triton(_rotate)[(tensor.shape[0], heads)](
+        tensor, angles, frequencies, tensor.stride(0),
+        tensor.stride(1) if tensor.ndim == 3 else 0, tensor.shape[-1] - 64,
+        -1 if inverse else 1, angles, True)
+
+
 @torch.library.custom_op("flare::cached_rotary", mutates_args=("q_out", "k_out"))
 def apply_cached_rotary(q: torch.Tensor, k: torch.Tensor, cache: torch.Tensor,
                        positions: torch.Tensor, q_out: torch.Tensor, k_out: torch.Tensor,

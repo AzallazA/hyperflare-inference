@@ -382,7 +382,8 @@ class PreparedParallelDraftRound:
         logprobs = PreparedVocabularyParallelLogprobs(logits, o.completion,
             o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows, o.frame,
             vocabulary=o.requests.vocab_size, offset=start, runtime=o.logprob_runtime, session=o.session,
-            coordinator=o.collectives["coordinator"], name=self.name + ".logprobs")
+            coordinator=o.collectives["coordinator"], name=self.name + ".logprobs",
+            single_exchange=getattr(o, "logprob_single_exchange", False))
         commit = PreparedSpeculativeCommit(o.requests, verify.output, self.candidates,
             o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows,
             o.completion, o.frame, o.sequence, rng=o.rng, draft_context_lag=0,

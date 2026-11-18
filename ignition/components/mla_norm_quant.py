@@ -46,7 +46,7 @@ class PreparedMLANormQuant:
     """Normalize query and KV slices, then encode the rounded BF16 query."""
 
     def __init__(self, projected, weights, query, kv, *, eps, session, name, buffers=None,
-                 release_dependents=False, examples=None):
+                 release_dependents=False, examples=None, plan_override=None):
         rows = projected.shape[0]
         if (projected.shape != (rows, 1792) or projected.dtype != torch.bfloat16
                 or not projected.is_contiguous() or query.shape != (rows, 1280)
@@ -71,11 +71,14 @@ class PreparedMLANormQuant:
                               allocate("scale_rows", rows_shape, torch.uint8),
                               allocate("scale_mma", mma_shape, torch.uint8))
         self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
-        self.plan = mla_norm_mxfp8.plan(mla_norm_mxfp8.Query(
+        from .linear import _overridden
+
+        # plan_override (TP3 fork): a config mapping taken as an explicit override; None = tuned (base).
+        self.plan = _overridden(mla_norm_mxfp8.plan, mla_norm_mxfp8.Query(
             rows=rows, query_weight_dtype=str(weights[0].dtype).removeprefix("torch."),
             kv_weight_dtype=str(weights[1].dtype).removeprefix("torch."),
             query_features=1280, kv_features=512, epsilon=eps, min_amax=1e-4,
-            affine_prefetch_ready=True, release_dependents=release_dependents))
+            affine_prefetch_ready=True, release_dependents=release_dependents), plan_override)
         representative = input_factory(projected, projected,
             storage=getattr(session, "benchmark_storage", None), session=session)
 
