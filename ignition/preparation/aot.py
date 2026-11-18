@@ -681,7 +681,7 @@ class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
     def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
-                 lock_gpu_clocks=False, compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+                 lock_gpu_clocks=False, compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None):
         runtime_patches.apply()
         import flashinfer
         from torch._inductor.codecache import torch_key
@@ -689,6 +689,8 @@ class ForwardCache:
         self.device = torch.device(device)
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
+        # Host admission estimate per forward compiler (None: host_memory.FORWARD_WORKER_BYTES); not in the cache key.
+        self.forward_worker_bytes = forward_worker_bytes
         self.lock_gpu_clocks = lock_gpu_clocks
         self.compile_headroom_bytes = compile_headroom_bytes
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
@@ -829,7 +831,8 @@ class ForwardCache:
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers,
-                compile_headroom_bytes=self.compile_headroom_bytes) as compiler:
+                compile_headroom_bytes=self.compile_headroom_bytes,
+                forward_worker_bytes=self.forward_worker_bytes) as compiler:
             def finish():
                 name, bound, path = _completed(pending)
                 try:
@@ -942,7 +945,8 @@ class ForwardCache:
             try:
                 resources = compiler_resources(self.device, headroom_bytes=self.headroom_bytes,
                     options=self.options, compile_workers=self.compile_workers,
-                    compile_headroom_bytes=self.compile_headroom_bytes)
+                    compile_headroom_bytes=self.compile_headroom_bytes,
+                    forward_worker_bytes=self.forward_worker_bytes)
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)

@@ -32,15 +32,20 @@ class CompilerResources:
     limit: int
     worker_bytes: int
     headroom: int
+    # The forward-compiler part of worker_bytes; None: host_memory.FORWARD_WORKER_BYTES.
+    forward_bytes: int | None = None
 
 
 def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None,
-                       compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+                       compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None):
     """Sample a rank's device capacity and its host's compiler memory budget.
 
     Host admission leaves the greater of `compile_headroom_bytes` and, on integrated GPUs,
-    `headroom_bytes` free.
+    `headroom_bytes` free. `forward_worker_bytes` replaces the per-worker host estimate
+    `host_memory.FORWARD_WORKER_BYTES` (TP3 fork, FLARE_EXPORT_FORWARD_WORKER_GIB).
     """
+    if forward_worker_bytes is not None and (type(forward_worker_bytes) is not int or forward_worker_bytes < 1):
+        raise ValueError("forward_worker_bytes must be a positive byte count")
     if type(headroom_bytes) is not int or headroom_bytes < 0:
         raise ValueError("headroom_bytes must be a nonnegative byte count")
     if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
@@ -58,9 +63,11 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
         capacity = min(8, capacity)
     if shared:
         available = min(available, free)
+    forward = host_memory.FORWARD_WORKER_BYTES if forward_worker_bytes is None else forward_worker_bytes
     return CompilerResources(capacity, available, limit,
-        host_memory.FORWARD_WORKER_BYTES + (device_bytes if shared else 0),
-        max(compile_headroom_bytes, headroom_bytes if shared else 0))
+        forward + (device_bytes if shared else 0),
+        max(compile_headroom_bytes, headroom_bytes if shared else 0),
+        forward_worker_bytes)
 
 
 def allocate_workers(resources, counts, hosts):
@@ -87,7 +94,8 @@ def allocate_workers(resources, counts, hosts):
             # Small forwards can fit below the concurrency estimate. Preserve one worker per host
             # under the minimum allowance without multiplying that allowance by the rank count.
             able = [rank for rank in members if resources[rank].capacity
-                    and resources[rank].worker_bytes - host_memory.FORWARD_WORKER_BYTES
+                    and resources[rank].worker_bytes - (host_memory.FORWARD_WORKER_BYTES
+                        if resources[rank].forward_bytes is None else resources[rank].forward_bytes)
                     + host_memory._WORKER_BYTES <= remaining]
             if able:
                 workers[able[0]] = 1
@@ -124,7 +132,7 @@ def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
 
 class CompilePool:
     def __init__(self, device, *, headroom_bytes=0, options=None, compile_workers=None, workers=None,
-                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None):
         """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
@@ -132,7 +140,8 @@ class CompilePool:
         if workers is None:
             resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
                                            compile_workers=compile_workers,
-                                           compile_headroom_bytes=compile_headroom_bytes)
+                                           compile_headroom_bytes=compile_headroom_bytes,
+                                           forward_worker_bytes=forward_worker_bytes)
             workers = allocate_workers([resources], [resources.limit], ["local"])[0]
         if type(workers) is not int or workers < 1:
             raise ValueError("forward compiler pool requires a positive admitted worker count")

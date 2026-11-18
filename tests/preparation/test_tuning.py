@@ -1710,3 +1710,34 @@ def test_collective_selection_is_reported_without_partitioning_operator_cache(ba
     session.declare((declaration("op"),))
     assert session.tune()["collective_tuning"] == mode
     session.close()
+
+
+def test_tune_only_export_ends_after_tuning_like_a_replica(backend, monkeypatch):
+    """TP3 fork (export_speed.py): FLARE_EXPORT_TUNE_ONLY=1 closes the tuned session and raises TuningComplete."""
+    from ignition.preparation.tuning_replicas import TuningComplete
+
+    events, _ = backend
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "1")
+    session = make_session(device=0, checkpoint="revision")
+    session.declare((declaration("op"),))
+    with pytest.raises(TuningComplete):
+        session.tune()
+    assert ("prepare", True, ("op",)) in events
+    assert session._tune_status == "closed"
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "0")
+    session = make_session(device=0, checkpoint="revision")
+    session.declare((declaration("op"),))
+    assert session.tune()["selection_counts"] == {"tuned": 1}
+    assert session._tune_status == "ready"
+    session.close()
+
+
+def test_tune_only_export_refuses_tuning_replicas(backend, monkeypatch):
+    from ignition.preparation.tuning_replicas import TuningReplica
+
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "1")
+    with pytest.raises(ValueError, match="FLARE_EXPORT_TUNE_ONLY=1 does not combine"):
+        make_session(device=0, checkpoint="revision", tuning_replica=TuningReplica("x", 0, 2, 1))
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "maybe")
+    with pytest.raises(ValueError, match="FLARE_EXPORT_TUNE_ONLY must be 1 or 0"):
+        make_session(device=0, checkpoint="revision")

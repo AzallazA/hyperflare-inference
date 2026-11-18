@@ -756,3 +756,53 @@ def test_invalid_compile_headroom_fails_before_preparation(host, capsys, value):
     assert export("qwen3.8-flash", f"--compile-headroom={value}") == 2
     assert "--compile-headroom" in capsys.readouterr().err
     assert "plan" not in host
+
+
+def test_tune_only_export_stops_after_tuning_without_a_package(host, monkeypatch, capsys):
+    """TP3 fork (export_speed.py): FLARE_EXPORT_TUNE_ONLY=1 exits 0 once every rank finished kernel tuning."""
+    from ignition.preparation.tuning_replicas import TuningComplete
+
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "1")
+    host["behavior"]["raises"] = TuningComplete()
+    assert export("qwen3.8-flash", "--no-compile") == 0
+    assert host["exports"] == 0 and "prepared" not in host
+    assert "no package was written" in capsys.readouterr().out
+    assert host["signals"].entered == host["signals"].exited == 1
+    # Without the switch, a TuningComplete outside a replica is not a successful export.
+    monkeypatch.delenv("FLARE_EXPORT_TUNE_ONLY")
+    with pytest.raises(TuningComplete):
+        export("qwen3.8-flash", "--no-compile")
+    assert host["exports"] == 0
+
+
+@pytest.mark.parametrize("environment,arguments,message", [
+    ({"FLARE_EXPORT_FORWARD_WORKERS": "0"}, (), "FLARE_EXPORT_FORWARD_WORKERS must be a positive integer"),
+    ({"FLARE_EXPORT_FORWARD_WORKER_GIB": "x"}, (), "FLARE_EXPORT_FORWARD_WORKER_GIB must be a positive integer"),
+    ({"FLARE_EXPORT_TUNE_ONLY": "yes"}, (), "FLARE_EXPORT_TUNE_ONLY must be 1 or 0"),
+    ({"FLARE_EXPORT_TUNE_ONLY": "1"}, ("--tuning-gpus", "0,1"), "does not combine with --tuning-gpus")])
+def test_export_speed_switches_are_checked_before_preparation(host, monkeypatch, capsys, environment, arguments,
+                                                              message):
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert export("qwen3.8-flash", "--no-compile", *arguments) != 0
+    assert message in capsys.readouterr().err
+    assert "plan" not in host and host["exports"] == 0
+
+
+def test_export_speed_worker_switches_leave_the_export_unchanged(host, monkeypatch):
+    monkeypatch.setenv("FLARE_EXPORT_FORWARD_WORKERS", "9")
+    monkeypatch.setenv("FLARE_EXPORT_FORWARD_WORKER_GIB", "16")
+    assert export("qwen3.8-flash", "--no-compile") == 0
+    assert host["exports"] == 1 and host["plan"].compile_workers is None
+    assert "compile_workers" not in host["options"]["rebuild_manifest"]
+
+
+def test_tune_only_is_refused_outside_a_single_host_export(monkeypatch):
+    from ignition.errors import UsageError
+
+    serve._refuse_tune_only("debug-serve")
+    monkeypatch.setenv("FLARE_EXPORT_TUNE_ONLY", "1")
+    with pytest.raises(UsageError, match="not debug-serve"):
+        serve._refuse_tune_only("debug-serve")
+    with pytest.raises(UsageError, match="multi-host export"):
+        serve._export_hosts(types.SimpleNamespace(roce_ring=False, roce_chain=False, ranks=2))

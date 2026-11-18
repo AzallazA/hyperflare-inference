@@ -15,6 +15,7 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
+from .export_speed import forward_compile_settings
 from .startup_tuning import capture_consumers
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
 from .host_memory import COMPILE_HEADROOM_BYTES
@@ -98,9 +99,11 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
     if compile_decoder:
+        # TP3 fork: FLARE_EXPORT_FORWARD_WORKERS / _WORKER_GIB after tuning (export_speed.py); unset = tuning budget.
+        compile_workers, forward_worker_bytes = forward_compile_settings(session)
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
-                             compile_workers=getattr(session, "requested_compile_workers", None),
+                             compile_workers=compile_workers, forward_worker_bytes=forward_worker_bytes,
                              lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune,
                              compile_headroom_bytes=getattr(session, "compile_headroom_bytes", COMPILE_HEADROOM_BYTES))
         forwards = {name: function for name, function in functions.items()

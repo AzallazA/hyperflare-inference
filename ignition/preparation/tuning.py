@@ -25,6 +25,7 @@ from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
 from .scratch_preference import from_environment as scratch_preference_from_environment
+from .export_speed import TUNE_ONLY_ENV, tune_only
 from .host_memory import COMPILE_HEADROOM_BYTES, candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
 
 
@@ -141,6 +142,10 @@ class RecordedPreparationSession(PreparationSession):
         cpu_workers(compile_workers)
         self.requested_compile_workers = compile_workers
         self.tuning_replica = tuning_replica
+        # TP3 fork (export_speed.py): FLARE_EXPORT_TUNE_ONLY=1 ends preparation after tuning, as a replica does.
+        self._tune_only = tune_only()
+        if self._tune_only and tuning_replica is not None:
+            raise ValueError(f"{TUNE_ONLY_ENV}=1 does not combine with --tuning-gpus replicas")
         self._replica_coordinator = None
         self._coordinator = coordinator
         self._recorded_requests = {}
@@ -695,7 +700,8 @@ class RecordedPreparationSession(PreparationSession):
                     self._tune_status = "failed"
                     raise
             self._replica_coordinator = None
-            if self._tune_status == "ready" and self.tuning_replica is not None and self.tuning_replica.index:
+            replica = self.tuning_replica is not None and self.tuning_replica.index
+            if self._tune_status == "ready" and (replica or getattr(self, "_tune_only", False)):
                 from .tuning_replicas import TuningComplete
 
                 if self._coordinator is not None:

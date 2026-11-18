@@ -123,11 +123,38 @@ def _check_host_shape(args) -> None:
         raise UsageError(error)
 
 
+def _refuse_tune_only(command) -> None:
+    """TP3 fork: FLARE_EXPORT_TUNE_ONLY=1 belongs to a single-host `ignition export` only."""
+    from ignition.preparation.export_speed import TUNE_ONLY_ENV, tune_only
+
+    try:
+        requested = tune_only()
+    except ValueError as error:
+        raise UsageError(str(error)) from error
+    if requested:
+        raise UsageError(f"{TUNE_ONLY_ENV}=1 applies to a single-host export, not {command}; unset it")
+
+
+def _check_export_speed(args) -> None:
+    """TP3 fork: validate the FLARE_EXPORT_* export-speed switches before any model or GPU work."""
+    from ignition.preparation import export_speed
+
+    try:
+        export_speed.forward_workers()
+        export_speed.forward_worker_bytes()
+        requested = export_speed.tune_only()
+    except ValueError as error:
+        raise UsageError(str(error)) from error
+    if requested and args.tuning_gpus is not None:
+        raise UsageError(f"{export_speed.TUNE_ONLY_ENV}=1 does not combine with --tuning-gpus")
+
+
 def export(args) -> int:
     from ignition.preparation.core_snapshot import export_options
     from .publishing import validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
+    _check_export_speed(args)
     model = resolve_model(configuration, args.model)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
@@ -155,6 +182,10 @@ def export(args) -> int:
             code, result = _export_hosts(args)
         else:
             code, result = _prepare(args)
+    if result is None:
+        # TP3 fork: FLARE_EXPORT_TUNE_ONLY=1 (ignition/preparation/export_speed.py).
+        print('Tune-only export: kernel tuning selections are in the kernel cache; no package was written')
+        return code
     print(f'Exported cache entry: {result.entry_path}')
     if repository:
         print(f'Hugging Face target: {repository}')
@@ -169,6 +200,7 @@ def _export_hosts(args):
     from ignition.preparation.host_ranks import HostRendezvous, local_topology, source_identity, topology_gpu
 
     _check_host_shape(args)
+    _refuse_tune_only("a multi-host export")
     if args.rendezvous is None:
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
@@ -334,8 +366,9 @@ def _prepare(args):
     signals.__enter__()
     try:
         try:
+            from ignition.preparation.export_speed import tune_only
             from ignition.preparation.module_images import ModuleImages
-            from ignition.preparation.tuning_replicas import prepare_recipe
+            from ignition.preparation.tuning_replicas import TuningComplete, prepare_recipe
 
             recorder = ModuleImages()
             preparation_options = {"retain_graphs": True}
@@ -347,10 +380,19 @@ def _prepare(args):
                 storage = CoreStorage(world=plan.world_size)
                 preparation_options["core_storage"] = storage
                 with storage:
-                    prepared = prepare_recipe(model.recipe.prepare,
-                        model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
-                        kernel_cache=configuration.directory("kernel_cache"), progress=progress,
-                        **preparation_options)
+                    try:
+                        prepared = prepare_recipe(model.recipe.prepare,
+                            model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
+                            kernel_cache=configuration.directory("kernel_cache"), progress=progress,
+                            **preparation_options)
+                    except TuningComplete:
+                        # TP3 fork: every rank flushed its tuning selections and closed its session.
+                        if not tune_only():
+                            raise
+                        prepared = None
+            if prepared is None:
+                progress("Tune-only export (FLARE_EXPORT_TUNE_ONLY=1): stopped after kernel tuning")
+                return 0, None
         except FlareError:
             raise
         except MemoryError as error:
@@ -408,6 +450,7 @@ def debug_serve(args) -> int:
     from ignition.progress import phase
 
     _check_host_shape(args)
+    _refuse_tune_only("debug-serve")
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
