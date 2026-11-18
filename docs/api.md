@@ -485,8 +485,12 @@ undeclared tools are returned with their generated names and arguments in both
 buffered and streaming responses across all three chat APIs. Clients can repair
 or reject these calls and provide feedback in a subsequent turn. Declared schemas
 guide argument conversion where the tool syntax requires it; unknown tools have
-no schema for that conversion. Malformed envelopes, empty names, and invalid
-argument syntax still fail parsing. Required mode needs at least one declared
+no schema for that conversion. Malformed envelopes and empty names still fail
+parsing. A value that is not valid JSON is retained as a string where the tool
+syntax delimits individual values and the parser has a retention rule: tagged
+parameters, as in GLM, and DeepSeek `string="false"` parameters. Other invalid
+argument syntax fails parsing, including an argument object written as one JSON
+document and an XTML typed value. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated

@@ -620,7 +620,9 @@ mod retained_literal_tests {
     use crate::server::output::Accumulator;
     use serde_json::json;
 
-    /// One call whose `string="false"` values are, in order, `values`.
+    /// One call whose `string="false"` values are, in order, `values`, between two
+    /// `string="true"` parameters. The output is fed in two pieces split at every
+    /// character boundary, and then one character at a time.
     fn arguments<const SPACED: bool>(values: &[&str]) -> Result<Vec<Value>> {
         let separator = if SPACED { " " } else { "" };
         let calls = if SPACED { "calls" } else { "tool_calls" };
@@ -633,18 +635,28 @@ mod retained_literal_tests {
             ));
         }
         text.push_str(&format!(
-            "</｜DSML｜{separator}invoke>\n</｜DSML｜{separator}{calls}>"
+            "<｜DSML｜{separator}parameter name=\"tail\" string=\"true\">[\"kept\\.\"</｜DSML｜{separator}parameter>\n</｜DSML｜{separator}invoke>\n</｜DSML｜{separator}{calls}>"
         ));
+        let characters: Vec<_> = text
+            .char_indices()
+            .map(|(offset, character)| &text[offset..offset + character.len_utf8()])
+            .collect();
+        let mut feeds: Vec<Vec<&str>> = text
+            .char_indices()
+            .map(|(offset, _)| vec![&text[..offset], &text[offset..]])
+            .collect();
+        feeds.push(characters);
         let mut results = Vec::new();
-        for split in text.char_indices().map(|(offset, _)| offset) {
+        for feed in feeds {
             let mut parser = DsmlOutput::<SPACED>::new(OutputConfig {
                 structured: false,
                 start: OutputStart::Reasoning,
                 tools: vec![json!({"type":"function", "function":{"name":"run"}})],
             });
             let mut output = Accumulator::new("request".into());
-            output.apply(parser.push(Input::Text(&text[..split]))?)?;
-            output.apply(parser.push(Input::Text(&text[split..]))?)?;
+            for piece in feed {
+                output.apply(parser.push(Input::Text(piece))?)?;
+            }
             output.apply(parser.finish(Termination::Eos)?)?;
             output.finish()?;
             let message = output.message();
@@ -655,7 +667,7 @@ mod retained_literal_tests {
             results.push(serde_json::from_str(text).expect("arguments are a JSON object"));
         }
         results.dedup();
-        assert_eq!(results.len(), 1, "every split parses alike");
+        assert_eq!(results.len(), 1, "every feed parses alike");
         Ok(results)
     }
 
@@ -674,12 +686,14 @@ mod retained_literal_tests {
         for (index, raw) in invalid.iter().enumerate() {
             assert_eq!(parsed[0][format!("v{index}")], json!(raw));
         }
+        // A string parameter after a retained value is escaped as before.
+        assert_eq!(parsed[0]["tail"], "[\"kept\\.\"");
         // Valid JSON values keep their type, also between and after retained ones.
         let mixed = ["[1, \"a\\\\.b\"]", "nope", " {\"k\": null} ", "true"];
         let parsed = arguments::<SPACED>(&mixed).unwrap();
         assert_eq!(
             parsed[0],
-            json!({"label": "a \"b\" \\.", "v0": [1, "a\\.b"], "v1": "nope", "v2": {"k": null}, "v3": true})
+            json!({"label": "a \"b\" \\.", "v0": [1, "a\\.b"], "v1": "nope", "v2": {"k": null}, "v3": true, "tail": "[\"kept\\.\""})
         );
     }
 

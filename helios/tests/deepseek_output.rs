@@ -311,21 +311,33 @@ async fn json_literals_keep_markup_as_content_and_tool_blocks_end_output() {
 fn complete_calls_reject_empty_names_and_retain_values_that_are_not_json() {
     for spaced in [false, true] {
         let (open, body, close) = block(spaced);
-        let run = |body: String| {
+        // Fed whole when `whole` is set, and one character at a time otherwise.
+        let feed = |body: String, whole: bool| {
             let text = format!("{open}{body}{close}");
+            let chunks: Vec<_> = if whole {
+                vec![text.as_str()]
+            } else {
+                text.char_indices()
+                    .map(|(i, c)| &text[i..i + c.len_utf8()])
+                    .collect()
+            };
             actual(
-                &[&text],
+                &chunks,
                 spaced,
                 OutputStart::Content,
                 false,
                 Termination::Eos,
             )
         };
+        let run = |body: String| feed(body, true);
         assert!(run(body.replace("name=\"lookup\"", "name=\"\"")).is_err());
         // A `string="false"` value is JSON the model wrote. Text that does not
         // parse stays in the call as a string.
-        for raw in ["not-json", r#"["grep '\.' a"]"#, r#""open"#, ""] {
-            let parsed = run(body.replace(">3</", &format!(">{raw}</"))).unwrap();
+        for (raw, whole) in ["not-json", r#"["grep '\.' a"]"#, r#""open"#, ""]
+            .into_iter()
+            .flat_map(|raw| [(raw, true), (raw, false)])
+        {
+            let parsed = feed(body.replace(">3</", &format!(">{raw}</")), whole).unwrap();
             assert_eq!(parsed.calls.len(), 2);
             let arguments: Value = serde_json::from_str(&parsed.calls[0].1).unwrap();
             assert_eq!(arguments["city"], "東京🙂\\\nquoted \"value\"");
