@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
 
 
-def fixture(batch=4, depth=3, vocab=8, rank=64, fp8=False):
+def fixture(batch=4, depth=3, vocab=8, rank=64, fp8=False, **options):
     state = DeviceRequestState.allocate("cuda", vocab_size=vocab, capacity=batch)
     state.status.fill_(RUNNING)
     state.generation.fill_(7)
@@ -44,7 +44,7 @@ def fixture(batch=4, depth=3, vocab=8, rank=64, fp8=False):
     offsets = torch.full((batch,), 2**32 + 28, device="cuda", dtype=torch.int64)
     proposal = PreparedVocabularySoftmax(logits, probabilities, valid, state, slots, epochs, live, tokens,
         start=0, runtime=None, session=None, coordinator=None, name="proposal", embedding=embedding, head=head,
-        pending=torch.zeros(batch, device="cuda", dtype=torch.int64), seeds=seeds, offsets=offsets, tokens=tokens)
+        pending=torch.zeros(batch, device="cuda", dtype=torch.int64), seeds=seeds, offsets=offsets, tokens=tokens, **options)
     proposal.prepare()
     return proposal
 

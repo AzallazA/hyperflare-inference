@@ -40,7 +40,7 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "markov_tile_rows")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
@@ -179,6 +179,11 @@ class TP3Config:
     decode regression, ab-regression-180256/DIAG.md). Same values (CPU proof: tests/components/
     test_markov_stage_rows_interpret.py). Needs vocabulary-parallel sampling. False = tiles read the table (base).
     Export-time only (2026-11-18)."""
+    markov_tile_rows: int | None = None
+    """Markov proposal score tiles cover this many request rows per program and read each head tile once for all of
+    them (vocabulary_sampling._score_tiles_rows) instead of once per row (173 us per 5 draft steps at c16, decode trace
+    2026-11-18 lever 5). Bit-identical (CPU proof: tests/components/test_markov_tile_rows_interpret.py). Needs
+    vocabulary-parallel sampling. None = one program per (tile, row) (base). Export-time only (2026-11-18)."""
     embed_rows: bool = False
     """With ``embed_host``: decode, verification and draft graphs gather the parked table's rows with one vectorised
     Triton launch (all of a row's loads before its stores) and take DSpark's noise-token rows from a 10 KB device copy
@@ -391,6 +396,8 @@ class TP3Config:
         for name in ("vision_arena_host", "markov_embed_host", "markov_stage_rows"):  # own line, as mma_pad_once's
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
+        if self.markov_tile_rows is not None and (type(self.markov_tile_rows) is not int or self.markov_tile_rows < 1):
+            raise ValueError(f"TP3 config: markov_tile_rows must be a positive integer or None, not {self.markov_tile_rows!r}")
         if self.markov_stage_rows and not self.markov_embed_host:
             raise ValueError("TP3 config: markov_stage_rows stages rows of the parked Markov embedding; it needs "
                              "markov_embed_host (FLARE_DS41_MARKOV_EMBED_HOST=1)")
@@ -550,6 +557,7 @@ class TP3Config:
             vision_arena_host=flag("VISION_ARENA_HOST"),
             markov_embed_host=flag("MARKOV_EMBED_HOST"),
             markov_stage_rows=flag("MARKOV_STAGE_ROWS"),
+            markov_tile_rows=optional("MARKOV_TILE_ROWS"),
             draft_vocab=None if not get("DRAFT_VOCAB") else Path(get("DRAFT_VOCAB")),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),

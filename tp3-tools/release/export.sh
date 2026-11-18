@@ -39,6 +39,8 @@
 #            default 0 (VRAM map 2026-11-15 item 3)
 #   MARKOV_HOST  1 = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory (FLARE_DS41_MARKOV_EMBED_HOST);
 #            default 0 (VRAM map item 6)
+#   MARKOV_TILE N = Markov proposal score tiles cover N request rows per program, one head-tile read for all of them
+#            (FLARE_DS41_MARKOV_TILE_ROWS; bit-identical); unset = one program per (tile, row)
 #   MARKOV_STAGE 1 = with MARKOV_HOST=1, copy each request's Markov predecessor row into VRAM once per draft step
 #            (FLARE_DS41_MARKOV_STAGE_ROWS); keeps MARKOV_HOST's ~74K KV without its decode cost (11-18 microbench:
 #            b1 +0.01 ms, b16 -0.00 ms per round vs the table in VRAM); default 0
@@ -111,6 +113,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
 [ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
 [ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
+[ -n "${MARKOV_TILE:-}" ] && export FLARE_DS41_MARKOV_TILE_ROWS=$MARKOV_TILE
 [ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
