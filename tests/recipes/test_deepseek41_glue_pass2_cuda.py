@@ -52,18 +52,28 @@ BLOCK = 6
 ARMS = (("off", None), ("off", 0xFF), ("on", None), ("on", 0xFF), ("on", 0x7F))
 
 
+_PATTERNS = {}
+
+
+def _pattern(dtype, byte):
+    """The value whose bytes are ``byte`` repeated, computed on the host OUTSIDE the trace (no .item() in the graph).
+    A dtype-view fill (``tensor.view(torch.uint8).fill_``) of a graph-local buffer makes flare's storage lowering
+    (ignition/preparation/compilation.py, StorageBackend) overlap live buffers: that was seq226's verify alias error
+    and its poison-arm draft differences, with or without the switch (CPU probe poison_alias_flare_probe.py, 11-17)."""
+    key = (dtype, byte)
+    if key not in _PATTERNS:
+        if dtype == torch.bool:
+            _PATTERNS[key] = True
+        else:
+            size = torch.empty(0, dtype=dtype).element_size()
+            _PATTERNS[key] = torch.full((size,), byte, dtype=torch.uint8).view(dtype).item()
+    return _PATTERNS[key]
+
+
 def _poisoned(tensor, byte):
     if tensor.numel() == 0:
         return tensor
-    if tensor.dim() > 0 and tensor.is_contiguous() and tensor.stride(-1) == 1:  # size-1 dims may carry stride 0
-        tensor.view(torch.uint8).fill_(byte)
-    elif tensor.dtype.is_floating_point:
-        tensor.fill_(float("nan"))
-    elif tensor.dtype == torch.bool:
-        tensor.fill_(True)
-    else:
-        tensor.fill_(-1)
-    return tensor
+    return tensor.fill_(_pattern(tensor.dtype, byte))  # NaN payloads may be canonicalised; still NaN
 
 
 @contextmanager
@@ -71,6 +81,9 @@ def _poison_allocations(byte):
     if byte is None:
         yield
         return
+    for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e8m0fnu,
+                  torch.uint8, torch.int8, torch.int32, torch.int64, torch.bool):
+        _pattern(dtype, byte)  # warm the table before Dynamo traces the patched allocators
     saved = torch.empty, torch.empty_like, torch.empty_strided
     empty, empty_like, empty_strided = saved
     torch.empty = lambda *args, **kwargs: _poisoned(empty(*args, **kwargs), byte)
@@ -179,6 +192,7 @@ class DraftForward:
 def _capture_arms(session, make, owners):
     graphs = {}
     for name, byte in ARMS:  # clean arms first: a poisoned trace patches the allocators while it compiles
+        print(f"\nGLUE2 capture arm={name} poison={'clean' if byte is None else hex(byte)}", flush=True)
         torch._dynamo.reset()
         forward = make(name == "on")
         with _poison_allocations(byte):
@@ -194,7 +208,38 @@ def _capture_arms(session, make, owners):
     return graphs
 
 
-def _compare(graphs, reset, observe):
+def assert_same_selection(value, reference, history, label):
+    """``value`` / ``reference`` [rows, 512] int32 selections of one layer; ``history`` per row (or one int): the
+    compressed entries ``0 <= index < history`` this test never writes (the pool's KV pages start zeroed), so they all
+    carry an all-zero index key and latent row: identical scores and identical attention contributions. The MXFP4
+    radix top-k picks an arbitrary subset of such ties when there are more entries than 512 (layer 20, ratio 1: ~600),
+    run to run (seq226 / seq320 ('pads', 6), 11-17). Equal means: each row the same multiset outside the history range
+    (this forward's tokens, -1 sentinels) and the same number of distinct history entries."""
+    assert value.shape == reference.shape, label
+    rows = value.shape[0]
+    history = [history] * rows if isinstance(history, int) else list(history)
+    for row, (mine, theirs) in enumerate(zip(value.cpu().tolist(), reference.cpu().tolist(), strict=True)):
+        h = history[row]
+        tied = [sorted(i for i in x if 0 <= i < h) for x in (mine, theirs)]
+        fixed = [sorted(i for i in x if not 0 <= i < h) for x in (mine, theirs)]
+        assert fixed[0] == fixed[1] and len(tied[0]) == len(tied[1]), (*label, row)
+        for picked in tied:
+            assert len(set(picked)) == len(picked), (*label, row, "duplicate history index")
+
+
+def _same(value, reference, index, selections, label):
+    if selections is not None and index in selections:
+        try:
+            assert_same_selection(value, reference, selections[index], label)
+        except AssertionError:
+            return False
+        return True
+    return torch.equal(value.view(torch.uint8), reference.view(torch.uint8))
+
+
+def _compare(graphs, reset, observe, selections=None):
+    """``selections``: {observed index: per-row history} for selection outputs (compared up to zero-history ties,
+    assert_same_selection); everything else byte for byte."""
     expected, failures = None, []
     for arm in (*ARMS, *ARMS):  # each arm twice: a replay after another arm's replay writes the same bytes
         reset()
@@ -206,7 +251,7 @@ def _compare(graphs, reset, observe):
             expected = actual
             continue
         for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
-            if not torch.equal(value.view(torch.uint8), reference.view(torch.uint8)):
+            if not _same(value, reference, index, selections, (arm, index)):
                 failures.append((arm, index))
     base = [failure for failure in failures if failure[0][0] == "off"]
     switch = [failure for failure in failures if failure[0][0] == "on"]
@@ -245,15 +290,22 @@ def test_target_layers_switch_on_writes_the_same_bytes(weights, lengths):
             metadata, accepted, outputs, selected, staging_shape, on), owners)
         session.freeze()
         saved = pool.backing.clone()
+        pages = [pool.pages[name] for name in sorted(pool.pages)]  # KV pages (index keys, latent rows): not in backing
+        saved_pages = [page.clone() for page in pages]
+        request_start = [START + 37 * request for request, count in enumerate(lengths) for _ in range(count)]
+        selections = {len(outputs) + i: [start // layer.ratio for start in request_start]
+                      for i, layer in enumerate(layers)}  # (2, 20, 24): ratios 2, 1, 1
 
         def reset():
             pool.backing.copy_(saved)
+            for page, value in zip(pages, saved_pages, strict=True):
+                page.copy_(value)
             arena.tensor.fill_(0xA5)
             for value in (*outputs, *selected):
                 value.fill_(-1)
 
         try:
-            _compare(graphs, reset, lambda: (*outputs, *selected, pool.backing))
+            _compare(graphs, reset, lambda: (*outputs, *selected, pool.backing, *pages), selections)
         finally:
             for graph in graphs.values():
                 graph.reset()
