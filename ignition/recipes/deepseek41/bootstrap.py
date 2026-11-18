@@ -537,7 +537,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
-        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
+        # TP3 tp3.no_generation_logprobs: no generation-logprob storage, flags or reductions (Helios: HTTP 400).
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity),
+                                                device=device, generation_logprobs=not tp3.no_generation_logprobs)
         coordinator = CollectivePreparation(group)
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)
@@ -552,7 +554,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
                 group, device, max_rows=verification_samples, columns=64 * shard.world_size,
                 ipc=core_storage.peer_storage))
-            logprob_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
+            logprob_collective = (None if tp3.no_generation_logprobs  # TP3: nothing to exchange without logprobs
+                else collective if coordinator.spans_hosts else create_all_gather_runtime(
                 group, device, max_rows=verification_samples, columns=512 * shard.world_size,
                 ipc=core_storage.peer_storage))
         # TP3 tp3.share_engram_token_map: set before any graph reads device_token_map (a cached property per instance).
@@ -632,6 +635,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
                 share_vocabulary_columns=tp3.share_vocab_columns,
                 stage_markov_rows=tp3.markov_stage_rows,
+                logprob_single_exchange=tp3.logprob_single_exchange,
                 forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 

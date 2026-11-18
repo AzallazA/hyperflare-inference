@@ -5,6 +5,7 @@
 """Block drafts conditioned on accepted target states, with sequential Markov logits."""
 
 import dataclasses
+import json
 
 import torch
 
@@ -46,10 +47,14 @@ class PreparedDraft:
         rotary = Rotary(weights.config, scratch.embedding.device)
         # TP3 glue_pass2 (draft layers get no other TP3 switch, as before): see __call__ and PreparedAttention._run.
         self.glue_pass2 = tp3 is not None and tp3.glue_pass2
-        layer_tp3 = TP3Config(glue_pass2=True) if self.glue_pass2 else None
+        # TP3 tp3.pin_small_qproj / tp3.rotary_once also reach the draft layers (same declarations as the target's).
+        pin_small_qproj = tp3 is not None and tp3.pin_small_qproj
+        layer_tp3 = (TP3Config(glue_pass2=self.glue_pass2, pin_small_qproj=pin_small_qproj)
+                     if self.glue_pass2 or pin_small_qproj else None)
         page_size = 128 + metadata.max_query_tokens
         self.window_metadata = AttentionIndices(metadata, mode="draft",
-            tokens=metadata.positions.numel(), page_size=page_size, width=page_size)
+            tokens=metadata.positions.numel(), page_size=page_size, width=page_size,
+            rotary=rotary if tp3 is not None and tp3.rotary_once else None)
         self.layers = tuple(PreparedLayer(i, layer, None, scratch, metadata, pool, rotary,
             shard=weights.shard, mode="draft", runtime=runtime, coordinator=coordinator,
             session=session, name=f"{name}.layer{i}", workspace=workspace, carry=i > 0,
@@ -73,8 +78,14 @@ class PreparedDraft:
                 raise ValueError("tp3.draft_vocab needs vocabulary-parallel FP32/BF16 draft logits")
             local_logits = torch.empty((local_logits.shape[0], self.draft_columns.numel()), dtype=local_logits.dtype,
                                        device=local_logits.device)
+        # TP3 tp3.draft_head_plans (prepared, not measured): an explicit head projection config for this row count.
+        head_plan = None
+        if tp3 is not None and tp3.draft_head_plans is not None:
+            head_plan = next((json.loads(config) for rows, config in tp3.draft_head_plans
+                              if rows == scratch.hidden.shape[0]), None)
         self.head = PreparedVocabularyProjection(scratch.hidden, head, local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace, gather=not vocabulary_parallel).functional(session=session)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace, gather=not vocabulary_parallel,
+            **({} if head_plan is None else {"plan_override": head_plan})).functional(session=session)
         self.window_metadata.functional()
         register_finalizer(session, self.release_outputs)
 

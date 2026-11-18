@@ -28,7 +28,7 @@ from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.scratch import ScratchArena
 
-from ignition.components.rotary import CompressedRotary as Rotary
+from ignition.components.rotary import CompressedRotary as Rotary, PreparedRotaryAngles, apply_shared_angles
 from ignition.components.parallel import TensorParallelShard
 
 from .pool import PAGE_TOKENS
@@ -51,6 +51,8 @@ class CompressionGeometry:
 class AttentionGeometry(WindowIndices):
     position: torch.Tensor
     ratios: dict
+    # TP3 tp3.rotary_once: {compressed flag: [tokens, 32, 2] FP32 (cos, sin) of ``position``}; empty = per launch.
+    angles: dict = None
 
     def compressed(self, ratio):
         return self.ratios[ratio]
@@ -60,9 +62,13 @@ class AttentionIndices(PreparedWindowIndices):
     """Window and compression addresses shared by layers with identical metadata."""
 
     def __init__(self, metadata, *, mode, tokens, page_size, width, ratios=(), visible=None,
-                 replay_start=None):
+                 replay_start=None, rotary=None):
+        """``rotary`` (TP3 tp3.rotary_once): the forward's ``Rotary``; layers then ask ``shared_angles`` for a RoPE
+        table of this forward's clamped positions, computed once per call and frequency set. None = per launch."""
         super().__init__(metadata, mode=mode, tokens=tokens, page_size=page_size, width=width,
                          visible=visible, replay_start=replay_start)
+        self.rotary = rotary
+        self.angle_operations = {}
         self.ratio_ids = tuple(sorted(set(ratios)))
         if any(type(ratio) is not int or ratio not in (1, 2) for ratio in self.ratio_ids):
             raise ValueError("DeepSeek V4.1 compression ratios must be one or two")
@@ -79,9 +85,26 @@ class AttentionIndices(PreparedWindowIndices):
             raise ValueError("compression geometry must be declared before preparing attention")
         return self.ratios[ratio]
 
+    def shared_angles(self, compressed):
+        """TP3 tp3.rotary_once: the key of the (cos, sin) table of ``position`` under the ``compressed`` frequency
+        set (registered on first request, computed by every call), or None when these indices share no angles.
+        Only consumers that rotate by ``position`` may use it (the table clamps positions at 0, as ``position``
+        already is); the ratio-2 compressor's positions can be -2 and keep per-launch angles."""
+        if self.rotary is None:
+            return None
+        key = bool(compressed)
+        if key not in self.angle_operations:
+            if self.position is None:
+                raise ValueError("shared rotary angles must be requested before functional conversion")
+            self.angle_operations[key] = PreparedRotaryAngles(self.position, self.rotary.frequencies[key])
+        return key
+
     def functional(self):
         super().functional()
         self.position = self.ratios = None
+        for operation in self.angle_operations.values():
+            operation.functional()
+        self.rotary = None
         return self
 
     def __call__(self, metadata, visible=None, replay_start=None):
@@ -102,8 +125,11 @@ class AttentionIndices(PreparedWindowIndices):
                 active_width=lengths.amax().view(1),
                 slots=snapshot(torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1)),
                 position=snapshot((position + 1) // ratio * ratio - ratio))
+        position = snapshot(position)
+        # TP3 tp3.rotary_once: one _angles launch per frequency set and call (positions already clamped at 0).
+        angles = {key: operation(position) for key, operation in self.angle_operations.items()}
         return AttentionGeometry(snapshot(window.window_slots), window.window_indices, snapshot(window.window_lengths),
-                                 window.window_page_size, snapshot(position), ratios)
+                                 window.window_page_size, position, ratios, angles)
 
 
 def normalize(source, weight, out, eps):
@@ -321,7 +347,11 @@ class IndexSideChain:
         index_query, workspace, index_weights, *bases = outputs
         attention.index_query.run_into(query_low, index_query, workspace,
                                        encoded_bases=tuple(bases) if bases else None)
-        attention.rotary.apply(index_query.view(source.shape[0], 32, 128), position, compressed=True)
+        if attention.index_angle_key is None:
+            attention.rotary.apply(index_query.view(source.shape[0], 32, 128), position, compressed=True)
+        else:  # TP3 tp3.rotary_once: ``position`` is the shared (cos, sin) table, an input of this task
+            apply_shared_angles(index_query.view(source.shape[0], 32, 128), position,
+                                attention.rotary.frequencies[True])
         attention.index_weight.run_into(source, index_weights)
 
     def start(self, source, query_low, position):
@@ -378,11 +408,13 @@ class PreparedAttention:
     inv_rope_output = None  # exl3/merges.py FLARE_DS41_EXL3_MERGE_ROPEQ (set in __init__ when on)
     index_side = None  # TP3 tp3.index_side_stream: IndexSideChain (decode/verify index layers); None = serial
     glue_pass2 = False  # TP3 tp3.glue_pass2 (draft window cache without a fill); set per instance
+    angle_key = index_angle_key = None  # TP3 tp3.rotary_once: shared RoPE table keys; None = per-launch angles
+    pinned_qproj = False  # TP3 tp3.pin_small_qproj: this layer's qkv_a / norm / q_b plans are the pinned triple
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, index_side_stream=False,
-                 glue_pass2=False):
+                 glue_pass2=False, pin_small_qproj=False):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.glue_pass2 = glue_pass2  # TP3 tp3.glue_pass2 (see _run); False = base graphs
         self.pool, self.rotary, self.mode = pool, rotary, mode
@@ -422,6 +454,11 @@ class PreparedAttention:
                 or not isinstance(window_metadata, AttentionIndices)):
             raise ValueError("shared window indices must match the attention metadata and cache geometry")
         self.window_metadata = window_metadata
+        # TP3 tp3.rotary_once: keys of the forward's shared RoPE tables (None = per-launch angles): the query and KV
+        # window rotate by ``position`` under the layer's frequency set, the index query under the compressed set.
+        # Only the decoder/draft passes indices with a rotary (decode, verify, draft); a standalone layer never does.
+        self.angle_key = window_metadata.shared_angles(bool(self.ratio))
+        self.index_angle_key = None
         self.window_slots = window_metadata.window_slots
         self.window_indices = window_metadata.window_indices
         self.window_lengths = window_metadata.window_lengths
@@ -435,11 +472,19 @@ class PreparedAttention:
         use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
         paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
                            for key in ("qkv_a", "q_b"))
+        # TP3 tp3.pin_small_qproj: declarations of <= PIN_SMALL_ROWS rows take the pinned qkv_a / norm / q_b triple
+        # as explicit overrides (tp3_config.PIN_SMALL_QPROJ); larger ones and the base keep the tuned selections.
+        from .tp3_config import PIN_SMALL_QPROJ, PIN_SMALL_ROWS
+        self.pinned_qproj = bool(pin_small_qproj and paired_mxfp8 and tokens <= PIN_SMALL_ROWS)
+        pins = PIN_SMALL_QPROJ if self.pinned_qproj else {}
         self.norm_quant = (PreparedMLANormQuant(scratch.projected,
             (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values,
             eps=self.eps, session=session, name=name + ".qkv_norm",
-            release_dependents=tokens <= 8, examples=examples)
+            release_dependents=tokens <= 8, examples=examples, plan_override=pins.get("norm"))
             if paired_mxfp8 and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
+        if self.pinned_qproj and self.norm_quant is None:
+            pins = {}  # the pinned triple was measured with the fused norm; without it keep the tuned plans
+            self.pinned_qproj = False
         for key, values, out in (
             ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
         ):
@@ -452,7 +497,8 @@ class PreparedAttention:
                 encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
                 rhs_prefetch_ready=packed_mxfp8,
                 allow_bf16_atomic_reduction=not packed_mxfp8,
-                examples=examples, example_role="attention." + key)
+                examples=examples, example_role="attention." + key,
+                plan_override=pins.get(key) if packed_mxfp8 else None)
         self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
             eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
         self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
@@ -479,6 +525,7 @@ class PreparedAttention:
             self.global_kv = PreparedGlobalKV(layer, weights, source, scratch, metadata, pool, rotary,
                 session=session, name=name, indices=window_metadata, deferred=mode == "verify", examples=examples)
         if "index_q" in weights:
+            self.index_angle_key = window_metadata.shared_angles(True)
             self.index_query = QuantizedProjection(scratch.query_low, weights["index_q"],
                 scratch.index_query.view(tokens, -1), session=session, name=f"{name}.index_query",
                 workspace=workspace, activation_mode="auto",
@@ -568,6 +615,14 @@ class PreparedAttention:
         self.window_slots = self.window_indices = self.window_lengths = self.token_offsets = None
         self.lengths = self.active_width = self.index_lengths = self.page_table = None
 
+    def rotate_position(self, tensor, indices, key, *, compressed):
+        """TP3 tp3.rotary_once: rotate ``tensor`` by this forward's token positions, from the shared table ``key``
+        when there is one, else per launch (base). Same values either way (rotary.apply_shared_angles)."""
+        if key is None:
+            self.rotary.apply(tensor, indices.position, compressed=compressed)
+        else:
+            apply_shared_angles(tensor, indices.angles[key], self.rotary.frequencies[compressed])
+
     def padded_mma_layouts(self):
         """Functional: MMA-scale layouts ``(shape, dtype)`` of this layer's MXFP8 activation bases that
         ``mxfp8_dense_bases`` zero-fills per call (qkv_a's quantizer, the q/KV norm's q_b encoding); TP3 mma_pad_once
@@ -622,13 +677,14 @@ class PreparedAttention:
         pending = None
         if self.concurrent_query is not None:
             pending = self.concurrent_query.start(query_low, encoded_bases=encoded_bases)
-        side = None if self.index_side is None else self.index_side.start(source, query_low, position)
+        side = None if self.index_side is None else self.index_side.start(
+            source, query_low, position if self.index_angle_key is None else indices.angles[self.index_angle_key])
         if self.window_norm is not None:
             window_values = self.window_norm(projected[:, 1280:])
         if self.concurrent_query is None:
             query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
-        self.rotary.apply(window_values, position, compressed=bool(self.ratio))
+            self.rotate_position(query, indices, self.angle_key, compressed=bool(self.ratio))
+        self.rotate_position(window_values, indices, self.angle_key, compressed=bool(self.ratio))
         self.window_writer(window_values, indices.window_slots,
                            history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
         dependency = window_cache
@@ -642,7 +698,7 @@ class PreparedAttention:
             if self.selectors:
                 if side is None:
                     index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                    self.rotary.apply(index_query, position, compressed=True)
+                    self.rotate_position(index_query, indices, self.index_angle_key, compressed=True)
                     index_weights = self.index_weight(source)
                 else:
                     index_query, index_weights = self.index_side.finish(side, window_cache)
@@ -667,7 +723,7 @@ class PreparedAttention:
                 dependency = selected
         if self.concurrent_query is not None:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
+            self.rotate_position(query, indices, self.angle_key, compressed=bool(self.ratio))
         attended = self.attention(query, indices.window_indices, indices.window_lengths,
             indexed_indices=selected if self.ratio else None,
             indexed_lengths=geometry.index_lengths if self.ratio else None,

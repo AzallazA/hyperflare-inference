@@ -11,6 +11,7 @@ accept ``"20-33"`` ranges and ``"20,21"`` lists (mixed, comma separated), and fl
 """
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import MISSING, dataclass, field, fields
@@ -40,11 +41,29 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
-RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2", "markov_stage_rows")
+RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2", "markov_stage_rows",
+                      "rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
+# Decode small-lever switches (perf/ds41-decode-small-levers, 2026-11-18): on/off, recorded only when on.
+SMALL_LEVERS = ("rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
+
+# tp3.pin_small_qproj: the plan triple pinned for every attention declaration of at most PIN_SMALL_ROWS rows (b12x
+# offers programmatic launch / evict-first / FP32 split-K partials for MXFP8 GEMMs only up to 8 rows,
+# gemm/_tuning.py ready_small_mxfp8). The values are the 11-15 cache's selections at 3 and 6 target rows (the 5-row
+# declarations lost both by 0.02 / 0.01 us in their standalone races: REVIEW-FABLE.md section 1, 2026-11-18).
+PIN_SMALL_ROWS = 8
+PIN_SMALL_QPROJ = {
+    "qkv_a": {"backend": "cutedsl", "tile_m": 32, "tile_n": 64, "tile_k": 128, "load_path": "tma", "swap_ab": False,
+              "split_k_slices": 4, "large_m_unroll": True, "target_occupancy": None,
+              "programmatic_serialization": True, "evict_first": False},
+    "q_b": {"backend": "cutedsl", "tile_m": 16, "tile_n": 128, "tile_k": 128, "load_path": "tma", "swap_ab": False,
+            "split_k_slices": 1, "large_m_unroll": False, "target_occupancy": None,
+            "programmatic_serialization": True, "evict_first": True},
+    "norm": {"programmatic_serialization": True},
+}
 
 # FLARE_DS41_PREFILL_SKIP_SUFFIX=1: the prefill capacities that get an encoder-only twin (the sizes that end the
 # non-final chunks of long cold prompts at the 4096 chunk); a comma list names them explicitly.
@@ -136,6 +155,24 @@ def parse_capacities(text: str, name: str = "PREFILL_GRAPHS") -> tuple[int, ...]
         return tuple(int(part) for part in text.split(","))
     except ValueError:
         raise ValueError(f"FLARE_DS41_{name}={text!r}: expected comma-separated token capacities") from None
+
+
+def parse_draft_head_plans(text: str) -> tuple | None:
+    """FLARE_DS41_DRAFT_HEAD_PLANS: "" -> None; else a JSON file (or inline JSON object) {"<rows>": {config}, ...}
+    -> ((rows, canonical config json), ...) sorted by rows. The record keeps the configs, never the path."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        raw = json.loads(text) if text.startswith("{") else json.loads(Path(text).read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"FLARE_DS41_DRAFT_HEAD_PLANS: {error}") from None
+    if not isinstance(raw, dict) or not raw or any(not isinstance(v, dict) for v in raw.values()):
+        raise ValueError("FLARE_DS41_DRAFT_HEAD_PLANS: expected {\"<rows>\": {config}, ...}")
+    try:
+        return tuple(sorted((int(rows), json.dumps(config, sort_keys=True)) for rows, config in raw.items()))
+    except ValueError:
+        raise ValueError("FLARE_DS41_DRAFT_HEAD_PLANS: row keys must be integers") from None
 
 
 def parse_skip_suffix(text: str) -> tuple[int, ...] | None:
@@ -275,6 +312,35 @@ class TP3Config:
     target-layer feedback concatenated once instead of copied slice by slice, and the proposal admission check
     without in-place mask updates (functional ``&``, fused). Same values. False = today's graphs (base). The
     MXFP8 MMA-scale padding fills are ``mma_pad_once`` (perf/ds41-launch-merge), not this switch."""
+    # --- decode small levers (perf/ds41-decode-small-levers, 2026-11-18; export-time) ---
+    rotary_once: bool = False
+    """Decode, verification and DSpark draft forwards compute the FP32 RoPE (cos, sin) table once per forward and
+    frequency set (``AttentionIndices``, rotary ``_angles``) and every layer's query, KV-window and index-query
+    rotation reads it (``_rotate`` SHARED_ANGLES) instead of evaluating sinf/cosf per launch (slow range reduction past
+    ~105K positions). Bit-identical: same expression on the same clamped positions (CPU proof
+    tests/components/test_rotary_shared_angles_interpret.py). The ratio-2 compressor rotations (positions can be -2)
+    and BRRR's in-kernel inverse rotation keep their own trigonometry; prefill keeps per-launch angles. False = base."""
+    pin_small_qproj: bool = False
+    """Attention declarations of at most ``PIN_SMALL_ROWS`` rows (decode, verification, draft) take the pinned plan
+    triple ``PIN_SMALL_QPROJ`` (qkv_a split-K4 32x64 + programmatic launch, q/KV norm programmatic launch, q_b 16x128
+    programmatic + evict-first) as explicit overrides instead of the tuning cache's selections (the 5-row
+    declarations' selections were coin flips, 0.2%). Numerics: the 5-row rounds get the rounding the 3- and 6-row
+    rounds already have. False = cache selections (base)."""
+    logprob_single_exchange: bool = False
+    """The verification commit's vocabulary-parallel generation-logprob reduction exchanges one statistics row per
+    sample instead of two (vocabulary_logprobs._finish_single): candidates are ranked by raw logit before the
+    exchange and normalised after it. Chosen/requested logprobs and every reported value are identical; ids among
+    exactly tied values can differ only when >= 13 distinct raw logits of one rank collapse to one FP32 value at the
+    top-20 boundary (CPU proof tests/components/test_logprob_single_exchange_interpret.py). False = two (base)."""
+    no_generation_logprobs: bool = False
+    """The package carries no generation-logprob storage, request flags or reductions (no logprob all-gathers, no
+    logprob exchange channel): Helios answers any generation-logprob request with HTTP 400. Prompt logprobs are not
+    affected. The handbook checks that need logprobs (verify_fix, consistency, engram-eval) cannot run on such a
+    package. Owner decision (B2). False = generation logprobs kept (base)."""
+    draft_head_plans: tuple | None = None
+    """Prepared, not measured: explicit plan overrides for the DSpark proposal head projection by row count,
+    ((rows, config-json), ...) from FLARE_DS41_DRAFT_HEAD_PLANS=<json file {"40": {...gemm.blockscaled_precision
+    config...}}>; rows without an entry keep the tuning cache's selection. None = cache selections (base)."""
     # --- packed verification graph shapes for exports above 8 slots (bootstrap.PreparationConfig) ---
     packed_keep_batches: int = 0
     """Batches up to N keep exactly the packed verification shapes an export with ``--max-concurrency N`` builds (same
@@ -391,6 +457,20 @@ class TP3Config:
         for name in ("vision_arena_host", "markov_embed_host", "markov_stage_rows"):  # own line, as mma_pad_once's
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
+        for name in SMALL_LEVERS:  # own line, as mma_pad_once's
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"TP3 config: {name} must be a boolean")
+        if self.logprob_single_exchange and self.no_generation_logprobs:
+            raise ValueError("TP3 config: logprob_single_exchange reshapes the generation-logprob reduction that "
+                             "no_generation_logprobs removes; set one of them")
+        if self.draft_head_plans is not None:
+            plans = self.draft_head_plans
+            if (type(plans) is not tuple or not plans
+                    or any(type(item) is not tuple or len(item) != 2 or type(item[0]) is not int or item[0] <= 0
+                           or type(item[1]) is not str for item in plans)
+                    or len({rows for rows, _ in plans}) != len(plans)):
+                raise ValueError("TP3 config: draft_head_plans must be ((rows, config-json), ...) with distinct "
+                                 "positive row counts")
         if self.markov_stage_rows and not self.markov_embed_host:
             raise ValueError("TP3 config: markov_stage_rows stages rows of the parked Markov embedding; it needs "
                              "markov_embed_host (FLARE_DS41_MARKOV_EMBED_HOST=1)")
@@ -570,6 +650,11 @@ class TP3Config:
             engram_side_layers=parse_layers(get("ENGRAM_SIDE_LAYERS")),
             context_side_stream=flag("CONTEXT_SIDE_STREAM"),
             mma_pad_once=flag("MMA_PAD_ONCE"),
+            rotary_once=flag("ROTARY_ONCE"),
+            pin_small_qproj=flag("PIN_SMALL_QPROJ"),
+            logprob_single_exchange=flag("LOGPROB_SINGLE_EXCHANGE"),
+            no_generation_logprobs=flag("NO_GENERATION_LOGPROBS"),
+            draft_head_plans=parse_draft_head_plans(get("DRAFT_HEAD_PLANS")),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),
@@ -633,6 +718,10 @@ class TP3Config:
                 continue  # kernel default: absent, so a default export's record (tp3-config.json) is unchanged
             if item.name in RECORDED_WHEN_TRUE and value is False:
                 continue
+            if item.name == "draft_head_plans":
+                if value is None:
+                    continue  # base: absent, so a default export's record is unchanged
+                value = {str(rows): json.loads(config) for rows, config in value}
             if isinstance(value, frozenset):
                 value = format_layers(value)
             elif item.name == "expert_counts_dir":

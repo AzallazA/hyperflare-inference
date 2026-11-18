@@ -55,6 +55,16 @@
 #   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py build; tp3-tools/release/draft-vocab/, held-out
 #            miss rates inside each table): the NVFP4 DSpark draft head keeps only those tokens (FLARE_DS41_DRAFT_VOCAB);
 #            default unset = full head
+#   ROTARY_ONCE  1 = decode/verify/draft forwards compute each RoPE (cos, sin) table once and the query, KV-window and
+#            index-query rotations read it (FLARE_DS41_ROTARY_ONCE; bit-identical); default 0 (perf/ds41-decode-small-levers)
+#   PIN_QPROJ    1 = attention declarations of <= 8 rows take the pinned qkv_a split-K4 / norm / q_b plan triple
+#            (FLARE_DS41_PIN_SMALL_QPROJ; 5-row rounds change rounding as 3/6-row rounds already have); default 0
+#   LOGPROB_ONE_EXCHANGE  1 = the verification commit's generation-logprob reduction exchanges once instead of twice
+#            (FLARE_DS41_LOGPROB_SINGLE_EXCHANGE; logprob values identical); default 0
+#   NO_GEN_LOGPROBS  1 = package without generation logprobs (FLARE_DS41_NO_GENERATION_LOGPROBS; requests that ask for
+#            them get HTTP 400; verify_fix/consistency/engram-eval cannot run on it); default 0, owner decision
+#   DRAFT_HEAD_PLANS  JSON file {"<rows>": {gemm.blockscaled_precision config}} of explicit DSpark head projection
+#            plans (FLARE_DS41_DRAFT_HEAD_PLANS; prepared, not measured); default unset = tuned
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
@@ -115,6 +125,11 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 [ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
+[ "${ROTARY_ONCE:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE=1
+[ "${PIN_QPROJ:-0}" = 1 ] && export FLARE_DS41_PIN_SMALL_QPROJ=1
+[ "${LOGPROB_ONE_EXCHANGE:-0}" = 1 ] && export FLARE_DS41_LOGPROB_SINGLE_EXCHANGE=1
+[ "${NO_GEN_LOGPROBS:-0}" = 1 ] && export FLARE_DS41_NO_GENERATION_LOGPROBS=1
+[ -n "${DRAFT_HEAD_PLANS:-}" ] && export FLARE_DS41_DRAFT_HEAD_PLANS=$DRAFT_HEAD_PLANS
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \

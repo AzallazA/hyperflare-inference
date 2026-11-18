@@ -271,7 +271,8 @@ class PreparedLayer:
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
             window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream,
-            glue_pass2=tp3.glue_pass2 and mode != "prefill")
+            glue_pass2=tp3.glue_pass2 and mode != "prefill",
+            pin_small_qproj=tp3.pin_small_qproj and mode != "prefill")
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
         # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).
@@ -593,10 +594,13 @@ class PreparedDecoder:
                 window_tokens=128, record_bytes=528, staging=staging)
         ratios = weights.config.text["compress_ratios"][:len(weights.layers)]
         prefix_ratios = ratios if self.packing is None else ratios[:decoder_start + 1]
+        # TP3 tp3.rotary_once: decode/verification forwards compute each RoPE table once (AttentionIndices.angles);
+        # prefill keeps per-launch angles (large chunks: table traffic instead of trigonometry).
         self.window_metadata = AttentionIndices(metadata, mode=mode,
             tokens=metadata.positions.numel(),
             page_size=128 if mode == "decode" else 128 + metadata.max_query_tokens, width=128,
-            ratios=set(prefix_ratios) - {0})
+            ratios=set(prefix_ratios) - {0},
+            rotary=self.rotary if tp3.rotary_once and mode in ("decode", "verify") else None)
         self.suffix_window_metadata = None
         if self.packing is not None:
             self.suffix_window_metadata = AttentionIndices(self.output_metadata, mode=mode,
