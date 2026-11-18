@@ -7,8 +7,17 @@ same bytes.
 Attention layers 2 (ratio-2 KV source), 13 (plain), 20 (ratio-1 KV + candidate source) and 24 (index-only), TP3
 rank-0 geometry (24 heads, BF16 MLA as served), chained as in the decoder, at rows 1/6/12/21/43. Four graphs of the
 same prepared operators: {per-layer fills, one fill per forward} x {serial indexer chain, tp3.index_side_stream}.
-Every graph is replayed from the same state (pool, poisoned arena) and must write the first one's outputs, selections
-and every cache byte; the pad graphs run three times. FLARE_LAUNCHMERGE_TIMING=1 also times
+Every graph is replayed from the same state (pool rows and KV pages, poisoned arena) and must write the first one's
+outputs and every cache byte (pool rows and KV pages) bit for bit, and the same selections up to ties (below); the pad
+graphs run three times.
+
+Selections and ties (seq226 / seq320 ('pads', 6), 11-17): the pool's KV pages start zeroed and only this forward's own
+tokens (positions >= START) are written, so every history entry (compressed index < START // ratio) has an all-zero
+index key and an all-zero latent row: identical index scores and identical attention contributions. Layer 20 (ratio 1)
+selects 512 of ~601 entries, so the MXFP4 radix top-k picks an arbitrary subset of those ~600 ties (shared-memory atomic
+order), run to run and graph to graph, with or without pad-once; the layer outputs that read the selection stay
+byte-equal. Selections must therefore agree exactly on every non-history entry (this forward's tokens and the -1
+sentinels) and in size; only the choice among zero-history ties may differ. FLARE_LAUNCHMERGE_TIMING=1 also times
 FLARE_LAUNCHMERGE_REPS (default 300) replays of each graph and prints
 ``LAUNCHMERGE item=mma_pad rows=N side=0|1 base_us=.. pads_us=.. saved_us=.. layers=4``
 (the served round has 40 target + 3 draft layers: per-round saving ~= saved_us / 4 x 43; the pad graph's own two
@@ -116,6 +125,19 @@ class ChainForward:
             self.selected[index].copy_(selection[0])
 
 
+def assert_same_selection(value, reference, history, label):
+    """``value`` / ``reference`` [rows, 512] int32 selections of one layer. Equal up to ties among the zero history
+    entries ``0 <= index < history`` (see module doc): each row the same multiset outside the history range (this
+    forward's tokens, -1 sentinels) and the same number of history entries; which history entries were picked is free."""
+    assert value.shape == reference.shape, label
+    for row, (mine, theirs) in enumerate(zip(value.cpu().tolist(), reference.cpu().tolist(), strict=True)):
+        tied = [sorted(i for i in x if 0 <= i < history) for x in (mine, theirs)]
+        fixed = [sorted(i for i in x if not 0 <= i < history) for x in (mine, theirs)]
+        assert fixed[0] == fixed[1] and len(tied[0]) == len(tied[1]), (*label, row)
+        for picked in tied:
+            assert len(set(picked)) == len(picked), (*label, row, "duplicate history index")
+
+
 def _replay_us(graph, reps):
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     samples = []
@@ -173,9 +195,14 @@ def test_mma_pad_once_is_bit_identical(attention_weights, rows):
             owners.extend((forward, compiled))
         session.freeze()
         saved = pool.backing.clone()
+        pages = [pool.pages[name] for name in sorted(pool.pages)]  # KV pages (index keys, latent rows): not in backing
+        saved_pages = [page.clone() for page in pages]
+        history = [START // attention.ratio if attention.ratio else 0 for attention in serial]
 
         def reset():
             pool.backing.copy_(saved)
+            for page, value in zip(pages, saved_pages, strict=True):
+                page.copy_(value)
             arena.tensor.fill_(0xA5)
             for value in (*outputs, *selected):
                 value.fill_(-1)
@@ -187,15 +214,16 @@ def test_mma_pad_once_is_bit_identical(attention_weights, rows):
                 torch.cuda.synchronize()
                 graphs[name].replay()
                 torch.cuda.synchronize()
-                actual = tuple(value.clone() for value in (*outputs, *selected, pool.backing))
+                actual = tuple(value.clone() for value in (*outputs, *selected, pool.backing, *pages))
                 if expected is None:
                     expected = actual
                     continue
                 for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
                     if len(outputs) <= index < len(outputs) + len(selected):
-                        # Selections are index sets: the MXFP4 indexer does not fix their order (its own tests
-                        # compare sort().values); the layer outputs that consume them and the pool stay byte-exact.
-                        value, reference = value.sort(dim=-1).values, reference.sort(dim=-1).values
+                        # Index sets, equal up to zero-history ties (module doc); outputs, pool rows and pages
+                        # stay byte-exact.
+                        assert_same_selection(value, reference, history[index - len(outputs)], (name, index))
+                        continue
                     assert torch.equal(value.view(torch.uint8), reference.view(torch.uint8)), (name, index)
             if os.environ.get("FLARE_LAUNCHMERGE_TIMING") == "1":
                 reps = int(os.environ.get("FLARE_LAUNCHMERGE_REPS", "300"))

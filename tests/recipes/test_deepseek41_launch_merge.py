@@ -363,3 +363,17 @@ def test_decoder_and_draft_default_to_per_layer_fills():
     assert dspark_module.PreparedDraft.mma_pad_layouts == ()
     # linear.mxfp8_dense_bases (GLM and every other user) is untouched
     assert linear.mxfp8_dense_bases.__module__ == "ignition.components.linear"
+
+
+def test_gpu_proof_selection_check_allows_only_zero_history_ties():
+    """The GPU proof's selection check (seq226 / seq320 ('pads', 6)): a different pick among history ties passes; a
+    different current-token entry, a lost -1 sentinel, a size change or a duplicate history index fails."""
+    from tests.recipes.test_deepseek41_launch_merge_cuda import assert_same_selection
+    reference = torch.tensor([[600, 3, 1, 2, -1], [601, 600, 7, 8, 9]], dtype=torch.int32)
+    assert_same_selection(torch.tensor([[2, 5, 600, 9, -1], [9, 600, 601, 4, 0]], dtype=torch.int32), reference, 600, ("t",))
+    for bad in ([[599, 3, 1, 2, -1], [601, 600, 7, 8, 9]],     # current token 600 dropped for a history tie
+                [[600, 3, 1, 2, 4], [601, 600, 7, 8, 9]],      # -1 sentinel replaced
+                [[600, 3, 1, 1, -1], [601, 600, 7, 8, 9]],     # duplicate history index
+                [[600, 3, 1, 2, -1], [601, 602, 7, 8, 9]]):    # different current token
+        with pytest.raises(AssertionError):
+            assert_same_selection(torch.tensor(bad, dtype=torch.int32), reference, 600, ("t",))
