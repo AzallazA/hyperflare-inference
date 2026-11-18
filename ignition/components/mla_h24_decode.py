@@ -272,7 +272,8 @@ class _H24Launch:
         if prepared is not None and _is_h24_program(prepared):
             self.replays += 1
             return self.real(*args, **kwargs)  # b12x builds the identical runtime tuple and runs our program
-        if not self._eligible(a):
+        if prepared is not None or not self._eligible(a):
+            # A prepared b12x program (rows not selected when it was prepared) replays through b12x unchanged.
             return self.inner(*args, **kwargs)
         offset, blocks, valid = int(a["head_block_offset"]), int(a["grid_h_blocks"]), int(a["valid_hpb"])
         index, identity = self._identity(a)

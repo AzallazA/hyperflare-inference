@@ -136,7 +136,10 @@ def test_prepared_replay_runs_the_program_through_b12x_and_skips_the_remainder(r
     program = _Program(h24.KERNEL_ID)
     assert _decode(wrapper, 13, prepared=(program, h24.REMAINDER_DONE)) == ("real-launcher", None)
     assert log == [("real", 0, program)]
-    # A prepared 16 + 8 pair (rows not selected at export) still goes through b12x's own path.
+    # A prepared 16 + 8 pair (rows not selected, or selected only now) still goes through b12x's own path.
+    log.clear()
+    _decode(wrapper, 13, prepared=(_Program("attention.mla.sm120.decode"), _Program("attention.mla.sm120.decode")))
+    assert [entry[0] for entry in log] == ["inner", "inner"] and wrapper.applied == []
     log.clear()
     _decode(wrapper, 5, prepared=(_Program("attention.mla.sm120.decode"), _Program("attention.mla.sm120.decode")))
     assert [entry[0] for entry in log] == ["inner", "inner"]
@@ -388,8 +391,8 @@ def test_offline_compile_programs_registers_and_mma_sharing(tmp_path, rows, spli
             lds = len(re.findall(r"\bLDS(?:\.\w+)*\s", sass))
             stats.setdefault(name, []).append(dict(regs=regs, stack=stack, local=local, hmma=hmma, lds=lds))
     (h,) = stats["h24"]
-    full, remainder = sorted(stats["b12x"], key=lambda s: s["regs"])
+    remainder, full = sorted(stats["b12x"], key=lambda s: s["regs"])  # 16-head program 168 regs, remainder 150
     assert h["stack"] == h["local"] == 0 and h["regs"] <= 224  # no spills; 288 threads fit one CTA per SM
     assert h["hmma"] == full["hmma"] + remainder["hmma"]          # both head tiles' MMAs
-    assert h["lds"] < 1.15 * full["lds"]                           # K/V decode loads once, not twice
+    assert h["lds"] < 1.15 * max(full["lds"], remainder["lds"])    # K/V decode loads once, not twice
     shutil.rmtree(tmp_path / "b12x", ignore_errors=True)

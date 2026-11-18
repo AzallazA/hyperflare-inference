@@ -9,10 +9,16 @@ b12x's 16-head + 8-head grids (remainder on the side stream, the production sett
 these rows. Both at the same forced split count (FLARE_DS41_MLA_DECODE_SPLITS hook; None = b12x's 10). The H24
 preparation must have lowered to our program plus the inert remainder launcher, and both graphs must write the same
 bytes (and match the reference). FLARE_H24_TIMING=1 also prints the median replay time of both graphs.
+
+Review fixes (REVIEW-FABLE-H24.md): the hooks are selected through their environment variables and installed with
+install_from_environment(), so the session's spawned compile workers plan the same programs (B1); tuning is off (one
+split geometry, B2); each arm keeps its own scratch arena alive and every replay starts from poisoned split partials
+(mid_out NaN, mid_lse 0.0), so a missing H24 write cannot be hidden by the other arm's partials (B3).
 """
 
 import os
 import statistics
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -71,17 +77,59 @@ def _inputs(rows, width, device):
     return data
 
 
+@contextmanager
+def _environment(values):
+    """Set/delete variables for one arm (spawned compile workers inherit them) and restore them afterwards."""
+    saved = {name: os.environ.get(name) for name in values}
+    try:
+        for name, value in values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def _record_partials(sink):
+    """Outermost passive wrapper on b12x's grid launcher: remembers the split partial views (mid_out, mid_lse)."""
+    from b12x.attention._shared.mla import kernel
+
+    inner = kernel._sparse_mla_decode_grid_flat_launch
+
+    def recording(*args, **kwargs):
+        if hasattr(args[3], "is_cuda") and args[3].is_cuda:
+            sink.append((args[3], args[4]))
+        return inner(*args, **kwargs)
+
+    kernel._sparse_mla_decode_grid_flat_launch = recording
+    try:
+        yield
+    finally:
+        kernel._sparse_mla_decode_grid_flat_launch = inner
+
+
 def _capture(data, rows, width, splits, arm, output):
     device = output.device
-    if splits is not None:
-        mla_decode_splits.install(((rows, splits),))
-    hook = mla_h24_decode.install(((rows, True),)) if arm == "h24" else None
+    values = {mla_decode_splits.ENV: None if splits is None else f"{rows}:{splits}",
+              mla_h24_decode.ENV: f"{rows}:1" if arm == "h24" else None}
     graph = torch.cuda.CUDAGraph()
     arena = ScratchArena(device)
+    partials = []
+    with _environment(values):
+        mla_decode_splits.install_from_environment()
+        hook = mla_h24_decode.install_from_environment()
+    assert (hook is not None) == (arm == "h24")
     try:
-        with RecordedPreparationSession(device=device, checkpoint="mla-h24-decode",
+        with _environment(values), RecordedPreparationSession(device=device, checkpoint="mla-h24-decode",
                 workload_schema=f"heads24-bf16-rows{rows}-w{width}-s{splits}-{arm}", numerical_policy="checkpoint",
-                compile_workers=2) as session:
+                compile_workers=2, autotune_effort="off") as session:
             session.register_scratch(arena)
             attention = PreparedCompressedMLA(data["query"], data["window"], data["window_indices"],
                 data["window_lengths"], data["sink"], output, indexed=data["indexed"],
@@ -97,22 +145,33 @@ def _capture(data, rows, width, splits, arm, output):
             if hook is not None:
                 assert mla_h24_decode._is_h24_program(launch.grid_programs[0]), launch.grid_programs
                 assert launch.grid_programs[1] is mla_h24_decode.REMAINDER_DONE
-                assert hook.applied and all(entry == (rows, launch.num_splits) for entry in hook.applied)
+                assert hook.applied and all(entry == (rows, launch.num_splits) for entry in hook.applied), hook.applied
             else:
                 assert not mla_h24_decode._is_h24_program(launch.grid_programs[0])
             attention()
             torch.cuda.synchronize()
-            with session.capture():
+            with session.capture(), _record_partials(partials):
                 with torch.cuda.graph(graph):
                     attention()
     finally:
         mla_h24_decode.uninstall()
         mla_decode_splits.uninstall()
-    return graph, launch
+    assert partials, "capture recorded no split partial views"
+    if hook is not None:
+        assert hook.replays >= 1, "the captured graph did not run the prepared H24 program"
+    # Keep the arena and attention alive with the graph: each arm owns its scratch memory.
+    return graph, launch, (arena, attention, partials)
 
 
-def _replay(graph, output):
+def _poison(owners):
+    for mid_out, mid_lse in owners[2]:
+        mid_out.fill_(torch.nan)
+        mid_lse.fill_(0.0)
+
+
+def _replay(graph, output, owners):
     output.fill_(torch.nan)
+    _poison(owners)
     graph.replay()
     torch.cuda.synchronize()
     return output.clone()
@@ -141,16 +200,18 @@ def test_h24_is_bit_identical_to_16_plus_8(rows, splits):
     width = 512
     data = _inputs(rows, width, device)
     output = torch.empty(rows, 24, 512, device=device, dtype=torch.bfloat16)
-    base, base_launch = _capture(data, rows, width, splits, "base", output)
-    fused, fused_launch = _capture(data, rows, width, splits, "h24", output)
+    base, base_launch, base_owners = _capture(data, rows, width, splits, "base", output)
+    fused, fused_launch, fused_owners = _capture(data, rows, width, splits, "h24", output)
     try:
         assert base_launch.num_splits == fused_launch.num_splits
-        expected = _replay(base, output)
-        got = _replay(fused, output)
+        assert base_owners[0].tensor.data_ptr() != fused_owners[0].tensor.data_ptr()
+        expected = _replay(base, output, base_owners)
+        assert not expected.isnan().any(), "base 16 + 8 output read a poisoned partial"
+        got = _replay(fused, output, fused_owners)
         assert torch.equal(got.view(torch.int16), expected.view(torch.int16)), (
             f"max |diff| {(got.float() - expected.float()).abs().max().item():.3e}")
         for _ in range(3):  # run-to-run stable
-            assert torch.equal(_replay(fused, output).view(torch.int16), expected.view(torch.int16))
+            assert torch.equal(_replay(fused, output, fused_owners).view(torch.int16), expected.view(torch.int16))
         physical = (data["table"].long().gather(1, (data["indexed_indices"].long() // data["page_size"]).clamp(
             0, data["logical_pages"] - 1)) * data["page_size"] + data["indexed_indices"].long() % data["page_size"]).int()
         reference = compressed_sparse_mla_reference(data["query"], data["window"], data["window_indices"],
