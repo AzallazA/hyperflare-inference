@@ -39,6 +39,17 @@
 #            default 0 (VRAM map 2026-11-15 item 3)
 #   MARKOV_HOST  1 = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory (FLARE_DS41_MARKOV_EMBED_HOST);
 #            default 0 (VRAM map item 6)
+#   MARKOV_STAGE 1 = with MARKOV_HOST=1, copy each request's Markov predecessor row into VRAM once per draft step
+#            (FLARE_DS41_MARKOV_STAGE_ROWS); keeps MARKOV_HOST's ~74K KV without its decode cost (11-18 microbench:
+#            b1 +0.01 ms, b16 -0.00 ms per round vs the table in VRAM); default 0
+#   GLUE2    1 = second decode-glue pass (FLARE_DS41_GLUE_PASS2: no zero fill of the verification staging / draft window
+#            cache, draft state rows once, one-kernel pre-mix, concatenated draft feedback, functional admission check;
+#            same bytes, GPU proof padglue2-proof-1117-2320); default 0
+#   SKIP_SUFFIX  prefill capacities that get an encoder-only twin (FLARE_DS41_PREFILL_SKIP_SUFFIX, e.g. 4096; "1" =
+#            3072,3584,4096): non-final chunks of long cold prompts skip layers 21-39 and the head (Helios decides per
+#            chunk; serve with --scheduler-encoder-prefill false to turn it off); default unset = no twins
+#   ORDER    expert order shipped in tp3-tools/release/expert-orders/<ORDER> (sets COUNTS when COUNTS is unset), e.g.
+#            order-mix-provisional-exl3S (blend order of the 11-18 default, fingerprint a70f5e67d564)
 #   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
 #            FLARE_EXPORT_SHARE_COMPUTED_OPERANDS, part of the compiler cache key); default 0
 #   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py build; tp3-tools/release/draft-vocab/, held-out
@@ -72,6 +83,13 @@ if [ -n "${B12X_OVERLAY:-}" ]; then
     [ -d "$B12X_OVERLAY/b12x_tree" ] || { echo "B12X_OVERLAY=$B12X_OVERLAY has no b12x_tree" >&2; exit 1; }
     export PYTHONPATH="$B12X_OVERLAY${PYTHONPATH:+:$PYTHONPATH}" B12X_PCIE_DCP_GATHER_PULL=0
 fi
+if [ -n "${ORDER:-}" ] && [ -z "${COUNTS:-}" ]; then
+    COUNTS=$HERE/expert-orders/$ORDER
+    [ -d "$COUNTS" ] || { echo "ORDER=$ORDER: no $COUNTS" >&2; exit 1; }
+fi
+if [ "${MARKOV_STAGE:-0}" = 1 ] && [ "${MARKOV_HOST:-0}" != 1 ]; then
+    echo "MARKOV_STAGE=1 needs MARKOV_HOST=1 (it stages rows of the parked table)" >&2; exit 1
+fi
 export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} FLARE_DS41_HOT_EXPERTS=${HOT:-342} \
        FLARE_DS41_MERGED_BANK=1 FLARE_DS41_TP3_VOCAB_PARALLEL=1 \
        FLARE_DS41_EXPERT_COUNTS_DIR=${COUNTS:-$HERE/expert-order} HF_HUB_OFFLINE=1 \
@@ -92,6 +110,9 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${PAD_ONCE:-0}" = 1 ] && export FLARE_DS41_MMA_PAD_ONCE=1
 [ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
 [ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
+[ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
+[ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
+[ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 [ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
