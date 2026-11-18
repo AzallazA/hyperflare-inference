@@ -472,7 +472,7 @@ Named selection presents only the selected tool definition to the model, retaini
 conversation history and adding no instructions or decoding constraints.
 Buffered and streaming responses omit ordinary assistant answer text while
 preserving reasoning and tool arguments. Usage includes all generated tokens,
-including omitted answer text. Every emitted call must target the selected tool,
+including omitted answer text. Every returned call must target the selected tool,
 and at least one completed call is required. A call to another tool fails before
 that call is emitted. Missing and incomplete calls fail as in required mode.
 
@@ -504,10 +504,22 @@ bounded llguidance compiler as structured output.
 
 `parallel_tool_calls: false` permits at most one tool call per response.
 Anthropic's `tool_choice.disable_parallel_tool_use: true` applies the same limit.
-The output validator fails the response when a second call begins, before emitting
-that call. Buffered requests receive HTTP 500; streams receive a terminal error
-and may already have delivered the first call. Combined with required mode, a
-successful response contains exactly one call. Generation uses ordinary sampling.
+When a second call begins, the server discards it and cancels further generation.
+The response completes normally with the first call and usage: Chat uses
+`finish_reason: "tool_calls"`, Messages uses `stop_reason: "tool_use"`, and
+Responses emits a completed response containing the first tool call.
+This applies to buffered and streamed requests. Combined with required mode, a
+successful response contains exactly one call. The limit is checked before
+validating the discarded call's name. Generation uses ordinary sampling.
+Usage counts every generated token, including discarded output. Detection follows
+the HTTP reader's pace: a slow or paused client delays cancellation while the
+worker continues decoding. Cancellation is processed at submission boundaries;
+already queued work retains its normal fences. If the worker processes
+cancellation before natural completion, runtime metrics count the request as
+cancelled rather than completed, despite the successful API response.
+Raw token IDs and Chat logprobs published before the parser recognizes the second
+call can include its opening tokens. Buffered token IDs can contain fewer entries
+than the generated-token usage count.
 
 Parallel tool results with unique IDs matching the preceding assistant's calls
 are normalized to call order before chat-template rendering. Each result's text

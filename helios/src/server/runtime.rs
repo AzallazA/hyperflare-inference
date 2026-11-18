@@ -149,6 +149,10 @@ pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()
 }
 
 impl Generation {
+    pub(super) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
     pub(super) async fn wait_for_first_token(&mut self) -> Result<()> {
         (&mut self.first_token)
             .await
@@ -170,7 +174,7 @@ impl Generation {
 }
 impl Drop for Generation {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel();
     }
 }
 
@@ -279,6 +283,17 @@ impl Incoming {
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
+    }
+
+    fn finish_cancelled(&self, carried: Carried) {
+        self.emit(GenerationEvent::Finished {
+            prompt_tokens: carried.prompt_tokens.unwrap_or(self.prompt.tokens.len()),
+            generated_tokens: carried.generated_tokens,
+            reused_prompt_tokens: carried.reused_prompt_tokens.unwrap_or(0),
+            reason: "stop",
+            termination: crate::output::Termination::Cancelled,
+            stop_sequence: None,
+        });
     }
 
     fn notify_admission(&self, result: Result<()>) {
@@ -1290,9 +1305,10 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        self.parked.retain(|(incoming, _)| {
+        self.parked.retain(|(incoming, parked)| {
             let cancelled = incoming.cancelled.load(Ordering::Acquire);
             if cancelled {
+                incoming.finish_cancelled(parked.carried);
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 progress = true;
             }
@@ -1307,6 +1323,13 @@ impl<'a> Worker<'a> {
                 if active.prepared_image.is_some() {
                     self.preparing_image = None;
                 }
+                let live = self.scheduler.request(active.request)?;
+                active.incoming.finish_cancelled(Carried {
+                    prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(live.prompt_tokens)),
+                    generated_tokens: active.carried.generated_tokens + live.generated_tokens,
+                    reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(live.reused_prompt_tokens())),
+                    ..active.carried
+                });
                 self.scheduler.cancel(active.request)?;
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 self.admissions[slot] = None;
@@ -1350,6 +1373,9 @@ impl<'a> Worker<'a> {
                 }
             };
             if incoming.cancelled.load(Ordering::Acquire) {
+                if let Some(parked) = &parked {
+                    incoming.finish_cancelled(parked.carried);
+                }
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -1874,7 +1900,10 @@ impl<'a> Worker<'a> {
                                     .fetch_add(1, Ordering::Relaxed);
                                 self.metrics.progress(0, 1, 0, 0, 0, 0);
                             }
-                            if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
+                            if !abandon && request.incoming.cancelled.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if abandon {
                                 self.scheduler.cancel(request.request)?;
                                 self.active[slot] = None;
                                 self.admissions[slot] = None;
