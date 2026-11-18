@@ -19,6 +19,32 @@ use crate::{
 // Graphs are uploaded before sizing caches; leave room for driver bookkeeping
 // and the execution streams and events created when the server starts.
 pub(super) const HEADROOM_BYTES: u64 = 64 << 20;
+/// TP3 fork: `FLARE_ENGINE_HEADROOM_MIB` replaces [`HEADROOM_BYTES`] (unset or empty = 64 MiB, the base) for the
+/// loader and the memory dry run alike. Serve-time only: the package does not change. Accepted 16..=1024 MiB; any
+/// other value fails the load instead of being ignored.
+pub(super) const HEADROOM_ENV: &str = "FLARE_ENGINE_HEADROOM_MIB";
+
+pub(super) fn parse_headroom_mib(value: &str) -> std::result::Result<u64, String> {
+    let mib: u64 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{HEADROOM_ENV}={value:?}: expected a whole number of MiB"))?;
+    if !(16..=1024).contains(&mib) {
+        return Err(format!("{HEADROOM_ENV}={mib}: must be 16..=1024 MiB"));
+    }
+    Ok(mib << 20)
+}
+
+/// Engine headroom in bytes: [`HEADROOM_ENV`] when set, else [`HEADROOM_BYTES`]. Read once per process.
+pub(super) fn headroom_bytes() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| match std::env::var(HEADROOM_ENV) {
+        Ok(value) if !value.trim().is_empty() => {
+            parse_headroom_mib(&value).unwrap_or_else(|error| panic!("{error}"))
+        }
+        _ => HEADROOM_BYTES,
+    })
+}
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
@@ -173,7 +199,7 @@ pub(super) fn headroom(config: &serde_json::Value) -> Result<u64> {
         .transpose()?
         .unwrap_or(0);
     reserve
-        .checked_add(HEADROOM_BYTES)
+        .checked_add(headroom_bytes())
         .ok_or_else(|| invalid("memory reserve overflows the device budget"))
 }
 
@@ -243,9 +269,9 @@ pub(super) fn limited_budget(
     let headroom = match limit {
         None => default_headroom,
         Some(MemoryLimit::Reserve(reserve)) => reserve
-            .checked_add(HEADROOM_BYTES)
+            .checked_add(headroom_bytes())
             .ok_or_else(|| invalid("memory reserve overflows the device budget"))?,
-        Some(_) => HEADROOM_BYTES,
+        Some(_) => headroom_bytes(),
     };
     let available = budget(
         memory.free.min(memory.total),
@@ -261,7 +287,7 @@ pub(super) fn limited_budget(
     // and driver allowance are part of its occupied budget.
     let required = loaded
         .checked_add(future)
-        .and_then(|n| n.checked_add(HEADROOM_BYTES))
+        .and_then(|n| n.checked_add(headroom_bytes()))
         .and_then(|n| n.checked_add(if integrated { INTEGRATED_HOST_BYTES } else { 0 }))
         .ok_or_else(|| invalid("loaded memory footprint overflows the device budget"))?;
     let remaining = cap.checked_sub(required).ok_or_else(|| invalid(format!(
@@ -496,7 +522,7 @@ pub(super) fn capacities(
 /// the selected graphs, the widest execution-row requirement, and the host prefix cache's device
 /// and host headroom. The loader and the memory dry run both size caches from these.
 pub(super) struct CacheSizing {
-    /// Core serving reserve plus [`HEADROOM_BYTES`], subtracted from each rank's free memory.
+    /// Core serving reserve plus [`headroom_bytes`], subtracted from each rank's free memory.
     pub reserve: u64,
     /// Tokens per physical page on each rank.
     pub page_tokens: u64,
@@ -911,7 +937,7 @@ impl NativeModel {
         );
         match options
             .memory_limit
-            .unwrap_or(MemoryLimit::Reserve(reserve - HEADROOM_BYTES))
+            .unwrap_or(MemoryLimit::Reserve(reserve - headroom_bytes()))
         {
             MemoryLimit::Reserve(0) => {}
             MemoryLimit::Reserve(bytes) => {
@@ -1164,6 +1190,16 @@ mod tests {
         protobuf::wire::Sizing,
     };
     use super::*;
+
+    #[test]
+    fn engine_headroom_override_parses_and_rejects_out_of_range_values() {
+        // TP3 fork switch FLARE_ENGINE_HEADROOM_MIB (parsed here; headroom_bytes() reads it once per process).
+        assert_eq!(parse_headroom_mib("32"), Ok(32 << 20));
+        assert_eq!(parse_headroom_mib(" 64 "), Ok(HEADROOM_BYTES));
+        assert!(parse_headroom_mib("8").is_err());
+        assert!(parse_headroom_mib("2048").is_err());
+        assert!(parse_headroom_mib("32MiB").is_err());
+    }
 
     #[test]
     fn integrated_memory_includes_reclaimable_ram_but_not_swap() {
