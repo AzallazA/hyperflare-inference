@@ -733,7 +733,7 @@ impl InboundRecord {
                 Ok(()) => {}
                 Err(error) => {
                     file.state = FileState::Closed;
-                    self.fail(error);
+                    self.fail(error.with_record_read());
                 }
             },
             Operation::ReadPages | Operation::ReadRow => {
@@ -762,7 +762,7 @@ impl InboundRecord {
                 }
                 match reply.result {
                     Ok(()) => self.bytes += reply.bytes,
-                    Err(error) => self.fail(error),
+                    Err(error) => self.fail(error.with_record_read()),
                 }
             }
             Operation::Close => file.state = FileState::Closed,
@@ -2429,13 +2429,13 @@ impl DiskStore {
                         self.stats.reused_tokens += job.tokens;
                         self.inbound_rate.observe(*bytes, job.started.elapsed());
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.stats.fetch_failed += 1;
-                        // A record that could not be restored is not offered
-                        // again. Its pages stay in the index for descendants
-                        // that hold it as an ancestor; only its row, which
-                        // makes it a lookup match, is dropped.
-                        if let Some(endpoint) = job.nodes.last() {
+                        // Only record read failures invalidate the lookup row;
+                        // transfer failures leave the stored bytes reusable.
+                        if error.is_record_read()
+                            && let Some(endpoint) = job.nodes.last()
+                        {
                             self.index.drop_row(endpoint);
                         }
                     }
@@ -3882,7 +3882,45 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_restore_is_not_offered_again() {
+    fn a_transient_restore_failure_keeps_the_record_offered() {
+        let geometry = geometry();
+        let directory = directory();
+        let full = history(2000);
+        let root = header(&geometry, &full, 700, None);
+        let leaf = header(&geometry, &full, 1990, Some(700));
+        let records = vec![
+            scanned(&directory, root, 0, true),
+            scanned(&directory, leaf.clone(), 1, true),
+        ];
+        let total: u64 = records.iter().map(|record| record.bytes).sum();
+        let (mut store, log) = store_with(records, 2 * total);
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, leaf.key);
+        let ticket = InboundTicket {
+            key: hit.key,
+            pages: (100..100 + hit.pages as u32).map(PageId).collect(),
+            slot: StateSlotId(2),
+        };
+        store.fetch(hit, ticket).unwrap();
+        let events = complete(
+            &log,
+            TransportEvent::Fetched {
+                id: JobId(1),
+                result: Err(invalid("copy cancelled")),
+            },
+            &mut store,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Fetched { key, result: Err(_) }] if *key == leaf.key
+        ));
+        assert!(store.index().nodes().all(|node| !node.pinned()));
+        assert_eq!(store.stats().fetch_failed, 1);
+        assert_eq!(store.lookup(&full, 700, u64::MAX).unwrap().key, leaf.key);
+    }
+
+    #[test]
+    fn a_record_read_failure_is_not_offered_again() {
         let geometry = geometry();
         let directory = directory();
         let full = history(2000);
@@ -3905,7 +3943,7 @@ mod tests {
         store.fetch(hit, ticket).unwrap();
         log.borrow_mut().events.push(TransportEvent::Fetched {
             id: JobId(1),
-            result: Err(invalid("page checksum mismatch")),
+            result: Err(invalid("page checksum mismatch").with_record_read()),
         });
         let mut events = Vec::new();
         store.poll(&mut events).unwrap();
@@ -5064,7 +5102,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(4));
-                assert!(result.is_err());
+                assert!(result.as_ref().unwrap_err().is_record_read());
             }
             other => panic!("unexpected events {other:?}"),
         }
@@ -5086,6 +5124,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(5));
+                assert!(result.as_ref().unwrap_err().is_record_read());
                 assert!(
                     result
                         .as_ref()
@@ -5290,6 +5329,7 @@ mod tests {
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(3));
+                assert!(!result.as_ref().unwrap_err().is_record_read());
                 assert!(
                     result
                         .as_ref()
