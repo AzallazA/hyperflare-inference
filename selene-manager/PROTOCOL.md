@@ -40,9 +40,10 @@ cite them by number.
    (neighbour GPU = level 2, neighbour DRAM = 3, neighbour NVMe = 4) are offered
    to every session, whether the copy goes through shared windows or through the
    manager's relay. Manager-store candidates are offered
-   to every session: a same-host manager's DRAM is level 3 and its NVMe level 4; a
-   remote manager's records (DRAM or NVMe) are level 5. The manager computes the
-   level from the requester's perspective.
+   to every session: a same-host manager chain is level 3 when every record the
+   claim reads is in DRAM, and level 4 when any requires NVMe. A remote manager's
+   records (DRAM or NVMe) are level 5. The candidate's `tier` is the endpoint's
+   tier; its level reflects the slowest tier read from the requester's perspective.
 5. **Content keys.** A source pins ready content by its scoped prefix key and
    validates the chain shape. Index entries are hints: late evictions can remove
    a fresh hint and cause a miss, but cannot grant ownership or change bytes.
@@ -215,10 +216,13 @@ Manager algorithm for each candidate source entry (endpoint `E` with a row):
 
 1. Skip the requester's own instance and sources the requester cannot reach
    (decision 4), including sources with no export slots. Busy sources are eligible.
-2. Compute the level from the tier and the relation to the requester.
+2. Compute the initial level from the endpoint's tier and the relation to the requester.
 3. `begin` = `resident_tokens` (exact, not page-aligned); the physical start
    is `floor(begin / page_tokens)`. Walk parents from `E` to the node containing
-   that page and require a contiguous chain. A hole gives no candidate.
+   that page and require a contiguous chain. A hole gives no candidate. Manager
+   chains may mix DRAM and NVMe; instance chains must stay in one tier. For a
+   same-host manager, use level 4 if any record the claim reads requires NVMe;
+   otherwise use level 3. The candidate's `tier` remains the endpoint's tier.
 4. Drop it if it supplies no page and no row beyond `begin` (zero pages with the
    row is kept: a row-only tail).
 5. Order by longest match, then fixed copy level and stable source identity; return at most
@@ -824,6 +828,8 @@ wire service; the store has none of its own.
   burst on one session beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once.
 - **Manager-store entries.** The manager's own store appears in each scope's index as the
   manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe).
+  Manager chains may mix both tiers; instance chains may not. A candidate's `tier`
+  names its endpoint's tier, while its level reflects the slowest tier the claim reads.
 - **Windows.** An instance-to-instance claim reserves one staging block for the whole export
   (its size rounds up to the allocator's size class), cut into windows by the pinned records.
   A host-tier source whose export does not fit streams with `window_credits`. Windows for the

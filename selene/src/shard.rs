@@ -629,13 +629,12 @@ impl Sharded {
             .results
             .iter()
             .enumerate()
-            .find_map(|(rank, result)| match result {
-                Some(Err(error)) => Some(Error::caused_by(
-                    format!("rank {rank}: {error}"),
-                    error.clone(),
-                )),
+            .filter_map(|(rank, result)| match result {
+                Some(Err(error)) => Some((rank, error)),
                 _ => None,
-            });
+            })
+            .min_by_key(|(_, error)| !error.is_record_read())
+            .map(|(rank, error)| Error::caused_by(format!("rank {rank}: {error}"), error.clone()));
         if let Some((store, error)) = pending.cleanup {
             // Preserve cleanup failures alongside the write failure.
             let leftover =

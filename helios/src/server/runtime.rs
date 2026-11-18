@@ -194,9 +194,12 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
-    /// Pool lookup started on arrival, retained until its answer or the first
-    /// prefill submission. Cancellation drops it with the `Incoming`.
+    /// Pool lookup started on arrival. A ticket that will never be answered is
+    /// replaced when next selected for admission; pending tickets survive until
+    /// prefill submission.
+    /// Cancellation drops the ticket with the `Incoming`.
     pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    /// Start of the pending ticket's admission grace period; reset on replacement.
     pool_lookup_started: Option<std::time::Instant>,
     /// Replaced on readmission and counted once when this request ends.
     host_lookup_outcome: Option<crate::offload::LookupOutcome>,

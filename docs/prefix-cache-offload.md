@@ -972,7 +972,10 @@ registered staging together and exits with the error, rather than releasing
 memory its transfers may still use.
 
 Rank event framing and aggregation preserve filesystem-space pressure so a
-failed copy can defer until progress after every rank drains.
+failed copy can defer until progress after every rank drains. When ranks fail
+a restore for different reasons, a record-read failure on any rank wins, so the
+unreadable record stops being offered.
+Event result codes require every rank to run the same build.
 
 ### 2.15 Sharing through a pool
 
@@ -1069,8 +1072,8 @@ same completion events the store produces.
   `HostStore::evictions_lost`, so the pool client announces holdings again.
 - **Lookups.** When a request reaches the worker, the worker builds its prefix
   history once and calls `begin_lookup`; the store returns a ticket whose state
-  never waits for a reply, and the ticket stays on the request while it queues.
-  Admission passes it to `lookup_for`, which answers from the local tiers and
+  never waits for a reply.
+  Admission passes the ticket to `lookup_for`, which answers from the local tiers and
   adds pool candidates only if the ticket is ready. A pending lookup holds
   admission for at most its grace period: 2 ms locally, or four measured control
   round trips for a network manager, bounded between 2 and 250 ms. After that,
@@ -1080,9 +1083,10 @@ same completion events the store produces.
   no prefill has been submitted. This rechecks history, cost and capacity through
   the same admission path, without extending the grace period. Requests with
   conditioned inputs keep their original decision because image preparation may
-  already own their slot. A request that waits on capacity keeps its ticket;
-  completion clears its capacity block, allowing another attempt without a
-  resource change. A cancelled request drops its ticket. Readmission without the
+  already own their slot. A request waiting on capacity retains a pending or
+  ready ticket; completion clears its capacity block, allowing another attempt
+  without a resource change. A ticket that will never be answered (state
+  none) is replaced only when its request is selected for admission. A cancelled request drops its ticket. Readmission without the
   store after a failed restore starts no new lookup.
 - **Restore deadlines.** Claims allow 10 seconds of setup plus transfer time at
   a conservative 8 MiB/s; the manager clamps setup to its configured limit

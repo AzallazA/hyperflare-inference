@@ -2431,11 +2431,13 @@ impl DiskStore {
                     }
                     Err(error) => {
                         self.stats.fetch_failed += 1;
-                        // Only record read failures invalidate the lookup row;
-                        // transfer failures leave the stored bytes reusable.
+                        // Only failures opening or reading the record file
+                        // invalidate the lookup row; other failures keep it.
                         if error.is_record_read()
                             && let Some(endpoint) = job.nodes.last()
                         {
+                            // Its pages stay in the index for descendants that
+                            // hold it as an ancestor; only its lookup row is dropped.
                             self.index.drop_row(endpoint);
                         }
                     }
