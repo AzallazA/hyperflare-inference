@@ -356,3 +356,11 @@ def test_attention_splits_only_index_layers_before_the_candidate_source():
     assert attention.INDEXER_QUERY_ROWS == split_module.BLOCK_ROWS
     layer = inspect.getsource(decoder.PreparedDecoder.__init__)
     assert "index_split=index_split if layer_metadata is metadata else None" in layer  # never the 128-row suffix
+
+
+def test_export_script_knob_reaches_the_switch():
+    from tests.recipes.test_deepseek41_tp3_config import export_environment
+
+    assert "FLARE_DS41_INDEX_ROW_SPLIT" not in export_environment()  # default export: replicated indexer
+    assert TP3Config.from_environment(export_environment(IDX_SPLIT="1")).index_row_split == ROW_SPLIT_DEFAULT
+    assert TP3Config.from_environment(export_environment(IDX_SPLIT="4096")).index_row_split == (4096,)

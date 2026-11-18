@@ -48,6 +48,9 @@
 #   SKIP_SUFFIX  prefill capacities that get an encoder-only twin (FLARE_DS41_PREFILL_SKIP_SUFFIX, e.g. 4096; "1" =
 #            3072,3584,4096): non-final chunks of long cold prompts skip layers 21-39 and the head (Helios decides per
 #            chunk; serve with --scheduler-encoder-prefill false to turn it off); default unset = no twins
+#   IDX_SPLIT  prefill capacities whose index layers 2/8/14 split the indexer rows across the ranks and all-gather the
+#            winners over the vocabulary channel (FLARE_DS41_INDEX_ROW_SPLIT, e.g. 4096; "1" = 3072,3584,4096; +1 vocabulary
+#            channel row); experimental, not GPU-proven (perf/ds41-indexer-row-split); default unset = replicated indexer
 #   ORDER    expert order shipped in tp3-tools/release/expert-orders/<ORDER> (sets COUNTS when COUNTS is unset), e.g.
 #            order-mix-provisional-exl3S (blend order of the 11-18 default, fingerprint a70f5e67d564)
 #   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
@@ -123,6 +126,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
 [ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
+[ -n "${IDX_SPLIT:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT=$IDX_SPLIT
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 [ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
 [ "${ROTARY_ONCE:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE=1
