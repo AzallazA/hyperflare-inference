@@ -1265,12 +1265,25 @@ fn without_zero_ranges(allocation: &mut Allocation, zero: &[(u64, u64)]) {
     }
 }
 
-fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResult<Vec<Allocation>> {
+fn external_allocations(spans: Vec<(u64, u64)>, granule: u64) -> ExportResult<Vec<Allocation>> {
+    external_allocations_isolating(spans, granule, &[])
+}
+
+/// Groups recorded external allocations into granule-aligned export allocations. A span lying wholly inside one of
+/// ``isolated`` (sorted, merged ranges: the request's inactive ranges, e.g. cuBLAS's own pool, library_scratch.py)
+/// never joins a neighbour that is merely adjacent at a granule boundary, and no neighbour joins its group: otherwise a
+/// reached neighbour retains the whole group, scratch included (DS41 181447 rank 0: a 2.5 MiB library allocation
+/// ending at the granule where the 64 MiB pool began). Spans sharing a granule still merge (one mapping per granule).
+fn external_allocations_isolating(
+    mut spans: Vec<(u64, u64)>,
+    granule: u64,
+    isolated: &[(u64, u64)],
+) -> ExportResult<Vec<Allocation>> {
     if !granule.is_power_of_two() {
         return Err(invalid("allocation granularity must be a power of two"));
     }
     spans.sort_unstable();
-    let mut groups: Vec<(u64, u64, Vec<(u64, u64)>)> = Vec::new();
+    let mut groups: Vec<(u64, u64, Vec<(u64, u64)>, bool)> = Vec::new();
     for (address, nbytes) in spans {
         if address == 0 || nbytes == 0 {
             return Err(invalid(
@@ -1283,17 +1296,25 @@ fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResul
             .and_then(|n| n.checked_add(granule - 1))
             .map(|n| n & !(granule - 1))
             .ok_or_else(|| invalid("external allocation address overflow"))?;
-        if let Some(group) = groups.last_mut().filter(|group| start <= group.1) {
+        let alone = {
+            let index = isolated.partition_point(|&(begin, _)| begin <= address);
+            index > 0 && address + nbytes <= isolated[index - 1].1
+        };
+        if let Some(group) = groups
+            .last_mut()
+            .filter(|group| start < group.1 || start == group.1 && !alone && !group.3)
+        {
             group.1 = group.1.max(end);
             group.2.push((address, nbytes));
+            group.3 |= alone;
         } else {
-            groups.push((start, end, vec![(address, nbytes)]));
+            groups.push((start, end, vec![(address, nbytes)], alone));
         }
     }
     groups
         .into_iter()
         .enumerate()
-        .map(|(index, (start, end, spans))| {
+        .map(|(index, (start, end, spans, _))| {
             Ok(Allocation {
                 name: format!("external-{index}"),
                 address: start,
@@ -1404,8 +1425,12 @@ fn prepare_allocations(
             external.push((recorded.address, recorded.nbytes));
         }
     }
-    allocations.extend(external_allocations(external.clone(), request.granularity)?);
     let inactive = merge_ranges(request.inactive.clone());
+    allocations.extend(external_allocations_isolating(
+        external.clone(),
+        request.granularity,
+        &inactive,
+    )?);
     let peer: HashSet<_> = request.peer_addresses.iter().copied().collect();
     allocations = allocations
         .into_iter()
@@ -4530,6 +4555,131 @@ mod tests {
             Some(vec![(0x500, 0x100), (0xa00, 0x200), (0x1100, 0x80)])
         );
         assert_eq!(spans[1].snapshot_spans, Some(vec![(0x100, 0x80)]));
+    }
+    // DS41 TP3 export 181447, rank 0 (export.log 'Unknown retained span' lines and 'library scratch primed on
+    // cuda:0'): the last retained library allocation (2.5 MiB at 0x79412bc00000) ends inside the 2 MiB granule that
+    // closes at 0x79412c000000, where cuBLAS's 64 MiB pool begins.
+    const RANK0_GRANULE: u64 = 2 << 20;
+    const RANK0_SCRATCH: (u64, u64) = (0x7941_2c00_0000, 64 << 20);
+    fn rank0_external_spans() -> Vec<(u64, u64)> {
+        vec![
+            (0x7941_2a80_0000, 2 << 20),
+            (0x7941_2ac0_0000, 5 << 19),
+            (0x7941_2b00_0000, 5 << 19),
+            (0x7941_2b40_0000, 9 << 19),
+            (0x7941_2bc0_0000, 5 << 19),
+            RANK0_SCRATCH,
+        ]
+    }
+    fn scratch_group(allocations: &[Allocation]) -> &Allocation {
+        allocations
+            .iter()
+            .find(|a| a.address <= RANK0_SCRATCH.0 && RANK0_SCRATCH.0 < a.address + a.nbytes)
+            .unwrap()
+    }
+    #[test]
+    fn library_scratch_never_merges_into_an_adjacent_neighbour() {
+        // Without isolation (the 181447 export): the pool joins its neighbour's group.
+        let merged = external_allocations(rank0_external_spans(), RANK0_GRANULE).unwrap();
+        let group = scratch_group(&merged);
+        assert_eq!((group.address, group.nbytes), (0x7941_2bc0_0000, (4 << 20) + (64 << 20)));
+        // With the request's inactive ranges: the pool is a group of its own, exactly its bytes.
+        let inactive = merge_ranges(vec![(RANK0_SCRATCH.0, RANK0_SCRATCH.0 + RANK0_SCRATCH.1)]);
+        let isolated =
+            external_allocations_isolating(rank0_external_spans(), RANK0_GRANULE, &inactive).unwrap();
+        assert_eq!(isolated.len(), merged.len() + 1);
+        let group = scratch_group(&isolated);
+        assert_eq!((group.address, group.nbytes), RANK0_SCRATCH);
+        assert_eq!(group.snapshot_spans, Some(vec![(0, RANK0_SCRATCH.1)]));
+        let neighbour = isolated
+            .iter()
+            .find(|a| a.address == 0x7941_2bc0_0000)
+            .unwrap();
+        assert_eq!(neighbour.nbytes, 4 << 20);
+        assert_eq!(neighbour.snapshot_spans, Some(vec![(0, 5 << 19)]));
+        // Every non-scratch group is unchanged.
+        let others = |all: &[Allocation]| {
+            all.iter()
+                .filter(|a| a.address + a.nbytes <= 0x7941_2bc0_0000)
+                .map(|a| (a.address, a.nbytes, a.snapshot_spans.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(others(&merged), others(&isolated));
+    }
+    #[test]
+    fn reached_neighbour_no_longer_retains_library_scratch() -> ExportResult<()> {
+        let inactive = merge_ranges(vec![(RANK0_SCRATCH.0, RANK0_SCRATCH.0 + RANK0_SCRATCH.1)]);
+        for (isolate, retained) in [(false, true), (true, false)] {
+            let allocations = external_allocations_isolating(
+                rank0_external_spans(),
+                RANK0_GRANULE,
+                if isolate { &inactive } else { &[] },
+            )?;
+            let scratch = scratch_group(&allocations).name.clone();
+            let mut reach = Reachability::new(&allocations, &[], &inactive, &[])?;
+            // A scanned value inside the scratch alone never retains it ...
+            reach.pointer(RANK0_SCRATCH.0 + 0x40)?;
+            assert!(!reach.reached.contains(&scratch));
+            // ... a value inside the neighbour retained the whole merged group before the fix.
+            reach.pointer(0x7941_2bc0_0010)?;
+            assert_eq!(reach.reached.contains(&scratch), retained);
+        }
+        Ok(())
+    }
+    #[test]
+    fn isolated_spans_sharing_a_granule_still_merge() {
+        // Scratch starting inside the neighbour's last granule: one mapping per granule, so one group.
+        let allocations = external_allocations_isolating(
+            vec![(0x1_0000, 0x180), (0x1_0200, 0x4000)],
+            0x1000,
+            &[(0x1_0200, 0x1_4200)],
+        )
+        .unwrap();
+        assert_eq!(allocations.len(), 1);
+        assert_eq!((allocations[0].address, allocations[0].nbytes), (0x1_0000, 0x5000));
+        assert_eq!(allocations[0].snapshot_spans, Some(vec![(0, 0x180), (0x200, 0x4000)]));
+        // A neighbour adjacent after an isolated group does not join it either.
+        let allocations = external_allocations_isolating(
+            vec![(0x1_0000, 0x1000), (0x1_1000, 0x800), (0x2_0000, 0x100)],
+            0x1000,
+            &[(0x1_0000, 0x1_1000)],
+        )
+        .unwrap();
+        assert_eq!(
+            allocations.iter().map(|a| (a.address, a.nbytes)).collect::<Vec<_>>(),
+            [(0x1_0000, 0x1000), (0x1_1000, 0x1000), (0x2_0000, 0x1000)]
+        );
+        // A span only partly inside an inactive range is not isolated.
+        let allocations = external_allocations_isolating(
+            vec![(0x1_0000, 0x1000), (0x1_1000, 0x2000)],
+            0x1000,
+            &[(0x1_1000, 0x1_2000)],
+        )
+        .unwrap();
+        assert_eq!(allocations.len(), 1);
+    }
+    #[test]
+    fn external_grouping_without_isolation_is_unchanged() {
+        let spans = vec![
+            (0x1000, 0x1000),
+            (0x2000, 0x1000),
+            (0x3800, 0x100),
+            (0x9000, 0x10),
+        ];
+        let plain = external_allocations(spans.clone(), 0x1000).unwrap();
+        assert_eq!(
+            plain.iter().map(|a| (a.address, a.nbytes)).collect::<Vec<_>>(),
+            [(0x1000, 0x3000), (0x9000, 0x1000)]
+        );
+        let none = external_allocations_isolating(spans.clone(), 0x1000, &[]).unwrap();
+        let unrelated =
+            external_allocations_isolating(spans, 0x1000, &[(0x5000, 0x8000)]).unwrap();
+        for other in [&none, &unrelated] {
+            assert_eq!(
+                plain.iter().map(|a| (&a.name, a.address, a.nbytes, &a.snapshot_spans)).collect::<Vec<_>>(),
+                other.iter().map(|a| (&a.name, a.address, a.nbytes, &a.snapshot_spans)).collect::<Vec<_>>()
+            );
+        }
     }
     #[test]
     fn trim_excludes_only_wholly_inactive_granules() {
