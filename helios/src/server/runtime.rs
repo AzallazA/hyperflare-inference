@@ -604,7 +604,14 @@ impl ModelRuntime {
                         )?;
                         scheduler.encoder_prefill_graphs(&executor.manifest().graphs.iter()
                             .filter(|graph| graph.kind == GraphKind::EncoderPrefill)
-                            .map(|graph| graph.token_capacity).collect::<Vec<_>>())
+                            .map(|graph| graph.token_capacity).collect::<Vec<_>>())?;
+                        // TP3 fork: negative control of the suffix-skip GPU proof only; outputs
+                        // are expected to be wrong.
+                        if std::env::var_os("FLARE_TEST_ENCODER_PREFILL_UNGUARDED").is_some_and(|v| v == "1") {
+                            eprintln!("WARNING: FLARE_TEST_ENCODER_PREFILL_UNGUARDED=1: encoder-only prefill without its window guards (negative control; outputs are wrong by design)");
+                            scheduler.unguarded_encoder_prefill();
+                        }
+                        Ok(())
                     })
                     .and_then(|()| {
                         scheduler.speculative_graphs(
@@ -1059,6 +1066,7 @@ impl<'a> Worker<'a> {
             };
             if let Some(completion) = executor.poll()? {
                 let kind = executor.manifest().graphs[completion.graph_index].kind;
+                // TP3 fork: an encoder-only twin completes its Prefill step (checked in `complete`).
                 self.complete(kind, completion)?;
                 progress = true;
             }
@@ -1519,6 +1527,12 @@ impl<'a> Worker<'a> {
             .advance_to(super::observation::monotonic_ns())?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
         let selection = self.scheduler.submitted_timing(completion.fence)?;
+        // TP3 fork: the encoder-only twin of a prefill graph completes the Prefill step it was
+        // submitted for, and only a step committed as encoder-only may run it.
+        if (kind == GraphKind::EncoderPrefill) != self.scheduler.submitted_encoder(completion.fence)? {
+            return Err("completion graph and the step's encoder-only decision differ".into());
+        }
+        let kind = if kind == GraphKind::EncoderPrefill { GraphKind::Prefill } else { kind };
         if measured_step.kind != kind {
             return Err("completion graph kind differs from submitted step".into());
         }
@@ -2118,9 +2132,11 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         validate_sampling_admissions(step, &self.admissions)?;
-        // TP3 fork: an eligible non-final chunk runs its prefill graph's encoder-only twin; the
-        // scheduler records the same decision when the step commits.
-        let kind = if self.scheduler.encoder_prefill_step(step)? { GraphKind::EncoderPrefill } else { step.kind };
+        let fence = executor.next_fence()?;
+        self.reserve_and_pack(step, fence)?;
+        // TP3 fork: an eligible non-final chunk runs its prefill graph's encoder-only twin. The
+        // scheduler decides once, in `commit`; the graph follows that record.
+        let kind = if self.scheduler.submitted_encoder(fence)? { GraphKind::EncoderPrefill } else { step.kind };
         let graph = crate::model::catalog::select_shape_with_drafts(
             self.config,
             executor.manifest(),
@@ -2132,8 +2148,6 @@ impl<'a> Worker<'a> {
             step.draft_tokens,
             SamplingMode::General,
         )?;
-        let fence = executor.next_fence()?;
-        self.reserve_and_pack(step, fence)?;
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
         if step
             .lanes

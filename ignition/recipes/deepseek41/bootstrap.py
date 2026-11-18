@@ -480,14 +480,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     tp3 = config.tp3  # TP3 fork switches: one instance, threaded through weights, Engram tables and the decoder
     if progress is not None:
         progress(tp3.describe())
-    # Truncated mini views (tp3.mini, test tooling) have no ratio-1 decoder suffix to compact prefill feedback.
-    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini,
-                              **({"side_stream": True} if tp3.context_side_stream else {}))
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
     # TP3: layer sets must name layers of this checkpoint (or its mini view); checked before any weight is loaded.
-    tp3.check_layers(ModelConfig.load(metadata_path, mini=tp3.mini).layers)
+    checked = ModelConfig.load(metadata_path, mini=tp3.mini)
+    tp3.check_layers(checked.layers)
+    # Truncated mini views (tp3.mini, test tooling) below layer 20 have no ratio-1 decoder suffix to compact prefill
+    # feedback; a mini view through layer 20 (the suffix-skip mini export) has one.
+    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini or checked.decoder_start is not None,
+                              **({"side_stream": True} if tp3.context_side_stream else {}))
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,

@@ -5567,3 +5567,42 @@ fn publication_losses_classify_oversize_and_copy_failure() {
         assert_eq!(pins(&worker, id), 0);
     }
 }
+
+/// TP3 fork: the worker completes an encoder-only twin as the Prefill step it was committed as.
+#[test]
+fn encoder_only_completions_finish_their_prefill_step_and_only_when_committed_so() {
+    let mut fixture = Fixture::new();
+    fixture.config.prepared_sequence_tokens = 512;
+    fixture.config.limits.max_sequence_tokens = 512;
+    fixture.config.limits.prefill_chunk_size = 192;
+    fixture.config.limits.pages = 64;
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 400], 4);
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.encoder_prefill_graphs(&[192]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    advance(&mut worker, GraphKind::Init, 1, None);
+    let handle = worker.active[0].as_ref().unwrap().request;
+    let (mut fence, mut encoder_chunks, mut prefill_tokens) = (2, 0, 0);
+    while worker.scheduler.request(handle).unwrap().consumed_tokens < 400 {
+        let step = planned(&mut worker, GraphKind::Prefill, fence);
+        let lane = step.lanes[0].clone();
+        let last = lane.start_position + lane.tokens as u64 == 400;
+        let encoder = worker.scheduler.submitted_encoder(Fence(fence)).unwrap();
+        assert!(!(encoder && last), "the final chunk samples and must run the ordinary graph");
+        // The other graph kind is refused before anything changes.
+        let wrong = if encoder { GraphKind::Prefill } else { GraphKind::EncoderPrefill };
+        assert!(worker.complete(wrong, completion(&worker, &step, fence, None)).is_err());
+        let kind = if encoder { GraphKind::EncoderPrefill } else { GraphKind::Prefill };
+        worker.complete(kind, completion(&worker, &step, fence, last.then_some(1))).unwrap();
+        encoder_chunks += u64::from(encoder);
+        prefill_tokens += lane.tokens as u64;
+        assert_eq!(worker.scheduler.request(handle).unwrap().consumed_tokens, lane.start_position + lane.tokens as u64);
+        fence += 1;
+    }
+    assert!(encoder_chunks >= 1, "a 400-token prompt on 192-row chunks has an encoder-only first chunk");
+    assert_eq!(worker.scheduler.stats().encoder_prefill_chunks, encoder_chunks);
+    // Encoder-only chunks count as prompt tokens like any prefill.
+    assert_eq!(fixture.metrics.snapshot(false).prefill_tokens, prefill_tokens);
+}

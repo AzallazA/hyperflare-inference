@@ -450,7 +450,7 @@ impl RequestScheduler {
         let work = end.saturating_sub(start);
         // TP3 fork: after an encoder-only chunk only a chunk longer than the decoder window may
         // follow (it replays its own suffix state); a capacity that cannot do that has no work.
-        if work <= super::SUFFIX_WINDOW && request.suffix_stale() {
+        if work <= super::SUFFIX_WINDOW && request.suffix_stale() && self.encoder_window_guard() {
             return 0;
         }
         work

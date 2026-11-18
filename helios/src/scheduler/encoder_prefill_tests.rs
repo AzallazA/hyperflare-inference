@@ -45,6 +45,11 @@ fn admit_with(s: &mut RequestScheduler, prompt: usize, boundaries: Vec<usize>) -
 
 /// Completes a committed step as `ds41_step` does (speculative records offer at most the lane's drafts).
 fn finish_step(s: &mut RequestScheduler, plan: &ScheduledPlan, fence: Fence) {
+    finish_step_timed(s, plan, fence, plan.estimated_duration_ns());
+}
+
+/// `finish_step` with a measured GPU time of `gpu_ns`.
+fn finish_step_timed(s: &mut RequestScheduler, plan: &ScheduledPlan, fence: Fence, gpu_ns: u64) {
     s.advance_to(s.now_ns + plan.estimated_duration_ns()).unwrap();
     let mut records = completion_records(s, plan, fence, 0);
     for lane in &plan.lanes {
@@ -52,7 +57,7 @@ fn finish_step(s: &mut RequestScheduler, plan: &ScheduledPlan, fence: Fence) {
             vector.offered_drafts = vector.offered_drafts.min(lane.tokens as i64 - 1);
         }
     }
-    for token in s.complete(fence, &records, gpu_time(plan.estimated_duration_ns())).unwrap() {
+    for token in s.complete(fence, &records, gpu_time(gpu_ns)).unwrap() {
         s.published_output(token.request, fence).unwrap();
     }
     let finished: Vec<_> = s.slots.iter().filter_map(|slot| slot.request.as_ref())
@@ -351,4 +356,125 @@ fn randomized_prompts_keep_the_stale_state_contract() {
         assert_eq!(s.stats().encoder_prefill_chunks, encoders);
         assert!(handles.iter().all(|h| finished(&s, h)), "every prompt reaches its end");
     }
+}
+
+#[test]
+fn image_requests_keep_the_ordinary_graph_after_their_patches_are_drained() {
+    // Vision graphs drain `vision_patches` before any prefill; the image slot stays held.
+    let mut s = engine(1, false);
+    let h = add(&mut s, 1, 1400, 32);
+    assert!(encoder_only_chunk(s.request(h).unwrap(), 0, 512));
+    s.request_mut(h).unwrap().image_slot = Some(0);
+    assert!(!encoder_only_chunk(s.request(h).unwrap(), 0, 512));
+}
+
+#[test]
+fn commit_refuses_a_window_sized_or_non_prefill_lane_on_a_stale_request() {
+    let mut s = ds41_engine(&[3072, 3584, 4096]);
+    let h = admit_with(&mut s, 12_000, vec![]);
+    loop {
+        let (_, encoder) = run_step(&mut s);
+        if encoder {
+            break;
+        }
+    }
+    assert!(s.request(h).unwrap().suffix_stale());
+    let plan = s.plan().unwrap();
+    assert!(plan.lanes[0].tokens > SUFFIX_WINDOW);
+    let fence = Fence(s.submitted.0 + 1);
+    let mut step = plan.step.clone();
+    step.lanes[0].tokens = SUFFIX_WINDOW;
+    let short = ScheduledPlan { step, ..plan.clone() };
+    assert!(s.commit(&short, fence).unwrap_err().to_string().contains("longer than the decoder window"));
+    // Nothing changed: the planned chunk still commits.
+    assert!(s.request(h).unwrap().suffix_stale());
+    s.commit(&plan, fence).unwrap();
+    finish_step(&mut s, &plan, fence);
+    assert!(!s.request(h).unwrap().suffix_stale() || s.stats().encoder_prefill_chunks == 2);
+}
+
+#[test]
+fn the_unguarded_negative_control_lets_a_window_sized_chunk_read_a_stale_suffix() {
+    // 4096 + 64: guarded, the first chunk runs the ordinary graph; unguarded, it runs the twin and
+    // the 64-row tail follows a stale endpoint (what the GPU negative control must detect).
+    for guarded in [true, false] {
+        let mut s = ds41_engine(&[3072, 3584, 4096]);
+        if !guarded {
+            s.unguarded_encoder_prefill();
+        }
+        let h = admit_with(&mut s, 4096 + 64, vec![]);
+        let chunks = prompt_chunks(&mut s, h);
+        assert_eq!(chunks.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(), [(0, 4096), (4096, 64)]);
+        assert_eq!(chunks[0].3, !guarded);
+        assert!(!chunks[1].3);
+    }
+}
+
+#[test]
+fn encoder_only_durations_do_not_train_the_full_prefill_estimate() {
+    // 12,000 tokens: the first chunk runs encoder-only; 4,196 tokens: the 4096 chunk is ordinary.
+    let mut seen = [false; 2];
+    for prompt in [12_000, 4_196] {
+        let mut s = ds41_engine(&[3072, 3584, 4096]);
+        admit_with(&mut s, prompt, vec![]);
+        let plan = loop {
+            let plan = s.plan().expect("the prompt makes progress");
+            if plan.kind == GraphKind::Prefill {
+                break plan;
+            }
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            finish_step(&mut s, &plan, fence);
+        };
+        assert_eq!((plan.kind, plan.token_capacity), (GraphKind::Prefill, 4096));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        let encoder = s.submitted_encoder(fence).unwrap();
+        let before = s.estimated_duration_ns(&plan);
+        finish_step_timed(&mut s, &plan, fence, plan.estimated_duration_ns() / 2);
+        assert_eq!(s.estimated_duration_ns(&plan) == before, encoder, "encoder {encoder}");
+        seen[usize::from(encoder)] = true;
+    }
+    assert_eq!(seen, [true, true]);
+}
+
+#[test]
+fn encoder_capacities_used_under_mixed_traffic() {
+    // Evidence for the twin set: which prefill capacities ever run encoder-only under the TTFT
+    // guard, prefill merge and tail merge with random prompts and message boundaries.
+    let mut used = std::collections::BTreeMap::<usize, u64>::new();
+    for case in 0..24u64 {
+        let mut seed = 0xcafe_u64 + case * 104_729;
+        let mut random = |low: usize, high: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            low + (seed >> 33) as usize % (high - low)
+        };
+        let mut s = tp3_engine(4, |kind, batch, tokens| match kind {
+            GraphKind::Prefill => 27_400_000 + tokens * 67_880,
+            GraphKind::Decode => 12 * MS + (batch - 1) * MS / 4,
+            GraphKind::Speculative => 12_500_000 + (tokens - 1) * 300_000 + (batch - 1) * 300_000,
+            _ => MS,
+        });
+        s.encoder_prefill_graphs(&[3072, 3584, 4096]).unwrap();
+        s.configure_policy(PolicyConfig { ttft_target_ms: 50.0, prefill_merge_min_rows: 512,
+            prefill_tail_merge: PrefillTailMerge::On, ..s.policy }).unwrap();
+        for _ in 0..4 {
+            let prompt = random(300, 60_000);
+            let mut boundaries: Vec<usize> = (0..random(0, 8)).map(|_| random(1, prompt)).collect();
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            admit_with(&mut s, prompt, boundaries);
+        }
+        for _ in 0..4000 {
+            let Some(plan) = s.plan() else { break };
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            if s.submitted_encoder(fence).unwrap() {
+                *used.entry(plan.token_capacity).or_default() += 1;
+            }
+            finish_step(&mut s, &plan, fence);
+        }
+    }
+    eprintln!("encoder-only chunks by capacity: {used:?}");
+    assert!(used.contains_key(&4096));
 }

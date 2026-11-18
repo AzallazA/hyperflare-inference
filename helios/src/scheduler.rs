@@ -103,6 +103,12 @@ pub(crate) const SUFFIX_WINDOW: usize = 128;
 /// graph. The policy then never schedules a window-sized successor (`prefill_work`), and no
 /// snapshot is taken at the stale endpoint.
 pub(crate) fn encoder_only_chunk(request: &LiveRequest, start: u64, tokens: usize) -> bool {
+    encoder_chunk(request, start, tokens, true)
+}
+
+/// `encoder_only_chunk`; `window_guard = false` drops the "next cut more than a window ahead"
+/// rule (test-only negative control, `RequestScheduler::unguarded_encoder_prefill`).
+fn encoder_chunk(request: &LiveRequest, start: u64, tokens: usize, window_guard: bool) -> bool {
     let end = start as usize + tokens;
     let next_cut = request
         .message_boundaries
@@ -114,10 +120,11 @@ pub(crate) fn encoder_only_chunk(request: &LiveRequest, start: u64, tokens: usiz
         && end < request.prompt_tokens
         && !request.prompt_logprobs
         && request.vision_patches.is_empty()
+        && request.image_slot.is_none()
         && request.conditioned_windows.is_empty()
         && request.prefill_spans.is_empty()
         && request.message_boundaries.binary_search(&end).is_err()
-        && next_cut > end + SUFFIX_WINDOW
+        && (!window_guard || next_cut > end + SUFFIX_WINDOW)
 }
 
 fn checkpoint_boundaries(
@@ -622,6 +629,8 @@ struct Submission {
     expected_tokens: [f64; REQUEST_LANES],
     origin: PlanOrigin,
     timing: SubmittedTiming,
+    /// TP3 fork: the step runs its prefill graph's encoder-only twin (decided once, in `commit`).
+    encoder: bool,
 }
 impl std::ops::Deref for Submission {
     type Target = ScheduledStep;
@@ -733,6 +742,8 @@ pub struct RequestScheduler {
     scored_prefill_catalog: Vec<usize>,
     /// TP3 fork: prefill capacities with an encoder-only twin graph.
     encoder_prefill_catalog: Vec<usize>,
+    /// TP3 fork, test only: the window guards are off (negative control of the GPU proof).
+    encoder_window_guard: bool,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     decoded_history: Option<decoded_history::DecodedHistory>,
@@ -831,6 +842,7 @@ impl RequestScheduler {
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
             scored_prefill_catalog: Vec::new(),
             encoder_prefill_catalog: Vec::new(),
+            encoder_window_guard: true,
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
             decoded_history: None,
@@ -917,6 +929,17 @@ impl RequestScheduler {
         Ok(())
     }
 
+    /// TP3 fork, NEGATIVE CONTROL ONLY: drop the window rule and its guards (a window-sized
+    /// chunk may then follow an encoder-only chunk and read its stale suffix state). The GPU
+    /// proof boots one server like this and requires its logprob gate to fail.
+    pub fn unguarded_encoder_prefill(&mut self) {
+        self.encoder_window_guard = false;
+    }
+
+    pub(crate) fn encoder_window_guard(&self) -> bool {
+        self.encoder_window_guard
+    }
+
     /// TP3 fork: whether `step` runs the encoder-only twin of its prefill graph: a one-lane
     /// prefill step whose chunk `encoder_only_chunk` admits, with a twin of its capacity, unless
     /// `--scheduler-encoder-prefill false`. `commit` records the same decision.
@@ -926,7 +949,7 @@ impl RequestScheduler {
             return Ok(false);
         }
         let lane = &step.lanes[0];
-        Ok(encoder_only_chunk(self.request(lane.request)?, lane.start_position, lane.tokens))
+        Ok(encoder_chunk(self.request(lane.request)?, lane.start_position, lane.tokens, self.encoder_window_guard))
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {
@@ -2331,6 +2354,16 @@ impl RequestScheduler {
             },
         };
         for (row, lane) in step.lanes.iter().enumerate() {
+            // TP3 fork: a stale suffix (layer >= 20 windows, draft ring, last hidden) is rebuilt only
+            // by a prefill chunk longer than the window; refuse anything else at the point of use.
+            if self.encoder_window_guard
+                && self.request(lane.request)?.suffix_stale()
+                && !(step.lane_kind(row).is_prefill() && lane.tokens > SUFFIX_WINDOW)
+            {
+                return Err("a request after an encoder-only chunk needs a prefill chunk longer than the decoder window".into());
+            }
+        }
+        for (row, lane) in step.lanes.iter().enumerate() {
             if step.lane_kind(row).is_prefill() {
                 // TP3 fork: the stale endpoint of an encoder-only chunk, cleared by any later chunk.
                 self.request_mut(lane.request)?.encoder_only_through =
@@ -2382,9 +2415,17 @@ impl RequestScheduler {
                 expected_tokens,
                 origin,
                 timing: submitted_timing,
+                encoder,
             },
         );
         Ok(())
+    }
+
+    /// TP3 fork: whether the step committed at `fence` runs the encoder-only twin. The runtime
+    /// selects the graph from this record, so the graph and the stale-state marker never disagree.
+    pub fn submitted_encoder(&self, fence: Fence) -> Result<bool> {
+        self.submissions.get(&fence).map(|submission| submission.encoder)
+            .ok_or_else(|| "unknown submission fence".into())
     }
 
     pub fn complete(
@@ -2594,7 +2635,13 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        self.observe_execution(&submission.step, timing);
+        // TP3 fork: an encoder-only chunk is ~10 % shorter than its prefill graph; keeping it out
+        // of the shared Prefill estimate keeps full chunks priced right (encoder steps are
+        // planned at the full-chunk cost, a conservative overestimate). An unknown estimate still
+        // takes the sample, so discovery always terminates.
+        if !submission.encoder || self.costs.get(&submission.step).is_none_or(|nanos| nanos == 0) {
+            self.observe_execution(&submission.step, timing);
+        }
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
