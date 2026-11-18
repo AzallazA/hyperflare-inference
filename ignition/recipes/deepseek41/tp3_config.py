@@ -136,6 +136,11 @@ class TP3Config:
     """Directory of ``expert-routes-rank0-layer{L}.json`` route counts (vLLM route-monitor format)."""
     embed_host: bool = False
     """Token embedding read from device-visible host memory (only its tokens' rows are gathered per step)."""
+    markov_embed_host: bool = False
+    """DSpark's Markov-head embedding (129,280 x 256 BF16, 63 MiB, replicated) read from device-visible host memory:
+    the drafter's embedding lookup and the fused Markov transition bias read only the pending tokens' rows (<= one per
+    request and draft step) through the mapping. Same values. False = VRAM (base). Export-time only (2026-11-15 memory
+    map item 6)."""
     embed_rows: bool = False
     """With ``embed_host``: decode, verification and draft graphs gather the parked table's rows with one vectorised
     Triton launch (all of a row's loads before its stores) and take DSpark's noise-token rows from a 10 KB device copy
@@ -150,6 +155,12 @@ class TP3Config:
     Requesting it parks the tower (``vision_host`` is forced on)."""
     vision_stage_copy: str = "memcpy"
     """Staging copy: ``memcpy`` (cudaMemcpy) or ``kernel`` (elementwise kernel over the mapped host range)."""
+    vision_arena_host: bool = False
+    """The image feature arena (``VisionState.arena``: image slots x 4,096 tokens x 5,120 BF16, 160 MiB per rank at 4
+    slots) lives in device-visible host memory (``CoreStorage.host_allocate``) instead of standing VRAM. The vision
+    graphs write an image's features there and the prefill graphs read them back, so image prompts move ~40 MB per
+    image over PCIe each way; text-only work never touches it. Zero-filled in the package as before (disposable
+    storage). False = VRAM (base). Export-time only (2026-11-15 memory map item 3)."""
     # --- collectives and planning (bootstrap.py, recipe.py, planning.py) ---
     ar_rows: int = 0
     """Rows the shared TP3 all-reduce runtime is sized for (chunked prefill reductions); 0 = a whole prefill chunk."""
@@ -320,6 +331,9 @@ class TP3Config:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if type(self.mma_pad_once) is not bool:  # own line: keeps merges with other branches' switch lists clean
             raise TypeError("TP3 config: mma_pad_once must be a boolean")
+        for name in ("vision_arena_host", "markov_embed_host"):  # own line, as mma_pad_once's
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"TP3 config: {name} must be a boolean")
         if any(type(layer) is not int or layer < 0
                for layer in (*self.host_expert_layers, *self.brrr_layers, *self.engram_side_layers)):
             raise ValueError("TP3 config: layer sets must hold non-negative layer indices")
@@ -467,6 +481,8 @@ class TP3Config:
             vision_host=flag("VISION_HOST"),
             vision_stage=flag("VISION_STAGE"),
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
+            vision_arena_host=flag("VISION_ARENA_HOST"),
+            markov_embed_host=flag("MARKOV_EMBED_HOST"),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),
             engram_part_rows=integer("ENGRAM_PART_ROWS"),

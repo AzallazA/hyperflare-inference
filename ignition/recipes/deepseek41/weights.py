@@ -56,16 +56,27 @@ class DSparkWeights:
     draft_head: object | None = None
 
     @classmethod
-    def load(cls, loader, *, confidence=False, vocabulary_parallel_sampling=False, markov_head_quantization=None):
+    def load(cls, loader, *, confidence=False, vocabulary_parallel_sampling=False, markov_head_quantization=None,
+             park_markov_embedding=None):
         config = loader.config.draft
         last = f"mtp.{config.layers - 1}"
         markov_name = last + ".markov_head.head.weight"
         temporary = markov_head_quantization in ("nvfp4", "fp8")
-        return cls(tuple(loader.load_layer(i, draft=True) for i in range(config.layers)),
-            loader.load_linear("mtp.0.main_proj"),
-            loader.load_linear_group(tuple(f"mtp.{i}.attn.wkv" for i in range(config.layers))),
-            loader.load_tensor("mtp.0.main_norm.weight"),
-            loader.load_tensor(last + ".norm.weight"), loader.load_tensor(last + ".markov_head.embed.weight"),
+        layers = tuple(loader.load_layer(i, draft=True) for i in range(config.layers))
+        main_projection = loader.load_linear("mtp.0.main_proj")
+        context_kv = loader.load_linear_group(tuple(f"mtp.{i}.attn.wkv" for i in range(config.layers)))
+        main_norm, norm = loader.load_tensor("mtp.0.main_norm.weight"), loader.load_tensor(last + ".norm.weight")
+        embed_name = last + ".markov_head.embed.weight"
+        if park_markov_embedding is None:
+            markov_embedding = loader.load_tensor(embed_name)
+        else:
+            # TP3 tp3.markov_embed_host: load into a pool of its own, copy into device-visible host memory, drop the
+            # device copy inside the pool (as the parked token embedding, ModelWeights.load).
+            from ignition.components.weights import _park_on_host
+            with _parking_pool():
+                markov_embedding = _park_on_host(park_markov_embedding, embed_name,
+                                                 loader.load_tensor(embed_name, temporary=True))
+        return cls(layers, main_projection, context_kv, main_norm, norm, markov_embedding,
             loader.load_padded_tensor(markov_name, rows=loader.shard.padded_partition(129280, alignment=64),
                                       temporary=temporary) if vocabulary_parallel_sampling
             else loader.load_tensor(markov_name, temporary=temporary),
@@ -113,7 +124,8 @@ class ModelWeights:
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader, confidence=confidence,
                 vocabulary_parallel_sampling=vocabulary_parallel_sampling,
-                markov_head_quantization=markov_head_quantization) if dspark else None
+                markov_head_quantization=markov_head_quantization,
+                park_markov_embedding=host_allocator if tp3.markov_embed_host else None) if dspark else None
             if draft is not None:
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))

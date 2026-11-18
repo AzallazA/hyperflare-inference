@@ -404,3 +404,52 @@ def test_embedding_and_vision_parking_load_temporaries(monkeypatch, embed_host, 
     # Parked tensors are the host regions' views, holding the loaded values.
     assert torch.equal(model.embedding, torch.full((2, 3), 7, dtype=torch.bfloat16))
     assert all(torch.equal(tensor, torch.full((2, 3), 7, dtype=torch.bfloat16)) for tensor in model.vision.values())
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# DSparkWeights.load: Markov-head embedding parking (TP3 tp3.markov_embed_host, ds41-tp3-next 2026-11-17)
+
+
+@pytest.mark.parametrize("park", [False, True])
+def test_markov_embedding_parking_loads_a_temporary_into_a_host_region(park):
+    loads, embed = [], "mtp.0.markov_head.embed.weight"
+
+    class Loader:
+        config = SimpleNamespace(draft=SimpleNamespace(layers=1))
+        shard = TensorParallelShard(0, WORLD)
+
+        def load_tensor(self, name, *, temporary=False, **kwargs):
+            loads.append((name, temporary))
+            return torch.full((4, 2), 3, dtype=torch.bfloat16)
+
+        def load_padded_tensor(self, name, *, temporary=False, **kwargs):
+            return self.load_tensor(name, temporary=temporary)
+
+        def load_layer(self, index, *, draft=False):
+            loads.append((f"layer{index}", draft))
+
+        def load_linear(self, name):
+            loads.append((name, False))
+
+        def load_linear_group(self, names):
+            loads.append((names, False))
+
+    storage = FakeStorage()
+    draft = weights.DSparkWeights.load(Loader(), vocabulary_parallel_sampling=True, markov_head_quantization="fp8",
+                                       park_markov_embedding=storage.host_allocate if park else None)
+    # Same load order as before the switch (layers, main_proj, wkv group, norms, embedding, head).
+    assert [name for name, _ in loads] == ["layer0", "mtp.0.main_proj", ("mtp.0.attn.wkv",), "mtp.0.main_norm.weight",
+                                           "mtp.0.norm.weight", embed, "mtp.0.markov_head.head.weight"]
+    assert dict((n, t) for n, t in loads if isinstance(n, str))[embed] is park
+    assert [name for _, name, _, _ in storage.regions] == ([embed] if park else [])
+    assert torch.equal(draft.markov_embedding, torch.full((4, 2), 3, dtype=torch.bfloat16))
+
+
+def test_markov_and_vision_arena_switches_parse_and_default_off():
+    assert TP3Config().markov_embed_host is False and TP3Config().vision_arena_host is False
+    on = TP3Config.from_environment({"FLARE_DS41_MARKOV_EMBED_HOST": "1", "FLARE_DS41_VISION_ARENA_HOST": "1"})
+    assert on.markov_embed_host is True and on.vision_arena_host is True
+    record = on.to_metadata()
+    assert record["markov_embed_host"] is True and record["vision_arena_host"] is True
+    with pytest.raises(TypeError):
+        TP3Config(markov_embed_host=1)

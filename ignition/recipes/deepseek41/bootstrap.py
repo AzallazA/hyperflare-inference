@@ -581,10 +581,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
-            feature_pool = core_storage.scratch_pool()
-            with feature_pool:
-                feature_arena = torch.zeros((config.image_concurrency, 4096,
-                    weights.vision["image_start"].numel()), dtype=torch.bfloat16, device=device)
+            arena_shape = (config.image_concurrency, 4096, weights.vision["image_start"].numel())
+            if tp3.vision_arena_host:
+                # TP3 tp3.vision_arena_host: the feature arena in device-visible host memory (zero-filled mapping;
+                # stays in `disposable`, so the package records it as zero fill), no VRAM scratch pool to release.
+                feature_arena = core_storage.host_allocate("vision_feature_arena", arena_shape,
+                                                           torch.bfloat16).device_view
+            else:
+                feature_pool = core_storage.scratch_pool()
+                with feature_pool:
+                    feature_arena = torch.zeros(arena_shape, dtype=torch.bfloat16, device=device)
             vision_state = VisionState(weights.vision, inputs, vision_prefill, requests, features=4096,
                 token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"),
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
