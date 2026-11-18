@@ -3555,7 +3555,7 @@ mod tests {
             assert!(!store.memory.record(&root.key).unwrap().durable);
             assert_eq!(store.parked[&root.key].failures, 0);
             assert_eq!(store.stats().store_failed, 0);
-            assert_eq!(store.stats().dropped, [0; 6]);
+            assert_eq!(store.stats().dropped, [0; 8]);
             assert!(store.stats().held[0] > 0);
             fs::remove_file(flag).unwrap();
             poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
@@ -3730,7 +3730,7 @@ mod tests {
         assert_eq!(store.stats().stored, 3 + persisted as u64);
         assert!(store.jobs.is_empty());
         assert_eq!(store.stats().store_failed, 0);
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert!(store.stats().held[0] > 0);
         store.close().unwrap();
         drop(store);
@@ -4585,7 +4585,7 @@ mod tests {
                 .all(|root| store.memory.record(&root.key).is_some())
         );
         assert_eq!(store.parked.len(), roots.len());
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert!(store.stats().held[0] > 0);
         let mut events = Vec::new();
         poll_until(&mut store, &mut events, |store| store.jobs.is_empty());

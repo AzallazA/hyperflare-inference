@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Layout, Result, Retirement, Retiring};
+use crate::{Error, Layout, Result, Retirement, Retiring, Tier};
 
 use super::{
     exporter::{Checksums, HostPin, HostWindow, PutBytes},
@@ -103,16 +103,26 @@ pub(crate) struct Cascade {
     /// Records whose put is running, by put id.
     moving: HashMap<u64, Move>,
     retry_after: Instant,
+    refused_until: Instant,
+    #[cfg(test)]
+    pub(crate) now: Option<Instant>,
+    /// Refusal discards by DRAM/NVMe source tier.
+    pub(crate) dropped: [u64; 2],
     page_bytes: usize,
     row_bytes: usize,
 }
 
 impl Cascade {
     pub(crate) fn new(layout: &Layout) -> Self {
+        let now = Instant::now();
         Self {
             pending: VecDeque::new(),
             moving: HashMap::new(),
-            retry_after: Instant::now(),
+            retry_after: now,
+            refused_until: now,
+            #[cfg(test)]
+            now: None,
+            dropped: [0; 2],
             page_bytes: layout.page_record_bytes as usize,
             row_bytes: layout.row_record_bytes as usize,
         }
@@ -124,8 +134,16 @@ impl Cascade {
         self.pending.len() + self.moving.len()
     }
 
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.now {
+            return now;
+        }
+        Instant::now()
+    }
+
     pub(crate) fn progress(&mut self) {
-        self.retry_after = Instant::now();
+        self.retry_after = self.now().max(self.refused_until);
     }
 
     /// Start bounded puts; unavailable destinations leave records local.
@@ -135,7 +153,7 @@ impl Cascade {
         pool: &mut P,
     ) {
         let up = pool.ready();
-        let ready = up && Instant::now() >= self.retry_after;
+        let ready = up && self.now() >= self.retry_after;
         inner.set_spill(ready);
         for record in inner.take_retiring() {
             // A failed put's backoff holds the queue; it does not fail what waits in it.
@@ -148,7 +166,7 @@ impl Cascade {
                 inner.retired(record.key, record.tier, Retirement::Failed);
             }
         }
-        while ready && self.moving.len() < MOVES_MAX && Instant::now() >= self.retry_after {
+        while ready && self.moving.len() < MOVES_MAX && self.now() >= self.retry_after {
             let Some(entry) = self.pending.pop_front() else {
                 break;
             };
@@ -198,7 +216,7 @@ impl Cascade {
     }
 
     fn back_off<S: crate::store::TierStore>(&mut self, inner: &mut S) {
-        self.retry_after = Instant::now() + Duration::from_millis(50);
+        self.retry_after = self.now() + Duration::from_millis(50);
         inner.set_spill(false);
     }
 
@@ -223,13 +241,18 @@ impl Cascade {
                 inner.retired(record.key, record.tier, Retirement::Moved);
             }
             PutOutcome::Refused(PutRefusal::Invalid | PutRefusal::Oversize) => {
+                self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
                 inner.retired(record.key, record.tier, Retirement::Dropped);
             }
             PutOutcome::Refused(PutRefusal::Budget | PutRefusal::Inflight) => {
                 self.back_off(inner);
+                self.refused_until = self.retry_after;
                 match crate::store::retry_once(&mut entry.failures) {
                     Retirement::Failed => self.pending.push_back(entry),
-                    how => inner.retired(record.key, record.tier, how),
+                    how => {
+                        self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
+                        inner.retired(record.key, record.tier, how);
+                    }
                 }
             }
             _ => self.failed(inner, record),

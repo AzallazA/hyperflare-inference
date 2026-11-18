@@ -356,7 +356,8 @@ deferred by the GPU headroom check before acquiring checkpoint pins.
 
 Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
-`end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
+`end_of_chain`, `oversize`, `io_error`, and `pool_refused` (pooled deployments only)
+drop reasons. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
 writes. `flare_host_cache_store_skipped_total` includes duplicates and
 retries; it is not a dropped-record counter. Local checkpoint pool capacity is

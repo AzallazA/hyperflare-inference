@@ -99,9 +99,10 @@ cite them by number.
     export pinned, subtracts the resources the pin protects once, and uses the
     reservation arithmetic that admission uses, never a copy of it.
 17. **Put is part of the protocol.** The eviction cascade ends in a write into the
-    manager's store. Refusals keep the source local and release its selection.
-    Retrying requires manager progress, reconnect or a short backoff; the model
-    worker never waits for room.
+    manager's store. Refusals follow the pressure policy in section 11: invalid
+    or oversized puts discard the source; budget or in-flight refusals retry once
+    after a backoff, then discard it. Other failures keep the source local and
+    release selection. The model worker never waits for room.
 18. **Entries die with their session; its successor announces its own.** When a
     session ends, with or without a successor, the manager removes every entry it
     announced. When a new session opens for the same `instance_id`, the old
@@ -792,10 +793,11 @@ writer                          manager
   policy does not establish a destination copy.
 - **Pressure policy.** `BUDGET` may mean temporary staging or arena pressure,
   not a full manager. `INVALID` and `OVERSIZE` discard the source; `BUDGET` and
-  `INFLIGHT` retain selection for one retry, then discard it if refused again
-  with either reason. Other refusals, synchronous submission errors and
-  repeated failures retain the source and release selection. Retries wait for
-  a manager or put event, a reconnect or a short backoff. Queue bounds stop
+  `INFLIGHT` retain selection for one retry after a 50 ms backoff, then discard
+  it if refused again with either reason. Pool events do not shorten this
+  backoff. Other refusals, synchronous submission errors and repeated failures
+  retain the source and release selection; their retries wait for a manager or
+  put event, a reconnect or a short backoff. Queue bounds stop
   selection before pinning. Unavailable or busy managers leave local LRU eviction
   as the end of the chain; only the manager's own LRU drops its committed data.
   Manager loss releases waiting selections through the failed-move path. Moves

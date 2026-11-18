@@ -148,9 +148,10 @@ pub struct StoreStats {
     pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
-    /// DRAM, NVMe holding events. Drops: each tier, then end_of_chain/oversize/io_error.
+    /// DRAM, NVMe holding events.
     pub held: [u64; 2],
-    pub dropped: [u64; 6],
+    /// Each tier's end_of_chain/oversize/io_error, then DRAM/NVMe pool_refused.
+    pub dropped: [u64; 8],
     pub expired: [u64; 2],
     /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
     pub rows_thinned: [u64; 2],
