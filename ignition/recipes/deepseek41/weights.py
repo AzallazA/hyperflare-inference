@@ -164,8 +164,11 @@ def draft_vocab_columns(tokens, world, rank, *, k=0, ranking=(), vocab=129280, a
     shares = [sorted({t - r * width for t in tokens if r * width <= t < min((r + 1) * width, vocab)}) for r in range(world)]
     count = min(width, -(-max(max(len(share) for share in shares), -(-k // world)) // multiple) * multiple)
     real = min(width, vocab - rank * width)
-    if real < count:
-        raise ValueError("draft vocabulary: a rank has fewer real columns than the trimmed width")
+    # Every rank checks every rank's real columns, so a too-wide table is refused on all ranks alike (rank 2 has
+    # 43,008 real columns, ranks 0-1 43,136; review L2 2026-11-17).
+    if min(min(width, vocab - r * width) for r in range(world)) < count:
+        raise ValueError(f"draft vocabulary: {count} columns per rank exceed the real columns of the last rank "
+                         f"({vocab - (world - 1) * width})")
     columns, have = list(shares[rank]), set(shares[rank])
     for token in ranking:
         if len(columns) >= count:
@@ -180,12 +183,13 @@ def draft_vocab_columns(tokens, world, rank, *, k=0, ranking=(), vocab=129280, a
     return sorted(columns)
 
 
-def trimmed_draft_head(head, vocabulary_file, shard, vocabulary_parallel_sampling):
-    """NVFP4 draft head of the draft vocabulary's rows of this rank's head shard + their local column ids."""
+def draft_vocab_rank_columns(vocabulary_file, world):
+    """Every rank's draft-vocabulary columns from a table file, or ValueError: the whole check of the weight load
+    without a checkpoint. Export chains call it in their CPU preflight (``python -m
+    ignition.recipes.deepseek41.weights <table> [world]``) so a bad table fails before the live server stops, not
+    minutes into the export (review L1 2026-11-17)."""
     import json
 
-    if not vocabulary_parallel_sampling:
-        raise ValueError("tp3.draft_vocab needs vocabulary-parallel sampling (the trimmed head is a rank-local projection)")
     record = json.loads(vocabulary_file.read_text())
     tokens, k = record["tokens"], int(record.get("k", 0))
     if not tokens or any(type(t) is not int or not 0 <= t < 129280 for t in tokens):
@@ -193,7 +197,14 @@ def trimmed_draft_head(head, vocabulary_file, shard, vocabulary_parallel_samplin
     ranking = record.get("ranking", [])
     if any(type(t) is not int or not 0 <= t < 129280 for t in ranking):
         raise ValueError(f"draft vocabulary {vocabulary_file.name}: ranking ids must be integers in [0, 129280)")
-    columns = draft_vocab_columns(tokens, shard.world_size, shard.rank, k=k, ranking=ranking)
+    return [draft_vocab_columns(tokens, world, rank, k=k, ranking=ranking) for rank in range(world)]
+
+
+def trimmed_draft_head(head, vocabulary_file, shard, vocabulary_parallel_sampling):
+    """NVFP4 draft head of the draft vocabulary's rows of this rank's head shard + their local column ids."""
+    if not vocabulary_parallel_sampling:
+        raise ValueError("tp3.draft_vocab needs vocabulary-parallel sampling (the trimmed head is a rank-local projection)")
+    columns = draft_vocab_rank_columns(vocabulary_file, shard.world_size)[shard.rank]
     if head.shape[0] != -(-129280 // (shard.world_size * 64)) * 64:
         raise ValueError("draft vocabulary: the head shard is not the padded vocabulary partition")
     index = persistent_empty((len(columns),), torch.int64, head.device)
@@ -389,3 +400,17 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
                 "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
                           * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
         return LayerWeights(result, routed, residual, engram)
+
+
+if __name__ == "__main__":
+    # CPU preflight of a draft-vocabulary table (no checkpoint, no GPU): exit 1 with the refusal, else the width.
+    import sys
+    from pathlib import Path
+
+    table, world = Path(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    try:
+        widths = {len(columns) for columns in draft_vocab_rank_columns(table, world)}
+    except (ValueError, KeyError, OSError) as error:
+        print(f"DRAFT_VOCAB REFUSED {table}: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(f"DRAFT_VOCAB OK {table}: {widths.pop()} columns per rank x {world}")

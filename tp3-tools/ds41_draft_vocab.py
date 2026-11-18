@@ -196,7 +196,7 @@ def main():
     b.add_argument("counts")
     b.add_argument("out")
     b.add_argument("--weights", required=True)
-    b.add_argument("--sizes", default="24576,32768,40960,49152,65536,98304,129408")
+    b.add_argument("--sizes", default="24576,32768,40960,49152,65536,98304,129024")  # 129024 = 3 x 43,008 (rank 2's real columns); 129408 aborted (review L3)
     b.add_argument("--write", default="all", help="comma list of requested sizes to write tables for, or 'all'")
     a = ap.parse_args()
     count(a) if a.cmd == "count" else build(a)

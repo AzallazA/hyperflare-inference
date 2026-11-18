@@ -491,6 +491,34 @@ def test_draft_vocab_fill_follows_the_ranking_not_the_id_order():
     assert weights.draft_vocab_columns(exact, 3, 2, k=3 * 128) == list(range(128))  # exact width: no fill needed
 
 
+def test_draft_vocab_refusals_are_rank_symmetric_and_checkable_before_an_export(tmp_path):
+    """Review L1/L2 (2026-11-17): a table wider than rank 2's 43,008 real columns is refused on every rank (ranks 0-1
+    used to accept it), and the whole check runs from the table file alone (CPU preflight, no checkpoint)."""
+    tokens = list(range(43008 + 128))  # 43,136 listed tokens on rank 0: width 43,136 > rank 2's real 43,008 columns
+    for rank in range(3):
+        with pytest.raises(ValueError, match="real columns of the last rank"):
+            weights.draft_vocab_columns(tokens, 3, rank, ranking=list(range(129280)))
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"tokens": list(range(128)) + list(range(43136, 43136 + 128))
+                                + list(range(86272, 86272 + 128)), "k": 384}))
+    assert [len(c) for c in weights.draft_vocab_rank_columns(good, 3)] == [128, 128, 128]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"tokens": [1, 2, 43136 + 7], "k": 384}))  # needs a fill, has no ranking
+    with pytest.raises(ValueError, match="rebuild the table"):
+        weights.draft_vocab_rank_columns(bad, 3)
+
+
+def test_draft_vocab_builder_default_sizes_fit_every_rank():
+    """Review L3: the builder's default --sizes ended with 129408, which rank 2 cannot hold (aborted before curve.json)."""
+    import inspect
+
+    tool = _draft_vocab_tool()
+    source = inspect.getsource(tool)
+    default = source.split('"--sizes", default="', 1)[1].split('"', 1)[0]
+    sizes = [int(size) for size in default.split(",")]
+    assert max(tool.columns_for(size) for size in sizes) <= 43008
+
+
 def _draft_vocab_tool():
     import importlib.util
     path = Path(__file__).resolve().parents[2] / "tp3-tools" / "ds41_draft_vocab.py"
