@@ -747,7 +747,9 @@ class PreparedVocabularySoftmax:
         steps = []
         for step in range(w if self.sample else 1):
             summary_rows = b if self.sample else b * w
-            score = self._prepare_tile_rows(step) if self.tile_rows is not None else prepare_triton(
+            # One row per program is _score_tiles' own work plus extra round trips: keep the production kernel.
+            tiled = self.tile_rows is not None and min(self.tile_rows, b) > 1
+            score = self._prepare_tile_rows(step) if tiled else prepare_triton(
                 _score_tiles,
                 (
                     self.vocabulary_offset,

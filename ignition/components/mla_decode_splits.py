@@ -23,6 +23,8 @@ import inspect
 import os
 
 ENV = "FLARE_DS41_MLA_DECODE_SPLITS"
+# 6-9 splits of 10 windows give chunks_per_split 2 with empty splits that still occupy SMs (always worse than 5).
+ALLOWED_SPLITS = (1, 2, 3, 4, 5, 10)
 _TARGET = "prepare_unified_decode_launch"
 _ORIGINAL = "_flare_decode_splits_original"
 
@@ -37,12 +39,16 @@ def parse_policy(text):
         if not sep:
             raise ValueError(f"{ENV}: expected ROWS:SPLITS pairs, got {item!r}")
         rows, splits = int(rows), int(splits)
-        if rows < 1 or splits < 1:
-            raise ValueError(f"{ENV}: rows and splits must be positive, got {item!r}")
+        if rows < 1 or splits not in ALLOWED_SPLITS:
+            raise ValueError(f"{ENV}: rows must be positive and splits one of {ALLOWED_SPLITS}, got {item!r}")
         if pairs and rows <= pairs[-1][0]:
             raise ValueError(f"{ENV}: row bounds must increase, got {text!r}")
         pairs.append((rows, splits))
     return tuple(pairs)
+
+
+def format_policy(policy):
+    return ",".join(f"{rows}:{splits}" for rows, splits in policy)
 
 
 def policy_from_environment(env=None):
@@ -76,7 +82,7 @@ class _DecodeSplitPolicy:
         self.policy = policy
         self.is_dsv41 = is_dsv41
         self.signature = inspect.signature(original)
-        self.applied = []  # (rows, splits) per forced preparation, for export logs and tests
+        self.applied = []  # (rows, requested, planned num_splits) per forced preparation, for logs and tests
 
     def __call__(self, *args, **kwargs):
         bound = self.signature.bind(*args, **kwargs)
@@ -87,7 +93,9 @@ class _DecodeSplitPolicy:
             splits = splits_for(self.policy, rows)
             if splits is not None:
                 arguments["forced_num_splits"] = splits
-                self.applied.append((rows, splits))
+                launch = self.original(*bound.args, **bound.kwargs)
+                self.applied.append((rows, splits, getattr(launch, "num_splits", None)))
+                return launch
         return self.original(*bound.args, **bound.kwargs)
 
 
@@ -114,5 +122,15 @@ def install_from_environment():
     """Install only when a policy is set, so the default leaves b12x exactly as shipped."""
     policy = policy_from_environment()
     if policy:
-        return install(policy)
+        wrapper = install(policy)
+        print(f"[flare] {ENV}={format_policy(policy)}: DSV41 decode split policy installed (pid {os.getpid()})",
+              flush=True)
+        return wrapper
     return None
+
+
+def installed_policy(kernel=None):
+    """The policy the b12x decode preparation runs with in this process (``()`` when the hook is absent)."""
+    kernel = _kernel_module() if kernel is None else kernel
+    current = getattr(kernel, _TARGET)
+    return current.policy if isinstance(current, _DecodeSplitPolicy) else ()

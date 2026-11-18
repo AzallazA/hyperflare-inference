@@ -21,7 +21,8 @@ from ignition.components import mla_decode_splits as ds
 def test_parse_policy():
     assert ds.parse_policy(None) == () and ds.parse_policy(" ") == ()
     assert ds.parse_policy("9:10, 18:5,28:10,37:5") == ((9, 10), (18, 5), (28, 10), (37, 5))
-    for bad in ("9", "9:0", "0:5", "18:5,9:10", "9:5,9:4", "a:b"):
+    assert ds.format_policy(ds.parse_policy(" 9:10,18:5 ")) == "9:10,18:5"
+    for bad in ("9", "9:0", "0:5", "18:5,9:10", "9:5,9:4", "a:b", "9:6", "9:9", "9:11"):
         with pytest.raises(ValueError):
             ds.parse_policy(bad)
 
@@ -37,7 +38,8 @@ def prepare(*, q_all, swa_k_cache, swa_indices, workspace, swa_page_size, sm_cou
             latent_scale_per_token=False, v41_compute_mode="fp8", v41_heads_per_block=None, traits_override=None,
             return_lse=False, controls=None):
     """Signature twin of b12x kernel.prepare_unified_decode_launch (checked against it below)."""
-    return dict(rows=q_all.shape[0], forced=forced_num_splits)
+    return types.SimpleNamespace(rows=q_all.shape[0], forced=forced_num_splits,
+                                 num_splits=None if forced_num_splits is None else min(forced_num_splits, 10))
 
 
 class _Q:
@@ -46,9 +48,10 @@ class _Q:
 
 
 def _call(wrapper, rows, *, indexed=True, dsv41=True, forced=None):
-    return wrapper(q_all=_Q(rows), swa_k_cache=None, swa_indices=None, workspace=None, swa_page_size=128,
+    launch = wrapper(q_all=_Q(rows), swa_k_cache=None, swa_indices=None, workspace=None, swa_page_size=128,
                    sm_count=188, indexed_k_cache=object() if indexed else None, forced_num_splits=forced,
                    traits_override="dsv41" if dsv41 else "dsv4")
+    return dict(rows=launch.rows, forced=launch.forced)
 
 
 @pytest.fixture
@@ -68,7 +71,8 @@ def test_policy_applies_to_dsv41_indexed_decode_only(kernel):
     assert _call(wrapper, 13, indexed=False) == dict(rows=13, forced=None)  # SWA-only (drafts)
     assert _call(wrapper, 13, dsv41=False) == dict(rows=13, forced=None)    # other models
     assert _call(wrapper, 13, forced=3) == dict(rows=13, forced=3)          # an explicit caller value wins
-    assert wrapper.applied == [(5, 10), (13, 5), (32, 5)]
+    assert wrapper.applied == [(5, 10, 10), (13, 5, 5), (32, 5, 5)]  # (rows, requested, planned)
+    assert ds.installed_policy(module) == ((9, 10), (18, 5), (37, 5))
 
 
 def test_install_replaces_policy_and_uninstall_restores(kernel):
@@ -78,6 +82,7 @@ def test_install_replaces_policy_and_uninstall_restores(kernel):
     assert _call(second, 3) == dict(rows=3, forced=2)
     ds.uninstall(module)
     assert module.prepare_unified_decode_launch is prepare and not hasattr(module, ds._ORIGINAL)
+    assert ds.installed_policy(module) == ()
 
 
 def test_unset_environment_installs_nothing(monkeypatch):
@@ -124,3 +129,62 @@ def test_b12x_fingerprints_do_not_move_with_the_policy():
     assert len(plain["modules"]) >= 32
     for key in ("unified_decode", "sink_merge", "factory", "modules"):
         assert plain[key] == on[key], key
+
+
+def _stub_worker_initializer():
+    """initialize_b12x_worker with only b12x's own device setup stubbed (it needs a GPU)."""
+    import b12x._lib.compile_pool as pool
+
+    pool._initialize_worker = lambda *args: None
+    from ignition.runtime_patches.triton import initialize_b12x_worker
+
+    initialize_b12x_worker()
+
+
+def _worker_probe(_):
+    from b12x.attention._shared.mla import kernel
+
+    return type(kernel.prepare_unified_decode_launch).__name__
+
+
+_WORKER = r"""
+import multiprocessing as mp
+from tests.recipes.test_deepseek41_mla_decode_splits import _stub_worker_initializer, _worker_probe
+if __name__ == "__main__":
+    with mp.get_context("spawn").Pool(1, initializer=_stub_worker_initializer) as workers:  # b12x spawns workers
+        print("WORKER", workers.map(_worker_probe, [0])[0])
+"""
+
+
+@pytest.mark.parametrize("policy,expected", [("9:10,18:5", "_DecodeSplitPolicy"), ("", "function")])
+def test_spawned_b12x_compile_worker_installs_the_policy(policy, expected):
+    """B1: a b12x compile worker is spawned and never imports compressed_mla; its initializer must install the hook
+    from the inherited variable, or workers compile 10-split programs the main process does not ask for."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONPATH": str(root), ds.ENV: policy}
+    result = subprocess.run([sys.executable, "-c", _WORKER], cwd=root, env=env, capture_output=True, text=True,
+                            timeout=600)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert f"WORKER {expected}" in result.stdout, result.stdout + result.stderr[-2000:]
+
+
+def test_tp3_config_records_the_policy_and_checks_the_installed_hook():
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
+
+    assert TP3Config().mla_decode_splits is None and "mla_decode_splits" not in TP3Config().to_metadata()
+    config = TP3Config.from_environment({ds.ENV: " 9:10, 18:5"})
+    assert config.mla_decode_splits == "9:10,18:5" and config.to_metadata()["mla_decode_splits"] == "9:10,18:5"
+    assert TP3Config.from_environment({ds.ENV: ""}).mla_decode_splits is None
+    config.check_mla_decode_splits(installed=((9, 10), (18, 5)))
+    TP3Config().check_mla_decode_splits(installed=())
+    with pytest.raises(ValueError, match="installed DSV41 decode split policy"):
+        config.check_mla_decode_splits(installed=())
+    with pytest.raises(ValueError, match="installed DSV41 decode split policy"):
+        TP3Config().check_mla_decode_splits(installed=((9, 10),))
+    with pytest.raises(ValueError):
+        TP3Config.from_environment({ds.ENV: "9:7"})
