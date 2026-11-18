@@ -832,7 +832,7 @@ class ForwardCache:
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers,
                 compile_headroom_bytes=self.compile_headroom_bytes,
-                forward_worker_bytes=self.forward_worker_bytes) as compiler:
+                forward_worker_bytes=getattr(self, "forward_worker_bytes", None)) as compiler:
             def finish():
                 name, bound, path = _completed(pending)
                 try:
@@ -946,7 +946,7 @@ class ForwardCache:
                 resources = compiler_resources(self.device, headroom_bytes=self.headroom_bytes,
                     options=self.options, compile_workers=self.compile_workers,
                     compile_headroom_bytes=self.compile_headroom_bytes,
-                    forward_worker_bytes=self.forward_worker_bytes)
+                    forward_worker_bytes=getattr(self, "forward_worker_bytes", None))
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
