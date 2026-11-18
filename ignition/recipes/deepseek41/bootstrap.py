@@ -200,6 +200,12 @@ class PreparationConfig:
         self.speculative_shapes
         self.packed_speculative_shapes
         encoder_capacities(self.tp3.prefill_skip_suffix, self.prefill_capacities, chunk=self.prefill_chunk_size)
+        if self.tp3.index_row_split:  # TP3 tp3.index_row_split (index_row_split.py)
+            from .index_row_split import split_capacities
+
+            split_capacities(self.tp3.index_row_split, self.prefill_capacities, chunk=self.prefill_chunk_size)
+            if len(self.devices) < 2:
+                raise ValueError("FLARE_DS41_INDEX_ROW_SPLIT splits indexer rows across tensor-parallel ranks")
         drafting = self.dspark and self.draft_tokens > 0
         for name in ("packed_verification",):
             value = getattr(self, name)
@@ -404,6 +410,13 @@ def vocabulary_channels(config, sample_rows):
     rows = sample_rows
     if tp3.trim_vocab_gather and parallel:
         rows = min(sample_rows, max(1, *config.batch_capacities))
+    if tp3.index_row_split:
+        # TP3 tp3.index_row_split: the split prefill graphs exchange their indexer winners over this channel
+        # (index_row_split.py; 4096 rows at TP3: 17 rows of 86,272 BF16 lanes per rank).
+        from .index_row_split import exchange_rows, split_capacities
+
+        split = split_capacities(tp3.index_row_split, config.prefill_capacities, chunk=config.prefill_chunk_size)
+        rows = max(rows, exchange_rows(split, len(config.devices)))
     return rows, bool(config.dspark) and not (tp3.skip_draft_vocab_gather and parallel)
 
 

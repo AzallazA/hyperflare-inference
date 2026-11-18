@@ -41,7 +41,7 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans", "index_row_split")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
@@ -175,6 +175,17 @@ def parse_draft_head_plans(text: str) -> tuple | None:
         raise ValueError("FLARE_DS41_DRAFT_HEAD_PLANS: row keys must be integers") from None
 
 
+def parse_index_row_split(text: str) -> tuple[int, ...] | None:
+    """FLARE_DS41_INDEX_ROW_SPLIT: "" / "0" -> None (off), "1" -> ``index_row_split.ROW_SPLIT_DEFAULT``, else a
+    capacity list."""
+    from .index_row_split import ROW_SPLIT_DEFAULT
+
+    text = text.strip()
+    if text in ("", "0"):
+        return None
+    return ROW_SPLIT_DEFAULT if text == "1" else parse_capacities(text, "INDEX_ROW_SPLIT")
+
+
 def parse_skip_suffix(text: str) -> tuple[int, ...] | None:
     """FLARE_DS41_PREFILL_SKIP_SUFFIX: "" / "0" -> None (off), "1" -> ``SKIP_SUFFIX_DEFAULT``, else a capacity list."""
     text = text.strip()
@@ -272,6 +283,15 @@ class TP3Config:
     replaces (decoder_prefill.py, scheduler ``encoder_only_chunk``). Every listed size must be on the prefill ladder
     and above 128. None = no twins (base). Export-time only (prepared graphs); serving can still turn the twins off
     with ``flare run --scheduler-encoder-prefill false``."""
+    index_row_split: tuple[int, ...] | None = None
+    """FLARE_DS41_INDEX_ROW_SPLIT ("1" = 3072,3584,4096, or a list of prefill capacities): in these prefill graphs (and
+    their encoder-only twins) each rank runs the indexer selectors of a contiguous uneven share of the chunk's 128-row
+    blocks (4096: 11/11/10) on the index layers before the candidate source (2, 8, 14), and the int32 winners are
+    all-gathered over the FP32 vocabulary channel (one or two more channel rows), so every rank holds the whole
+    ``selected`` (index_row_split.py). Equal to the owner rank's replicated selection bit for bit; equal to today's
+    per-rank selection where the indexer inputs are rank-identical. Prompt-logprob graphs and decode/verify graphs
+    keep the replicated indexer. Every listed size must be on the prefill ladder. None = replicated (base).
+    Export-time only (prepared graphs). Experimental (perf/ds41-indexer-row-split, not GPU-proven yet)."""
     # --- Engram tables (engram.py Tables) ---
     engram_tables: str = "auto"
     """Engram table layout in the package: ``shared`` = every rank reads the whole tables (the layout of every TP3
@@ -538,6 +558,12 @@ class TP3Config:
                 or tuple(sorted(set(self.prefill_skip_suffix))) != self.prefill_skip_suffix):
             raise ValueError("TP3 config: prefill_skip_suffix must be distinct increasing multiples of 64 above 128 "
                              f"(got {self.prefill_skip_suffix!r})")
+        if self.index_row_split is not None and (
+                not isinstance(self.index_row_split, tuple) or not self.index_row_split
+                or any(type(c) is not int or c < 384 or c % 128 for c in self.index_row_split)
+                or tuple(sorted(set(self.index_row_split))) != self.index_row_split):
+            raise ValueError("TP3 config: index_row_split must be distinct increasing multiples of 128 from 384 "
+                             f"(three ranks of whole 128-row selector blocks; got {self.index_row_split!r})")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
             raise ValueError("TP3 config: tp3_graph_gib must be positive")
 
@@ -639,6 +665,7 @@ class TP3Config:
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             prefill_graphs=parse_capacities(get("PREFILL_GRAPHS")),
             prefill_skip_suffix=parse_skip_suffix(get("PREFILL_SKIP_SUFFIX")),
+            index_row_split=parse_index_row_split(get("INDEX_ROW_SPLIT")),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             packed_keep_batches=integer("PACKED_KEEP_BATCHES"),

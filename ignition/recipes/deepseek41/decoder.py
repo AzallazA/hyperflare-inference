@@ -24,6 +24,7 @@ from ignition.preparation.tuning import register_finalizer
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .index_row_split import prefill_split_context
 from .host_embedding import HostRowGather
 from .probe import Probe
 from .routecapture import RouteCapture
@@ -229,7 +230,7 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
-                 window_metadata=None, examples=None, tp3=None, probe=None):
+                 window_metadata=None, examples=None, tp3=None, probe=None, index_split=None):
         tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches; the decoder shares one instance per graph
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
@@ -272,7 +273,7 @@ class PreparedLayer:
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
             window_metadata=window_metadata, examples=examples, index_side_stream=tp3.index_side_stream,
             glue_pass2=tp3.glue_pass2 and mode != "prefill",
-            pin_small_qproj=tp3.pin_small_qproj and mode != "prefill")
+            pin_small_qproj=tp3.pin_small_qproj and mode != "prefill", index_split=index_split)
         # Chunked: a runtime sized for fewer rows than a prefill chunk (TP3Config.ar_rows) still reduces prefill
         # rows, in row chunks the runtime accepts; one part (a plain reduction) whenever the rows fit.
         # TP3Config.ar_part_rows caps the parts and cuts at the cap (0 = halving, base).
@@ -607,6 +608,12 @@ class PreparedDecoder:
                 tokens=self.output_metadata.positions.numel(),
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
+        # TP3 tp3.index_row_split: listed prefill capacities (and their encoder-only twins) split the indexer rows of the
+        # full-row index layers across ranks and exchange the winners over the vocabulary channel; prompt-logprob
+        # graphs keep the replicated indexer (index_row_split.py).
+        index_split = prefill_split_context(mode=mode, capacity=metadata.positions.numel(), scoring=scoring, tp3=tp3,
+            shard=weights.shard, runtime=vocabulary_runtime, coordinator=coordinator, examples=examples)
+        self.index_split = index_split
         self.layers, carry = [], False
         built = weights.layers[:decoder_start + 1] if encoder_only else weights.layers
         for index, layer in enumerate(built):
@@ -631,7 +638,8 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples, tp3=tp3, probe=self.probe))
+                examples=examples, tp3=tp3, probe=self.probe,
+                index_split=index_split if layer_metadata is metadata else None))
             carry = defer
         configure_engram_side(self.layers, tp3.engram_side_layers, mode)
         self.route_capture = RouteCapture()

@@ -31,11 +31,14 @@ from ignition.preparation.scratch import ScratchArena
 from ignition.components.rotary import CompressedRotary as Rotary, PreparedRotaryAngles, apply_shared_angles
 from ignition.components.parallel import TensorParallelShard
 
+from .index_row_split import BLOCK_ROWS as SPLIT_BLOCK_ROWS, PreparedIndexExchange
 from .pool import PAGE_TOKENS
 
 
 # Bound indexer workspace while amortizing prefill selection launches.
 INDEXER_QUERY_ROWS = 128
+if INDEXER_QUERY_ROWS != SPLIT_BLOCK_ROWS:
+    raise ImportError("the indexer row split owns whole selector launches (index_row_split.BLOCK_ROWS)")
 
 
 @dataclass(frozen=True)
@@ -410,11 +413,14 @@ class PreparedAttention:
     glue_pass2 = False  # TP3 tp3.glue_pass2 (draft window cache without a fill); set per instance
     angle_key = index_angle_key = None  # TP3 tp3.rotary_once: shared RoPE table keys; None = per-launch angles
     pinned_qproj = False  # TP3 tp3.pin_small_qproj: this layer's qkv_a / norm / q_b plans are the pinned triple
+    # TP3 tp3.index_row_split (index_row_split.py): this rank's selector ordinals and the winners' exchange; None = every
+    # rank runs every selector (base).
+    index_owned = index_exchange = None
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, index_side_stream=False,
-                 glue_pass2=False, pin_small_qproj=False):
+                 glue_pass2=False, pin_small_qproj=False, index_split=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.glue_pass2 = glue_pass2  # TP3 tp3.glue_pass2 (see _run); False = base graphs
         self.pool, self.rotary, self.mode = pool, rotary, mode
@@ -549,6 +555,15 @@ class PreparedAttention:
                     page_size=128 // self.ratio, session=session, name=f"{name}.index{first}", workspace=workspace,
                     mode="prefill" if mode == "prefill" else "decode", **candidates)
                 self.selectors.append(selector)
+            # TP3 tp3.index_row_split: prefill index layers before the candidate source (no candidate rows to carry)
+            # run only this rank's selector blocks and all-gather the winners. Every selector is still built: the
+            # first one writes the index keys (PreparedGlobalKV, the decoder boundary) and all share one plan.
+            if index_split is not None and mode == "prefill" and layer < candidate_source:
+                if index_split.split.capacity != tokens or len(self.selectors) != index_split.split.blocks:
+                    raise ValueError("an indexer row split must cover this graph's selector blocks")
+                self.index_owned = tuple(index_split.split.owned_blocks(index_split.rank))
+                self.index_exchange = PreparedIndexExchange(index_split, device, session=session,
+                                                            name=f"{name}.index_exchange")
         indexed = {} if not self.ratio else dict(indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
             indexed_indices=scratch.selected, indexed_lengths=self.index_lengths,
             page_table=self.page_table,
@@ -606,6 +621,8 @@ class PreparedAttention:
             self.index_weight.functional(session=session)
             for selector in self.selectors:
                 selector.functional(session=session)
+            if self.index_exchange is not None:
+                self.index_exchange.functional(session=session)
         if self.owns_window_metadata:
             self.window_metadata.functional()
         register_finalizer(session, self.release_examples)
@@ -704,7 +721,9 @@ class PreparedAttention:
                     index_query, index_weights = self.index_side.finish(side, window_cache)
                 index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
-                for ordinal, selector in enumerate(self.selectors):
+                ordinals = range(len(self.selectors)) if self.index_owned is None else self.index_owned
+                for ordinal in ordinals:
+                    selector = self.selectors[ordinal]
                     first = ordinal * INDEXER_QUERY_ROWS
                     last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
                     result = selector(index_query[first:last], index_weights[first:last],
@@ -717,6 +736,8 @@ class PreparedAttention:
                         count_outputs.append(next_counts)
                     outputs.append(result)
                 selected = torch.cat(outputs, dim=0)
+                if self.index_exchange is not None:
+                    selected = self.index_exchange(selected)  # this rank's blocks -> every row, owners' bits
                 if self.layer == self.candidate_source:
                     candidates = torch.cat(candidate_outputs, dim=0)
                     candidate_counts = torch.cat(count_outputs, dim=0)
