@@ -561,13 +561,23 @@ use std::net::TcpListener;
             kind.event(id, result),
             TransportEvent::StoreInvalidated { id: JobId(11), .. }
         ));
-        for result in [Ok(42u64), Err(invalid("disk full"))] {
+        for result in [
+            Ok(42u64),
+            Err(invalid("disk full")),
+            Err(Error::caused_by(
+                "rank 1: page checksum mismatch",
+                invalid("page checksum mismatch").with_record_read(),
+            )),
+        ] {
             let frame = encode_event(Kind::Fetched, JobId(9), &result);
             let (kind, id, decoded) = decode_event(&frame[5..]).unwrap();
             assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
             match (result, decoded) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
-                (Err(a), Err(b)) => assert!(b.to_string().contains(&a.to_string())),
+                (Err(a), Err(b)) => {
+                    assert!(b.to_string().contains(&a.to_string()));
+                    assert_eq!(a.is_record_read(), b.is_record_read());
+                }
                 other => panic!("{other:?}"),
             }
         }
