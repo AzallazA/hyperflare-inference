@@ -90,12 +90,12 @@ class AttentionIndices(PreparedWindowIndices):
         set (registered on first request, computed by every call), or None when these indices share no angles.
         Only consumers that rotate by ``position`` may use it (the table clamps positions at 0, as ``position``
         already is); the ratio-2 compressor's positions can be -2 and keep per-launch angles."""
+        if self.position is None:
+            raise ValueError("shared rotary angles must be requested before functional conversion")
         if self.rotary is None:
             return None
         key = bool(compressed)
         if key not in self.angle_operations:
-            if self.position is None:
-                raise ValueError("shared rotary angles must be requested before functional conversion")
             self.angle_operations[key] = PreparedRotaryAngles(self.position, self.rotary.frequencies[key])
         return key
 
@@ -125,11 +125,11 @@ class AttentionIndices(PreparedWindowIndices):
                 active_width=lengths.amax().view(1),
                 slots=snapshot(torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1)),
                 position=snapshot((position + 1) // ratio * ratio - ratio))
-        position = snapshot(position)
+        # base snapshot order (slots, lengths, position): the off-state graph stays 181718's
+        slots, lengths, position = snapshot(window.window_slots), snapshot(window.window_lengths), snapshot(position)
         # TP3 tp3.rotary_once: one _angles launch per frequency set and call (positions already clamped at 0).
         angles = {key: operation(position) for key, operation in self.angle_operations.items()}
-        return AttentionGeometry(snapshot(window.window_slots), window.window_indices, snapshot(window.window_lengths),
-                                 window.window_page_size, position, ratios, angles)
+        return AttentionGeometry(slots, window.window_indices, lengths, window.window_page_size, position, ratios, angles)
 
 
 def normalize(source, weight, out, eps):
