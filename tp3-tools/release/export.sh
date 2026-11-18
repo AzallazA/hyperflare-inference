@@ -41,6 +41,8 @@
 #            default 0 (VRAM map item 6)
 #   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
 #            FLARE_EXPORT_SHARE_COMPUTED_OPERANDS, part of the compiler cache key); default 0
+#   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py; e.g. tp3-tools/release/draft-vocab/draft-vocab-32k.json):
+#            the NVFP4 DSpark draft head keeps only those tokens (FLARE_DS41_DRAFT_VOCAB); default unset = full head
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
@@ -80,6 +82,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
 [ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
+[ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \

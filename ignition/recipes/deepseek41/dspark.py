@@ -15,6 +15,10 @@ from .decoder import PreparedLayer, allocate_mma_pads, mma_pad_layouts
 from .host_embedding import HostRowGather
 
 
+# TP3 tp3.draft_vocab: logit of a token outside the draft vocabulary (finite: block-wise max/LSE stay defined)
+DRAFT_FILL = -1e30
+
+
 class PreparedDraft:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
     mma_pad_layouts = ()  # TP3 tp3.mma_pad_once: MMA-scale tiles zeroed once per forward; () = per-layer fills
@@ -51,7 +55,16 @@ class PreparedDraft:
         self.logit_shape, self.logit_dtype = tuple(scratch.logits.shape), scratch.logits.dtype
         self.local_logit_shape, self.local_logit_dtype = tuple(scratch.local_logits.shape), scratch.local_logits.dtype
         head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head
-        self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
+        # TP3 tp3.draft_vocab: the trimmed head projects onto its kept columns only; __call__ places them in the rank's
+        # full local logits, every other column a large negative constant (never proposed).
+        self.draft_columns = getattr(weights.draft, "draft_columns", None)
+        local_logits = scratch.local_logits
+        if self.draft_columns is not None:
+            if not vocabulary_parallel or local_logits.dtype not in (torch.float32, torch.bfloat16):
+                raise ValueError("tp3.draft_vocab needs vocabulary-parallel FP32/BF16 draft logits")
+            local_logits = torch.empty((local_logits.shape[0], self.draft_columns.numel()), dtype=local_logits.dtype,
+                                       device=local_logits.device)
+        self.head = PreparedVocabularyProjection(scratch.hidden, head, local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace, gather=not vocabulary_parallel).functional(session=session)
         self.window_metadata.functional()
         register_finalizer(session, self.release_outputs)
@@ -77,4 +90,8 @@ class PreparedDraft:
         hidden = torch.zeros_like(head_hidden)
         normalize(head_hidden, self.weights.draft.norm, hidden, self.weights.config.text["rms_norm_eps"])
         features = {"head_hidden": head_hidden.view(metadata.starts.numel(), -1, head_hidden.shape[-1])}
-        return self.head(hidden), None, features
+        logits = self.head(hidden)
+        if self.draft_columns is not None:
+            full = torch.full((logits.shape[0], self.local_logit_shape[1]), DRAFT_FILL, dtype=logits.dtype, device=logits.device)
+            logits = full.index_copy(1, self.draft_columns, logits)
+        return logits, None, features

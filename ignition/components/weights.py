@@ -56,7 +56,7 @@ for _container, _fields in (
      ('attention', 'experts', 'residual', 'engram')),
     ('ignition.recipes.deepseek41.weights.DSparkWeights',
      ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm',
-      'markov_embedding', 'markov_head', 'confidence_head', 'draft_head')),
+      'markov_embedding', 'markov_head', 'confidence_head', 'draft_head', 'draft_columns')),
     ('ignition.recipes.deepseek4.weights.ExpertWeights',
      ('router', 'correction', 'vision_correction', 'token_experts', 'experts', 'shared')),
     ('ignition.recipes.deepseek4.weights.LayerWeights',

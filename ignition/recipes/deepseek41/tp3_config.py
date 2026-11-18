@@ -40,7 +40,7 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs")
+                     "prefill_graphs", "draft_vocab")
 
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
@@ -91,6 +91,14 @@ def describe_checkpoint(path: Path | None) -> str | None:
     return f"{path.name}#{digest}"
 
 
+def describe_file(path: Path | None) -> str | None:
+    """``<basename>#<sha256[:12] of the file>``; never the full path."""
+    if path is None:
+        return None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else "missing"
+    return f"{path.name}#{digest}"
+
+
 def parse_layers(spec: str) -> frozenset:
     """``"20-22"`` / ``"20,21"`` / ``"0-3,7"`` -> frozenset of layer indices; empty -> empty set."""
     layers = set()
@@ -136,6 +144,13 @@ class TP3Config:
     """Directory of ``expert-routes-rank0-layer{L}.json`` route counts (vLLM route-monitor format)."""
     embed_host: bool = False
     """Token embedding read from device-visible host memory (only its tokens' rows are gathered per step)."""
+    draft_vocab: Path | None = None
+    """FR-Spec style draft vocabulary (FLARE_DS41_DRAFT_VOCAB=<json from tp3-tools/ds41_draft_vocab.py>): the NVFP4 DSpark
+    draft head keeps only these tokens' rows (each rank its tokens in its vocabulary shard, padded to one equal multiple
+    of 128 columns on every rank); the other columns of the draft logits are a large negative constant, so proposals
+    never pick them (q = 0) while verification keeps the full BF16 head: outputs are exact, only acceptance on rare
+    tokens can drop. Needs --draft-head-quantization nvfp4 and vocabulary-parallel sampling. None = full head (base).
+    Export-time only (IDEAS 2026-11-17 item 6)."""
     markov_embed_host: bool = False
     """DSpark's Markov-head embedding (129,280 x 256 BF16, 63 MiB, replicated) read from device-visible host memory:
     the drafter's embedding lookup and the fused Markov transition bias read only the pending tokens' rows (<= one per
@@ -331,6 +346,8 @@ class TP3Config:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if type(self.mma_pad_once) is not bool:  # own line: keeps merges with other branches' switch lists clean
             raise TypeError("TP3 config: mma_pad_once must be a boolean")
+        if self.draft_vocab is not None and not isinstance(self.draft_vocab, Path):
+            raise TypeError("TP3 config: draft_vocab must be a Path or None")
         for name in ("vision_arena_host", "markov_embed_host"):  # own line, as mma_pad_once's
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
@@ -483,6 +500,7 @@ class TP3Config:
             vision_stage_copy=get("VISION_STAGE_COPY", "memcpy"),
             vision_arena_host=flag("VISION_ARENA_HOST"),
             markov_embed_host=flag("MARKOV_EMBED_HOST"),
+            draft_vocab=None if not get("DRAFT_VOCAB") else Path(get("DRAFT_VOCAB")),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),
             engram_part_rows=integer("ENGRAM_PART_ROWS"),
@@ -565,6 +583,8 @@ class TP3Config:
                 value = format_layers(value)
             elif item.name == "expert_counts_dir":
                 value = describe_counts_dir(value)
+            elif item.name == "draft_vocab":
+                value = describe_file(value)
             elif item.name == "brrr_ckpt":
                 value = describe_checkpoint(value)
             record[item.name] = value

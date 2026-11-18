@@ -453,3 +453,39 @@ def test_markov_and_vision_arena_switches_parse_and_default_off():
     assert record["markov_embed_host"] is True and record["vision_arena_host"] is True
     with pytest.raises(TypeError):
         TP3Config(markov_embed_host=1)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# TP3 tp3.draft_vocab (FR-Spec style draft-head trim, ds41-tp3-next 2026-11-17)
+
+
+def test_draft_vocab_columns_equal_width_on_every_rank_and_keep_every_listed_token():
+    tokens = [0, 5, 7, 43135, 43136, 50000, 86272, 129279, 129000]
+    width = 43136
+    per = [weights.draft_vocab_columns(tokens, 3, r, k=600) for r in range(3)]
+    assert {len(c) for c in per} == {256}  # max(share 4, 600 / 3 = 200) rounded up to 128
+    for r, columns in enumerate(per):
+        assert columns == sorted(set(columns)) and all(0 <= c < width for c in columns)
+        assert all(t - r * width in columns for t in tokens if r * width <= t < (r + 1) * width)
+        assert all(r * width + c < 129280 for c in columns)  # never a padding row
+    assert TP3Config().draft_vocab is None
+    assert "draft_vocab" not in TP3Config().to_metadata()  # recorded only when set: default records unchanged
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_draft_vocab_fill_is_exact_zero_probability_under_blockwise_softmax(dtype):
+    from ignition.recipes.deepseek41.dspark import DRAFT_FILL
+    torch.manual_seed(0)
+    width, keep = 1024, torch.tensor(sorted(torch.randperm(1024)[:256].tolist()))
+    sub = torch.randn(3, 256).to(dtype)
+    full = torch.full((3, width), DRAFT_FILL, dtype=dtype).index_copy(1, keep, sub).float()
+    bias = torch.randn(3, width)  # Markov transition bias added on top
+    logits = full + bias
+    blocks = logits.view(3, 4, 256)  # block maxima / sums as the fused Markov kernel combines them
+    m = blocks.amax(-1)
+    s = torch.exp(blocks - m[..., None]).sum(-1)
+    lse = m.amax(-1) + torch.log((s * torch.exp(m - m.amax(-1, keepdim=True))).sum(-1))
+    p = torch.exp(logits - lse[:, None])
+    assert torch.isfinite(p).all() and torch.all(p[:, [c for c in range(width) if c not in set(keep.tolist())]] == 0)
+    reference = torch.softmax(sub.float() + bias[:, keep], -1)
+    assert torch.allclose(p[:, keep], reference, atol=1e-6)

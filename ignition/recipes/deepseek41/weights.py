@@ -14,7 +14,7 @@ from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
-from ignition.preparation.persistent import active_core_storage, persistent_copy, allocated_tensor_bytes
+from ignition.preparation.persistent import active_core_storage, allocated_tensor_bytes, persistent_copy, persistent_empty
 
 from .config import ModelConfig
 from .tp3_config import TP3Config
@@ -54,6 +54,7 @@ class DSparkWeights:
     markov_head: object
     confidence_head: torch.Tensor | None = None
     draft_head: object | None = None
+    draft_columns: torch.Tensor | None = None  # TP3 tp3.draft_vocab: local vocabulary columns of draft_head's rows
 
     @classmethod
     def load(cls, loader, *, confidence=False, vocabulary_parallel_sampling=False, markov_head_quantization=None,
@@ -127,7 +128,10 @@ class ModelWeights:
                 markov_head_quantization=markov_head_quantization,
                 park_markov_embedding=host_allocator if tp3.markov_embed_host else None) if dspark else None
             if draft is not None:
-                if draft_head_quantization == "nvfp4":
+                if draft_head_quantization == "nvfp4" and tp3.draft_vocab is not None:
+                    draft = replace(draft, **trimmed_draft_head(head, tp3.draft_vocab, shard,
+                                                                vocabulary_parallel_sampling))
+                elif draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
                 elif draft_head_quantization == "mxfp8":
                     draft = replace(draft, draft_head=mxfp8_draft_head(head))
@@ -147,6 +151,44 @@ class ModelWeights:
                     vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
         return cls(config, shard, embedding, norm, head, layers, draft,
                    allocated_tensor_bytes(device) - before, vision)
+
+
+def draft_vocab_columns(tokens, world, rank, *, k=0, vocab=129280, alignment=64, multiple=128):
+    """TP3 tp3.draft_vocab: this rank's sorted local columns of the draft vocabulary (the listed tokens in this rank's
+    shard). Every rank keeps the same count, max(largest share, k / world) rounded up to ``multiple``; shares below it
+    are filled with the rank's lowest unused real columns, so every rank prepares the same projection shape."""
+    width = -(-vocab // (world * alignment)) * alignment
+    shares = [sorted({t - r * width for t in tokens if r * width <= t < min((r + 1) * width, vocab)}) for r in range(world)]
+    count = min(width, -(-max(max(len(share) for share in shares), -(-k // world)) // multiple) * multiple)
+    real = min(width, vocab - rank * width)
+    columns, have = list(shares[rank]), set(shares[rank])
+    filler = (c for c in range(width) if c not in have)
+    while len(columns) < count:
+        column = next(filler)
+        if column >= real:
+            raise ValueError("draft vocabulary: a rank has fewer real columns than the trimmed width")
+        columns.append(column)
+    return sorted(columns)
+
+
+def trimmed_draft_head(head, vocabulary_file, shard, vocabulary_parallel_sampling):
+    """NVFP4 draft head of the draft vocabulary's rows of this rank's head shard + their local column ids."""
+    import json
+
+    if not vocabulary_parallel_sampling:
+        raise ValueError("tp3.draft_vocab needs vocabulary-parallel sampling (the trimmed head is a rank-local projection)")
+    record = json.loads(vocabulary_file.read_text())
+    tokens, k = record["tokens"], int(record.get("k", 0))
+    if not tokens or any(type(t) is not int or not 0 <= t < 129280 for t in tokens):
+        raise ValueError(f"draft vocabulary {vocabulary_file.name}: token ids must be integers in [0, 129280)")
+    columns = draft_vocab_columns(tokens, shard.world_size, shard.rank, k=k)
+    if head.shape[0] != -(-129280 // (shard.world_size * 64)) * 64:
+        raise ValueError("draft vocabulary: the head shard is not the padded vocabulary partition")
+    index = persistent_empty((len(columns),), torch.int64, head.device)
+    index.copy_(torch.tensor(columns, dtype=torch.int64))
+    with _parking_pool():
+        draft_head = nvfp4_draft_head(head.index_select(0, index).contiguous())
+    return {"draft_head": draft_head, "draft_columns": index}
 
 
 def _parking_pool():
