@@ -403,10 +403,13 @@ DeepSeek reasoning and both DSML tool syntaxes use the pinned official
 `deepseek-recipe` state machine. Helios adapts its actions into the same neutral
 events, validates nonempty tool names and JSON objects with nonempty, unique
 argument names, and publishes each call when its arguments complete. A parameter
-marked `string="false"` carries JSON written by the model. When that text is not
-valid JSON, Helios retains it as a JSON string, so the call reaches the client
-with a well-formed argument object and the client validates the value. Closing the
-outer calls block ends parsed output; subsequent generated text is discarded.
+marked `string="false"` keeps its JSON type if its text decodes as one value
+inside the argument object. If decoding fails, Helios retains the original
+text as a JSON string. This includes valid JSON exceeding 126 levels of array
+or object nesting within the parameter. The combined size of the UTF-8 tool
+name and complete JSON argument object is limited to 1 MiB, including escapes
+and delimiters. Helios rejects a larger call before publishing it. Closing the
+outer calls block ends parsed output and discards subsequent generated text.
 The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
@@ -486,11 +489,10 @@ buffered and streaming responses across all three chat APIs. Clients can repair
 or reject these calls and provide feedback in a subsequent turn. Declared schemas
 guide argument conversion where the tool syntax requires it; unknown tools have
 no schema for that conversion. Malformed envelopes and empty names still fail
-parsing. A value that is not valid JSON is retained as a string where the tool
-syntax delimits individual values and the parser has a retention rule: tagged
-parameters, as in GLM, and DeepSeek `string="false"` parameters. Other invalid
-argument syntax fails parsing, including an argument object written as one JSON
-document and an XTML typed value. Required mode needs at least one declared
+parsing. Tagged parameters, as in GLM, retain malformed JSON values as strings.
+DeepSeek retains the original text of a `string="false"` parameter that cannot
+be decoded inside the argument object. Invalid JSON in a whole argument document
+or a typed XTML value fails parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated
