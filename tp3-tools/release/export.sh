@@ -50,6 +50,10 @@
 #            compiler processes per host for "Compile model forwards" and their host-RAM admission estimate (upstream 32 GiB).
 #            They apply only after kernel tuning (GPUs idle; COMPILE_WORKERS still caps tuning). N=9 G=16: expected
 #            ~13 -> ~5-6 min for 30 forwards. Device/host admission still decides: read "N compiler workers; per rank"
+#   FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB=M  (fork) per-worker GPU-memory admission estimate (upstream 1024; a worker holds
+#            only its CUDA context, ~700 MiB measured 11-17): 768 admits 2 workers per GPU at ~3.2 GiB free (1 GiB margin
+#            kept), 3 at >= 3,328 MiB. Export-time VRAM only. Log line: "Forward compiler admission: ..."
+#            On an out-of-memory retry, unset every FLARE_EXPORT_FORWARD_* variable.
 #   FLARE_EXPORT_TUNE_ONLY=1  (fork) stop after "Prepare and tune kernels" (selections flushed to the kernel cache, exit 0,
 #            no package): the warm-up before a cold-cache HOT 342 export (HOT=300 FLARE_EXPORT_TUNE_ONLY=1, then the export)
 #   FLARE_DS41_VISION_STAGE 1 (default) = vision tower in host RAM, weights staged through VRAM slots per block

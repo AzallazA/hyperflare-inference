@@ -778,6 +778,7 @@ def test_tune_only_export_stops_after_tuning_without_a_package(host, monkeypatch
 @pytest.mark.parametrize("environment,arguments,message", [
     ({"FLARE_EXPORT_FORWARD_WORKERS": "0"}, (), "FLARE_EXPORT_FORWARD_WORKERS must be a positive integer"),
     ({"FLARE_EXPORT_FORWARD_WORKER_GIB": "x"}, (), "FLARE_EXPORT_FORWARD_WORKER_GIB must be a positive integer"),
+    ({"FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB": "0"}, (), "FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB must be a positive integer"),
     ({"FLARE_EXPORT_TUNE_ONLY": "yes"}, (), "FLARE_EXPORT_TUNE_ONLY must be 1 or 0"),
     ({"FLARE_EXPORT_TUNE_ONLY": "1"}, ("--tuning-gpus", "0,1"), "does not combine with --tuning-gpus")])
 def test_export_speed_switches_are_checked_before_preparation(host, monkeypatch, capsys, environment, arguments,

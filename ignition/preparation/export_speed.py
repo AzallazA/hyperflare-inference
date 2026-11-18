@@ -14,6 +14,12 @@ FLARE_EXPORT_FORWARD_WORKERS=N
 FLARE_EXPORT_FORWARD_WORKER_GIB=G
     Host-memory admission estimate per forward compiler, in GiB (upstream: 32, sized for Kimi
     K3's 93-layer forwards). Applies with the switch above, after tuning only.
+FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB=M
+    Device-memory admission estimate per forward compiler on a discrete GPU, in MiB (upstream:
+    1024). A worker holds only its CUDA context there: 698-702 MiB measured per worker on the
+    RTX PRO 6000 TP3 export of 2026-11-17 (seq322), so 768 leaves ~10 % margin. The 1 GiB
+    preparation headroom per GPU is kept. Applies with the switches above, after tuning only;
+    export-time VRAM only (the workers exit before warm-up and capture; serving is unaffected).
 FLARE_EXPORT_TUNE_ONLY=1
     Stop after "Prepare and tune kernels": every rank flushes its tuning selections to the
     kernel cache, closes its session and exits the way a tuning replica does (TuningComplete);
@@ -31,6 +37,7 @@ import os
 
 FORWARD_WORKERS_ENV = "FLARE_EXPORT_FORWARD_WORKERS"
 FORWARD_WORKER_GIB_ENV = "FLARE_EXPORT_FORWARD_WORKER_GIB"
+FORWARD_WORKER_VRAM_MIB_ENV = "FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB"
 TUNE_ONLY_ENV = "FLARE_EXPORT_TUNE_ONLY"
 
 
@@ -54,6 +61,12 @@ def forward_worker_bytes():
     return None if gib is None else gib << 30
 
 
+def forward_worker_device_bytes():
+    """Per-worker device-memory admission estimate requested for forward compilers, or None."""
+    mib = _positive_int(FORWARD_WORKER_VRAM_MIB_ENV)
+    return None if mib is None else mib << 20
+
+
 def tune_only():
     """Whether this export stops after kernel tuning."""
     text = os.environ.get(TUNE_ONLY_ENV, "").strip()
@@ -63,7 +76,7 @@ def tune_only():
 
 
 def forward_compile_settings(session):
-    """(compile_workers, forward_worker_bytes) for a session's forward compilation.
+    """(compile_workers, forward_worker_bytes, forward_worker_device_bytes) for a session's forward compilation.
 
     The overrides apply only once the session's kernel tuning is complete ("ready"): forward
     compiles that run inside tuning (DeepSeek V4.1 joint tuning's contextual trials) keep the
@@ -71,6 +84,6 @@ def forward_compile_settings(session):
     """
     requested = getattr(session, "requested_compile_workers", None)
     if getattr(session, "_tune_status", None) != "ready":
-        return requested, None
+        return requested, None, None
     workers = forward_workers()
-    return (requested if workers is None else workers), forward_worker_bytes()
+    return (requested if workers is None else workers), forward_worker_bytes(), forward_worker_device_bytes()

@@ -607,7 +607,11 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    and exits 0 after "Prepare and tune kernels" (selections flushed to the kernel cache, no package), which skips
    the warm-up's compile, capture and publish (~20-25 min). Forward compiling after tuning can use more processes
    than the PSU-capped tuning budget: `FLARE_EXPORT_FORWARD_WORKERS=9 FLARE_EXPORT_FORWARD_WORKER_GIB=16`
-   (`ignition/preparation/export_speed.py`; neither value reaches a cache key or the package).
+   (`ignition/preparation/export_speed.py`; neither value reaches a cache key or the package). On DS41 TP3 the
+   GPU-memory check, not host RAM, caps it (seq322, 11-17: 3 workers, ~3.2 GiB free per GPU, 1 GiB per worker
+   assumed vs ~700 MiB measured); add `FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB=768` (6 workers at that free memory).
+   The export log line `Forward compiler admission: ...` names free MiB, capacity and admitted workers per rank.
+   An out-of-memory retry must run without every `FLARE_EXPORT_FORWARD_*` variable.
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
 4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
    five times (twice more on 11-12). The `grep '[x]yz'` bracket trick does NOT help when the same command line also

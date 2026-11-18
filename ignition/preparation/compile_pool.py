@@ -34,18 +34,26 @@ class CompilerResources:
     headroom: int
     # The forward-compiler part of worker_bytes; None: host_memory.FORWARD_WORKER_BYTES.
     forward_bytes: int | None = None
+    # Admission sample (TP3 fork, reported only): device free bytes and the per-worker device estimate.
+    free: int | None = None
+    device_bytes: int | None = None
 
 
 def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None,
-                       compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None):
+                       compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None,
+                       forward_worker_device_bytes=None):
     """Sample a rank's device capacity and its host's compiler memory budget.
 
     Host admission leaves the greater of `compile_headroom_bytes` and, on integrated GPUs,
     `headroom_bytes` free. `forward_worker_bytes` replaces the per-worker host estimate
-    `host_memory.FORWARD_WORKER_BYTES` (TP3 fork, FLARE_EXPORT_FORWARD_WORKER_GIB).
+    `host_memory.FORWARD_WORKER_BYTES` (TP3 fork, FLARE_EXPORT_FORWARD_WORKER_GIB);
+    `forward_worker_device_bytes` replaces a discrete GPU's 1 GiB per-worker device estimate
+    (TP3 fork, FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB). Integrated GPUs keep their estimate.
     """
-    if forward_worker_bytes is not None and (type(forward_worker_bytes) is not int or forward_worker_bytes < 1):
-        raise ValueError("forward_worker_bytes must be a positive byte count")
+    for name, value in (("forward_worker_bytes", forward_worker_bytes),
+                        ("forward_worker_device_bytes", forward_worker_device_bytes)):
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"{name} must be a positive byte count")
     if type(headroom_bytes) is not int or headroom_bytes < 0:
         raise ValueError("headroom_bytes must be a nonnegative byte count")
     if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
@@ -57,7 +65,8 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
     available = host_memory.available_bytes()
     free = device_memory_info(device)[0]
     shared = torch.cuda.get_device_properties(device).is_integrated
-    device_bytes = _WORKER_DEVICE_BYTES if shared else _DISCRETE_WORKER_DEVICE_BYTES
+    device_bytes = _WORKER_DEVICE_BYTES if shared else (_DISCRETE_WORKER_DEVICE_BYTES
+        if forward_worker_device_bytes is None else forward_worker_device_bytes)
     capacity = max(0, (free - headroom_bytes) // device_bytes)
     if compile_workers is None:
         capacity = min(8, capacity)
@@ -67,7 +76,20 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
     return CompilerResources(capacity, available, limit,
         forward + (device_bytes if shared else 0),
         max(compile_headroom_bytes, headroom_bytes if shared else 0),
-        forward_worker_bytes)
+        forward_worker_bytes, free, device_bytes)
+
+
+def admission_report(resources, counts, workers):
+    """One line: per-rank free device memory at the admission sample, estimates, and the admitted count."""
+    mib = lambda value: "?" if value is None else str(value >> 20)
+    ranks = "; ".join(f"rank {rank} free {mib(item.free)} MiB, capacity {item.capacity}, missing {count}, "
+                      f"admitted {admitted}" for rank, (item, count, admitted)
+                      in enumerate(zip(resources, counts, workers)))
+    first = resources[0] if resources else None
+    estimate = "" if first is None else (f" (per worker {mib(first.device_bytes)} MiB device, "
+                                         f"{mib(first.worker_bytes)} MiB host; "
+                                         f"host available {mib(first.available)} MiB)")
+    return f"Forward compiler admission: {sum(workers)} workers{estimate}: {ranks}"
 
 
 def allocate_workers(resources, counts, hosts):
@@ -132,7 +154,8 @@ def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
 
 class CompilePool:
     def __init__(self, device, *, headroom_bytes=0, options=None, compile_workers=None, workers=None,
-                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None):
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None,
+                 forward_worker_device_bytes=None):
         """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
@@ -141,7 +164,8 @@ class CompilePool:
             resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
                                            compile_workers=compile_workers,
                                            compile_headroom_bytes=compile_headroom_bytes,
-                                           forward_worker_bytes=forward_worker_bytes)
+                                           forward_worker_bytes=forward_worker_bytes,
+                                           forward_worker_device_bytes=forward_worker_device_bytes)
             workers = allocate_workers([resources], [resources.limit], ["local"])[0]
         if type(workers) is not int or workers < 1:
             raise ValueError("forward compiler pool requires a positive admitted worker count")

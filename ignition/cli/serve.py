@@ -142,6 +142,7 @@ def _check_export_speed(args) -> None:
     try:
         export_speed.forward_workers()
         export_speed.forward_worker_bytes()
+        export_speed.forward_worker_device_bytes()
         requested = export_speed.tune_only()
     except ValueError as error:
         raise UsageError(str(error)) from error
