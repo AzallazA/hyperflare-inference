@@ -14,6 +14,11 @@ from ignition import runtime_patches
 from ignition.preparation import compilation
 
 
+@pytest.fixture(autouse=True)
+def _share_computed_operands(monkeypatch):  # TP3 fork: a386501f is behind FLARE_EXPORT_SHARE_COMPUTED_OPERANDS
+    monkeypatch.setenv('FLARE_EXPORT_SHARE_COMPUTED_OPERANDS', '1')
+
+
 def _graph(opaque=True, *, mutable=False):
     fx = torch.fx.Graph()
     source, output = fx.placeholder('source'), fx.placeholder('output')
@@ -87,3 +92,31 @@ def test_absent_fake_operand_does_not_materialize_pointwise():
         assert lowering.constrain_to_fake_tensor(source, None) is source
         assert isinstance(source.data.data, ir.Pointwise)
         assert not graph.buffers
+
+
+def test_switch_off_keeps_one_copy_per_opaque_consumer(monkeypatch):
+    """TP3 fork: with the switch off (the code default) the lowering is the one before a386501f."""
+    monkeypatch.setenv('FLARE_EXPORT_SHARE_COMPUTED_OPERANDS', '0')
+    runtime_patches.apply()
+    graph = _graph()
+    fake = torch.empty_strided((4, 8), (8, 1), dtype=torch.bfloat16, device='meta')
+    with V.set_graph_handler(graph):
+        source = _pointwise()
+        results = [lowering.constrain_to_fake_tensor(source, fake) for _ in range(3)]
+        assert len(graph.buffers) == 3
+        assert len({result.get_name() for result in results}) == 3
+        assert isinstance(source.data.data, ir.Pointwise)
+
+
+def test_switch_is_part_of_the_compiler_cache_key(monkeypatch):
+    from ignition.runtime_patches import operator_layouts
+    keys = {}
+    for value in ('0', '1'):
+        monkeypatch.setenv('FLARE_EXPORT_SHARE_COMPUTED_OPERANDS', value)
+        runtime_patches.identity.cache_clear()
+        keys[value] = runtime_patches.identity()
+    runtime_patches.identity.cache_clear()
+    assert keys['0'] != keys['1']
+    monkeypatch.setenv('FLARE_EXPORT_SHARE_COMPUTED_OPERANDS', 'yes')
+    with pytest.raises(ValueError):
+        operator_layouts.enabled()

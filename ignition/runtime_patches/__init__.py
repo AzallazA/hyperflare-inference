@@ -33,6 +33,8 @@ def identity() -> str:
     for path in sorted(Path(__file__).parent.glob("*.py")):
         key.update(path.name.encode())
         key.update(path.read_bytes())
+    from .operator_layouts import SWITCH, enabled  # TP3 fork switch (a386501f): part of the cache key
+    key.update(f"{SWITCH}={int(enabled())}".encode())
     return "ignition-runtime-patches-" + key.hexdigest()
 
 

@@ -17,6 +17,11 @@ pytestmark = pytest.mark.skipif(os.getenv('FLARE_RUN_CUDA_TESTS') != '1', reason
 _ADDRESSES = []
 
 
+@pytest.fixture(autouse=True)
+def _share_computed_operands(monkeypatch):  # TP3 fork: a386501f is behind FLARE_EXPORT_SHARE_COMPUTED_OPERANDS
+    monkeypatch.setenv('FLARE_EXPORT_SHARE_COMPUTED_OPERANDS', '1')
+
+
 @triton.jit
 def _copy(X, Y, N: tl.constexpr, STRIDE: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
