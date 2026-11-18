@@ -3,8 +3,11 @@
 
 """TP3 indexer row split (``TP3Config.index_row_split``, index_row_split.py), CPU only.
 
-- geometry: contiguous uneven block ownership (4096 rows: 11 / 11 / 10 blocks), channel rows on the FP32 vocabulary
-  channel (86,272 BF16 lanes per rank at TP3; 4096 rows need 17);
+- geometry: contiguous uneven block ownership (4096 rows: 11 / 11 / 10 blocks), equal per-rank windows (rank-symmetric
+  trace: 11 selector launches on every rank), channel rows on the FP32 vocabulary channel (86,272 BF16 lanes per rank
+  at TP3; 4096 rows need 17);
+- rank symmetry under the export's compiled-forward binding (``aot_forward`` + ``guard_check``): the earlier pattern
+  (Python ownership ordinals) fails the guards on the other ranks, the window pattern binds on all three;
 - pack / emulated column gather / unpack is a bit copy (every int32 pattern, BF16 NaN halves, 0x8000 halves);
 - reference-model equivalence: a CPU top-512 selector over three emulated ranks, split + exchange == the replicated
   selection on every rank; with rank-dependent inputs, every rank holds the owners' selections (the identity
@@ -32,7 +35,7 @@ LANES = 86272  # TP3 FP32 vocabulary channel: padded 43,136-column shard x 2 BF1
 # --- geometry ------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("capacity,blocks", [(4096, (11, 11, 10)), (3584, (10, 9, 9)), (3072, (8, 8, 8)),
-                                             (512, (2, 1, 1)), (384, (1, 1, 1))])
+                                             (512, (2, 1, 1)), (384, (1, 1, 1)), (640, (2, 2, 1))])
 def test_blocks_are_contiguous_uneven_and_cover_the_chunk(capacity, blocks):
     split = RowSplit(capacity, WORLD)
     assert tuple(len(split.owned_blocks(rank)) for rank in range(WORLD)) == blocks
@@ -44,10 +47,23 @@ def test_blocks_are_contiguous_uneven_and_cover_the_chunk(capacity, blocks):
     assert split.max_rows == max(blocks) * 128
 
 
-def test_short_last_block_is_clipped():
-    split = RowSplit(448, WORLD)  # 4 blocks, the last one 64 rows
-    assert split.row_counts() == (256, 128, 64)
-    assert split.rows(2) == (384, 448)
+@pytest.mark.parametrize("capacity,starts,offsets", [(4096, (0, 11, 21), (0, 0, 128)), (3584, (0, 10, 18), (0, 0, 128)),
+                                                      (3072, (0, 8, 16), (0, 0, 0)), (640, (0, 2, 3), (0, 0, 128))])
+def test_windows_have_one_size_and_contain_the_owned_blocks(capacity, starts, offsets):
+    split = RowSplit(capacity, WORLD)
+    assert tuple(split.window_start(rank) for rank in range(WORLD)) == starts
+    assert split.window_offsets() == offsets
+    for rank in range(WORLD):
+        rows = split.window_rows(rank)
+        assert rows.dtype == torch.int64 and rows.numel() == split.window_rows_count == split.window_blocks * 128
+        first, last = split.rows(rank)
+        assert int(rows[0]) <= first and last <= int(rows[-1]) + 1 <= capacity
+        assert int(rows[0]) + split.window_offsets()[rank] == first
+
+
+def test_short_last_block_is_refused():
+    with pytest.raises(ValueError, match="whole"):
+        RowSplit(448, WORLD)
 
 
 def test_geometry_refusals():
@@ -68,6 +84,7 @@ def test_tp3_vocabulary_channel_rows():
     assert layout.payload_bytes == 17 * LANES * 2
     assert exchange_rows(ROW_SPLIT_DEFAULT, WORLD) == 17
     assert exchange_rows((3072,), WORLD) == 13
+    assert exchange_rows((3584,), WORLD) == 16
     assert exchange_rows((), WORLD) == 0
 
 
@@ -84,11 +101,15 @@ def _patterns(rows, seed):
     return values
 
 
-@pytest.mark.parametrize("capacity", [4096, 3584, 3072, 448])
+def _windows(full, split):
+    return [full.index_select(0, split.window_rows(rank)) for rank in range(split.world)]
+
+
+@pytest.mark.parametrize("capacity", [4096, 3584, 3072, 640])
 def test_pack_gather_unpack_is_a_bit_copy(capacity):
     layout = ExchangeLayout(RowSplit(capacity, WORLD), LANES)
     full = _patterns(capacity, capacity)
-    partitions = [pack(full[slice(*layout.split.rows(rank))], layout, rank) for rank in range(WORLD)]
+    partitions = [pack(window, layout) for window in _windows(full, layout.split)]
     assert all(p.dtype == torch.int32 and tuple(p.shape) == (layout.channel_rows, LANES // 2) for p in partitions)
     gathered = emulate_gather(partitions)
     result = unpack(gathered, layout)
@@ -98,9 +119,9 @@ def test_pack_gather_unpack_is_a_bit_copy(capacity):
 def test_pack_refuses_the_wrong_share():
     layout = ExchangeLayout(RowSplit(4096, WORLD), LANES)
     with pytest.raises(ValueError):
-        pack(torch.zeros((1280, 512), dtype=torch.int32), layout, 0)  # rank 0 owns 1408 rows
+        pack(torch.zeros((1280, 512), dtype=torch.int32), layout)  # every window is 1408 rows
     with pytest.raises(ValueError):
-        pack(torch.zeros((1408, 512), dtype=torch.int64), layout, 0)
+        pack(torch.zeros((1408, 512), dtype=torch.int64), layout)
     with pytest.raises(ValueError):
         unpack(torch.zeros((16, 3 * LANES // 2), dtype=torch.int32), layout)
     with pytest.raises(ValueError):
@@ -111,10 +132,10 @@ def test_compiled_pack_and_unpack_stay_bit_exact():
     """Inductor (CPU) traces the int32 transforms and keeps every bit, including -1 and BF16-NaN-shaped halves."""
     layout = ExchangeLayout(RowSplit(4096, WORLD), LANES)
     full = _patterns(4096, 5)
-    owns = [full[slice(*layout.split.rows(rank))].clone() for rank in range(WORLD)]
+    owns = _windows(full, layout.split)
 
     def step(a, b, c):
-        return unpack(emulate_gather([pack(a, layout, 0), pack(b, layout, 1), pack(c, layout, 2)]), layout)
+        return unpack(emulate_gather([pack(a, layout), pack(b, layout), pack(c, layout)]), layout)
 
     assert torch.equal(torch.compile(step, fullgraph=True)(*owns), full)
 
@@ -145,17 +166,18 @@ def _replicated(query, weights, keys, lengths, block=128):
 
 
 def _split(inputs, layout, keys):
-    """The split path on three emulated ranks: each rank's owned blocks, pack, column gather, unpack on every rank.
+    """The split path on three emulated ranks, as attention runs it: gather the window rows through the rank's row-id
+    tensor, the same number of selector blocks on every rank, pack, column gather, unpack on every rank.
     ``inputs[rank]`` = that rank's (query, weights, lengths) for the whole chunk."""
     split = layout.split
     partitions = []
     for rank in range(split.world):
-        query, weights, lengths = inputs[rank]
-        outputs = []
-        for ordinal in split.owned_blocks(rank):
-            first, last = ordinal * split.block_rows, min(split.capacity, (ordinal + 1) * split.block_rows)
-            outputs.append(_reference_select(query[first:last], weights[first:last], keys, lengths[first:last]))
-        partitions.append(pack(torch.cat(outputs), layout, rank))
+        rows = split.window_rows(rank)
+        query, weights, lengths = (value.index_select(0, rows) for value in inputs[rank])
+        outputs = [_reference_select(query[first:first + split.block_rows], weights[first:first + split.block_rows],
+                                     keys, lengths[first:first + split.block_rows])
+                   for first in range(0, split.window_rows_count, split.block_rows)]
+        partitions.append(pack(torch.cat(outputs), layout))
     gathered = emulate_gather(partitions)
     return [unpack(gathered, layout) for _ in range(split.world)]  # every rank unpacks the same gathered bytes
 
@@ -173,7 +195,7 @@ def _chunk(capacity, keys_count, context, seed):
     return query, weights, keys, lengths
 
 
-@pytest.mark.parametrize("capacity,context", [(3072, 4096), (3584, 6144), (448, 2048)])
+@pytest.mark.parametrize("capacity,context", [(3072, 4096), (3584, 6144), (640, 2048)])
 def test_split_exchange_equals_the_replicated_selection_on_every_rank(capacity, context):
     query, weights, keys, lengths = _chunk(capacity, context // 2, context, seed=capacity)
     full = _replicated(query, weights, keys, lengths)
@@ -205,6 +227,24 @@ def test_rank_dependent_inputs_give_every_rank_the_owners_selection():
     assert not torch.equal(replicated[0], owners)  # rank 0 now reads rank 1's selection of rank 1's rows
 
 
+def test_window_overlap_rows_come_from_their_owner():
+    """640 rows: windows of two blocks; rank 2's window starts in rank 1's block 3. Rows a rank computes without owning
+    them are dropped, even where that rank's inputs differ."""
+    capacity, context = 640, 2048
+    query, weights, keys, lengths = _chunk(capacity, context // 2, context, seed=9)
+    layout = ExchangeLayout(RowSplit(capacity, WORLD), LANES)
+    assert layout.split.window_start(2) == 3 and layout.split.owned_blocks(1) == range(2, 4)
+    inputs = []
+    for rank in range(WORLD):
+        q = query.clone()
+        if rank == 2:
+            q[384:512] = -q[384:512]  # block 3: in rank 2's window, owned by rank 1
+        inputs.append((q, weights, lengths))
+    full = _replicated(query, weights, keys, lengths)
+    for selected in _split(inputs, layout, keys):
+        assert torch.equal(selected, full)
+
+
 # --- the prepared exchange's call path -----------------------------------------------------------------------------
 
 class _ChannelStub:
@@ -214,48 +254,117 @@ class _ChannelStub:
         self.max_batch_size = rows
 
 
+class _StubGather:
+    """PreparedAllGather planning stand-in (module level: compiled-forward guards serialize the objects they read)."""
+    handle = 4101
+    rows = 0
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        assert source.dtype == output.dtype == torch.bfloat16
+        assert source.shape == (self.rows, LANES) and output.shape == (self.rows, WORLD * LANES)
+
+    def functional(self, *, session):
+        return self
+
+
 def _stub_channel(monkeypatch, rows, partitions_by_rank, ranks):
     """PreparedAllGather planning replaced by a recorder; the column transport by a copy of the emulated gather of
     every rank's partition (``ranks[0]`` = the calling rank, the stand-in publishes its source there)."""
     from ignition.components import collectives
 
-    class Gather:
-        handle = 4101
-
-        def __init__(self, source, output, *, runtime, session, coordinator, name):
-            assert source.dtype == output.dtype == torch.bfloat16
-            assert source.shape == (rows, LANES) and output.shape == (rows, WORLD * LANES)
-
-        def functional(self, *, session):
-            return self
-
     def transport(source, output, handle):
-        assert handle == Gather.handle and source.dtype == output.dtype == torch.bfloat16
+        assert handle == _StubGather.handle and source.dtype == output.dtype == torch.bfloat16
         partitions_by_rank[ranks[0]] = source.view(torch.int32).clone()
         output.view(torch.int32).copy_(emulate_gather(partitions_by_rank))
 
-    monkeypatch.setattr(collectives, "PreparedAllGather", Gather)
+    monkeypatch.setattr(_StubGather, "rows", rows)
+    monkeypatch.setattr(collectives, "PreparedAllGather", _StubGather)
     monkeypatch.setattr(collectives, "_gather_columns", transport)
     monkeypatch.setattr(collectives, "_roce", lambda runtime: False)
+
+
+def _exchanges(monkeypatch, split, full):
+    """Three ranks' PreparedIndexExchange on a stand-in channel whose other partitions hold ``full``'s windows."""
+    layout = ExchangeLayout(split, LANES)
+    partitions = [pack(window, layout) for window in _windows(full, split)]
+    calling = [0]
+    _stub_channel(monkeypatch, layout.channel_rows, partitions, calling)
+    exchanges = []
+    for rank in range(WORLD):
+        context = IndexRowSplitContext(split, rank, _ChannelStub(layout.channel_rows), coordinator=None, examples={})
+        exchange = split_module.PreparedIndexExchange(context, "cpu", session=None, name="layer2.index_exchange")
+        exchanges.append(exchange.functional(session=None))
+    return exchanges, calling
 
 
 def test_prepared_exchange_packs_gathers_and_unpacks(monkeypatch):
     capacity = 4096
     full = _patterns(capacity, 11)
     split = RowSplit(capacity, WORLD)
-    layout = ExchangeLayout(split, LANES)
-    partitions = [pack(full[slice(*split.rows(rank))], layout, rank) for rank in range(WORLD)]
-    calling = [0]
-    _stub_channel(monkeypatch, layout.channel_rows, partitions, calling)
-    for rank in range(WORLD):
+    exchanges, calling = _exchanges(monkeypatch, split, full)
+    for rank, exchange in enumerate(exchanges):
         calling[0] = rank
-        context = IndexRowSplitContext(split, rank, _ChannelStub(layout.channel_rows), coordinator=None, examples={})
-        exchange = split_module.PreparedIndexExchange(context, "cpu", session=None, name="layer2.index_exchange")
-        exchange.functional(session=None)
-        assert torch.equal(exchange(full[slice(*split.rows(rank))]), full)
+        assert exchange.rows.dtype == torch.int64 and torch.equal(exchange.rows, split.window_rows(rank))
+        assert torch.equal(exchange(exchange.window(full)), full)
     # Traced as a serving forward traces it: the custom op's output mutation and the int32 transforms compile.
-    compiled = torch.compile(lambda own: exchange(own), fullgraph=True)
-    assert torch.equal(compiled(full[slice(*split.rows(WORLD - 1))].clone()), full)
+    compiled = torch.compile(lambda value: exchange(exchange.window(value)), fullgraph=True)
+    assert torch.equal(compiled(full.clone()), full)
+
+
+class _OwnedOrdinalsForward:
+    """The first commit's pattern: the rank's owned selector ordinals as Python ints in the traced forward."""
+
+    def __init__(self, split, rank, scores):
+        self.owned, self.scores = tuple(split.owned_blocks(rank)), scores
+
+    def __call__(self):
+        return torch.cat([self.scores[o * 128:(o + 1) * 128].topk(512, dim=1).indices for o in self.owned])
+
+
+class _WindowForward:
+    """The split's traced shape since the D1 fix: window gather through the rank's row-id tensor, the same number of
+    128-row "selector" launches on every rank (a top-512 stand-in), then the exchange."""
+
+    def __init__(self, exchange, scores):
+        self.exchange, self.scores = exchange, scores
+
+    def __call__(self):
+        window = self.exchange.window(self.scores)
+        blocks = [window[first:first + 128].topk(512, dim=1).indices.sort(dim=1).values.to(torch.int32)
+                  for first in range(0, window.shape[0], 128)]
+        return self.exchange(torch.cat(blocks))
+
+
+def _stand_in_selection(scores):
+    return torch.cat([scores[first:first + 128].topk(512, dim=1).indices.sort(dim=1).values.to(torch.int32)
+                      for first in range(0, scores.shape[0], 128)])
+
+
+@torch.no_grad()
+def test_split_forward_binds_one_compiled_artifact_on_every_rank(monkeypatch):
+    """Review D1: the export compiles one forward per prefill graph on one rank and every rank binds it
+    (``aot_forward`` + ``guard_check``, as ``ForwardCache._load``). Ownership ordinals as Python ints fail the guards on
+    the other ranks; the row-id tensor window passes on all three and each rank's compiled call returns the owners'
+    selection, identical to the replicated one."""
+    from ignition.preparation.aot import aot_forward
+
+    capacity = 4096
+    split = RowSplit(capacity, WORLD)
+    scores = torch.randn((capacity, 1024), generator=torch.Generator().manual_seed(3))
+    old = [_OwnedOrdinalsForward(split, rank, scores) for rank in range(WORLD)]
+    compiled_old = aot_forward(old[0])
+    assert compiled_old.guard_check(old[0])
+    assert not compiled_old.guard_check(old[1]) and not compiled_old.guard_check(old[2])
+
+    full = _stand_in_selection(scores)
+    exchanges, calling = _exchanges(monkeypatch, split, full)
+    new = [_WindowForward(exchange, scores) for exchange in exchanges]
+    compiled_new = aot_forward(new[0])
+    for rank, forward in enumerate(new):
+        assert compiled_new.guard_check(forward), f"rank {rank} cannot bind rank 0's compiled split forward"
+        calling[0] = rank
+        assert torch.equal(compiled_new(forward), full)
+        assert torch.equal(forward(), full)
 
 
 def test_prepared_exchange_refuses_a_short_channel_and_roce(monkeypatch):
@@ -349,9 +458,11 @@ def test_attention_splits_only_index_layers_before_the_candidate_source():
     from ignition.recipes.deepseek41 import attention, decoder
 
     init = inspect.getsource(attention.PreparedAttention.__init__)
-    assert 'index_split is not None and mode == "prefill" and layer < candidate_source' in init
+    assert 'split_here = index_split is not None and mode == "prefill" and layer < candidate_source' in init
+    assert "selector_rows = index_split.split.window_rows_count if split_here else tokens" in init
     run = inspect.getsource(attention.PreparedAttention._run)
-    assert "ordinals = range(len(self.selectors)) if self.index_owned is None else self.index_owned" in run
+    assert "index_owned" not in run and ".rank" not in run  # rank-symmetric trace: only the row-id tensor differs
+    assert "pages, lengths = exchange.window(pages), exchange.window(lengths)" in run
     assert run.index("selected = torch.cat(outputs, dim=0)") < run.index("selected = self.index_exchange(selected)")
     assert attention.INDEXER_QUERY_ROWS == split_module.BLOCK_ROWS
     layer = inspect.getsource(decoder.PreparedDecoder.__init__)

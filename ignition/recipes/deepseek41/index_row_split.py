@@ -16,6 +16,13 @@ halves and -1 sentinels survive), gathered, and unpacked into row order. Every v
 owner's selector wrote: ``selected`` equals the owner rank's replicated selection exactly. It equals every rank's own
 replicated selection only where the indexer inputs are rank-identical (see PLAN.md, "identity precondition").
 
+Rank-symmetric trace (review D1): the export compiles ONE forward per prefill graph and every rank binds it, so the
+traced code must not depend on the rank through Python values (Dynamo guards them). Every rank therefore runs the same
+number of selectors, ``window_blocks`` (the largest share: 11 at 4096 rows), on a window of rows it gathers through a
+per-rank int64 row-id TENSOR (a persistent buffer, bound like any other input). A rank with a smaller share widens its
+window into its neighbour's blocks (rank 2 at 4096 runs blocks 21-31 and owns 22-31); the unpack takes every row from
+its owner at fixed offsets that are the same on every rank. The slowest rank keeps 11 blocks: the gain is unchanged.
+
 Pure geometry and the pack/unpack transforms live here (CPU-testable, traceable torch ops); ``PreparedIndexExchange``
 binds them to the channel.
 """
@@ -36,7 +43,9 @@ BLOCK_ROWS = 128
 @dataclass(frozen=True)
 class RowSplit:
     """Contiguous uneven ownership of a chunk's 128-row selector blocks: the first ``blocks % world`` ranks take one
-    block more (4096 rows: 11 / 11 / 10 blocks). The same on every rank (pure function of capacity and world)."""
+    block more (4096 rows: 11 / 11 / 10 blocks). The same on every rank (pure function of capacity and world).
+
+    Every rank computes a window of ``window_blocks`` blocks that contains its owned blocks (rank-symmetric trace)."""
 
     capacity: int
     world: int
@@ -46,16 +55,19 @@ class RowSplit:
         if (type(self.capacity) is not int or type(self.world) is not int or type(self.block_rows) is not int
                 or self.capacity <= 0 or self.world < 2 or self.block_rows <= 0):
             raise ValueError("an indexer row split needs a positive capacity, two or more ranks and positive blocks")
+        if self.capacity % self.block_rows:
+            raise ValueError(f"an indexer row split needs whole {self.block_rows}-row selector blocks "
+                             f"(capacity {self.capacity})")
         if self.blocks < self.world:
             raise ValueError(f"an indexer row split of {self.capacity} rows has fewer {self.block_rows}-row blocks "
                              f"than {self.world} ranks")
 
     @property
     def blocks(self) -> int:
-        return -(-self.capacity // self.block_rows)
+        return self.capacity // self.block_rows
 
     def owned_blocks(self, rank: int) -> range:
-        """Selector ordinals this rank runs (``attention.PreparedAttention.selectors`` indices)."""
+        """Blocks whose winners this rank publishes (it is their owner)."""
         if type(rank) is not int or not 0 <= rank < self.world:
             raise ValueError("rank outside the row split's world")
         base, extra = divmod(self.blocks, self.world)
@@ -63,12 +75,35 @@ class RowSplit:
         return range(first, first + base + (rank < extra))
 
     def rows(self, rank: int) -> tuple[int, int]:
-        """[first, last) chunk rows this rank selects for (the last block may be short)."""
+        """[first, last) chunk rows this rank owns."""
         owned = self.owned_blocks(rank)
-        return owned.start * self.block_rows, min(self.capacity, owned.stop * self.block_rows)
+        return owned.start * self.block_rows, owned.stop * self.block_rows
 
     def row_counts(self) -> tuple[int, ...]:
         return tuple(last - first for first, last in map(self.rows, range(self.world)))
+
+    @property
+    def window_blocks(self) -> int:
+        """Selector launches per rank: the largest share, the same on every rank."""
+        return -(-self.blocks // self.world)
+
+    @property
+    def window_rows_count(self) -> int:
+        return self.window_blocks * self.block_rows
+
+    def window_start(self, rank: int) -> int:
+        """First block of this rank's window: its first owned block, moved back so the window ends inside the chunk."""
+        return min(self.owned_blocks(rank).start, self.blocks - self.window_blocks)
+
+    def window_offsets(self) -> tuple[int, ...]:
+        """Per rank: rows from the start of its window to its first owned row (rank-independent constants)."""
+        return tuple((self.owned_blocks(rank).start - self.window_start(rank)) * self.block_rows
+                     for rank in range(self.world))
+
+    def window_rows(self, rank: int, device=None) -> torch.Tensor:
+        """Chunk row ids [window_rows_count] int64 of this rank's window (the per-rank gather index)."""
+        first = self.window_start(rank) * self.block_rows
+        return torch.arange(first, first + self.window_rows_count, dtype=torch.int64, device=device)
 
     @property
     def max_rows(self) -> int:
@@ -77,10 +112,10 @@ class RowSplit:
 
 @dataclass(frozen=True)
 class ExchangeLayout:
-    """How one rank's winners ride a column gather of ``lanes`` BF16 lanes per rank and row.
+    """How one rank's window of winners rides a column gather of ``lanes`` BF16 lanes per rank and row.
 
-    Rank r's ``rows(r)`` winners ([n_r, 512] int32 = n_r * 1024 BF16 lanes) fill its partition row-major from lane 0
-    of channel row 0; ``channel_rows`` covers the largest share. Lanes past a rank's winners are padding."""
+    A rank's window ([window_rows_count, 512] int32 = 1024 BF16 lanes per row) fills its partition row-major from
+    lane 0 of channel row 0; lanes past it are padding. Every rank packs the same count (rank-symmetric)."""
 
     split: RowSplit
     lanes: int
@@ -92,7 +127,7 @@ class ExchangeLayout:
 
     @property
     def channel_rows(self) -> int:
-        return -(-self.split.max_rows * self.width * 2 // self.lanes)
+        return -(-self.split.window_rows_count * self.width * 2 // self.lanes)
 
     @property
     def payload_bytes(self) -> int:
@@ -128,17 +163,19 @@ def split_capacities(requested, prefill_capacities, *, chunk) -> tuple[int, ...]
     return tuple(sorted(requested))
 
 
-def pack(own: torch.Tensor, layout: ExchangeLayout, rank: int) -> torch.Tensor:
-    """This rank's winners [n_r, 512] int32 -> its gather partition [channel_rows, lanes / 2] int32 (bit copy).
+def pack(window: torch.Tensor, layout: ExchangeLayout) -> torch.Tensor:
+    """A rank's window of winners [window_rows_count, 512] int32 -> its gather partition [channel_rows, lanes / 2]
+    int32 (bit copy). No rank enters: every rank packs the same shape.
 
     Everything stays int32 in traced code: the BF16 reinterpretation the channel needs happens inside the exchange's
     custom op (``_exchange``), never in an Inductor kernel, whose BF16 copies may round through FP32 and canonicalize
     NaN halves (-1 is 0xFFFF 0xFFFF)."""
-    rows = layout.split.row_counts()[rank]
-    if own.dtype != torch.int32 or tuple(own.shape) != (rows, layout.width):
-        raise ValueError(f"rank {rank} packs [{rows}, {layout.width}] int32 winners, not {tuple(own.shape)} {own.dtype}")
+    rows = layout.split.window_rows_count
+    if window.dtype != torch.int32 or tuple(window.shape) != (rows, layout.width):
+        raise ValueError(f"an index exchange packs [{rows}, {layout.width}] int32 winners, "
+                         f"not {tuple(window.shape)} {window.dtype}")
     columns = layout.lanes // 2
-    flat = own.reshape(-1)
+    flat = window.reshape(-1)
     padding = flat.new_full((layout.channel_rows * columns - flat.numel(),), -1)
     return torch.cat((flat, padding)).view(layout.channel_rows, columns)
 
@@ -146,15 +183,16 @@ def pack(own: torch.Tensor, layout: ExchangeLayout, rank: int) -> torch.Tensor:
 def unpack(gathered: torch.Tensor, layout: ExchangeLayout) -> torch.Tensor:
     """The gathered channel rows [channel_rows, world * lanes / 2] int32 -> ``selected`` [capacity, 512] int32.
 
-    Row i of the gather holds rank 0's columns, then rank 1's, ...; rank r's partition, read row-major, is its
-    winners followed by padding."""
+    Row i of the gather holds rank 0's columns, then rank 1's, ...; rank r's partition, read row-major, is its window
+    followed by padding; its owned rows start ``window_offsets()[r]`` rows into the window. Rows a rank computed but
+    does not own are dropped (their owner's copy is used), so every rank assembles identical bits."""
     split, rows, columns = layout.split, layout.channel_rows, layout.lanes // 2
     if gathered.dtype != torch.int32 or tuple(gathered.shape) != (rows, split.world * columns):
         raise ValueError("an index exchange unpacks [channel_rows, world * lanes / 2] int32")
     parts = []
-    for rank, count in enumerate(split.row_counts()):
+    for rank, (count, offset) in enumerate(zip(split.row_counts(), split.window_offsets(), strict=True)):
         partition = gathered[:, rank * columns:(rank + 1) * columns].reshape(-1)
-        parts.append(partition[:count * layout.width].view(count, layout.width))
+        parts.append(partition[offset * layout.width:(offset + count) * layout.width].view(count, layout.width))
     return torch.cat(parts)
 
 
@@ -202,11 +240,16 @@ def prefill_split_context(*, mode, capacity, scoring, tp3, shard, runtime, coord
 
 
 class PreparedIndexExchange:
-    """All-gather of the split winners through the vocabulary channel; ``__call__(own) -> selected``."""
+    """The rank's window and the all-gather of its winners through the vocabulary channel.
+
+    ``rows`` is this rank's window as an int64 row-id tensor in persistent storage: the only rank-specific value the
+    traced forward reads, and a tensor, so every rank binds the same compiled forward. ``window(tensor)`` gathers a
+    [capacity, ...] operand's window rows; ``__call__(window_winners) -> selected`` exchanges."""
 
     def __init__(self, context: IndexRowSplitContext, device, *, session, name):
         from ignition.components.collectives import PreparedAllGather, _roce
         from ignition.preparation.examples import declaration_tensor
+        from ignition.preparation.persistent import persistent_copy
 
         runtime = context.runtime
         if runtime is None or _roce(runtime):
@@ -215,11 +258,11 @@ class PreparedIndexExchange:
             raise ValueError("the indexer row split's world must match the vocabulary channel's")
         lanes = runtime.heads_per_rank * runtime.query_head_dim
         self.layout = context.layout(lanes)
-        self.rank = context.rank
         rows = self.layout.channel_rows
         if rows > runtime.max_batch_size:
             raise ValueError(f"the indexer row split needs {rows} vocabulary channel rows, the channel has "
                              f"{runtime.max_batch_size} (bootstrap.vocabulary_channels sizes it)")
+        self.rows = persistent_copy(context.split.window_rows(context.rank, device=device))
         # The gather is planned on BF16 views of int32 declarations (the bytes the forward exchanges).
         send = declaration_tensor(context.examples, "attention.index_exchange_send", (rows, lanes // 2),
                                   torch.int32, device)
@@ -233,9 +276,14 @@ class PreparedIndexExchange:
         self.gather.functional(session=session)
         return self
 
-    def __call__(self, own: torch.Tensor) -> torch.Tensor:
-        """Traced: this rank's winners [n_r, 512] -> every row's winners [capacity, 512] (owners' bits)."""
-        source = pack(own, self.layout, self.rank)
-        output = torch.empty(self.receive_shape, dtype=torch.int32, device=own.device)
+    def window(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Traced: this rank's window rows of a [capacity, ...] operand (same shape on every rank)."""
+        return tensor.index_select(0, self.rows)
+
+    def __call__(self, window: torch.Tensor) -> torch.Tensor:
+        """Traced: this rank's window winners [window_rows_count, 512] -> every row's winners [capacity, 512] (owners'
+        bits)."""
+        source = pack(window, self.layout)
+        output = torch.empty(self.receive_shape, dtype=torch.int32, device=window.device)
         _exchange(source, output, self.gather.handle)
         return unpack(output, self.layout)
