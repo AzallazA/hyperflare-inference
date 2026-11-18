@@ -774,16 +774,19 @@ writer                          manager
  ...
  PutCommit{metadata} ---------->|
  <------ Stored{bytes}          |  committed, indexed: the writer may drop its copy
- or  <-- PutRefused{reason}     |  PRESENT is success; refusals keep the source local
+ or  <-- PutRefused{reason}     |  PRESENT is success; other reasons follow pressure policy
 ```
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- "Already held means committed": `Stored` and `PRESENT` are the only answers
-  that let the writer remove its local copy after a handover. All refusals,
-  synchronous submission errors and repeated failures retain the source.
+- "Already held means committed": only `Stored` and `PRESENT` confirm a
+  committed destination copy. Discarding a refused source under the pressure
+  policy does not establish a destination copy.
 - **Pressure policy.** `BUDGET` may mean temporary staging or arena pressure,
-  not a full manager. Every refusal releases selection and retries only after
+  not a full manager. `INVALID` and `OVERSIZE` discard the source; `BUDGET` and
+  `INFLIGHT` retain selection for one retry, then discard it if refused again
+  with either reason. Other refusals, synchronous submission errors and
+  repeated failures retain the source and release selection. Retries wait for
   a manager or put event, a reconnect or a short backoff. Queue bounds stop
   selection before pinning. Unavailable or busy managers leave local LRU eviction
   as the end of the chain; only the manager's own LRU drops its committed data.

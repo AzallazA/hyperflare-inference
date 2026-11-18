@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Pool handovers keep local records until the manager commits a copy.
-//! Refusals release selection and retry on manager progress or a short backoff.
+//! Pool handovers discard invalid or oversized records and retry budget or
+//! in-flight refusals once. Other failures keep local records and retry on
+//! manager progress or a short backoff.
 //! Manager loss unwinds waiting selections; active moves retain their pins
 //! until the drained terminal event. While the manager cannot accept records,
 //! the local tier's LRU is the end of the chain.
@@ -18,7 +19,7 @@ use crate::{Error, Layout, Result, Retirement, Retiring};
 
 use super::{
     exporter::{Checksums, HostPin, HostWindow, PutBytes},
-    shared::{PutOutcome, PutRequest, PutSource},
+    shared::{PutOutcome, PutRefusal, PutRequest, PutSource},
     store::PoolPort,
 };
 
@@ -91,11 +92,16 @@ impl PutBytes for PinBytes {
     }
 }
 
+struct Move {
+    record: Retiring,
+    failures: u8,
+}
+
 pub(crate) struct Cascade {
     /// Records chosen by the local tier, coldest first.
-    pending: VecDeque<Retiring>,
+    pending: VecDeque<Move>,
     /// Records whose put is running, by put id.
-    moving: HashMap<u64, Retiring>,
+    moving: HashMap<u64, Move>,
     retry_after: Instant,
     page_bytes: usize,
     row_bytes: usize,
@@ -134,19 +140,22 @@ impl Cascade {
         for record in inner.take_retiring() {
             // A failed put's backoff holds the queue; it does not fail what waits in it.
             if up && self.pending.len() + self.moving.len() < PENDING_MAX + MOVES_MAX {
-                self.pending.push_back(record);
+                self.pending.push_back(Move {
+                    record,
+                    failures: 0,
+                });
             } else {
                 inner.retired(record.key, record.tier, Retirement::Failed);
             }
         }
         while ready && self.moving.len() < MOVES_MAX && Instant::now() >= self.retry_after {
-            let Some(record) = self.pending.pop_front() else {
+            let Some(entry) = self.pending.pop_front() else {
                 break;
             };
-            self.begin(inner, pool, record);
+            self.begin(inner, pool, entry);
         }
         if !up {
-            for record in self.pending.drain(..) {
+            for Move { record, .. } in self.pending.drain(..) {
                 inner.retired(record.key, record.tier, Retirement::Failed);
             }
         }
@@ -156,8 +165,9 @@ impl Cascade {
         &mut self,
         inner: &mut S,
         pool: &mut P,
-        record: Retiring,
+        entry: Move,
     ) {
+        let record = &entry.record;
         if !record.row {
             // Without its row the record can end no restore.
             return self.failed(inner, record);
@@ -181,15 +191,19 @@ impl Cascade {
         };
         match pool.put(request) {
             Ok(id) => {
-                self.moving.insert(id, record);
+                self.moving.insert(id, entry);
             }
             Err(_) => self.failed(inner, record),
         }
     }
 
-    fn failed<S: crate::store::TierStore>(&mut self, inner: &mut S, record: Retiring) {
+    fn back_off<S: crate::store::TierStore>(&mut self, inner: &mut S) {
         self.retry_after = Instant::now() + Duration::from_millis(50);
         inner.set_spill(false);
+    }
+
+    fn failed<S: crate::store::TierStore>(&mut self, inner: &mut S, record: &Retiring) {
+        self.back_off(inner);
         inner.retired(record.key, record.tier, Retirement::Failed);
     }
 
@@ -200,12 +214,23 @@ impl Cascade {
         id: u64,
         outcome: &PutOutcome,
     ) -> bool {
-        let Some(record) = self.moving.remove(&id) else {
+        let Some(mut entry) = self.moving.remove(&id) else {
             return false;
         };
+        let record = &entry.record;
         match outcome {
             PutOutcome::Stored { .. } | PutOutcome::Present => {
                 inner.retired(record.key, record.tier, Retirement::Moved);
+            }
+            PutOutcome::Refused(PutRefusal::Invalid | PutRefusal::Oversize) => {
+                inner.retired(record.key, record.tier, Retirement::Dropped);
+            }
+            PutOutcome::Refused(PutRefusal::Budget | PutRefusal::Inflight) => {
+                self.back_off(inner);
+                match crate::store::retry_once(&mut entry.failures) {
+                    Retirement::Failed => self.pending.push_back(entry),
+                    how => inner.retired(record.key, record.tier, how),
+                }
             }
             _ => self.failed(inner, record),
         }
