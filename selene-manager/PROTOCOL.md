@@ -228,8 +228,9 @@ Answers: `LOOKUP_OK`, `LOOKUP_NOT_READY` (with `retry_after_ms`),
 `LOOKUP_OVERLOADED` (the session already has `max_concurrent_lookups` lookups
 waiting; answered at once, never queued), `LOOKUP_INVALID`.
 The requester treats every non-OK answer, a timeout, and a lost session as "no
-pool candidates for this request" and admits with its local match. Each request
-owns its lookup ticket.
+pool candidates for this attempt" and can admit with its local match. A queued
+request whose ticket has no answer retries the lookup when selected for
+admission. Each request owns its lookup ticket.
 
 A candidate is a hint. After the reply the client verifies each node against its
 history; any mismatch drops the candidate. Lookup reserves no export slot: another

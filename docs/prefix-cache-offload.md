@@ -675,7 +675,10 @@ If no resource holder remains or the budget expires, admission tries recomputati
 If recomputation also lacks capacity, it waits for resource changes without
 repeated timeout retries. A successful admission clears the wait accounting so
 readmission after preemption starts a separate wait. Pooled lookups keep their
-ticket and validated history across retries and recheck GPU residency.
+validated history across retries and recheck GPU residency. Pending and ready
+tickets are retained; a ticket with no answer is replaced only when its request
+is selected for admission. First lookups start even while capacity is blocked,
+once prompt scoring is complete.
 A newly created ticket starts the inbound job through `fetch`. On inbound failure the worker cancels each
 waiter and pushes its `Incoming` to the front of the pending queue with host
 lookup disabled for that attempt.

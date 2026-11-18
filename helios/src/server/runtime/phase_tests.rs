@@ -1989,7 +1989,7 @@ struct FakeStore {
     reused: Vec<crate::cache::PrefixKey>,
     /// Whether each `lookup_for` call carried a ticket.
     tickets_seen: Vec<bool>,
-    /// Tickets dropped without an answer.
+    /// Tickets released by their request.
     withdrawn: Arc<AtomicUsize>,
     exports: Vec<(flare_selene::ExportId, flare_selene::ExportChain)>,
     refused: Vec<(flare_selene::ExportId, flare_selene::ExportRefusal)>,
@@ -1997,6 +1997,7 @@ struct FakeStore {
     evictions_lost: usize,
     /// Tickets stay unanswered instead of answering with nothing.
     pending_tickets: bool,
+    refused_lookups: usize,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
@@ -2031,6 +2032,7 @@ impl FakeStore {
             reject_export: false,
             evictions_lost: 0,
             pending_tickets: false,
+            refused_lookups: 0,
             evicted: Vec::new(),
         }
     }
@@ -2048,12 +2050,18 @@ impl flare_selene::HostStore for FakeStore {
         history: &dyn flare_selene::History,
     ) -> Option<flare_selene::pool::LookupTicket> {
         self.begun.push(history.token_count());
+        if self.refused_lookups != 0 {
+            self.refused_lookups -= 1;
+            return Some(flare_selene::pool::LookupTicket::none());
+        }
         let withdrawn = self.withdrawn.clone();
         Some(flare_selene::pool::LookupTicket::watched(
             if self.pending_tickets {
                 flare_selene::pool::LookupState::Pending
             } else {
-                flare_selene::pool::LookupState::None
+                flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+                    candidates: vec![],
+                }))
             },
             move || {
                 withdrawn.fetch_add(1, Ordering::Relaxed);
@@ -3008,12 +3016,141 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
 }
 
 #[test]
+fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.share_snapshot_pages(&vec![0..2; 16]).unwrap();
+    let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
+    worker.enqueue(vec![running]);
+    worker.admit().unwrap();
+
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    store.refused_lookups = 2;
+    worker.attach_store(Some(Box::new(store)));
+    worker.prefill_rate = 1.0;
+    worker.enqueue(vec![incoming]);
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+    assert!(matches!(
+        worker.pending[0].pool_lookup.as_ref().unwrap().state(),
+        flare_selene::pool::LookupState::None
+    ));
+    assert_eq!(worker.scheduler.stats().host_lookups, 0);
+
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 1);
+
+    running_generation.cancelled.store(true, Ordering::Release);
+    worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(fake_store(&mut worker).begun, [70; 3]);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    assert_eq!(worker.scheduler.stats().host_lookups, 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 2);
+    assert_eq!(fixture.metrics.admitted.load(Ordering::Relaxed), 2);
+    let active = worker.active.iter().flatten().next().unwrap();
+    assert_eq!(
+        worker.scheduler.request(active.request).unwrap().phase,
+        RequestPhase::Inbound
+    );
+    drop(worker);
+    assert!(fixture.metrics.render().contains(
+        "flare_host_cache_lookup_outcomes_total{reason=\"admitted\"} 1\n"
+    ));
+}
+
+#[test]
+fn refused_pool_lookups_retry_only_for_selected_requests() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = usize::MAX;
+    worker.attach_store(Some(Box::new(store)));
+    let mut generations = Vec::new();
+    let mut group = Vec::new();
+    for fill in 0..6 {
+        let (incoming, generation) = fixture.incoming(vec![fill; 70], 4);
+        generations.push(generation);
+        group.push(incoming);
+    }
+    worker.enqueue(group);
+    assert_eq!(fake_store(&mut worker).begun, [70; 6]);
+    worker.admit().unwrap();
+    assert_eq!(worker.active.iter().flatten().count(), 4);
+    assert_eq!(worker.pending.len(), 2);
+    assert_eq!(fake_store(&mut worker).begun, [70; 10]);
+    assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
+}
+
+#[test]
+fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = 1;
+    worker.attach_store(Some(Box::new(store)));
+    let (mut incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    incoming.prompt_score_end = 70;
+    let stats = worker.scheduler.stats();
+    incoming.blocked = Some((
+        worker.scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    ));
+    worker.enqueue(vec![incoming]);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    worker.pending[0].prompt_scored = 70;
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+
+    fake_store(&mut worker).pending_tickets = true;
+    worker.pending[0].blocked = None;
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.active.iter().all(Option::is_none));
+    worker.pending[0].pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    worker.pending[0].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert!(worker.pending.is_empty());
+    assert!(worker.active[0].is_some());
+}
+
+#[test]
 fn gpu_residency_is_rechecked_using_the_queued_history() {
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store.pooled = true;
+    store.refused_lookups = 1;
     worker.attach_store(Some(Box::new(store)));
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     worker.enqueue(vec![incoming]);
@@ -3022,6 +3159,7 @@ fn gpu_residency_is_rechecked_using_the_queued_history() {
     worker.admit().unwrap();
     let handle = worker.active[0].as_ref().unwrap().request;
     assert_eq!(worker.scheduler.request(handle).unwrap().prefix(), Some(checkpoint));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
 }
 
@@ -3289,6 +3427,10 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
 
         let pending = answer.is_none();
+        let retry = matches!(&answer, Some(LookupState::None));
+        if retry {
+            fake_store(&mut worker).pending_tickets = false;
+        }
         if let Some(answer) = answer {
             worker.pending[0]
                 .pool_lookup
@@ -3302,7 +3444,8 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert!(worker.active[0].is_some());
         assert!(worker.pending.is_empty());
         assert_eq!(worker.idle_wait(), Duration::from_millis(2));
-        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending) + usize::from(retry));
+        assert_eq!(fake_store(&mut worker).begun.len(), 1 + usize::from(retry));
         if pending {
             assert!(worker.active[0].as_ref().unwrap().incoming.pool_lookup.is_some());
             advance(&mut worker, GraphKind::Init, 1, None);
@@ -3332,7 +3475,11 @@ fn a_pending_pool_lookup_does_not_hold_other_requests() {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     let (ready, _ready_generation) = fixture.incoming(vec![1; 70], 4);
     worker.enqueue(vec![ready]);
-    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(flare_selene::pool::LookupState::None);
+    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
     worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(worker.pending.len(), 1);
