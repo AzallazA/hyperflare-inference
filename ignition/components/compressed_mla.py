@@ -16,9 +16,12 @@ from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.fixtures.compressed_mla import Inputs, benchmark_call
 from ignition.preparation.fixtures.resources import candidate_inputs
 from ignition.components.mla_remainder_stream import install_from_environment
+from ignition.components import mla_decode_splits
 
 # B12X_MLA_DECODE_REMAINDER_STREAM=1: run the 8-head remainder decode grid beside the 16-head grid (export-time switch).
 install_from_environment()
+# FLARE_DS41_MLA_DECODE_SPLITS=ROWS:SPLITS,...: per-row-count DSV41 decode split counts (export-time switch).
+mla_decode_splits.install_from_environment()
 
 
 def validate_mla_compute_mode(mode):
