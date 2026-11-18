@@ -41,7 +41,7 @@ def test_switch_default_off_parses_and_is_recorded():
     assert TP3Config.from_environment({}).mma_pad_once is False
     config = TP3Config.from_environment({"FLARE_DS41_MMA_PAD_ONCE": "1"})
     assert config.mma_pad_once is True
-    assert config.to_metadata()["mma_pad_once"] is True and TP3Config().to_metadata()["mma_pad_once"] is False
+    assert config.to_metadata()["mma_pad_once"] is True and "mma_pad_once" not in TP3Config().to_metadata()  # recorded only when on
     assert "mma_pad_once=True" in config.describe() and "mma_pad_once" not in TP3Config().describe()
     for off in ("0", "", "true"):  # release convention: only "1" is on
         assert TP3Config.from_environment({"FLARE_DS41_MMA_PAD_ONCE": off}).mma_pad_once is False

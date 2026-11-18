@@ -489,3 +489,10 @@ def test_draft_vocab_fill_is_exact_zero_probability_under_blockwise_softmax(dtyp
     assert torch.isfinite(p).all() and torch.all(p[:, [c for c in range(width) if c not in set(keep.tolist())]] == 0)
     reference = torch.softmax(sub.float() + bias[:, keep], -1)
     assert torch.allclose(p[:, keep], reference, atol=1e-6)
+
+
+def test_ds41_tp3_next_switches_are_absent_from_a_default_record():
+    record = TP3Config().to_metadata()
+    for name in ("mma_pad_once", "vision_arena_host", "markov_embed_host", "draft_vocab"):
+        assert name not in record
+    assert TP3Config(mma_pad_once=True).to_metadata()["mma_pad_once"] is True

@@ -280,10 +280,10 @@ def test_metadata_record_is_json_ready_and_complete():
     from dataclasses import fields
 
     record = TP3Config.from_environment(RELEASE_ENV).to_metadata()
-    from ignition.recipes.deepseek41.tp3_config import RECORDED_WHEN_SET
+    from ignition.recipes.deepseek41.tp3_config import RECORDED_WHEN_SET, RECORDED_WHEN_TRUE
 
     # the release export sets the two wo_a switches (recorded when set), the other tuning switches stay unset
-    assert set(record) == ({item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET)
+    assert set(record) == ({item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET) - set(RECORDED_WHEN_TRUE)
                            | {"brrr_woa_small", "brrr_woa_uneven"})
     assert (record["brrr_woa_small"], record["brrr_woa_uneven"]) == (0, 1)
     assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"

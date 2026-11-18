@@ -42,6 +42,10 @@ VRAM_RECLAIM = {
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
                      "prefill_graphs", "draft_vocab")
 
+# On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
+# earlier reference record.
+RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host")
+
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
 
@@ -579,6 +583,8 @@ class TP3Config:
             value = getattr(self, item.name)
             if item.name in RECORDED_WHEN_SET and value is None:
                 continue  # kernel default: absent, so a default export's record (tp3-config.json) is unchanged
+            if item.name in RECORDED_WHEN_TRUE and value is False:
+                continue
             if isinstance(value, frozenset):
                 value = format_layers(value)
             elif item.name == "expert_counts_dir":
