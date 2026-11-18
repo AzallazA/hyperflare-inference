@@ -843,23 +843,25 @@ fn strict_tools_render_the_reference_normalized_schema() {
 
 /// Malformed tool-argument markup passes through as the DeepSeek reference returns it. The
 /// expected arguments are the reference StreamProcessor's output for the same completions
-/// (recipe-compare out/rust_parse.json, cases o09, o10, o12).
+/// (recipe-compare out/rust_parse.json, cases o09, o10, o12), except that a `string="false"`
+/// value that is not JSON is retained as a JSON string (upstream #359), so that call is a
+/// valid object and ends with ToolEnd.
 #[test]
 fn malformed_tool_arguments_pass_through_like_the_reference() {
     let f = Fixture::new(PromptEncoder::DeepseekV41);
     let call = |params: &str| {
         format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{params}</｜DSML｜ invoke>\n</｜DSML｜ calls>")
     };
-    for (completion, expected) in [
-        // string="false" with a value that is not JSON
+    for (completion, expected, raw) in [
+        // string="false" with a value that is not JSON: retained as a string
         (call("<｜DSML｜ parameter name=\"city\" string=\"false\">Paris</｜DSML｜ parameter>\n"),
-         r#"{"city": Paris}"#),
+         r#"{"city": "Paris"}"#, false),
         // parameter without its string attribute
         (call("<｜DSML｜ parameter name=\"city\">Paris</｜DSML｜ parameter>\n"),
-         "{\"city\">Paris</｜DSML｜: "),
+         "{\"city\">Paris</｜DSML｜: ", true),
         // duplicate parameter name
         (call("<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"),
-         r#"{"city": "Paris", "city": "Rome"}"#),
+         r#"{"city": "Paris", "city": "Rome"}"#, true),
     ] {
         let request = f.prepare(json!({"enable_thinking":false,"messages":[{"role":"user","content":"x"}],
             "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]})).unwrap();
@@ -884,7 +886,8 @@ fn malformed_tool_arguments_pass_through_like_the_reference() {
         }).collect();
         assert_eq!(calls, [expected], "{completion}");
         assert!(events.iter().any(|event| matches!(event, Event::ToolBegin { name, .. } if name == "get_weather")));
-        assert!(events.contains(&Event::ToolEndRaw { index: 0 }), "{events:?}");
+        let end = if raw { Event::ToolEndRaw { index: 0 } } else { Event::ToolEnd { index: 0 } };
+        assert!(events.contains(&end), "{events:?}");
         assert!(!events.iter().any(|event| matches!(event, Event::Content(text) if !text.trim().is_empty())));
     }
 }

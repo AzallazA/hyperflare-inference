@@ -455,3 +455,9 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Decide whether an XTML typed argument value that is not valid JSON is
+    retained as a string, as tagged and DeepSeek string="false" values are.
+    helios/src/output/xtml.rs fails the call with "invalid XTML JSON argument".
+    Close when XTML retains the text with tests, or docs/api.md states that the
+    difference is intended.
