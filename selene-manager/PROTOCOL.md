@@ -29,7 +29,7 @@ cite them by number.
 3. **Encryption is declared, not negotiated.** The client selects its connection
    mode before connecting; see [address forms and trust](docs/network-operations.md#addresses-and-startup-warnings).
    For TCP clients, `Hello.encryption` must equal what the client connected with,
-   else the pool is disabled for the process (one warning, local tiers only).
+   else instance startup fails with an encryption-mode error.
    Unix-socket clients trust filesystem permissions and accept either network mode.
    RDMA is not listed in `data_transports` when the manager is TLS.
 4. **Same host is proven by the socket; levels.** `shared_memory` is
@@ -696,8 +696,10 @@ Other files are left alone. Shutdown retains the regions for reconnecting client
   back the pool. It disables the pool for the process (local tiers only, one
   warning) and never registers late. Restarting the instance picks up the new
   regions;
-- manager unreachable at the first connect: it waits a bounded time, then runs
-  local-only for the life of the process and never attaches later.
+- manager unreachable at the first connect: it waits up to 30 seconds, then
+  fails startup. Registration failure, session-opening timeout and rejected memory
+  approval also fail startup; the operator must correct the cause or remove
+  `--prefix-cache-pool` to run local-only.
 
 **Why reuse is safe.** Reusing the files gives up what files created per
 incarnation would guarantee: that no access under the dead manager can alias a
