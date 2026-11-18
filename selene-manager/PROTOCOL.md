@@ -780,6 +780,9 @@ writer                          manager
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
+- For a record not already indexed, if the published parent is absent or has no
+  stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
+  the complete page chain and endpoint row as a root, over shared memory or the data channel.
 - "Already held means committed": only `Stored` and `PRESENT` confirm a
   committed destination copy. Discarding a refused source under the pressure
   policy does not establish a destination copy.
