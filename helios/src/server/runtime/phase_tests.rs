@@ -3108,6 +3108,7 @@ fn refused_pool_lookups_retry_only_for_selected_requests() {
     assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
 }
 
+// Retry on selection itself is covered by refused_pool_lookups_retry_only_for_selected_requests.
 #[test]
 fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
     let fixture = Fixture::new();
@@ -3136,12 +3137,19 @@ fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
 
     fake_store(&mut worker).pending_tickets = true;
     worker.pending[0].blocked = None;
+    let mut incoming = worker.pending.pop_front().unwrap();
+    begin_pool_lookup(
+        &mut worker.scheduler,
+        worker.store.as_mut().unwrap().as_mut(),
+        &mut incoming,
+    );
+    incoming.pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    worker.pending.push_back(incoming);
     worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 2]);
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.active.iter().all(Option::is_none));
-    worker.pending[0].pool_lookup_started =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
     assert_eq!(fake_store(&mut worker).begun, [70; 2]);
     worker.pending[0].pool_lookup.as_ref().unwrap().set_state(

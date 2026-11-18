@@ -603,6 +603,39 @@ use std::net::TcpListener;
     }
 
 #[test]
+fn record_read_failure_survives_rank_events_and_aggregation() {
+    let results = [
+        Err(invalid("copy cancelled")),
+        Err(invalid("page checksum mismatch").with_record_read()),
+    ]
+    .into_iter()
+    .map(|result| {
+        let frame = encode_event(Kind::Fetched, JobId(9), &result);
+        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
+        Some(result)
+    })
+    .collect();
+    let mut transport = Sharded::new(staged(), Vec::new()).unwrap();
+    transport.finish(
+        JobId(9),
+        Pending {
+            kind: Kind::Fetched,
+            results,
+            path: None,
+            cleanup: None,
+            started: Instant::now(),
+        },
+    );
+    assert!(matches!(
+        &transport.events[..],
+        [TransportEvent::Fetched { id: JobId(9), result: Err(error) }]
+            if error.is_record_read() && error.to_string().contains("rank 1: page checksum mismatch")
+    ));
+    transport.close().unwrap();
+}
+
+#[test]
 fn space_pressure_survives_rank_events_and_aggregation() {
     for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
         let frame = encode_event(

@@ -263,7 +263,8 @@ pub trait HostStore {
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
 
-    /// Whether request lookups should start while queued for this shared store.
+    /// Whether pool lookups start while queued and replace a ticket that will
+    /// never be answered when the request is next selected for admission.
     fn pooled(&self) -> bool {
         false
     }
@@ -282,8 +283,9 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
-    /// Start looking for pool candidates for a request that just queued. `None`
-    /// when no lookup is wanted or possible.
+    /// Start looking for pool candidates when a request queues, or replace a
+    /// ticket that will never be answered when the request is next selected for
+    /// admission. `None` when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
         None
     }

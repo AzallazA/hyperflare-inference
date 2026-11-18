@@ -420,5 +420,6 @@ mod tests {
         assert_eq!(candidate.key, Some(key_to(child)));
         assert_eq!(candidate.nodes.len(), 2);
         assert_eq!(candidate.level, v2::Level::HostNvme as i32);
+        assert_eq!(candidate.tier, v2::Tier::Dram as i32);
     }
 }

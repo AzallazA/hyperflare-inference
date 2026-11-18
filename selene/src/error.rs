@@ -14,6 +14,8 @@ pub struct Error {
     message: String,
     source: Option<Arc<dyn StdError + Send + Sync>>,
     carried: bool,
+    /// The failure came from opening or reading a record file;
+    /// the record may be unusable.
     record_read: bool,
 }
 
@@ -55,6 +57,7 @@ impl Error {
         self
     }
 
+    /// Whether this failure, or one it wraps, read a possibly unusable record.
     pub(crate) fn is_record_read(&self) -> bool {
         self.record_read
             || self.source.as_ref().is_some_and(|source| {
