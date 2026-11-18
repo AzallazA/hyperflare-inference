@@ -944,12 +944,31 @@ impl RequestScheduler {
     /// prefill step whose chunk `encoder_only_chunk` admits, with a twin of its capacity, unless
     /// `--scheduler-encoder-prefill false`. `commit` records the same decision.
     pub fn encoder_prefill_step(&self, step: &ScheduledStep) -> Result<bool> {
-        if !self.policy.encoder_prefill || step.kind != GraphKind::Prefill || step.mixed.is_some()
-            || step.lanes.len() != 1 || !self.encoder_prefill_catalog.contains(&step.token_capacity) {
+        if step.kind != GraphKind::Prefill || step.mixed.is_some() || step.lanes.len() != 1 {
             return Ok(false);
         }
         let lane = &step.lanes[0];
-        Ok(encoder_chunk(self.request(lane.request)?, lane.start_position, lane.tokens, self.encoder_window_guard))
+        Ok(self.encoder_lane(self.request(lane.request)?, lane.start_position, lane.tokens, step.token_capacity))
+    }
+
+    /// TP3 fork: a one-lane prefill chunk `[start, start + tokens)` on capacity `capacity` runs the
+    /// encoder-only twin: the switch is on, the package has the twin, the chunk qualifies
+    /// (`encoder_chunk`), and the full graph of that capacity has a measured cost. The last rule
+    /// makes cost discovery time a full chunk first, so the planner always holds a full-graph
+    /// bound for the twin's price (`policy::add_candidate`); the planner and `commit` share it.
+    pub(crate) fn encoder_lane(&self, request: &LiveRequest, start: u64, tokens: usize, capacity: usize) -> bool {
+        self.policy.encoder_prefill
+            && self.encoder_prefill_catalog.contains(&capacity)
+            && self.costs.duration(GraphKind::Prefill, 1, capacity).is_some_and(|nanos| nanos != 0)
+            && encoder_chunk(request, start, tokens, self.encoder_window_guard)
+    }
+
+    /// TP3 fork: the cost key a committed step is timed under: the twin's own `EncoderPrefill`
+    /// entry for an encoder-only chunk (when the package lists the twin), else the step's graph.
+    fn step_cost_key(&self, step: &ScheduledStep, encoder: bool) -> cost::Key {
+        let key = cost::Key::from_step(step);
+        let twin = cost::Key { kind: GraphKind::EncoderPrefill, ..key };
+        if encoder && self.costs.duration_key(twin).is_some() { twin } else { key }
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {
@@ -2268,7 +2287,9 @@ impl RequestScheduler {
         if fence <= self.submitted || fence.0 > i64::MAX as u64 {
             return Err("submission fences must increase within int64 range".into());
         }
-        let key = cost::Key::from_step(step);
+        // TP3 fork: the step is timed under the encoder-only decision below (an unknown request
+        // is refused later, after the window checks, so it is not an error here).
+        let key = self.step_cost_key(step, matches!(self.encoder_prefill_step(step), Ok(true)));
         let observed_at_ns = self.costs.observation(key).and_then(|(_, observed, _)| observed);
         let origin = match plan.origin {
             PlanOrigin::Ordinary if observed_at_ns.is_none() => PlanOrigin::Discovery,
@@ -2635,12 +2656,12 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        // TP3 fork: an encoder-only chunk is ~10 % shorter than its prefill graph; keeping it out
-        // of the shared Prefill estimate keeps full chunks priced right (encoder steps are
-        // planned at the full-chunk cost, a conservative overestimate). An unknown estimate still
-        // takes the sample, so discovery always terminates.
-        if !submission.encoder || self.costs.get(&submission.step).is_none_or(|nanos| nanos == 0) {
-            self.observe_execution(&submission.step, timing);
+        // TP3 fork: an encoder-only chunk is timed under its twin's own estimate, which prices
+        // eligible chunks (`policy::add_candidate`); the full Prefill estimate learns only from
+        // full chunks. Without a twin entry (test graph sets) the sample is dropped.
+        let key = self.step_cost_key(&submission.step, submission.encoder);
+        if !submission.encoder || key.kind == GraphKind::EncoderPrefill {
+            self.costs.observe_key(key, timing);
         }
         let step = submission.step;
         let now_ns = self.now_ns;

@@ -64,7 +64,7 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
     ready(&mut s, &handles);
     let candidate = Candidate { host_lengths: None, draft_tokens: 0, kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
         batch: 1, capacity: 1, packed_token_capacity: 1, prefill_capacity: 0, prefill_slot: None,
-        work: 0, duration_ns: MS, rate: ValueRate::new(MS, 1.0, 0.0), feedback: true,
+        work: 0, duration_ns: MS, rate: ValueRate::new(MS, 1.0, 0.0), feedback: true, encoder: false,
         };
     assert!(!s.dominates_padding(candidate, Candidate { batch: 4, capacity: 4, draft_tokens: 3, packed_token_capacity: 16, ..candidate }));
     assert!(!s.dominates_padding(candidate, Candidate { batch: 4, packed_token_capacity: 4, mask: 1 << handles[1].slot, ..candidate }));

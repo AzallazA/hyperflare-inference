@@ -245,6 +245,10 @@ impl ActionCosts {
     }
 
     pub fn observe(&mut self, step: &ScheduledStep, timing: ExecutionTiming) {
+        self.observe_key(Key::from_step(step), timing);
+    }
+
+    pub fn observe_key(&mut self, key: Key, timing: ExecutionTiming) {
         let Some(raw_sample) = timing.gpu_ns.into_iter().flatten().max().filter(|n| *n > 0) else {
             return;
         };
@@ -252,14 +256,6 @@ impl ActionCosts {
         if sample == 0 {
             return;
         }
-        let key = Key {
-            drafts: step.draft_tokens,
-            kind: step.kind,
-            batch: step.batch_capacity,
-            tokens: step.token_capacity,
-            prefill: step.prefill_capacity(),
-            packed: step.packed_token_capacity,
-        };
         if let Some(&index) = self.index.get(&key) {
             let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);

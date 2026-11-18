@@ -175,12 +175,15 @@ pub(super) struct Candidate {
     pub rate: ValueRate,
     pub feedback: bool,
     pub host_lengths: Option<[usize; REQUEST_LANES]>,
+    /// TP3 fork: a one-lane prefill chunk that runs its graph's encoder-only twin, priced and
+    /// timed under the twin's `EncoderPrefill` estimate.
+    pub encoder: bool,
 }
 
 impl Candidate {
     pub(super) fn cost_key(self) -> cost::Key {
         cost::Key { drafts: self.draft_tokens,
-            kind: self.kind,
+            kind: if self.encoder { GraphKind::EncoderPrefill } else { self.kind },
             batch: self.batch,
             tokens: self.capacity,
             prefill: self.prefill_capacity,
@@ -217,7 +220,7 @@ impl RequestScheduler {
         let left = physical(smaller);
         let right = physical(larger);
         if smaller.kind != larger.kind || smaller.mask != larger.mask
-            || smaller.prefill_slot != larger.prefill_slot
+            || smaller.prefill_slot != larger.prefill_slot || smaller.encoder != larger.encoder
             || left == right || left.iter().zip(right).any(|(a, b)| *a > b) {
             return false;
         }
@@ -980,13 +983,50 @@ impl RequestScheduler {
         kind: GraphKind,
         batch: usize,
         capacity: usize,
-        mask: u64,
+        mut mask: u64,
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
     ) {
         let Some(duration_ns) = self.costs.duration(kind, batch, capacity) else {
             return;
         };
+        // TP3 fork: a prompt whose next chunk on this capacity runs the encoder-only twin is
+        // offered at the twin's own estimate (unmeasured: discovery), never above the full graph's,
+        // since the twin runs a prefix of its work. Pricing it at the full-chunk cost made the
+        // twin capacity a near-tie with the next smaller capacity, and a single slow first sample
+        // (the first large prefill after boot) locked it out for good.
+        if kind == GraphKind::Prefill && batch == 1
+            && let Some(twin_ns) = self.costs.duration(GraphKind::EncoderPrefill, 1, capacity)
+        {
+            let eligible = bits(mask).filter(|&slot| {
+                let r = self.slots[slot].request.as_ref().unwrap();
+                self.encoder_lane(r, r.scheduled_consumed, self.prefill_work(r, capacity), capacity)
+            }).fold(0, |mask, slot| mask | 1 << slot);
+            if eligible != 0 {
+                let price = if twin_ns == 0 { 0 } else { twin_ns.min(duration_ns) };
+                self.add_priced_candidate(output, kind, batch, capacity, eligible, values, age_price, price, true);
+                mask &= !eligible;
+                if mask == 0 {
+                    return;
+                }
+            }
+        }
+        self.add_priced_candidate(output, kind, batch, capacity, mask, values, age_price, duration_ns, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_priced_candidate(
+        &self,
+        output: &mut Vec<Candidate>,
+        kind: GraphKind,
+        batch: usize,
+        capacity: usize,
+        mask: u64,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+        duration_ns: u64,
+        encoder: bool,
+    ) {
         let mut offers = [(0usize, 0.0); REQUEST_LANES];
         let mut count = 0;
         for slot in bits(mask) {
@@ -1024,7 +1064,7 @@ impl RequestScheduler {
         let drafts = if kind == GraphKind::Speculative { capacity - 1 } else { 0 };
         let packed = if kind == GraphKind::Speculative { batch * capacity } else { 0 };
         let feedback = !self.costs.is_fresh(cost::Key { drafts,
-            kind, batch, tokens: capacity, prefill: 0, packed,
+            kind: if encoder { GraphKind::EncoderPrefill } else { kind }, batch, tokens: capacity, prefill: 0, packed,
         })
             || !matches!(kind, GraphKind::Decode | GraphKind::Speculative)
             || bits(selected).any(|slot| {
@@ -1069,6 +1109,7 @@ impl RequestScheduler {
             duration_ns,
             rate,
             feedback,
+            encoder,
         });
     }
 
@@ -1227,6 +1268,7 @@ impl RequestScheduler {
                     duration_ns,
                     rate: ValueRate::new(duration_ns, expected, age_price),
                     feedback: true,
+                    encoder: false,
                 });
             }
         }

@@ -478,3 +478,100 @@ fn encoder_capacities_used_under_mixed_traffic() {
     eprintln!("encoder-only chunks by capacity: {used:?}");
     assert!(used.contains_key(&4096));
 }
+
+/// A fresh TP3 server: every graph cost unmeasured, the package's encoder twin of 4096 listed (as
+/// `runtime.rs` gives the scheduler every manifest graph, twins included).
+fn fresh_ds41_server() -> RequestScheduler {
+    let mut s = RequestScheduler::new([41; 32],
+        SchedulerLimits { max_active: 1, request_slots: 1, max_sequence_tokens: 65536,
+            prefill_chunk_size: 4096, pages: 32768, snapshots: 256 },
+        SchedulerCapabilities { completion_token_capacity: 16, vocabulary: 1024, page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(), draft_pages_per_request: 0,
+            completion_inputs: vec![], speculative_allocations: vec![], state_rows_per_request: None }).unwrap();
+    s.prefill_graphs(&prefill_capacities(4096).collect::<Vec<_>>()).unwrap();
+    s.enable_speculation(&[1, 6]).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    let mut twin = graphs.iter().find(|g| g.kind == GraphKind::Prefill && g.token_capacity == 4096).unwrap().clone();
+    twin.kind = GraphKind::EncoderPrefill;
+    twin.name = "encoder_prefill4096".into();
+    graphs.push(twin);
+    s.graph_durations(&graphs).unwrap();
+    s.encoder_prefill_graphs(&[4096]).unwrap();
+    s
+}
+
+/// The suffix-proof warm-up on a fresh server: unique raw prompts of `tokens`, one after another.
+/// GPU model: a full chunk costs 1 ms + 20 us per graph row, its encoder twin `ratio` of that; the
+/// first launch of `cold` (the first large full prefill, or the twin) pays 50 % more (lazy
+/// loading and first touches after boot). Returns per prompt (encoder chunks, (capacity, encoder)).
+fn warm_up(ratio: f64, cold: Option<bool>, tokens: usize) -> (RequestScheduler, Vec<(u64, Vec<(usize, bool)>)>) {
+    let mut s = fresh_ds41_server();
+    let mut cold = cold;
+    let mut prompts = Vec::new();
+    for n in 0..4u32 {
+        let before = s.stats().encoder_prefill_chunks;
+        let h = s.admit(RequestSpec {
+            prompt: (0..tokens as u32).map(|t| (t * 7 + n * 13 + t / 97) % 1000 + 1).collect(),
+            message_boundaries: vec![], conditioning: vec![], max_new_tokens: 1, grammar_constrained: false,
+            host_stops: false, prompt_logprobs: false, growable_output: false, tools: false,
+            reasoning_prompt: false }).unwrap();
+        let mut chunks = Vec::new();
+        for _ in 0..400 {
+            if s.request(h).is_err() {
+                break;
+            }
+            let plan = s.plan().expect("the warm-up prompt makes progress");
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            let encoder = s.submitted_encoder(fence).unwrap();
+            let mut ns = match plan.kind {
+                GraphKind::Prefill => 1_000_000.0 + 20_000.0 * plan.token_capacity as f64,
+                GraphKind::Decode | GraphKind::Speculative => 12.0 * MS as f64,
+                _ => MS as f64 / 10.0,
+            } * if encoder { ratio } else { 1.0 };
+            if plan.kind == GraphKind::Prefill && plan.token_capacity >= 1024 && cold == Some(encoder) {
+                ns *= 1.5;
+                cold = None;
+            }
+            if plan.kind == GraphKind::Prefill {
+                chunks.push((plan.token_capacity, encoder));
+            }
+            finish_step_timed(&mut s, &plan, fence, ns as u64);
+        }
+        prompts.push((s.stats().encoder_prefill_chunks - before, chunks));
+    }
+    (s, prompts)
+}
+
+#[test]
+fn a_slow_first_sample_does_not_lock_encoder_chunks_out_of_the_warm_up() {
+    // The 11-17 mini warm-up: four unique 24,000-token prompts ran +1, +0, +0, +0 encoder chunks.
+    // Discovery timed the first 4096 chunk (the first large prefill after boot) on the twin;
+    // that one slow sample priced 4096 below 3584 per token, encoder samples were then dropped,
+    // and every later prompt ran 3584-row chunks, which have no twin. Now discovery times a full
+    // 4096 chunk first, the twin learns its own estimate, and an eligible chunk is priced at the
+    // twin (never above the full graph): every prompt after the first runs the 5 chunks the
+    // window rule allows (24,000 = 5 x 4096 + 3520).
+    let full = cost::Key { drafts: 0, kind: GraphKind::Prefill, batch: 1, tokens: 4096, prefill: 0, packed: 0 };
+    let twin = cost::Key { kind: GraphKind::EncoderPrefill, ..full };
+    for ratio in [0.88, 0.5] {
+        for cold in [None, Some(false), Some(true)] {
+            let (s, prompts) = warm_up(ratio, cold, 24_000);
+            let label = format!("ratio {ratio} cold {cold:?}: {prompts:?}");
+            assert_eq!(prompts[0].1[0], (4096, false), "discovery times the full graph first: {label}");
+            assert_eq!(prompts[0].1[1], (4096, true), "then the twin: {label}");
+            for (encoders, chunks) in &prompts[1..] {
+                assert_eq!(*encoders, 5, "{label}");
+                assert_eq!(chunks.iter().filter(|chunk| chunk.1).count(), 5, "{label}");
+                assert!(chunks.iter().filter(|chunk| chunk.1).all(|chunk| chunk.0 == 4096), "{label}");
+            }
+            // Each estimate holds only its own graph's samples.
+            let full_ns = s.costs.duration_key(full).unwrap();
+            let twin_ns = s.costs.duration_key(twin).unwrap();
+            assert_eq!(full_ns, if cold == Some(false) { 124_380_000 } else { 82_920_000 }, "{label}");
+            if cold != Some(true) {
+                assert_eq!(twin_ns, (82_920_000.0 * ratio) as u64, "{label}");
+            }
+        }
+    }
+}
