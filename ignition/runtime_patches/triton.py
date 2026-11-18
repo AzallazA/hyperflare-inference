@@ -29,7 +29,9 @@ def initialize_b12x_worker(*args):
     apply_triton()
     # TP3 fork: FLARE_DS41_MLA_DECODE_SPLITS (inherited) must shape the decode programs workers discover and compile
     # exactly as in the main process, or the main process asks for programs no worker compiled.
-    from ignition.components import mla_decode_splits
+    # FLARE_DS41_MLA_H24 likewise selects which decode programs exist (24-head one-launch vs 16 + 8 grids).
+    from ignition.components import mla_decode_splits, mla_h24_decode
 
     mla_decode_splits.install_from_environment()
+    mla_h24_decode.install_from_environment()
     _initialize_worker(*args)

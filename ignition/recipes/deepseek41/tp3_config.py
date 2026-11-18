@@ -40,7 +40,8 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "markov_tile_rows", "mla_decode_splits")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "markov_tile_rows", "mla_decode_splits",
+                     "mla_h24")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
@@ -184,6 +185,13 @@ class TP3Config:
     decode split count per prepared row count for target attention. Changes output bits (BF16 split partials), so it
     is recorded when set; preparation refuses a record that disagrees with the hook installed in this process.
     None = b12x's tuned split geometry (base). Export-time only (decode lever 4a, 2026-11-18)."""
+    mla_h24: str | None = None
+    """Record of ``FLARE_DS41_MLA_H24`` (canonical ``ROWS:0|1,...``; components/mla_h24_decode.py): prepared row counts
+    whose DSV41 BF16 target decode runs all 24 heads in one launch (one CTA per row and split gathers each KV window
+    once for both head tiles) instead of b12x's 16-head grid + 8-head remainder grid. Same values as 16 + 8 at the
+    same split count by construction (GPU check: tests/components/test_mla_h24_decode_cuda.py); recorded when set
+    because it changes the compiled programs, and preparation refuses a record that disagrees with the installed hook.
+    None = 16 + 8 grids (base). Export-time only (decode lever 4b, 2026-11-18)."""
     markov_tile_rows: int | None = None
     """Markov proposal score tiles cover this many request rows per program and read each head tile once for all of
     them (vocabulary_sampling._score_tiles_rows) instead of once per row (173 us per 5 draft steps at c16, decode trace
@@ -407,6 +415,9 @@ class TP3Config:
             if not policy:
                 raise ValueError("TP3 config: mla_decode_splits must name at least one ROWS:SPLITS pair or be None")
             object.__setattr__(self, "mla_decode_splits", format_policy(policy))
+        if self.mla_h24 is not None:
+            from ignition.components.mla_h24_decode import format_policy as h24_format, parse_policy as h24_parse
+            object.__setattr__(self, "mla_h24", h24_format(h24_parse(self.mla_h24)))  # raises on an empty selection
         if self.markov_tile_rows is not None and (type(self.markov_tile_rows) is not int or self.markov_tile_rows < 1):
             raise ValueError(f"TP3 config: markov_tile_rows must be a positive integer or None, not {self.markov_tile_rows!r}")
         if self.markov_stage_rows and not self.markov_embed_host:
@@ -521,6 +532,19 @@ class TP3Config:
                              f"split policy is {hook.format_policy(installed)!r}; set {hook.ENV} before the export")
         return self
 
+    def check_mla_h24(self, installed=None):
+        """Raise when the recorded 24-head decode selection differs from the hook installed in this process
+        (``installed``; default: read from b12x's decode module)."""
+        from ignition.components import mla_h24_decode as hook
+        if installed is None:
+            import ignition.components.compressed_mla  # noqa: F401  (installs the hook from the environment)
+            installed = hook.installed_policy()
+        recorded = hook.parse_policy(self.mla_h24)
+        if tuple(installed) != recorded:
+            raise ValueError(f"TP3 config: mla_h24={self.mla_h24!r} but the installed DSV41 24-head decode selection "
+                             f"is {hook.format_policy(installed)!r}; set {hook.ENV} before the export")
+        return self
+
     def check_mhc_pdl(self, compiled=None):
         """Raise when ``mhc_pdl`` disagrees with b12x's imported value (``compiled``; default: read from the b12x mHC
         kernel module, importing it). A mismatch means B12X_MHC_PDL changed after b12x was imported, or the config was
@@ -583,6 +607,7 @@ class TP3Config:
             markov_stage_rows=flag("MARKOV_STAGE_ROWS"),
             markov_tile_rows=optional("MARKOV_TILE_ROWS"),
             mla_decode_splits=get("MLA_DECODE_SPLITS") or None,
+            mla_h24=get("MLA_H24") or None,
             draft_vocab=None if not get("DRAFT_VOCAB") else Path(get("DRAFT_VOCAB")),
             ar_rows=integer("AR_ROWS"),
             ar_part_rows=integer("AR_PART_ROWS"),

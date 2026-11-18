@@ -22,6 +22,9 @@
 #            (B12X_MLA_DECODE_REMAINDER_STREAM; ignition hook, no b12x change); 0 = serial
 #   MLA_SPLITS  ROWS:SPLITS,... = DSV41 decode split count per prepared row count (FLARE_DS41_MLA_DECODE_SPLITS;
 #            ignition hook, no b12x change; e.g. 9:10,18:5,28:10,37:5); unset = b12x's tuned split geometry
+#   H24      ROWS:0|1,... = prepared row counts whose DSV41 decode runs all 24 heads in one launch (FLARE_DS41_MLA_H24;
+#            ignition kernel, no b12x change; same values as 16 + 8 at the same split count; e.g. 9:0,80:1);
+#            unset = b12x's 16-head + 8-head grids
 #   MHC_PDL  1 (default) = programmatic dependent launch in b12x's mHC norm kernels (B12X_MHC_PDL); 0 = off
 #   AR_PART_ROWS, ENGRAM_PART_ROWS  prefill all-reduce part caps for the decoder and the Engram projection (default
 #            768 each = 5 x 768 + 256 per 4096-row chunk instead of 4 x 1024; 0 = halving, the 20261111 layout)
@@ -117,6 +120,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
 [ -n "${MARKOV_TILE:-}" ] && export FLARE_DS41_MARKOV_TILE_ROWS=$MARKOV_TILE
 [ -n "${MLA_SPLITS:-}" ] && export FLARE_DS41_MLA_DECODE_SPLITS=$MLA_SPLITS
+[ -n "${H24:-}" ] && export FLARE_DS41_MLA_H24=$H24
 [ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1

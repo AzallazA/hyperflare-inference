@@ -11,7 +11,9 @@ sink, provided output, remainder grid on a side stream = B12X_MLA_DECODE_REMAIND
     FLARE_DS41_MLA_DECODE_SPLITS hook; B12X_MLA_SM120_NUM_SPLITS does not reach DSV41 decode);
   * 16 heads (one grid: the lower bound for a one-launch 24-head CTA) at S = 10 and 5, and S = 4 and 2 at >= 40 rows;
   * FP8 arithmetic with 8-head blocks (b12x's existing one-launch 3 x 8 path; numerics differ, timing reference only);
-  * remainder stream off (serial grids) at S = 10, to price the stream itself.
+  * remainder stream off (serial grids) at S = 10, to price the stream itself;
+  * --h24 / --h24-only: the one-launch 24-head kernel (ignition/components/mla_h24_decode.py, FLARE_DS41_MLA_H24) at
+    every S of the sweep (decode lever 4b). --h24-only keeps just the 24-head 16 + 8 and H24 arms.
 
 Cold gathers (review M1): every case binds SETS = 20 index sets (own SWA pages, page-table rows and candidates per set,
 indexed pages drawn from a 1.2 GB pool built once) and the graph cycles through them, so consecutive calls never
@@ -20,7 +22,9 @@ re-read the same KV records; serving reads each layer's own KV.
 Self-checks (review M2), exit 1 on failure:
   * every forced BF16 case: the hook applied, and the planned split count equals the forced one;
   * the serial arm's output equals the 10-split output bit for bit;
-  * no forced case differs from 10 splits by more than 5e-2 (expected: about one BF16 step of a partial, <= ~1e-2).
+  * no forced case differs from 10 splits by more than 5e-2 (expected: about one BF16 step of a partial, <= ~1e-2);
+  * every H24 case: the hook lowered the decode to the H24 program (applied, and the captured graph ran the
+    prepared H24 program), and its output equals the 16 + 8 output at the same split count bit for bit.
 Informational: 24-head 10-split times vs the 181718 trace (6.4 / 11.5 / 17 / 22.9 us at <=9 / 10-18 / 19-28 / 29-37
 rows), flagged when off by more than 10 %.
 
@@ -29,6 +33,7 @@ Usage (GPUs exclusive: stop the server first; private compile caches are require
       B12X_COMPILE_CACHE_DIR=<dir>/b12x TRITON_CACHE_DIR=<dir>/triton \\
       python tp3-tools/attn_split_bench.py --out <dir>/attn-splits.tsv [--quick]
   --quick: rows 5,13,23,32,40,80 and S 10,5,4,3,2 (about 6-8 min including compiles); full: about 12-15 min.
+  --h24 adds 5 (quick) / 6 (full) H24 cases per row count (about +2 / +4 min); --h24-only --quick about 5 min.
 """
 
 import argparse
@@ -180,14 +185,17 @@ def time_graph(call, *, calls, replays=60, warmup=10):
 
 
 def run_case(device, pool, swa_page, rows, heads, splits, variant, cache_dir):
-    """variant: bf16 (production), fp8h8 (b12x one-launch 3 x 8 heads, FP8 arithmetic), serial (stream off)."""
+    """variant: bf16 (production), fp8h8 (b12x one-launch 3 x 8 heads, FP8 arithmetic), serial (stream off),
+    h24 (one-launch 24-head kernel, remainder stream on as in production)."""
     import torch
     from b12x.preparation import PreparationSession
-    from ignition.components import mla_decode_splits, mla_remainder_stream
+    from ignition.components import mla_decode_splits, mla_h24_decode, mla_remainder_stream
 
+    mla_h24_decode.uninstall()  # the remainder-stream hook must sit under the H24 hook, never above it
     os.environ[mla_remainder_stream.ENV] = "0" if variant == "serial" else "1"
     mla_remainder_stream.install()
     hook = mla_decode_splits.install(((rows, splits),)) if splits is not None else None
+    fused = mla_h24_decode.install(((rows, True),)) if variant == "h24" else None
     generator = torch.Generator(device=device).manual_seed(4118 + rows)
     swa, sets, sink = build_sets(rows, heads, device, generator, swa_page)
     try:
@@ -201,15 +209,25 @@ def run_case(device, pool, swa_page, rows, heads, splits, variant, cache_dir):
             result = output.float().clone()
     finally:
         mla_decode_splits.uninstall()
+        mla_h24_decode.uninstall()
     applied = list(hook.applied) if hook else []
-    return dict(rows=rows, heads=heads, forced_splits=splits, variant=variant, us=round(median, 3),
-                us_p10=round(p10, 3), applied=applied), result
+    info = dict(rows=rows, heads=heads, forced_splits=splits, variant=variant, us=round(median, 3),
+                us_p10=round(p10, 3), applied=applied)
+    if fused is not None:
+        info.update(h24_applied=list(fused.applied), h24_replays=fused.replays)
+    return info, result
 
 
-def cases(rows_list, splits_list):
+def cases(rows_list, splits_list, h24="off"):
+    """h24: off | on (add H24 arms) | only (24-head 16 + 8 and H24 arms only)."""
     for rows in rows_list:
         for splits in splits_list:
             yield rows, 24, splits, "bf16"
+        if h24 != "off":
+            for splits in splits_list:  # after the 16 + 8 arm at the same split count (its bit-identity reference)
+                yield rows, 24, splits, "h24"
+        if h24 == "only":
+            continue
         for splits in (10, 5) + ((4, 2) if rows >= 40 else ()):
             yield rows, 16, splits, "bf16"
         yield rows, 24, None, "fp8h8"
@@ -220,6 +238,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--h24", action="store_true", help="add one-launch 24-head (H24) arms at every split count")
+    parser.add_argument("--h24-only", action="store_true", help="only the 24-head 16 + 8 and H24 arms")
     parser.add_argument("--cache-dir", default=None, help="b12x preparation cache (default: <out dir>/prep-cache)")
     args = parser.parse_args()
     preflight()
@@ -232,18 +252,32 @@ def main():
     os.makedirs(cache_dir, exist_ok=True)
     rows_list, splits_list = (ROWS_QUICK, SPLITS_QUICK) if args.quick else (ROWS_FULL, SPLITS_FULL)
     pool, swa_page = build_pool(device, torch.Generator(device=device).manual_seed(1118))
-    reference, failures, times = {}, [], {}
+    h24_mode = "only" if args.h24_only else ("on" if args.h24 else "off")
+    reference, same_split, failures, times = {}, {}, [], {}
     started = time.time()
     with open(args.out, "w") as handle:
         handle.write("rows\theads\tvariant\tforced_splits\tplanned_splits\tus_median\tus_p10\t"
                      "max_abs_diff_vs_S10\tapplied\n")
-        for rows, heads, splits, variant in cases(rows_list, splits_list):
+        for rows, heads, splits, variant in cases(rows_list, splits_list, h24_mode):
             info, out = run_case(device, pool, swa_page, rows, heads, splits, variant, cache_dir)
             key = (rows, heads)
             if variant == "bf16" and splits == 10:
                 reference[key] = out
+            if variant == "bf16" and heads == 24:
+                same_split[(rows, splits)] = out
             diff = (out - reference[key]).abs().max().item() if key in reference else float("nan")
             planned = info["applied"][-1][2] if info["applied"] else None
+            if variant == "h24":
+                twin = same_split.get((rows, splits))
+                same = twin is not None and torch.equal(out.view(torch.int32), twin.view(torch.int32))
+                info["bit_identical_vs_16p8"] = same
+                if not same:
+                    gap = float("nan") if twin is None else (out - twin).abs().max().item()
+                    failures.append(f"rows {rows} H24 S{splits}: differs from 16 + 8 at S{splits} (max {gap:.3e})")
+                if info["h24_applied"] != [(rows, planned)] * len(info["h24_applied"]) or not info["h24_applied"] \
+                        or info["h24_replays"] < 1:
+                    failures.append(f"rows {rows} H24 S{splits}: hook applied {info['h24_applied']}, "
+                                    f"prepared runs {info['h24_replays']}")
             if variant != "fp8h8":
                 if not info["applied"] or planned != splits:
                     failures.append(f"rows {rows} heads {heads} {variant} S{splits}: planned {planned}, "
@@ -268,6 +302,15 @@ def main():
                     f"fp8h8={times.get((rows, 24, 'fp8h8', None))} serial={times.get((rows, 24, 'serial', 10))}")
             handle.write("# " + line + "\n")
             print(line, flush=True)
+            fused = {s: us for (r, h, v, s), us in times.items() if r == rows and v == "h24"}
+            if fused:
+                h_us, h_s = min((us, s) for s, us in fused.items())
+                same = " ".join(f"S{s}:{times[(rows, 24, 'bf16', s)]}->{us}" for s, us in sorted(fused.items(),
+                                key=lambda item: -item[0]) if (rows, 24, "bf16", s) in times)
+                line = (f"H24 rows={rows} best=S{h_s} {h_us} us vs 16+8 best S{best[1]} {best[0]} us "
+                        f"({h_us - best[0]:+.2f}) vs S10 {ours} us ({h_us - ours:+.2f}); same-S {same}")
+                handle.write("# " + line + "\n")
+                print(line, flush=True)
     if failures:
         print("SELF-CHECK FAILED:\n  " + "\n  ".join(failures), flush=True)
         sys.exit(1)
