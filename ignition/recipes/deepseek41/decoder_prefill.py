@@ -66,3 +66,72 @@ class PreparedDecoderSuffix:
             max_query_tokens=self.window,
         )
         return DecoderSuffix(metadata, indices, live, torch.where(skipped > 0, starts, 0))
+
+
+def encoder_capacities(requested, prefill_capacities, *, chunk):
+    """TP3 (``tp3.prefill_skip_suffix``): the prefill capacities that get an encoder-only twin.
+
+    Every requested size must be a captured prefill capacity above the decoder suffix window, so the twin has the
+    same token capacity and inputs as an ordinary prefill graph. None or () -> no twins."""
+    if not requested:
+        return ()
+    missing = [capacity for capacity in requested if capacity not in prefill_capacities or capacity <= 128]
+    if missing:
+        raise ValueError(f"FLARE_DS41_PREFILL_SKIP_SUFFIX {','.join(map(str, requested))}: "
+                         f"{','.join(map(str, missing))} not captured prefill capacities above 128 "
+                         f"(ladder {','.join(map(str, prefill_capacities))} for chunk {chunk})")
+    return tuple(sorted(requested, reverse=True))
+
+
+class PreparedEncoderGeneration:
+    """TP3 encoder-only prefill (graph kind ``encoder_prefill``, ``tp3.prefill_skip_suffix``).
+
+    The ordinary prefill generation (``PreparedGeneration``) without the decoder suffix: validate and pack the
+    chunk, run ``PreparedDecoder(encoder_only=True)`` (layers through the global-KV boundary, Engram history
+    commit), consume the prompt tokens and record completion without a vocabulary projection.
+
+    State contract (Helios ``encoder_only_chunk`` decides when this may run):
+    - written as by the ordinary graph: every row's KV/window/compressor/Engram state of layers 0-19, layer 20's
+      compressed KV, index keys and latent pages (the global-KV sources 2/8/14/20 serve every later layer), the
+      consumed-token count and the completion record (no token: the chunk is not the prompt's last);
+    - left stale: the SWA windows of layers 20-39, the DSpark draft ring and ``last_hidden``. The next chunk is a
+      prefill longer than the window (Helios refuses a <= 128-row successor and any snapshot at the stale
+      endpoint), so it starts a fresh replay boundary for layers >= 20, rewrites all 128 ring slots and saves
+      ``last_hidden``.
+    """
+
+    def __init__(self, decoder, batch, records, frame, sequence, *, runtime, coordinator, session, name):
+        from ignition.components.collectives import PreparedAllReduce
+        from ignition.components.sampling import PreparedSampling
+
+        if not getattr(decoder, "encoder_only", False):
+            raise ValueError("encoder-only generation requires an encoder-only decoder")
+        self.decoder, self.batch = decoder, batch
+        self.validation = PreparedAllReduce(batch.validation_input, batch.validation_sum, runtime=runtime,
+            coordinator=coordinator, session=session, name=name + ".validation")
+        b, rows = batch.inputs, batch.rows
+        # Only the record kernel (SAMPLE=False) runs: it writes the consumption record of each live row.
+        self.completion = PreparedSampling(decoder.scratch.logits, batch.requests, b.row_slot_ids[:rows],
+            b.row_generations[:rows], b.live_rows, records, frame, sequence, sample_enabled=b.sample_enabled[:rows])
+        self.completion.prepare()
+        self.completion.functional(session=session)
+        decoder.release_outputs()
+        self.validation.functional(session=session)
+        self.batch.functional()
+
+    def __call__(self):
+        self._run()
+
+    def observe(self):
+        """Forward-local packed metadata for diagnostic consumers (there is no hidden state or logits)."""
+        return self._run(observe=True)
+
+    def _run(self, *, observe=False):
+        validation, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation), present=present)
+        self.decoder(metadata)
+        self.batch.finish(metadata)
+        self.completion.record_completion()
+        if observe:
+            return {"target." + name: getattr(metadata, name) for name in
+                    ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}

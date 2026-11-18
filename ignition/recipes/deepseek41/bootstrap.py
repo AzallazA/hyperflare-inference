@@ -49,6 +49,7 @@ from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import RECIPE
 from .attention import INDEXER_QUERY_ROWS
 from .decoder import PreparedDecoder, Scratch, DraftScratch, check_brrr_decisions
+from .decoder_prefill import PreparedEncoderGeneration, encoder_capacities
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -198,7 +199,7 @@ class PreparationConfig:
                     vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
-        self.prefill_capacities
+        encoder_capacities(self.tp3.prefill_skip_suffix, self.prefill_capacities, chunk=self.prefill_chunk_size)
         drafting = self.dspark and self.draft_tokens > 0
         for name in ("packed_verification",):
             value = getattr(self, name)
@@ -631,6 +632,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
+    # TP3 (tp3.prefill_skip_suffix): encoder-only twins of these prefill capacities (decoder_prefill.py).
+    encoders = encoder_capacities(tp3.prefill_skip_suffix, config.prefill_capacities, chunk=config.prefill_chunk_size)
+    count += len(modes) * len(encoders)
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -677,6 +681,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         context_factory=PreparedContext if kind == "scored_prefill" else context_factory)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
+            for capacity in encoders:
+                # Same metadata, storage, inputs and prefill runtime as prefill<capacity>; no head or sampling.
+                name = f"encoder_prefill{capacity}" + suffix
+                metadata[name] = Metadata.allocate(capacity, 1, blocks, device)
+                scratch[name] = prefill_storage.rows(capacity, 1)
+                decoder = decoder_factory(mode_weights, tables, scratch[name], metadata[name], pool, mode="prefill",
+                    runtime=prefill_collective, vocabulary_runtime=vocabulary_collective,
+                    coordinator=coordinator, session=session, name=name, workspace=arena, encoder_only=True)
+                batch = PreparedBatch(inputs, requests, metadata[name], mode="prefill", shard=shard, pool=pool,
+                    input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
+                    validate_prefill=vision_state.validate_prefill if vision_state is not None else None)
+                forward = PreparedEncoderGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
+                    coordinator=coordinator, session=session, name=name + ".generation")
+                fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if vision_state is not None else forward_inputs
+                add(name, forward, "encoder_prefill", 1, capacity, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
@@ -792,7 +811,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
+            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision", "encoder_prefill"))
     finally:
         if feature_pool is not None:
             feature_pool.materialize()

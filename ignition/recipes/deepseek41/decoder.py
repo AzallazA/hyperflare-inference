@@ -191,6 +191,13 @@ class PreparedDecoderBoundary:
         self.global_kv(normalized, indexer, metadata, indices.compressed(self.global_kv.ratio))
         return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
 
+    def global_only(self, incoming, pre_mix, metadata, indices, indexer):
+        """TP3 encoder-only prefill (``PreparedDecoder(encoder_only=True)``): the same mHC and global KV on every row,
+        without packing or gathering the decoder suffix (nothing after the boundary runs)."""
+        attn_mix = torch.empty_like(pre_mix)
+        _, _, _, normalized = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+        self.global_kv(normalized, indexer, metadata, indices.compressed(self.global_kv.ratio))
+
 
 class PreparedLayer:
     # TP3 fork attributes; class defaults keep the upstream behaviour (one router-ID-ordered bank, no debug hooks).
@@ -503,7 +510,7 @@ class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
-                 tp3=None):
+                 tp3=None, encoder_only=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
@@ -519,6 +526,11 @@ class PreparedDecoder:
                     or any(source.layer > decoder_start for source in weights.config.sources)):
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
             self.packing = PreparedDecoderSuffix(metadata)
+        # TP3 (tp3.prefill_skip_suffix): an encoder-only twin stops after the boundary's global KV; it builds the
+        # layers through the boundary layer (whose first index selector writes the index keys) and nothing after.
+        self.encoder_only = encoder_only
+        if encoder_only and self.packing is None:
+            raise ValueError("an encoder-only prefill needs a prefill chunk larger than the decoder suffix")
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch
         if self.packing is not None:
@@ -534,7 +546,8 @@ class PreparedDecoder:
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
-        self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
+        self.auxiliary = None if encoder_only else torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16,
+                                                               device=metadata.positions.device)
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
         # TP3 (tp3.embed_rows): decode and verification graphs gather the host-parked table's rows with one
         # vectorised launch (host_embedding.py, same values); prefill graphs and the default keep b12x's lookup.
@@ -570,7 +583,8 @@ class PreparedDecoder:
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
         self.layers, carry = [], False
-        for index, layer in enumerate(weights.layers):
+        built = weights.layers[:decoder_start + 1] if encoder_only else weights.layers
+        for index, layer in enumerate(built):
             boundary = replay_start = None
             layer_scratch, layer_metadata = scratch, metadata
             if self.packing is not None and index >= decoder_start:
@@ -608,8 +622,10 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
             logits_dtype=torch.float32)
-        self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
-            coordinator=coordinator, session=session, name=name, workspace=workspace)
+        self.head = None
+        if not encoder_only:
+            self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
+                coordinator=coordinator, session=session, name=name, workspace=workspace)
         self.window_metadata.functional()
         if self.suffix_window_metadata is not None:
             self.suffix_window_metadata.functional()
@@ -663,13 +679,17 @@ class PreparedDecoder:
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         # Each draft target layer's feedback is copied into its whole 5120-column slice of every row below
         # (rows match or broadcast); every slice is written when every target layer is in this stack.
-        auxiliary = (torch.empty if all(layer < len(self.layers) for layer in self.aux_layers) else torch.zeros)(
+        auxiliary = None if self.encoder_only else (
+            torch.empty if all(layer < len(self.layers) for layer in self.aux_layers) else torch.zeros)(
             self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
         engram_projected = None  # TP3 tp3.engram_side_layers: projection handed from the previous layer
         mma_pads = allocate_mma_pads(self.mma_pad_layouts, embedding.device)  # TP3 tp3.mma_pad_once; None = off
         for index, layer in enumerate(self.layers):
             boundary = None
+            if layer.boundary is not None and self.encoder_only:
+                layer.boundary.global_only(incoming, pre_mix, metadata, indices, layer.attention.selectors[0])
+                break
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
@@ -691,6 +711,9 @@ class PreparedDecoder:
                 **({} if mma_pads is None else {"mma_pads": mma_pads}))
             engram_projected = handoff[0] if handoff else None
             records.append(record)
+        if self.encoder_only:
+            self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+            return None
         residual, = incoming
         samples = metadata.sample_indices
         head_residual = residual if self.compact_head else residual[samples]

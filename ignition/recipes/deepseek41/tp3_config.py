@@ -40,11 +40,15 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
 RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host")
+
+# FLARE_DS41_PREFILL_SKIP_SUFFIX=1: the prefill capacities that get an encoder-only twin (the sizes that end the
+# non-final chunks of long cold prompts at the 4096 chunk); a comma list names them explicitly.
+SKIP_SUFFIX_DEFAULT = (3072, 3584, 4096)
 
 # Engram table layouts at export (``engram_tables``).
 ENGRAM_TABLES = ("auto", "shared", "partitioned")
@@ -123,7 +127,7 @@ def format_layers(layers) -> str:
     return ",".join(parts)
 
 
-def parse_capacities(text: str) -> tuple[int, ...] | None:
+def parse_capacities(text: str, name: str = "PREFILL_GRAPHS") -> tuple[int, ...] | None:
     """``"128,256,1024"`` -> (128, 256, 1024); "" -> None. Order and range are checked by the config."""
     text = text.strip()
     if not text:
@@ -131,7 +135,15 @@ def parse_capacities(text: str) -> tuple[int, ...] | None:
     try:
         return tuple(int(part) for part in text.split(","))
     except ValueError:
-        raise ValueError(f"FLARE_DS41_PREFILL_GRAPHS={text!r}: expected comma-separated token capacities") from None
+        raise ValueError(f"FLARE_DS41_{name}={text!r}: expected comma-separated token capacities") from None
+
+
+def parse_skip_suffix(text: str) -> tuple[int, ...] | None:
+    """FLARE_DS41_PREFILL_SKIP_SUFFIX: "" / "0" -> None (off), "1" -> ``SKIP_SUFFIX_DEFAULT``, else a capacity list."""
+    text = text.strip()
+    if text in ("", "0"):
+        return None
+    return SKIP_SUFFIX_DEFAULT if text == "1" else parse_capacities(text, "PREFILL_SKIP_SUFFIX")
 
 
 @dataclass(frozen=True)
@@ -207,6 +219,15 @@ class TP3Config:
     size saves its graph's device memory (~10-14 MiB per GPU per prefill graph in the 170303 export's capture deltas;
     the graph pool is sized by the largest graph and does not shrink). None = the full ladder (base). Export-time only."""
     """Admit vocabulary-parallel sampling at TP3 (b12x gathers enabled for world 3)."""
+    prefill_skip_suffix: tuple[int, ...] | None = None
+    """FLARE_DS41_PREFILL_SKIP_SUFFIX ("1" = 3072,3584,4096, or a list of prefill capacities): capture an
+    encoder-only twin (graph kind ``encoder_prefill``) of each listed prefill graph. The twin runs layers 0-19 and
+    layer 20's mHC plus global KV (compressor, index keys, latent pages) on every row, commits the Engram history,
+    and records consumption; it has no decoder suffix (layers 20-39 on the 128-row replay), head, sampling, DSpark
+    context or ``last_hidden`` write. Helios runs it for non-final chunks whose stale suffix state the next chunk
+    replaces (decoder_prefill.py, scheduler ``encoder_only_chunk``). Every listed size must be on the prefill ladder
+    and above 128. None = no twins (base). Export-time only (prepared graphs); serving can still turn the twins off
+    with ``flare run --scheduler-encoder-prefill false``."""
     # --- Engram tables (engram.py Tables) ---
     engram_tables: str = "auto"
     """Engram table layout in the package: ``shared`` = every rank reads the whole tables (the layout of every TP3
@@ -413,6 +434,12 @@ class TP3Config:
                 or tuple(sorted(set(self.prefill_graphs))) != self.prefill_graphs or self.prefill_graphs[0] != 128):
             raise ValueError("TP3 config: prefill_graphs must be distinct increasing multiples of 64 starting at 128 "
                              f"(got {self.prefill_graphs!r})")
+        if self.prefill_skip_suffix is not None and (
+                not isinstance(self.prefill_skip_suffix, tuple) or not self.prefill_skip_suffix
+                or any(type(c) is not int or c <= 128 or c % 64 for c in self.prefill_skip_suffix)
+                or tuple(sorted(set(self.prefill_skip_suffix))) != self.prefill_skip_suffix):
+            raise ValueError("TP3 config: prefill_skip_suffix must be distinct increasing multiples of 64 above 128 "
+                             f"(got {self.prefill_skip_suffix!r})")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
             raise ValueError("TP3 config: tp3_graph_gib must be positive")
 
@@ -512,6 +539,7 @@ class TP3Config:
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             prefill_graphs=parse_capacities(get("PREFILL_GRAPHS")),
+            prefill_skip_suffix=parse_skip_suffix(get("PREFILL_SKIP_SUFFIX")),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             packed_keep_batches=integer("PACKED_KEEP_BATCHES"),

@@ -324,6 +324,9 @@ enum GraphOperation {
   reserved 10, 11, 13;
   reserved "PROPOSAL", "VERIFICATION", "PACKED_SPECULATIVE";
   SCORED_PREFILL = 12;
+  // TP3 fork: the encoder-only twin of a prefill graph (no decoder suffix, head or sampling) for
+  // non-final chunks whose suffix state the next chunk replaces.
+  ENCODER_PREFILL = 14;
 
 }
 message TunedBinding { string buffer = 1; string tuning_graph = 2; }
