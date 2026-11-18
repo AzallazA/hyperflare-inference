@@ -16,6 +16,8 @@ mod planning_tests;
 mod ttft_order_tests;
 #[path = "prefill_merge_tests.rs"]
 mod prefill_merge_tests;
+#[path = "encoder_prefill_tests.rs"]
+mod encoder_prefill_tests;
 
 #[path = "acceptance_population_tests.rs"]
 mod acceptance_population_tests;

@@ -79,11 +79,16 @@ pub enum GraphKind {
     Mixed,
     Resume,
     Vision,
+    /// TP3 fork: the encoder-only twin of a prefill graph of the same capacity and inputs. It
+    /// consumes the chunk and records completion but runs no decoder suffix, head or sampling,
+    /// so the scheduler selects it only for non-final chunks whose suffix state the next chunk
+    /// replaces (`scheduler::encoder_only_chunk`); the scheduler's own step kind stays `Prefill`.
+    EncoderPrefill,
 }
 
 impl GraphKind {
     pub fn is_prefill(self) -> bool {
-        matches!(self, Self::Prefill | Self::ScoredPrefill)
+        matches!(self, Self::Prefill | Self::ScoredPrefill | Self::EncoderPrefill)
     }
 
     pub fn samples(self) -> bool {
@@ -127,6 +132,7 @@ impl TryFrom<&str> for GraphKind {
             "snapshot" => Ok(Self::Snapshot),
             "prefill" => Ok(Self::Prefill),
             "scored_prefill" => Ok(Self::ScoredPrefill),
+            "encoder_prefill" => Ok(Self::EncoderPrefill),
             "decode" => Ok(Self::Decode),
             "speculative" => Ok(Self::Speculative),
             "mixed" => Ok(Self::Mixed),
@@ -606,6 +612,11 @@ impl ExecutionManifest {
                         && graph.batch_capacity <= self.request_capacity()
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
+                GraphKind::EncoderPrefill => {
+                    graph.batch_capacity == 1
+                        && graph.token_capacity > 128
+                        && graph.token_capacity.is_multiple_of(64)
+                }
                 GraphKind::Prefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1
                         && ([1, 16].contains(&graph.token_capacity)
@@ -705,6 +716,28 @@ impl ExecutionManifest {
                 ExecutionError::Manifest,
                 "different input buffers overlap in host frame",
             ));
+        }
+        self.validate_encoder_prefill()
+    }
+
+    /// TP3 fork: the runtime packs an encoder-only step with its prefill twin's plan, so every
+    /// `EncoderPrefill` graph needs a `Prefill` graph of the same shape and uploads.
+    fn validate_encoder_prefill(&self) -> Result<()> {
+        fn uploads(graph: &GraphDescriptor) -> Vec<&str> {
+            let mut names: Vec<_> = graph.input_bindings.iter().map(|b| b.buffer_name.as_str()).collect();
+            names.sort_unstable();
+            names
+        }
+        for encoder in self.graphs.iter().filter(|g| g.kind == GraphKind::EncoderPrefill) {
+            if !self.graphs.iter().any(|graph| graph.kind == GraphKind::Prefill
+                && graph.batch_capacity == encoder.batch_capacity
+                && graph.token_capacity == encoder.token_capacity
+                && uploads(graph) == uploads(encoder)) {
+                return Err(Error::execution(
+                    ExecutionError::Manifest,
+                    format!("encoder-only graph {} lacks a prefill twin with the same capacity and inputs", encoder.name),
+                ));
+            }
         }
         Ok(())
     }

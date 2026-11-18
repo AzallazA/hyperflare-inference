@@ -743,6 +743,7 @@ pub(crate) fn consumes(kind: GraphKind) -> bool {
         kind,
         GraphKind::Prefill
             | GraphKind::ScoredPrefill
+            | GraphKind::EncoderPrefill
             | GraphKind::Decode
             | GraphKind::Speculative
             | GraphKind::Mixed

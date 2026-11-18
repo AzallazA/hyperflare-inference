@@ -601,7 +601,10 @@ impl ModelRuntime {
                                 .filter(|graph| graph.kind == crate::execution::GraphKind::Prefill)
                                 .map(|graph| graph.token_capacity)
                                 .collect::<Vec<_>>(),
-                        )
+                        )?;
+                        scheduler.encoder_prefill_graphs(&executor.manifest().graphs.iter()
+                            .filter(|graph| graph.kind == GraphKind::EncoderPrefill)
+                            .map(|graph| graph.token_capacity).collect::<Vec<_>>())
                     })
                     .and_then(|()| {
                         scheduler.speculative_graphs(
@@ -2115,10 +2118,13 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         validate_sampling_admissions(step, &self.admissions)?;
+        // TP3 fork: an eligible non-final chunk runs its prefill graph's encoder-only twin; the
+        // scheduler records the same decision when the step commits.
+        let kind = if self.scheduler.encoder_prefill_step(step)? { GraphKind::EncoderPrefill } else { step.kind };
         let graph = crate::model::catalog::select_shape_with_drafts(
             self.config,
             executor.manifest(),
-            step.kind,
+            kind,
             step.batch_capacity,
             step.token_capacity,
             step.prefill_capacity(),

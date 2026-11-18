@@ -93,6 +93,10 @@ pub struct PolicyConfig {
     /// intermediate boundary; a branch at a skipped boundary resumes from the chunk start, which
     /// is fewer than this many tokens earlier.
     pub prefill_merge_min_rows: usize,
+    /// TP3 fork: run a package's encoder-only prefill twins for eligible non-final chunks
+    /// (`scheduler::encoder_only_chunk`); false always runs the ordinary prefill graph. Without
+    /// twins in the package it changes nothing.
+    pub encoder_prefill: bool,
 }
 
 impl Default for PolicyConfig {
@@ -114,6 +118,7 @@ impl Default for PolicyConfig {
             prefill_tail_merge: PrefillTailMerge::ToolsOnly,
             eager_message_offers: true,
             prefill_merge_min_rows: 0,
+            encoder_prefill: true,
         }
     }
 }
@@ -442,7 +447,13 @@ impl RequestScheduler {
         {
             end = span.start;
         }
-        end.saturating_sub(start)
+        let work = end.saturating_sub(start);
+        // TP3 fork: after an encoder-only chunk only a chunk longer than the decoder window may
+        // follow (it replays its own suffix state); a capacity that cannot do that has no work.
+        if work <= super::SUFFIX_WINDOW && request.suffix_stale() {
+            return 0;
+        }
+        work
     }
 
     /// The next selected message boundary after the consumed tokens (or the prompt end); under

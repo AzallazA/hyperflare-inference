@@ -90,6 +90,36 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
+/// Rows the DeepSeek V4.1 decoder suffix replays per prefill chunk (its SWA window and draft ring).
+pub(crate) const SUFFIX_WINDOW: usize = 128;
+
+/// TP3 fork: may the prefill chunk `[start, start + tokens)` run its encoder-only twin?
+///
+/// Layers after the global-KV boundary keep only SWA windows, the draft ring and `last_hidden`;
+/// a following chunk longer than the window replays its own (fresh replay boundary, all 128 ring
+/// slots, `last_hidden`). So the suffix of a chunk is dead when the chunk is longer than the
+/// window, is not the prompt's last, ends at no checkpoint, and the next cut (message boundary or
+/// prompt end) is more than a window away. Images, scored prompts and spans keep the ordinary
+/// graph. The policy then never schedules a window-sized successor (`prefill_work`), and no
+/// snapshot is taken at the stale endpoint.
+pub(crate) fn encoder_only_chunk(request: &LiveRequest, start: u64, tokens: usize) -> bool {
+    let end = start as usize + tokens;
+    let next_cut = request
+        .message_boundaries
+        .get(request.message_boundaries.partition_point(|&n| n <= end))
+        .copied()
+        .unwrap_or(request.prompt_tokens)
+        .min(request.prompt_tokens);
+    tokens > SUFFIX_WINDOW
+        && end < request.prompt_tokens
+        && !request.prompt_logprobs
+        && request.vision_patches.is_empty()
+        && request.conditioned_windows.is_empty()
+        && request.prefill_spans.is_empty()
+        && request.message_boundaries.binary_search(&end).is_err()
+        && next_cut > end + SUFFIX_WINDOW
+}
+
 fn checkpoint_boundaries(
     mut boundaries: Vec<usize>,
     consumed: usize,
@@ -166,6 +196,9 @@ pub struct SchedulerStats {
     pub inbound_waiting: usize,
     /// Growable requests finished early to free KV pages and requeued by the runtime.
     pub preemptions: u64,
+    /// TP3 fork: prefill chunks submitted to an encoder-only graph, and their prompt tokens.
+    pub encoder_prefill_chunks: u64,
+    pub encoder_prefill_tokens: u64,
 }
 
 #[derive(Clone)]
@@ -290,9 +323,18 @@ pub struct LiveRequest {
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
+    /// TP3 fork: end of the last chunk submitted to an encoder-only graph while no later chunk
+    /// has been submitted; the decoder-suffix state (layer >= 20 windows, draft ring,
+    /// `last_hidden`) at that endpoint is stale until a chunk longer than the window replays it.
+    pub(crate) encoder_only_through: Option<u64>,
 }
 
 impl LiveRequest {
+    /// TP3 fork: the state at the consumed endpoint left a decoder suffix unrun.
+    pub(crate) fn suffix_stale(&self) -> bool {
+        self.encoder_only_through == Some(self.consumed_tokens)
+    }
+
     fn plans_prompt_capture(&self) -> bool {
         self.checkpoint_budget >= 2 && self.max_new_tokens > 1
     }
@@ -689,6 +731,8 @@ pub struct RequestScheduler {
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
+    /// TP3 fork: prefill capacities with an encoder-only twin graph.
+    encoder_prefill_catalog: Vec<usize>,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     decoded_history: Option<decoded_history::DecodedHistory>,
@@ -786,6 +830,7 @@ impl RequestScheduler {
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
             scored_prefill_catalog: Vec::new(),
+            encoder_prefill_catalog: Vec::new(),
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
             decoded_history: None,
@@ -854,6 +899,34 @@ impl RequestScheduler {
         }
         self.scored_prefill_catalog = catalog;
         Ok(())
+    }
+
+    /// TP3 fork: prefill capacities whose package carries an encoder-only twin; select after
+    /// `prefill_graphs`.
+    pub fn encoder_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
+        if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
+            return Err("encoder-only prefill graphs must be selected before admission".into());
+        }
+        let mut catalog = capacities.to_vec();
+        catalog.sort_unstable();
+        if catalog.iter().any(|n| *n <= SUFFIX_WINDOW || !self.prefill_catalog.contains(n))
+            || catalog.windows(2).any(|p| p[0] == p[1]) {
+            return Err("encoder-only prefill graphs must twin distinct prefill capacities above the window".into());
+        }
+        self.encoder_prefill_catalog = catalog;
+        Ok(())
+    }
+
+    /// TP3 fork: whether `step` runs the encoder-only twin of its prefill graph: a one-lane
+    /// prefill step whose chunk `encoder_only_chunk` admits, with a twin of its capacity, unless
+    /// `--scheduler-encoder-prefill false`. `commit` records the same decision.
+    pub fn encoder_prefill_step(&self, step: &ScheduledStep) -> Result<bool> {
+        if !self.policy.encoder_prefill || step.kind != GraphKind::Prefill || step.mixed.is_some()
+            || step.lanes.len() != 1 || !self.encoder_prefill_catalog.contains(&step.token_capacity) {
+            return Ok(false);
+        }
+        let lane = &step.lanes[0];
+        Ok(encoder_only_chunk(self.request(lane.request)?, lane.start_position, lane.tokens))
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {
@@ -1387,7 +1460,9 @@ impl RequestScheduler {
         let request = self.request_mut(handle)?;
         request.preempted = preempted;
         request.phase = RequestPhase::Finishing;
-        if request.consumed_tokens <= request.prefix_tokens || request.error_code.is_some() {
+        // TP3 fork: never retain a terminal snapshot of a stale encoder-only endpoint.
+        if request.consumed_tokens <= request.prefix_tokens || request.error_code.is_some()
+            || request.suffix_stale() {
             return Ok(());
         }
         let unused = std::mem::take(&mut request.reserved_pages);
@@ -1697,6 +1772,7 @@ impl RequestScheduler {
             reasoning_prompt: spec.reasoning_prompt,
             preempted: false,
             admission_order: self.admissions,
+            encoder_only_through: None,
         });
         self.admissions += 1;
         self.stats.cache_lookups += u64::from(!spec.prompt_logprobs);
@@ -2235,6 +2311,7 @@ impl RequestScheduler {
                 } else if matches!(step.lane_kind(row), GraphKind::Decode | GraphKind::Resume) { 1.0 }
                 else if step.lane_kind(row).is_prefill() { lane.tokens as f64 } else { 0.0 }
             }));
+        let encoder = self.encoder_prefill_step(step)?;
         let participants = self.service_participants();
         let submitted_timing = SubmittedTiming {
             retained_ns: plan.selected_cost.retained_ns,
@@ -2253,6 +2330,17 @@ impl RequestScheduler {
                 _ => None,
             },
         };
+        for (row, lane) in step.lanes.iter().enumerate() {
+            if step.lane_kind(row).is_prefill() {
+                // TP3 fork: the stale endpoint of an encoder-only chunk, cleared by any later chunk.
+                self.request_mut(lane.request)?.encoder_only_through =
+                    encoder.then(|| lane.start_position + lane.tokens as u64);
+            }
+        }
+        if encoder {
+            self.stats.encoder_prefill_chunks += 1;
+            self.stats.encoder_prefill_tokens += step.lanes[0].tokens as u64;
+        }
         let mut cleared_pages = Vec::new();
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
@@ -2605,7 +2693,8 @@ impl RequestScheduler {
                 }
             }
             request.phase = if finished {
-                if request.consumed_tokens > request.prefix_tokens && request.error_code.is_none() {
+                if request.consumed_tokens > request.prefix_tokens && request.error_code.is_none()
+                    && !request.suffix_stale() {
                     RequestPhase::Snapshot
                 } else {
                     RequestPhase::Finishing
@@ -2638,7 +2727,11 @@ impl RequestScheduler {
                 if !finished && request.consumed_tokens < request.prompt_tokens as u64 {
                     request.phase = request.prompt_phase();
                 }
-                let capture = if request.message_boundaries.binary_search(&(endpoint as usize)).is_ok()
+                // TP3 fork: an encoder-only endpoint is never captured (encoder_only_chunk excludes
+                // checkpoint ends; this keeps a stale state out of the cache regardless).
+                let capture = if request.suffix_stale() {
+                    None
+                } else if request.message_boundaries.binary_search(&(endpoint as usize)).is_ok()
                     && endpoint > request.prefix_tokens
                 {
                     Some(BoundaryKind::Message)
