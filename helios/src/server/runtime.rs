@@ -1316,7 +1316,9 @@ impl<'a> Worker<'a> {
         while self.scheduler.has_available_slot() {
             let now = std::time::Instant::now();
             for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
-                if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                if incoming.pool_plan.is_none()
+                    && let Some(store) = self.store.as_mut().filter(|store| store.pooled())
+                {
                     begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
                 }
                 incoming.poll_pool_lookup();
@@ -1355,6 +1357,16 @@ impl<'a> Worker<'a> {
             }
             if incoming.prompt.logprobs && self.config.max_top_logprobs == 0 {
                 incoming.reject_admission("logprobs are not available in this model core".into());
+                continue;
+            }
+            if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                begin_pool_lookup(&mut self.scheduler, store.as_mut(), &mut incoming);
+            }
+            if incoming.awaits_pool(std::time::Instant::now()) {
+                match parked {
+                    Some(parked) => self.parked.insert(position, (incoming, parked)),
+                    None => self.pending.insert(position, incoming),
+                }
                 continue;
             }
             let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
@@ -2630,15 +2642,28 @@ fn begin_pool_lookup(
     store: &mut dyn flare_selene::HostStore,
     incoming: &mut Incoming,
 ) {
-    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end || incoming.pool_plan.is_some() {
+    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end {
         return;
     }
-    let Ok(plan) = scheduler.plan_admission(&incoming.spec()) else {
+    let retry = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
+        matches!(ticket.state(), flare_selene::pool::LookupState::None)
+    });
+    if incoming.pool_plan.is_some() && !retry {
+        return;
+    }
+    let plan = match incoming.pool_plan.as_ref() {
+        Some(plan) => scheduler.refresh_admission_plan(plan),
+        None => scheduler.plan_admission(&incoming.spec()),
+    };
+    let Ok(plan) = plan else {
         return;
     };
     if plan.resident_tokens() < incoming.prompt.tokens.len() as u64 {
-        incoming.pool_lookup_started = Some(std::time::Instant::now());
         incoming.pool_lookup = store.begin_lookup(plan.history());
+        incoming.pool_lookup_started = incoming.pool_lookup.as_ref().and_then(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                .then(std::time::Instant::now)
+        });
     }
     incoming.pool_plan = Some(plan);
 }
