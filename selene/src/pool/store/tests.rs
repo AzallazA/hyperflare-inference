@@ -842,9 +842,11 @@ fn invalid_or_oversize_put_is_discarded() {
 }
 
 #[test]
-fn a_budget_or_inflight_refusal_gets_one_retry() {
+fn a_budget_or_inflight_refusal_waits_for_backoff_despite_progress() {
     for refusal in [PutRefusal::Budget, PutRefusal::Inflight] {
         let mut rig = rig();
+        let now = Instant::now();
+        rig.store.cascade.now = Some(now);
         rig.ready(true);
         let record = rig.retiring(4);
         rig.offer(std::slice::from_ref(&record));
@@ -856,6 +858,12 @@ fn a_budget_or_inflight_refusal_gets_one_retry() {
 
         rig.ready(true);
         rig.poll();
+        assert_eq!(rig.started().len(), 1, "{refusal:?}");
+        rig.store.cascade.now = Some(now + Duration::from_millis(49));
+        rig.poll();
+        assert_eq!(rig.started().len(), 1, "{refusal:?}");
+        rig.store.cascade.now = Some(now + Duration::from_millis(50));
+        rig.poll();
         assert_eq!(rig.started().len(), 2);
         rig.end(rig.started()[1].0, PutOutcome::Refused(refusal));
         rig.poll();
@@ -864,6 +872,43 @@ fn a_budget_or_inflight_refusal_gets_one_retry() {
             [(record.key, Retirement::Dropped)],
             "{refusal:?}"
         );
+    }
+}
+
+#[test]
+fn refusal_discards_count_the_source_tier() {
+    for (index, tier) in [Tier::Dram, Tier::Nvme].into_iter().enumerate() {
+        for refusal in [
+            PutRefusal::Invalid,
+            PutRefusal::Oversize,
+            PutRefusal::Budget,
+            PutRefusal::Inflight,
+        ] {
+            let mut rig = rig();
+            let now = Instant::now();
+            rig.store.cascade.now = Some(now);
+            rig.ready(true);
+            let mut record = rig.retiring(4);
+            record.tier = tier;
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            assert!(rig.store.stats().dropped.iter().all(|count| *count == 0));
+            rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+            rig.poll();
+            if matches!(refusal, PutRefusal::Budget | PutRefusal::Inflight) {
+                assert!(rig.store.stats().dropped.iter().all(|count| *count == 0));
+                rig.store.cascade.now = Some(now + Duration::from_millis(50));
+                rig.poll();
+                rig.end(rig.started()[1].0, PutOutcome::Refused(refusal));
+                rig.poll();
+            }
+            assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
+            let stats = rig.store.stats();
+            assert_eq!(stats.dropped[6 + index], 1, "{tier:?} {refusal:?}");
+            assert_eq!(stats.dropped.iter().sum::<u64>(), 1);
+            rig.poll();
+            assert_eq!(rig.store.stats().dropped, stats.dropped);
+        }
     }
 }
 

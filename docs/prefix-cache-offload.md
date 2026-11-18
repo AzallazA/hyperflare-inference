@@ -1106,7 +1106,8 @@ same completion events the store produces.
   Selection is bounded by the spill and move caps, without sorting all
   parked records. Full queues delay demotion and never discard a parked copy.
   Invalid or oversized puts discard the source. Budget or in-flight refusals
-  retain selection for one retry, then discard the source on either refusal.
+  retain selection for one retry after a 50 ms backoff, then discard the source
+  on either refusal. Pool events do not shorten this backoff.
   Other refusals, submission errors and repeated handover failures keep records
   local, release selection and retry only after manager progress or a short backoff.
   Manager loss releases waiting selections; started moves keep their pins until
@@ -1120,8 +1121,10 @@ same completion events the store produces.
   GPU eviction sends its eviction notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
   holding events. `flare_host_cache_dropped_total{tier,reason}` counts local
-  end-of-chain, oversize and terminal I/O drops (`end_of_chain`, `oversize`,
-  `io_error`). Tiers are `dram` and `nvme`. The `parked_records` count is
+  end-of-chain, oversized publication, terminal I/O and pool refusal drops
+  (`end_of_chain`, `oversize`, `io_error`, `pool_refused`). Pool refusal drops
+  include invalid or oversized puts and budget or in-flight refusals after one
+  retry. Tiers are `dram` and `nvme`. The `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge.
   `flare_host_cache_store_skipped_total` counts publications that started no
   copy, including duplicates and retries.

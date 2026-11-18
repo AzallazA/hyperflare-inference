@@ -79,8 +79,9 @@ formula or from the figure in the warning.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
-largest record an instance can put, or the put is refused `OVERSIZE`. Keep it above `--memory`:
-DRAM eviction needs durability, so a full NVMe budget stops DRAM from making room.
+largest record an instance can put, or the put is refused `OVERSIZE` and the instance discards
+its local record. Keep it above `--memory`: DRAM eviction needs durability, so a full NVMe
+budget stops DRAM from making room.
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>-<hash>`, where the hash is
 the 32-hex-digit BLAKE2b digest of the absolute `--socket` path, so the shared-memory mount
@@ -244,10 +245,11 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | `COPY_ERROR` / `CHECKSUM` | A read, write or checksum failed, or the copy was not exact. | Alert on repeats; check the device. |
 | `DEADLINE` / `NO_PROGRESS` | The claim ran past its deadline or stopped making progress (3s). | Look at copy throughput. |
 | put `PRESENT` | Already stored and committed: success, nothing transferred. | None. |
-| put `BUDGET` | Temporary arena, staging or durable-budget pressure: the writer keeps its local record and releases its selection. | Retry after manager progress or reconnect; add capacity if sustained. |
-| put `OVERSIZE` | Can never fit in this configuration. | Raise the budget or add `--root`. |
+| put `BUDGET` | Temporary arena, staging or durable-budget pressure: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | Add capacity if sustained. |
+| put `INFLIGHT` | Another put of the same key is in flight: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | None. |
+| put `OVERSIZE` | Can never fit in this configuration; the writer discards the local record. | Raise the budget or add `--root`. |
 | put `QUEUE` | The writer has `max_open_puts` (4) open. | None. |
-| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed. | Alert: client and manager disagree. |
+| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed; the writer discards the local record. | Alert: client and manager disagree. |
 | put `IO` | A device error. | Check the NVMe and the file system. |
 | put `PUT_NOT_READY` | Not ready (see Readiness). | None. |
 

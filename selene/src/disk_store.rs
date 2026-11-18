@@ -3324,7 +3324,7 @@ mod tests {
             matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget }] if *checkpoint == record.id)
         );
         assert!(store.outbound.is_empty());
-        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().dropped, [0; 8]);
         assert_eq!(store.stats().held[1], 1);
         assert!(!store.index.contains(&record.key));
     }
