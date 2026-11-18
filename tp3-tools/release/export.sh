@@ -33,6 +33,15 @@
 #            vocabulary gather, no draft-vocabulary channel, shared vocabulary columns); 0 = off
 #   LIBRARY_SCRATCH  unset = code default (on): cuBLAS's own 64 MiB pool is kept out of the export's reachability
 #            (FLARE_EXPORT_LIBRARY_SCRATCH); 0 = off, as the code the release package was exported from
+#   PAD_ONCE     1 = one MXFP8 MMA-scale zero fill per decode/verify/draft forward instead of one per layer
+#            (FLARE_DS41_MMA_PAD_ONCE); default 0 (ds41-tp3-next 2026-11-17, not measured on the GPU yet)
+#   VISION_ARENA_HOST  1 = image feature arena (160 MiB/GPU) in device-visible host memory (FLARE_DS41_VISION_ARENA_HOST);
+#            default 0 (VRAM map 2026-11-15 item 3)
+#   MARKOV_HOST  1 = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory (FLARE_DS41_MARKOV_EMBED_HOST);
+#            default 0 (VRAM map item 6)
+#   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
+#            FLARE_EXPORT_SHARE_COMPUTED_OPERANDS, part of the compiler cache key); default 0
+#   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
 #   FLARE_DS41_VISION_STAGE 1 (default) = vision tower in host RAM, weights staged through VRAM slots per block
@@ -67,7 +76,11 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${EMBED_ROWS:-1}" = 1 ] && export FLARE_DS41_EMBED_ROWS=1
 [ -n "${ENGRAM_SIDE:-}" ] && export FLARE_DS41_ENGRAM_SIDE_LAYERS=$ENGRAM_SIDE
 [ -n "${LIBRARY_SCRATCH:-}" ] && export FLARE_EXPORT_LIBRARY_SCRATCH=$LIBRARY_SCRATCH
+[ "${PAD_ONCE:-0}" = 1 ] && export FLARE_DS41_MMA_PAD_ONCE=1
+[ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
+[ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
+[ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \
-  ${COMPILE_WORKERS:+--compile-workers "$COMPILE_WORKERS"}
+  ${COMPILE_WORKERS:+--compile-workers "$COMPILE_WORKERS"} ${CONFIG:+--config "$CONFIG"}
