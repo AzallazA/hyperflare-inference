@@ -929,10 +929,11 @@ impl RequestScheduler {
         Ok(())
     }
 
-    /// TP3 fork, NEGATIVE CONTROL ONLY: drop the window rule and its guards (a window-sized
-    /// chunk may then follow an encoder-only chunk and read its stale suffix state). The GPU
-    /// proof boots one server like this and requires its logprob gate to fail.
-    pub fn unguarded_encoder_prefill(&mut self) {
+    /// TP3 fork, NEGATIVE CONTROL ONLY (unit tests): drop the window rule and its guards (a
+    /// window-sized chunk may then follow an encoder-only chunk and read its stale suffix state).
+    /// Not reachable from a server: the GPU proof's env hook was removed before merging.
+    #[cfg(test)]
+    pub(crate) fn unguarded_encoder_prefill(&mut self) {
         self.encoder_window_guard = false;
     }
 

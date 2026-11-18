@@ -605,12 +605,6 @@ impl ModelRuntime {
                         scheduler.encoder_prefill_graphs(&executor.manifest().graphs.iter()
                             .filter(|graph| graph.kind == GraphKind::EncoderPrefill)
                             .map(|graph| graph.token_capacity).collect::<Vec<_>>())?;
-                        // TP3 fork: negative control of the suffix-skip GPU proof only; outputs
-                        // are expected to be wrong.
-                        if std::env::var_os("FLARE_TEST_ENCODER_PREFILL_UNGUARDED").is_some_and(|v| v == "1") {
-                            eprintln!("WARNING: FLARE_TEST_ENCODER_PREFILL_UNGUARDED=1: encoder-only prefill without its window guards (negative control; outputs are wrong by design)");
-                            scheduler.unguarded_encoder_prefill();
-                        }
                         Ok(())
                     })
                     .and_then(|()| {

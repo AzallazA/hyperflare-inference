@@ -273,6 +273,29 @@ def test_a_successor_longer_than_the_window_never_reads_the_stale_layer_20_39_wi
     assert committed == set(range(128))
 
 
+@pytest.mark.parametrize("start", [129, 255, 3001, 3071, 4097, 4351, 65537])
+def test_every_successor_count_above_the_window_reads_only_its_own_rows_at_any_start(start):
+    # Review (2026-11-18): chat chunks start anywhere, so the successor property must hold for starts that are not
+    # multiples of 128 and for every successor length 129..4096, not only for the sampled ones above.
+    capacity = 4096
+    source = Metadata.allocate(capacity, 1, 40, "cpu")
+    packing = PreparedDecoderSuffix(source)
+    indices = PreparedWindowIndices(packing.metadata, mode="prefill", tokens=128, page_size=256, width=128,
+                                    replay_start=packing.replay_start)
+    failures = []
+    for count in range(129, capacity + 1):
+        _set_chunk(source, start, count)
+        packed = packing.begin(source)
+        window = indices(packed.metadata, replay_start=packed.replay_start)
+        live = packed.metadata.positions >= 0
+        read = window.window_indices[live]
+        committed = {(start + token) % 128 for token in range(max(0, count - 128), count)}
+        if (int(live.sum()) != 128 or packed.replay_start.item() != start + count - 128
+                or read[read >= 0].min().item() < 128 or committed != set(range(128))):
+            failures.append(count)
+    assert failures == []
+
+
 @pytest.mark.parametrize("count", [1, 64, 128])
 def test_a_window_sized_successor_would_read_the_stale_window(count):
     # Why Helios never schedules a <= 128-row chunk right after an encoder-only one: the ordinary (unpacked) path
