@@ -824,13 +824,52 @@ fn a_record_the_manager_already_holds_is_released_without_another_copy() {
 }
 
 #[test]
+fn invalid_or_oversize_put_is_discarded() {
+    for refusal in [PutRefusal::Oversize, PutRefusal::Invalid] {
+        let mut rig = rig();
+        rig.ready(true);
+        let record = rig.retiring(4);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert_eq!(
+            rig.retired(),
+            [(record.key, Retirement::Dropped)],
+            "{refusal:?}"
+        );
+    }
+}
+
+#[test]
+fn a_budget_or_inflight_refusal_gets_one_retry() {
+    for refusal in [PutRefusal::Budget, PutRefusal::Inflight] {
+        let mut rig = rig();
+        rig.ready(true);
+        let record = rig.retiring(4);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert!(rig.retired().is_empty(), "{refusal:?}");
+        assert_eq!(rig.started().len(), 1);
+
+        rig.ready(true);
+        rig.poll();
+        assert_eq!(rig.started().len(), 2);
+        rig.end(rig.started()[1].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert_eq!(
+            rig.retired(),
+            [(record.key, Retirement::Dropped)],
+            "{refusal:?}"
+        );
+    }
+}
+
+#[test]
 fn refusals_keep_records_local_and_retry_only_after_progress() {
-    for refusal in [
-        PutRefusal::Budget,
-        PutRefusal::Queue,
-        PutRefusal::NotReady,
-        PutRefusal::Oversize,
-    ] {
+    for refusal in [PutRefusal::Queue, PutRefusal::NotReady] {
         let mut rig = rig();
         rig.ready(true);
         let record = rig.retiring(4);
@@ -863,8 +902,6 @@ fn repeated_failures_keep_the_record_local() {
         PutOutcome::Failed("the session was lost".into()),
         PutOutcome::Cancelled,
         PutOutcome::Refused(PutRefusal::Io),
-        PutOutcome::Refused(PutRefusal::Invalid),
-        PutOutcome::Refused(PutRefusal::Inflight),
     ] {
         let mut rig = rig();
         rig.ready(true);

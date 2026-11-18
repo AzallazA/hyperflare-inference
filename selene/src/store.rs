@@ -213,7 +213,7 @@ pub struct Retiring {
 pub enum Retirement {
     /// The next tier holds a committed copy: the tier drops its own.
     Moved,
-    /// A terminal I/O failure permits discarding the source.
+    /// The move cannot be completed; discard the source.
     Dropped,
     /// Keep the source and retry after progress.
     Failed,

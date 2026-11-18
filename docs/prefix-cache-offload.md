@@ -1098,14 +1098,17 @@ same completion events the store produces.
   progress trigger one coalesced maintenance pass per model-thread poll.
   Selection is bounded by the spill and move caps, without sorting all
   parked records. Full queues delay demotion and never discard a parked copy.
-  Refusals, submission errors and repeated handover failures keep records local,
-  release selection and retry only after manager progress or a short backoff.
+  Invalid or oversized puts discard the source. Budget or in-flight refusals
+  retain selection for one retry, then discard the source on either refusal.
+  Other refusals, submission errors and repeated handover failures keep records
+  local, release selection and retry only after manager progress or a short backoff.
   Manager loss releases waiting selections; started moves keep their pins until
   their drained terminal event. While a manager is unavailable or busy, local
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
-  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  expiry, invalid or oversized puts, repeated budget or in-flight refusals and
+  terminal disk I/O errors discard data.
   A host offer announces the GPU holding and starts its first host copy;
   GPU eviction sends its eviction notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
