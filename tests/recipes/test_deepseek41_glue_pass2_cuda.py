@@ -49,6 +49,7 @@ WORLD = 3
 MLA = "bf16"
 START = 600
 BLOCK = 6
+PAGES = 7  # 896 tokens per request >= the last start 600 + 37 x 7 + 6 (5 pages clamped late rows onto the last page)
 ARMS = (("off", None), ("off", 0xFF), ("on", None), ("on", 0xFF), ("on", 0x7F))
 
 
@@ -135,11 +136,11 @@ def _metadata(lengths, device, *, tokens=None):
     """Packed requests (lengths; 0 = idle row) in ``tokens`` rows (default: packed, sum of lengths)."""
     batch, width = len(lengths), max(max(lengths), 1)
     rows = sum(lengths) if tokens is None else tokens
-    metadata = Metadata.allocate(rows, batch, 5, device, max_query_tokens=width)
+    metadata = Metadata.allocate(rows, batch, PAGES, device, max_query_tokens=width)
     counts = torch.tensor(lengths, dtype=torch.int32, device=device)
     starts = torch.full((batch,), START, dtype=torch.int64, device=device) + torch.arange(batch, device=device) * 37
     states = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
-    pages = torch.arange(1, batch * 5 + 1, dtype=torch.int32, device=device).view(batch, 5)
+    pages = torch.arange(1, batch * PAGES + 1, dtype=torch.int32, device=device).view(batch, PAGES)
     inputs = torch.zeros((batch, width), dtype=torch.int64, device=device)
     metadata.set(starts, counts, states, pages, inputs, torch.tensor([batch], dtype=torch.int32, device=device))
     return rows, batch, metadata, counts
@@ -269,7 +270,7 @@ def test_target_layers_switch_on_writes_the_same_bytes(weights, lengths):
     torch.manual_seed(41152 + sum(lengths))
     rows, batch, metadata, counts = _metadata(lengths, device)
     mode = "decode" if rows == 1 else "verify"
-    pool = ContinuationPool.allocate(config, batch + 1, batch * 5 + 1, device)
+    pool = ContinuationPool.allocate(config, batch + 1, batch * PAGES + 1, device)
     pool.backing.random_(0, 120)  # finite history (no 0x7F / 0xFF bytes), so the reference output is finite
     scratch = AttentionScratch.allocate(rows, WORLD, device)
     sources = [torch.randn((rows, 5120), dtype=torch.bfloat16, device=device) * .1 for _ in range(3)]
@@ -318,7 +319,7 @@ def test_draft_layers_switch_on_writes_the_same_bytes(weights, lengths):
     device = torch.device("cuda:0")
     torch.manual_seed(41153 + len(lengths))
     rows, batch, metadata, _ = _metadata(lengths, device, tokens=len(lengths) * BLOCK)
-    pool = ContinuationPool.allocate(config, batch + 1, batch * 5 + 1, device, dspark=True)
+    pool = ContinuationPool.allocate(config, batch + 1, batch * PAGES + 1, device, dspark=True)
     pool.backing.random_(0, 120)
     scratch = AttentionScratch.allocate(rows, WORLD, device)
     sources = [torch.randn((rows, 5120), dtype=torch.bfloat16, device=device) * .1 for _ in range(3)]
