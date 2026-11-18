@@ -19,6 +19,8 @@
 #              slab in whole 2 MiB granules); 0 = upstream layout (the hyperflare-glm-20261112 package layout)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3
 #              (Hyperflare config [preparation] compile_workers) to stay inside the test system's power-supply limit
+#   FLARE_EXPORT_FORWARD_WORKERS=N, FLARE_EXPORT_FORWARD_WORKER_GIB=G, FLARE_EXPORT_TUNE_ONLY=1  (fork, export speed;
+#              unset = as before) forward compilers after tuning / tune-only warm-up, see tp3-tools/release/export.sh
 #   CONFIG     a Hyperflare config.toml that selects another package store (paths.package_cache)
 # Expect "Graph catalog: 74 graphs" (text-only: 68), the lines "trial graph pool released: ... MiB returned before the
 # serving capture" and "prefill slab ... in ... MiB of its own segments (FLARE_GLM53_SLAB_SEGMENT=1)", and at the end

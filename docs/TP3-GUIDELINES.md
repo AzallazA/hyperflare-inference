@@ -603,6 +603,11 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    HOT 300 export had 6,003 MiB free before tuning and tuned for 955 s from scratch; the HOT 342 export after it had
    3,083 MiB free before tuning (1241: 3,235) and tuned in 227 s from the warm cache, 41 min for the whole export,
    no memory error.
+   *Faster warm-up (fork, perf/export-speed, 2026-11-17):* `HOT=300 FLARE_EXPORT_TUNE_ONLY=1` runs the same tuning
+   and exits 0 after "Prepare and tune kernels" (selections flushed to the kernel cache, no package), which skips
+   the warm-up's compile, capture and publish (~20-25 min). Forward compiling after tuning can use more processes
+   than the PSU-capped tuning budget: `FLARE_EXPORT_FORWARD_WORKERS=9 FLARE_EXPORT_FORWARD_WORKER_GIB=16`
+   (`ignition/preparation/export_speed.py`; neither value reaches a cache key or the package).
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
 4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
    five times (twice more on 11-12). The `grep '[x]yz'` bracket trick does NOT help when the same command line also

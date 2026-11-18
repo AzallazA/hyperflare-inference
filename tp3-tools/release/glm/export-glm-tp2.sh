@@ -18,6 +18,8 @@
 #              for the rows that use it, 512 at these settings, instead of 4096); 0 = upstream layout
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3
 #              (Hyperflare config [preparation] compile_workers) to stay inside the test system's power-supply limit
+#   FLARE_EXPORT_FORWARD_WORKERS=N, FLARE_EXPORT_FORWARD_WORKER_GIB=G, FLARE_EXPORT_TUNE_ONLY=1  (fork, export speed;
+#              unset = as before) forward compilers after tuning / tune-only warm-up, see tp3-tools/release/export.sh
 #   CONFIG     a Hyperflare config.toml that selects another package store (paths.package_cache)
 # Expect "Graph catalog: 56 graphs" (text-only: 50), the line "trial graph pool released: ... MiB returned before the
 # serving capture", and at the end "Exported cache entry: .../gb202-tp2-<timestamp>".

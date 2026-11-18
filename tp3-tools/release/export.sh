@@ -46,6 +46,12 @@
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
+#   FLARE_EXPORT_FORWARD_WORKERS=N, FLARE_EXPORT_FORWARD_WORKER_GIB=G  (fork, export speed; unset = as before) forward
+#            compiler processes per host for "Compile model forwards" and their host-RAM admission estimate (upstream 32 GiB).
+#            They apply only after kernel tuning (GPUs idle; COMPILE_WORKERS still caps tuning). N=9 G=16: expected
+#            ~13 -> ~5-6 min for 30 forwards. Device/host admission still decides: read "N compiler workers; per rank"
+#   FLARE_EXPORT_TUNE_ONLY=1  (fork) stop after "Prepare and tune kernels" (selections flushed to the kernel cache, exit 0,
+#            no package): the warm-up before a cold-cache HOT 342 export (HOT=300 FLARE_EXPORT_TUNE_ONLY=1, then the export)
 #   FLARE_DS41_VISION_STAGE 1 (default) = vision tower in host RAM, weights staged through VRAM slots per block
 #   GPUS     default 0,1,2
 # A cold tuning cache needs more free VRAM than serving. If tuning runs out of memory, export once with HOT=300,
