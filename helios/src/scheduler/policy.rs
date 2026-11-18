@@ -327,8 +327,12 @@ impl RequestScheduler {
     }
 
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+        self.prefill_work_through(request, capacity, self.estimated_checkpoint_cut(request))
+    }
+
+    fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
         let start = request.consumed_tokens as usize;
-        let mut end = self.checkpoint_cut(request)
+        let mut end = cut
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
@@ -1184,11 +1188,12 @@ impl RequestScheduler {
                 request: r.handle,
                 start_position: r.scheduled_consumed,
                 tokens: if kind.is_prefill() {
-                    if candidate.kind == GraphKind::Mixed {
-                        self.prefill_work(r, candidate.prefill_capacity)
+                    let capacity = if candidate.kind == GraphKind::Mixed {
+                        candidate.prefill_capacity
                     } else {
-                        candidate.work
-                    }
+                        candidate.capacity
+                    };
+                    self.prefill_work_through(r, capacity, self.checkpoint_cut(r))
                 } else {
                     if candidate.packed_token_capacity != 0 {
                         lengths.as_ref().unwrap()[slot]

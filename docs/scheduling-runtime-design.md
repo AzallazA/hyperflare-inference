@@ -171,11 +171,19 @@ candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
 
-Each prefill capacity competes using the actual tokens it can consume. Atomic
-image spans, system boundaries, and prompt length restrict logical work. A
-4096-token graph processing a 64-token tail earns 64 prompt units and at most one
-output token. There is no smallest-fitting-shape filter, duration ceiling,
-forced oldest-request filter, or per-chunk prefill lateness cost.
+Each prefill capacity competes using the checkpoint selection loop's predicted
+work, including optional cuts and their split and copy budgets, without quoting
+snapshot storage. Estimates and quoted selections are cached separately within
+each planning scope. Both paths reuse persisted selections containing optional
+cuts; persisted cuts can include the anchor itself. Submission quotes storage
+for the winning prompt row and stops at its first selected cut or graph
+capacity. With sufficient storage, estimated and submitted work agree; storage
+shortage can exclude optional cuts, so the estimate can stop earlier than the
+quoted selection. Atomic image spans, feature windows, and prompt length also
+restrict logical work. A graph with 64 useful prompt tokens earns 64 prompt
+units and at most one output token, regardless of physical capacity. There is
+no duration ceiling, forced oldest-request filter, or per-chunk prefill
+lateness cost.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a

@@ -8,7 +8,7 @@
 
 use super::*;
 
-pub(super) type SelectionCache = HashMap<RequestHandle, (CheckpointAccounting, bool, bool)>;
+pub(super) type SelectionCache = HashMap<(RequestHandle, bool), (CheckpointAccounting, bool, bool)>;
 
 pub(super) struct PlanningScope<'a>(&'a std::cell::RefCell<Option<SelectionCache>>);
 
@@ -214,17 +214,25 @@ impl RequestScheduler {
     }
 
     fn checkpoint_selection(&self, request: &LiveRequest) -> (CheckpointAccounting, bool, bool) {
+        self.checkpoint_selection_cached(request, true)
+    }
+
+    fn checkpoint_selection_cached(
+        &self,
+        request: &LiveRequest,
+        quote_storage: bool,
+    ) -> (CheckpointAccounting, bool, bool) {
         if let Some(value) = self
             .checkpoint_selections
             .borrow()
             .as_ref()
-            .and_then(|cache| cache.get(&request.handle))
+            .and_then(|cache| cache.get(&(request.handle, quote_storage)))
         {
             return value.clone();
         }
-        let selection = self.checkpoint_selection_uncached(request);
+        let selection = self.checkpoint_selection_uncached(request, quote_storage);
         if let Some(cache) = self.checkpoint_selections.borrow_mut().as_mut() {
-            cache.insert(request.handle, selection.clone());
+            cache.insert((request.handle, quote_storage), selection.clone());
         }
         selection
     }
@@ -232,6 +240,7 @@ impl RequestScheduler {
     fn checkpoint_selection_uncached(
         &self,
         request: &LiveRequest,
+        quote_storage: bool,
     ) -> (CheckpointAccounting, bool, bool) {
         let mut accounting = request.checkpoints.clone();
         if accounting
@@ -333,7 +342,7 @@ impl RequestScheduler {
                 .filter(|cut| cut.endpoint > start)
                 .count()
                 - usize::from(request.anchor_guard.is_some() && start < anchor);
-            if self
+            if quote_storage && self
                 .quote_snapshots_preserving(1, rows, self.checkpoint_headroom(), rank)
                 .is_none()
             {
@@ -349,6 +358,15 @@ impl RequestScheduler {
         }
         accounting.cuts.sort_unstable_by_key(|cut| cut.endpoint);
         (accounting, unknown, budget)
+    }
+
+    pub(super) fn estimated_checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
+        let (accounting, _, _) = self.checkpoint_selection_cached(request, false);
+        accounting
+            .cuts
+            .iter()
+            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
+            .map(|cut| cut.endpoint)
     }
 
     pub(super) fn checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
