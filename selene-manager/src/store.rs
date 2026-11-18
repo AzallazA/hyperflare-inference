@@ -429,6 +429,7 @@ fn finish_record(
 #[derive(Default)]
 pub struct Metrics {
     pub dropped: u64,
+    /// Operations stopped by cancel before becoming terminal, excluding committed puts.
     pub cancels: u64,
     pub puts_ok: u64,
     pub puts_error: u64,
@@ -2909,7 +2910,6 @@ impl Store {
     // ----------------------------------------------------------- Cancel, close
 
     fn cancel(&mut self, connection: u64, transfer: u64) {
-        self.metrics.cancels += 1;
         // A Begin that has not reached dispatch yet must be withdrawn too.
         let mut removed_pending = false;
         if let Some(queue) = self.pending_puts.get_mut(&connection) {
@@ -2933,6 +2933,7 @@ impl Store {
             }
         }
         if removed_pending {
+            self.metrics.cancels += 1;
             return;
         }
         let Some(open) = self
@@ -2947,12 +2948,18 @@ impl Store {
                 if put.committed {
                     return;
                 }
+                if !put.terminal {
+                    self.metrics.cancels += 1;
+                }
                 put.cancelled = true;
                 put.terminal = true;
                 put.blocked.clear();
                 put.outbox.clear();
             }
             Operation::Get(get) => {
+                if !get.terminal {
+                    self.metrics.cancels += 1;
+                }
                 get.cancelled = true;
                 get.terminal = true;
                 get.outbox.clear();
@@ -5479,6 +5486,57 @@ mod tests {
         );
         store.cancel(1, 2);
         assert!(store.dispatch_trace().is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cancels_count_only_the_operations_they_stop() {
+        let (mut refused_store, directory) = idle_put("cancel-refused");
+        refused_store.window_filled(1, 1, 0, Vec::new(), None).unwrap();
+        let put = put_of(&mut refused_store);
+        assert!(put.terminal);
+        assert!(!put.cancelled);
+        assert!(matches!(put.outbox.back(), Some(Ok(PutAnswer::Refused(_)))));
+        refused_store.flush_outboxes();
+        assert!(refused_store.sessions[&1].ops.contains_key(&1));
+        assert_eq!(refused_store.metrics.cancels, 0);
+        // The pool cancels a refused put to finish its cleanup.
+        refused_store.cancel(1, 1);
+        assert_eq!(refused_store.metrics.cancels, 0);
+        drop(refused_store);
+        let _ = fs::remove_dir_all(directory);
+
+        let (mut store, directory) = store("cancel-count");
+        let value = descriptor();
+        store.register_namespace(value.clone()).unwrap();
+        store.hello(1, std::process::id(), value).unwrap();
+        // Cleanup of an operation that is not there: not a cancellation.
+        store.cancel(1, 99);
+        assert_eq!(store.metrics.cancels, 0);
+        let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                namespace: store.namespace_id().unwrap(),
+                key: Key {
+                    consumed_tokens: 128,
+                    digest: [8; 16],
+                },
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 2,
+                published_tail_pages: 2,
+                row: true,
+            },
+            put_events,
+        );
+        store.cancel(1, 1);
+        assert_eq!(store.metrics.cancels, 1);
+        // The pool's cleanup Cancel for the same, already withdrawn put.
+        store.cancel(1, 1);
+        assert_eq!(store.metrics.cancels, 1);
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
