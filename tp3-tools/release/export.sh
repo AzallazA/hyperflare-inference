@@ -41,8 +41,9 @@
 #            default 0 (VRAM map item 6)
 #   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
 #            FLARE_EXPORT_SHARE_COMPUTED_OPERANDS, part of the compiler cache key); default 0
-#   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py; e.g. tp3-tools/release/draft-vocab/draft-vocab-32k.json):
-#            the NVFP4 DSpark draft head keeps only those tokens (FLARE_DS41_DRAFT_VOCAB); default unset = full head
+#   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py build; tp3-tools/release/draft-vocab/, held-out
+#            miss rates inside each table): the NVFP4 DSpark draft head keeps only those tokens (FLARE_DS41_DRAFT_VOCAB);
+#            default unset = full head
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit

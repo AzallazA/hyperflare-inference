@@ -24,6 +24,7 @@ placement the byte count does not cover.
 import json
 import math
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -462,7 +463,8 @@ def test_markov_and_vision_arena_switches_parse_and_default_off():
 def test_draft_vocab_columns_equal_width_on_every_rank_and_keep_every_listed_token():
     tokens = [0, 5, 7, 43135, 43136, 50000, 86272, 129279, 129000]
     width = 43136
-    per = [weights.draft_vocab_columns(tokens, 3, r, k=600) for r in range(3)]
+    ranking = [9, 3, 43200, 43137, 129100, 86300] + list(range(129280))  # frequency order, then everything
+    per = [weights.draft_vocab_columns(tokens, 3, r, k=600, ranking=ranking) for r in range(3)]
     assert {len(c) for c in per} == {256}  # max(share 4, 600 / 3 = 200) rounded up to 128
     for r, columns in enumerate(per):
         assert columns == sorted(set(columns)) and all(0 <= c < width for c in columns)
@@ -470,6 +472,57 @@ def test_draft_vocab_columns_equal_width_on_every_rank_and_keep_every_listed_tok
         assert all(r * width + c < 129280 for c in columns)  # never a padding row
     assert TP3Config().draft_vocab is None
     assert "draft_vocab" not in TP3Config().to_metadata()  # recorded only when set: default records unchanged
+
+
+def test_draft_vocab_fill_follows_the_ranking_not_the_id_order():
+    """Review H1 (2026-11-17): the fill took each rank's lowest unused ids, so ranks 1-2 got ~8K arbitrary rare tokens
+    and common rank-0 tokens just above the fill ("So", " agent") were dropped. The fill now takes the ranking."""
+    width = 43136
+    tokens = [1, 2, 43136 + 7]
+    ranking = [43136 + 40000, 30000, 20000] + [43136 + 500 + i for i in range(200)] + list(range(1000, 1300))
+    rank0 = weights.draft_vocab_columns(tokens, 3, 0, k=3 * 128, ranking=ranking)
+    assert len(rank0) == 128 and {1, 2, 30000, 20000} <= set(rank0)
+    assert set(rank0) - {1, 2, 30000, 20000} == set(range(1000, 1124))  # in ranking order, not ids 0, 3, 4, ...
+    rank1 = weights.draft_vocab_columns(tokens, 3, 1, k=3 * 128, ranking=ranking)
+    assert rank1 == sorted([7, 40000] + [500 + i for i in range(126)])  # 43136 + 40000 ranked first on rank 1
+    with pytest.raises(ValueError, match="rebuild the table"):  # no ranking: refused instead of an id-order fill
+        weights.draft_vocab_columns(tokens, 3, 0, k=3 * 128)
+    exact = list(range(128)) + list(range(width, width + 128)) + list(range(2 * width, 2 * width + 128))
+    assert weights.draft_vocab_columns(exact, 3, 2, k=3 * 128) == list(range(128))  # exact width: no fill needed
+
+
+def _draft_vocab_tool():
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "tp3-tools" / "ds41_draft_vocab.py"
+    spec = importlib.util.spec_from_file_location("ds41_draft_vocab", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_draft_vocab_builder_keeps_the_most_frequent_tokens_per_rank_and_measures_held_out_misses():
+    tool = _draft_vocab_tool()
+    width = tool.shard_width()
+    assert width == 43136 and tool.columns_for(32768) == 11008 and tool.columns_for(24576) == 8192
+    assert tool.columns_for(10 ** 6) == width and all(tool.columns_for(k) % 128 == 0 for k in (1, 24576, 40960, 65536))
+    records = {
+        "code": {"train": {5: 50, 6: 30, width + 1: 10, 2 * width + 3: 5}, "heldout": {5: 8, 6: 1, 7: 1}},
+        "prose": {"train": {9: 40, 8: 20, width + 2: 20}, "heldout": {9: 5, width + 9: 5}},
+    }
+    order = tool.ranking(records, {"code": 0.5, "prose": 0.5})
+    assert order[:3] == [5, 9, 6] and len(order) == 129280 and len(set(order)) == 129280
+    specials = [0, 1, 2, 128000, 129279]
+    keep = tool.select(order, specials, 128)
+    per_rank = [sum(r * width <= t < (r + 1) * width for t in keep) for r in range(3)]
+    assert per_rank == [128, 128, 128] and set(specials) <= set(keep)
+    assert {5, 6, 8, 9, width + 1, width + 2, 2 * width + 3} <= set(keep)
+    miss = tool.miss_rates(records, keep)
+    assert miss["code"] == 0.0  # 7 is unseen but inside the id-order tail of rank 0's 128 columns
+    assert miss["prose"] == 0.0  # width + 9: rank 1 tail in id order
+    tight = tool.miss_rates(records, tool.select(order, specials, 128)[:3])
+    assert tight["code"] == 1.0
+    assert tool.heldout("doc-a", 0.2) == tool.heldout("doc-a", 0.2)  # deterministic per document group
+    assert 0.15 < sum(tool.heldout(f"d{i}", 0.2) for i in range(4000)) / 4000 < 0.25
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

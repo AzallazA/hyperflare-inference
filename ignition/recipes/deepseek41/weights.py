@@ -153,21 +153,30 @@ class ModelWeights:
                    allocated_tensor_bytes(device) - before, vision)
 
 
-def draft_vocab_columns(tokens, world, rank, *, k=0, vocab=129280, alignment=64, multiple=128):
+def draft_vocab_columns(tokens, world, rank, *, k=0, ranking=(), vocab=129280, alignment=64, multiple=128):
     """TP3 tp3.draft_vocab: this rank's sorted local columns of the draft vocabulary (the listed tokens in this rank's
-    shard). Every rank keeps the same count, max(largest share, k / world) rounded up to ``multiple``; shares below it
-    are filled with the rank's lowest unused real columns, so every rank prepares the same projection shape."""
+    shard). Every rank keeps the same count, max(largest share, k / world) rounded up to ``multiple``. A share below it
+    is filled from ``ranking`` (token ids, most frequent first; the table's own frequency order), never by id order:
+    the lowest unused ids are arbitrary rare tokens on ranks 1-2 and dropped common ones on rank 0 (review H1,
+    2026-11-17). A table that needs filling and has no ranking left for this rank is refused; ds41_draft_vocab.py build
+    writes exactly the width per rank, so it never needs a fill."""
     width = -(-vocab // (world * alignment)) * alignment
     shares = [sorted({t - r * width for t in tokens if r * width <= t < min((r + 1) * width, vocab)}) for r in range(world)]
     count = min(width, -(-max(max(len(share) for share in shares), -(-k // world)) // multiple) * multiple)
     real = min(width, vocab - rank * width)
+    if real < count:
+        raise ValueError("draft vocabulary: a rank has fewer real columns than the trimmed width")
     columns, have = list(shares[rank]), set(shares[rank])
-    filler = (c for c in range(width) if c not in have)
-    while len(columns) < count:
-        column = next(filler)
-        if column >= real:
-            raise ValueError("draft vocabulary: a rank has fewer real columns than the trimmed width")
-        columns.append(column)
+    for token in ranking:
+        if len(columns) >= count:
+            break
+        column = token - rank * width
+        if 0 <= column < real and column not in have:
+            columns.append(column)
+            have.add(column)
+    if len(columns) < count:
+        raise ValueError(f"draft vocabulary: rank {rank} lists {len(shares[rank])} tokens for {count} columns and its "
+                         "ranking cannot fill the rest; rebuild the table with tp3-tools/ds41_draft_vocab.py build")
     return sorted(columns)
 
 
@@ -181,7 +190,10 @@ def trimmed_draft_head(head, vocabulary_file, shard, vocabulary_parallel_samplin
     tokens, k = record["tokens"], int(record.get("k", 0))
     if not tokens or any(type(t) is not int or not 0 <= t < 129280 for t in tokens):
         raise ValueError(f"draft vocabulary {vocabulary_file.name}: token ids must be integers in [0, 129280)")
-    columns = draft_vocab_columns(tokens, shard.world_size, shard.rank, k=k)
+    ranking = record.get("ranking", [])
+    if any(type(t) is not int or not 0 <= t < 129280 for t in ranking):
+        raise ValueError(f"draft vocabulary {vocabulary_file.name}: ranking ids must be integers in [0, 129280)")
+    columns = draft_vocab_columns(tokens, shard.world_size, shard.rank, k=k, ranking=ranking)
     if head.shape[0] != -(-129280 // (shard.world_size * 64)) * 64:
         raise ValueError("draft vocabulary: the head shard is not the padded vocabulary partition")
     index = persistent_empty((len(columns),), torch.int64, head.device)
