@@ -308,25 +308,30 @@ async fn json_literals_keep_markup_as_content_and_tool_blocks_end_output() {
 }
 
 #[test]
-fn complete_calls_validate_nonempty_names_and_json_arguments() {
+fn complete_calls_reject_empty_names_and_retain_values_that_are_not_json() {
     for spaced in [false, true] {
         let (open, body, close) = block(spaced);
-        for invalid in [
-            body.replace("name=\"lookup\"", "name=\"\""),
-            body.replace(">3</", ">not-json</"),
-        ] {
-            let text = format!("{open}{invalid}{close}");
-            assert!(
-                actual(
-                    &[&text],
-                    spaced,
-                    OutputStart::Content,
-                    false,
-                    Termination::Eos
-                )
-                .is_err(),
-                "{text}"
-            );
+        let run = |body: String| {
+            let text = format!("{open}{body}{close}");
+            actual(
+                &[&text],
+                spaced,
+                OutputStart::Content,
+                false,
+                Termination::Eos,
+            )
+        };
+        assert!(run(body.replace("name=\"lookup\"", "name=\"\"")).is_err());
+        // A `string="false"` value is JSON the model wrote. Text that does not
+        // parse stays in the call as a string.
+        for raw in ["not-json", r#"["grep '\.' a"]"#, r#""open"#, ""] {
+            let parsed = run(body.replace(">3</", &format!(">{raw}</"))).unwrap();
+            assert_eq!(parsed.calls.len(), 2);
+            let arguments: Value = serde_json::from_str(&parsed.calls[0].1).unwrap();
+            assert_eq!(arguments["city"], "東京🙂\\\nquoted \"value\"");
+            assert_eq!(arguments["limit"], json!(raw));
+            let arguments: Value = serde_json::from_str(&parsed.calls[1].1).unwrap();
+            assert_eq!(arguments, json!({"items": [true, null, {"x": 2}]}));
         }
     }
 }

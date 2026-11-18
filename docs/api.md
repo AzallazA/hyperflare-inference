@@ -402,7 +402,10 @@ its output limit; recognized but incomplete calls at natural completion are erro
 DeepSeek reasoning and both DSML tool syntaxes use the pinned official
 `deepseek-recipe` state machine. Helios adapts its actions into the same neutral
 events, validates nonempty tool names and JSON objects with nonempty, unique
-argument names, and publishes each call when its arguments complete. Closing the
+argument names, and publishes each call when its arguments complete. A parameter
+marked `string="false"` carries JSON written by the model. When that text is not
+valid JSON, Helios retains it as a JSON string, so the call reaches the client
+with a well-formed argument object and the client validates the value. Closing the
 outer calls block ends parsed output; subsequent generated text is discarded.
 The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
