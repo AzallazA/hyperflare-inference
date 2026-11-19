@@ -212,7 +212,6 @@ impl ProcessedImages {
 }
 
 pub struct ImagePrompt {
-    pub text: String,
     pub token_ids: Vec<u32>,
     pub mm_token_type_ids: Vec<i32>,
     /// Text, temporal, height, and width position rows, each of length token_ids.len().
@@ -257,7 +256,17 @@ pub enum ImageSettings {
     Glm {},
 }
 
+/// The text that stands for an image in a RADIO prompt.
+pub(crate) const RADIO_PLACEHOLDER: &str = "<image>";
+
 impl ImageSettings {
+    /// The text that positions an image when a request spells it and the chat template wrote
+    /// none, for layouts whose template lets message text place the images. It comes from the
+    /// layout because cores prepared for RADIO declare no image placeholder token ID.
+    pub fn spelled_placeholder(&self) -> Option<&'static str> {
+        matches!(self, Self::Radio {}).then_some(RADIO_PLACEHOLDER)
+    }
+
     pub fn preparation_kind(&self) -> crate::model::contract::ImagePreparationKind {
         use crate::model::contract::ImagePreparationKind;
         match self {
@@ -856,12 +865,14 @@ impl ImageProcessor {
     pub fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         match &self.profile {
-            Profile::Qwen(profile) => profile.expand_prompt(frontend, text, images),
-            Profile::PatchMerge(profile) => profile.expand_prompt(frontend, text, images),
+            Profile::Qwen(profile) => profile.expand_prompt(frontend, prompt_token_ids, images),
+            Profile::PatchMerge(profile) => {
+                profile.expand_prompt(frontend, prompt_token_ids, images)
+            }
             Profile::DeepSeek4 | Profile::DeepseekRowMajor(_) => Err("DeepSeek image spans require its model contract".into()),
             Profile::MiMo(_) => Err("MiMo image expansion requires its model contract".into()),
             Profile::Moonvit => Err("MoonViT image expansion requires its model contract".into()),

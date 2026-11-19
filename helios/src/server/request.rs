@@ -302,6 +302,7 @@ pub(super) fn prepare_inference_cached(
                 token_ids,
                 image_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),
+                ordinary: Vec::new(),
             },
             echo,
         )
