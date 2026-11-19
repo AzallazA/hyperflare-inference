@@ -26,6 +26,13 @@
     when payload and logical-resource cores report the same per-rank counts
     for one rebuild manifest.
 
+[ ] Reconcile device-counted record gathers across context-parallel prefill paths
+    with the PCIe byte gather in local-inference-lab/flashinfer#114. Check the
+    shared RoCEnante gather contract and the GLM-5.3 and Kimi K3 peer-cache
+    reads. On DCP2/4, compare pack, gather, and placement against direct peer
+    reads for identical context windows. Verify record order and byte equality
+    as live counts change across graph replays before choosing a transport.
+
 [ ] Validate GLM TP4/TP8 A16 expert preparation through export and native replay.
     Verify DirectWeightLoader.load_nvfp4_experts keeps only final scale layouts
     in persistent storage when loading expanded CSF scales.
@@ -42,6 +49,17 @@
 [ ] Prevent healthy TP forward compilation from exhausting the two-hour Gloo
     timeout in ForwardCache._prepare_ranks when idle ranks gather outcomes.
     Preserve compiler failure and dead-peer detection while waiting for work.
+
+[ ] Resolve CUBLAS_STATUS_ALLOC_FAILED during Kimi K3.1 Pro TP16 DFlash2
+    prefill4096 warmup after forward compilation, with concurrency 8,
+    speculative token capacity 64, DCP8, CSF scales, and KDA-input MXFP8.
+    Cached-forward warmup recovers from 128 MiB allocation failures with less
+    than 35 MiB free. Validate cold compilation through capture at these capacities.
+
+[ ] Prevent tensor-parallel shutdown deadlines from discarding completed exports.
+    Kimi K3.1 Pro TP16 DFlash2 captures 129 graphs and writes every rank source,
+    but preparation cleanup exceeds the 60-second rank shutdown deadline under
+    swap pressure. Validate resource drain and final assembly at these capacities.
 
 [ ] Restore loading and serving for cores with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in
