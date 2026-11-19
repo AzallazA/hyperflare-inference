@@ -668,8 +668,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     # (the long-context split variant; index_row_split.split_variants)
     from .index_row_split import context_variant_name, split_variants
     world = len(config.devices)
-    count += len(modes) * sum(len(split_variants(tp3, mode="prefill", capacity=capacity, scoring=None, world=world)) - 1
-                              for capacity in (*config.prefill_capacities, *encoders))
+    count += len(modes) * (sum(len(split_variants(tp3, mode="prefill", capacity=capacity, scoring=None, world=world)) - 1
+                               for capacity in config.prefill_capacities)
+                           + sum(len(split_variants(tp3, mode="prefill", capacity=capacity, scoring=None, world=world,
+                                                    graph="encoder_prefill")) - 1 for capacity in encoders))
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -723,7 +725,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
             for capacity, variant in ((capacity, variant) for capacity in encoders
                                       for variant in split_variants(tp3, mode="prefill", capacity=capacity, scoring=None,
-                                                                    world=world)):
+                                                                    world=world, graph="encoder_prefill")):
                 # Same metadata, storage, inputs and prefill runtime as prefill<capacity>; no head or sampling.
                 name = f"encoder_prefill{capacity}" + suffix
                 if variant:  # tp3.index_row_split_min_context: the twin's long-context split variant

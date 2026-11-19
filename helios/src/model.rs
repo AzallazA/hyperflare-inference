@@ -345,7 +345,8 @@ pub fn scheduler_capabilities_with_manifest(
         return Err("model completion capacity differs from its execution manifest".into());
     }
     let mut capabilities = scheduler_capabilities(config);
-    for graph in &manifest.graphs {
+    // TP3 fork: a context variant shares its base's shape and input plan (catalog::validate).
+    for graph in manifest.graphs.iter().filter(|graph| !catalog::is_context_variant(&graph.name)) {
         let semantics = config.contract.graph(&graph.name)?;
         let inputs: Vec<_> = semantics.inputs.iter().filter(|binding|
             matches!(binding.source, ValueSource::PendingToken | ValueSource::PromptAndPendingToken)

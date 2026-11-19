@@ -738,3 +738,32 @@ def test_export_sh_passes_the_min_context_knob():
     text = EXPORT_SH.read_text()
     assert 'FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX' in text
     assert text.index("FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX") < text.index("exec .venv/bin/ignition export")
+
+
+def test_variant_graph_kinds_switch_parses_validates_records_and_selects():
+    base = {"FLARE_DS41_INDEX_ROW_SPLIT": "4096", "FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX": "32768"}
+    both = TP3Config.from_environment(base)
+    assert both.index_row_split_variant_graphs is None and "index_row_split_variant_graphs" not in both.to_metadata()
+    enc = TP3Config.from_environment({**base, "FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS": "encoder_prefill"})
+    assert enc.index_row_split_variant_graphs == ("encoder_prefill",)
+    assert list(enc.to_metadata()["index_row_split_variant_graphs"]) == ["encoder_prefill"]
+    kw = dict(mode="prefill", capacity=4096, scoring=None, world=3)
+    assert split_module.split_variants(both, **kw) == (False, True)
+    assert split_module.split_variants(both, graph="encoder_prefill", **kw) == (False, True)
+    assert split_module.split_variants(enc, **kw) == (False,)              # the full prefill graph: replicated only
+    assert split_module.split_variants(enc, graph="encoder_prefill", **kw) == (False, True)
+    full = TP3Config.from_environment({**base, "FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS": "prefill"})
+    assert split_module.split_variants(full, graph="encoder_prefill", **kw) == (False,)
+    for bad in ("decode", "prefill,prefill", "encoder"):
+        with pytest.raises(ValueError, match="index_row_split_variant_graphs"):
+            TP3Config.from_environment({**base, "FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS": bad})
+    with pytest.raises(ValueError, match="index_row_split_variant_graphs"):
+        TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT": "4096", "FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS": "prefill"})
+
+
+def test_export_sh_passes_the_variant_kinds_knob():
+    from tests.recipes.test_deepseek41_tp3_config import EXPORT_SH
+
+    text = EXPORT_SH.read_text()
+    assert 'FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS=$IDX_SPLIT_VARIANTS' in text
+    assert text.index("FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS=$IDX_SPLIT_VARIANTS") < text.index("exec .venv/bin/ignition export")

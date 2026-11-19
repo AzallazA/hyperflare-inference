@@ -32,6 +32,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
     }
     config.contract.validate(manifest)?;
     validate_context_variants(manifest)?;
+    validate_context_variant_plans(config, manifest)?;
     config.sampling_ranges.validate(&config.sampling_defaults)?;
     if config
         .sampling_ranges
@@ -213,6 +214,17 @@ pub fn select_context_variant(manifest: &ExecutionManifest, base: usize, start: 
     best.0
 }
 
+/// TP3 fork: true for a context variant graph name (see [`CONTEXT_VARIANT_MARK`]).
+pub fn is_context_variant(name: &str) -> bool {
+    context_variant(name).is_some()
+}
+
+/// TP3 fork: the graphs the scheduler plans with. A context variant shares its base's shape (the
+/// runtime swaps it in at submit), so the shape catalogs and the cost model see the base only.
+pub fn scheduling_graphs(graphs: &[crate::execution::GraphDescriptor]) -> Vec<crate::execution::GraphDescriptor> {
+    graphs.iter().filter(|graph| !is_context_variant(&graph.name)).cloned().collect()
+}
+
 fn same_shape(a: &crate::execution::GraphDescriptor, b: &crate::execution::GraphDescriptor) -> bool {
     a.kind == b.kind
         && a.batch_capacity == b.batch_capacity
@@ -225,7 +237,7 @@ fn same_shape(a: &crate::execution::GraphDescriptor, b: &crate::execution::Graph
 
 /// TP3 fork: every context variant names an existing one-lane prefill / encoder-only base graph
 /// of the same shape and binds exactly its uploads (the runtime packs the step before it picks).
-fn validate_context_variants(manifest: &ExecutionManifest) -> Result<()> {
+pub(crate) fn validate_context_variants(manifest: &ExecutionManifest) -> Result<()> {
     fn uploads(graph: &crate::execution::GraphDescriptor) -> Vec<&str> {
         let mut names: Vec<_> = graph.input_bindings.iter().map(|b| b.buffer_name.as_str()).collect();
         names.sort_unstable();
@@ -243,6 +255,25 @@ fn validate_context_variants(manifest: &ExecutionManifest) -> Result<()> {
                 graph.name
             )
             .into());
+        }
+    }
+    Ok(())
+}
+
+/// TP3 fork: a context variant's semantic input plan (source, indexing, offset, padding, tensor
+/// of every upload) equals its base's: the runtime packs a step with the plan of the shape's
+/// first contract graph and swaps the variant in afterwards (review C2; as the encoder twins).
+pub(crate) fn validate_context_variant_plans(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<()> {
+    let plan = |name: &str| -> Result<Vec<_>> {
+        let mut inputs: Vec<_> = config.contract.graph(name)?.inputs.iter().map(|b| (b.buffer.clone(),
+            b.source as i32, b.indexing as i32, b.value_offset, b.padding, b.tensor.clone())).collect();
+        inputs.sort();
+        Ok(inputs)
+    };
+    for graph in &manifest.graphs {
+        let Some((base, _)) = context_variant(&graph.name) else { continue };
+        if plan(&graph.name)? != plan(base)? {
+            return Err(format!("context variant {} binds a different input plan than {base}", graph.name).into());
         }
     }
     Ok(())

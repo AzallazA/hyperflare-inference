@@ -77,3 +77,51 @@ fn a_twin_without_a_matching_prefill_graph_is_refused() {
     assert!(config.contract.validate(&manifest).unwrap_err().to_string()
         .contains("prefill twin's uploads"));
 }
+
+/// TP3 fork (DS41 long-context indexer split): `with_twin()` plus `-split-ctx32768` variants of
+/// the 512-token prefill graph and of its encoder-only twin.
+fn with_variants() -> (ModelConfig, ExecutionManifest) {
+    let (mut config, mut manifest) = with_twin();
+    let prefill = manifest.graphs.iter().find(|g| g.kind == GraphKind::Prefill).unwrap().name.clone();
+    for base in [prefill, TWIN.to_string()] {
+        let name = format!("{base}{}32768", catalog::CONTEXT_VARIANT_MARK);
+        let mut contract = config.contract.graphs.iter().find(|g| g.graph == base).unwrap().clone();
+        contract.graph = name.clone();
+        config.contract.graphs.push(contract);
+        let descriptor = manifest.graphs.iter().find(|g| g.name == base).unwrap().clone();
+        manifest.graphs.push(GraphDescriptor { name, ..descriptor });
+    }
+    for (index, graph) in manifest.graphs.iter_mut().enumerate() {
+        graph.handle = index + 1;
+    }
+    (config, manifest)
+}
+
+#[test]
+fn context_variants_validate_select_apart_and_must_share_their_base_input_plan() {
+    let (config, manifest) = with_variants();
+    manifest.validate().unwrap();
+    config.contract.validate(&manifest).unwrap();
+    catalog::validate_context_variants(&manifest).unwrap();
+    catalog::validate_context_variant_plans(&config, &manifest).unwrap();
+    let index = |name: &str| manifest.graphs.iter().position(|g| g.name == name).unwrap();
+    let prefill = manifest.graphs.iter().position(|g| g.kind == GraphKind::Prefill).unwrap();
+    let base = manifest.graphs[prefill].name.clone();
+    let select = |kind| catalog::select(&config, &manifest, kind, 1, 512, 0, crate::execution::SamplingMode::General);
+    assert_eq!(select(GraphKind::Prefill).unwrap(), prefill);
+    assert_eq!(select(GraphKind::EncoderPrefill).unwrap(), index(TWIN));
+    assert_eq!(catalog::select_context_variant(&manifest, prefill, 32767), prefill);
+    assert_eq!(catalog::select_context_variant(&manifest, prefill, 32768), index(&format!("{base}-split-ctx32768")));
+    assert_eq!(catalog::select_context_variant(&manifest, index(TWIN), 40960), index(&format!("{TWIN}-split-ctx32768")));
+    // the scheduler's completion inputs are the base catalog's (variants share the shape)
+    let (plain_config, plain) = with_twin();
+    assert_eq!(scheduler_capabilities_with_manifest(&config, &manifest).unwrap().completion_inputs.len(),
+        scheduler_capabilities_with_manifest(&plain_config, &plain).unwrap().completion_inputs.len());
+    // same buffers, a different semantic source: refused (the step is packed with the base's plan)
+    let (mut config, manifest) = with_variants();
+    let variant = config.contract.graphs.iter_mut().find(|g| g.graph == format!("{TWIN}-split-ctx32768")).unwrap();
+    let binding = variant.inputs.iter_mut().find(|b| b.source == ValueSource::PromptPosition).unwrap();
+    binding.source = ValueSource::PromptToken;
+    assert!(catalog::validate_context_variant_plans(&config, &manifest).unwrap_err().to_string()
+        .contains("different input plan"));
+}

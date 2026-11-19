@@ -575,3 +575,41 @@ fn a_slow_first_sample_does_not_lock_encoder_chunks_out_of_the_warm_up() {
         }
     }
 }
+
+/// TP3 fork (review B1): a package with long-context variants (`<base>-split-ctx<N>`, same shape
+/// as the base) passes the start-up catalog set-up the runtime runs (cost model on
+/// `catalog::scheduling_graphs`, then `shape_catalogs`); handed every graph unfiltered, the cost
+/// model and the prefill / encoder catalogs refuse the duplicate shapes.
+#[test]
+fn context_variants_stay_out_of_the_cost_model_and_the_shape_catalogs() {
+    use crate::execution::{GraphDescriptor, SamplingMode};
+    let graph = |name: String, kind: GraphKind, tokens: usize| GraphDescriptor {
+        tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+        name, kind, sampling_mode: SamplingMode::General, handle: 0x5000,
+        batch_capacity: 1, token_capacity: tokens, prefill_capacity: 0, estimated_duration_ns: 1_000_000,
+        input_bindings: vec![],
+    };
+    let mut graphs: Vec<_> = prefill_capacities(4096).map(|n| graph(format!("prefill{n}"), GraphKind::Prefill, n)).collect();
+    for n in [3072, 3584, 4096] {
+        graphs.push(graph(format!("encoder_prefill{n}"), GraphKind::EncoderPrefill, n));
+    }
+    // the engine runs speculation at widths 1 and 6 on batch 1 (tp3_engine)
+    graphs.extend(super::tests::duration_graphs(1).into_iter()
+        .filter(|g| g.kind == GraphKind::Speculative && [1, 6].contains(&g.token_capacity)));
+    graphs.push(graph("prefill4096-split-ctx32768".into(), GraphKind::Prefill, 4096));
+    graphs.push(graph("encoder_prefill4096-split-ctx32768".into(), GraphKind::EncoderPrefill, 4096));
+    let mut s = ds41_engine(&[]);
+    assert!(crate::scheduler::cost::ActionCosts::prepared(&graphs, 16).is_err());
+    assert!(s.prefill_graphs(&graphs.iter().filter(|g| g.kind == GraphKind::Prefill)
+        .map(|g| g.token_capacity).collect::<Vec<_>>()).is_err());
+    let mut s = ds41_engine(&[]);
+    s.graph_durations(&crate::model::catalog::scheduling_graphs(&graphs)).unwrap();
+    s.shape_catalogs(&graphs).unwrap();
+    assert_eq!(s.prefill_catalog, prefill_capacities(4096).collect::<Vec<_>>());
+    assert_eq!(s.encoder_prefill_catalog, [3072, 3584, 4096]);
+    assert_eq!(crate::model::catalog::scheduling_graphs(&graphs).len(), graphs.len() - 2);
+    // the runtime counts what it swapped in
+    s.record_context_variant(4096);
+    s.record_context_variant(4096);
+    assert_eq!((s.stats().context_variant_chunks, s.stats().context_variant_tokens), (2, 8192));
+}

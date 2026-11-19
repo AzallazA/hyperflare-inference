@@ -555,7 +555,8 @@ impl ModelRuntime {
                     }
                 };
                 if let Err(error) = scheduler
-                    .graph_durations(&executor.manifest().graphs)
+                    // TP3 fork: context variants share their base's shape (cost key): base graphs only.
+                    .graph_durations(&crate::model::catalog::scheduling_graphs(&executor.manifest().graphs))
                     .and_then(|()| scheduler.configure_policy(policy))
                     .and_then(|()| match &executor.manifest().cache {
                         Some(cache) if !cache.snapshot_pages.is_empty() => {
@@ -579,51 +580,7 @@ impl ModelRuntime {
                     .and_then(|()| {
                         scheduler.fixed_speculative_width(worker_config.speculative_fixed_width)
                     })
-                    .and_then(|()| {
-                        scheduler.mixed_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|g| g.kind == GraphKind::Mixed)
-                                .map(|g| (g.batch_capacity, g.token_capacity, g.prefill_capacity))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .and_then(|()| {
-                        scheduler.scored_prefill_graphs(&executor.manifest().graphs.iter()
-                            .filter(|g| g.kind == GraphKind::ScoredPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
-                        scheduler.prefill_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|graph| graph.kind == crate::execution::GraphKind::Prefill)
-                                .map(|graph| graph.token_capacity)
-                                .collect::<Vec<_>>(),
-                        )?;
-                        scheduler.encoder_prefill_graphs(&executor.manifest().graphs.iter()
-                            .filter(|graph| graph.kind == GraphKind::EncoderPrefill)
-                            .map(|graph| graph.token_capacity).collect::<Vec<_>>())?;
-                        Ok(())
-                    })
-                    .and_then(|()| {
-                        scheduler.speculative_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|graph| {
-                                    matches!(
-                                        graph.kind,
-                                        GraphKind::Speculative
-                                    )
-                                })
-                                .map(|graph| (graph.batch_capacity, graph.token_capacity))
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .into_iter().collect::<Vec<_>>(),
-                        )
-                    })
+                    .and_then(|()| scheduler.shape_catalogs(&executor.manifest().graphs))
                 {
                     let _ = ready_tx.send(Err(error.clone()));
                     let mut shutdown = executor.close();
@@ -2146,7 +2103,11 @@ impl<'a> Worker<'a> {
         // or past a context variant's minimum runs that variant (same shape and uploads).
         let graph = match (kind, step.lanes.as_slice()) {
             (GraphKind::Prefill | GraphKind::EncoderPrefill, [lane]) if step.mixed.is_none() => {
-                crate::model::catalog::select_context_variant(executor.manifest(), graph, lane.start_position)
+                let variant = crate::model::catalog::select_context_variant(executor.manifest(), graph, lane.start_position);
+                if variant != graph {
+                    self.scheduler.record_context_variant(lane.tokens);
+                }
+                variant
             }
             _ => graph,
         };

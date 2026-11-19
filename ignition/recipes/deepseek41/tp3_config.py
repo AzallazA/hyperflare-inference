@@ -42,7 +42,7 @@ VRAM_RECLAIM = {
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
                      "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans", "index_row_split",
-                     "index_row_split_min_context")
+                     "index_row_split_min_context", "index_row_split_variant_graphs")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
@@ -303,8 +303,14 @@ class TP3Config:
     the split graph for a one-lane prefill chunk whose start position (the context already indexed) is at least
     <tokens>, the replicated one below (helios ``catalog::context_variant``). The split's exchange costs a near
     constant ~2.3 ms per index layer and 4096-row chunk (C2: 17-row channel gather), while the indexer work it saves
-    grows with the context (G2 A/B, 2026-11-19: break-even near 20-30K tokens). None = every listed graph split
-    (G2 behaviour). Export-time only."""
+    grows with the context (G2 A/B, 2026-11-19: about +3-5 ms per 4096-row chunk constant, -0.157 ms per 1K tokens
+    of context; break-even near 21-29K tokens). None = every listed graph split (G2 behaviour). Export-time only."""
+    index_row_split_variant_graphs: tuple[str, ...] | None = None
+    """FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS=<kinds> (needs index_row_split_min_context): which graphs get the
+    long-context variant, a comma list of ``prefill`` (the full prefill graph: a prompt's final chunk of 3,585-4,096
+    rows) and ``encoder_prefill`` (the encoder-only twin: every non-final chunk). None = both. ``encoder_prefill``
+    alone keeps nearly all of the gain (the full variant runs at most once per prompt) for one variant graph's
+    capture memory instead of two. Export-time only."""
     index_row_split_check: bool = False
     """FLARE_DS41_INDEX_ROW_SPLIT_CHECK=1, debug-serve only (never export with it): the split's exchanges also carry a
     checksum per window row, and a counter op counts per layer the rows whose checksum differs after the gather
@@ -588,6 +594,14 @@ class TP3Config:
                 or self.index_row_split_min_context <= 0):
             raise ValueError("TP3 config: index_row_split_min_context must be a positive token count and needs "
                              f"index_row_split (got {self.index_row_split_min_context!r})")
+        if self.index_row_split_variant_graphs is not None and (
+                self.index_row_split_min_context is None or not isinstance(self.index_row_split_variant_graphs, tuple)
+                or not self.index_row_split_variant_graphs
+                or any(k not in ("prefill", "encoder_prefill") for k in self.index_row_split_variant_graphs)
+                or len(set(self.index_row_split_variant_graphs)) != len(self.index_row_split_variant_graphs)):
+            raise ValueError("TP3 config: index_row_split_variant_graphs must be distinct names from prefill, "
+                             "encoder_prefill and needs index_row_split_min_context "
+                             f"(got {self.index_row_split_variant_graphs!r})")
         if self.index_row_split_check and not self.index_row_split:
             raise ValueError("TP3 config: index_row_split_check needs index_row_split")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
@@ -693,6 +707,8 @@ class TP3Config:
             prefill_skip_suffix=parse_skip_suffix(get("PREFILL_SKIP_SUFFIX")),
             index_row_split=parse_index_row_split(get("INDEX_ROW_SPLIT")),
             index_row_split_min_context=optional("INDEX_ROW_SPLIT_MIN_CTX"),
+            index_row_split_variant_graphs=tuple(k.strip() for k in get("INDEX_ROW_SPLIT_VARIANTS").split(",") if k.strip())
+                                           or None,
             index_row_split_check=flag("INDEX_ROW_SPLIT_CHECK"),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),

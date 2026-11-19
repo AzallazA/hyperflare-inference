@@ -54,6 +54,9 @@
 #   IDX_SPLIT_MIN_CTX  tokens: long-context-only split (FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX; needs IDX_SPLIT): the
 #            IDX_SPLIT graphs stay replicated and each gets a "-split-ctx<tokens>" twin that Helios runs for one-lane
 #            prefill chunks starting at <tokens> or later (needs a binary with catalog::context_variant); default unset
+#   IDX_SPLIT_VARIANTS  which graphs get that twin (FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS; needs IDX_SPLIT_MIN_CTX):
+#            "prefill", "encoder_prefill" or both comma-separated; default unset = both. "encoder_prefill" = the non-final
+#            chunks only (nearly all of the gain, one variant graph's capture memory instead of two)
 #   ORDER    expert order shipped in tp3-tools/release/expert-orders/<ORDER> (sets COUNTS when COUNTS is unset), e.g.
 #            order-mix-provisional-exl3S (blend order of the 11-18 default, fingerprint a70f5e67d564)
 #   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
@@ -131,6 +134,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ -n "${IDX_SPLIT:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT=$IDX_SPLIT
 [ -n "${IDX_SPLIT_MIN_CTX:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX
+[ -n "${IDX_SPLIT_VARIANTS:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS=$IDX_SPLIT_VARIANTS
 # the row split's check mode counts in a Python op (debug-serve only): an export must never carry it
 [ -n "${FLARE_DS41_INDEX_ROW_SPLIT_CHECK:-}" ] && { echo "refusing: FLARE_DS41_INDEX_ROW_SPLIT_CHECK is debug-serve only" >&2; exit 2; }
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1

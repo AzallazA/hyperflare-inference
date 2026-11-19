@@ -206,6 +206,10 @@ pub struct SchedulerStats {
     /// TP3 fork: prefill chunks submitted to an encoder-only graph, and their prompt tokens.
     pub encoder_prefill_chunks: u64,
     pub encoder_prefill_tokens: u64,
+    /// TP3 fork: prefill chunks the runtime ran on a long-context variant graph
+    /// (`<base>-split-ctx<N>`), and their prompt tokens.
+    pub context_variant_chunks: u64,
+    pub context_variant_tokens: u64,
 }
 
 #[derive(Clone)]
@@ -896,6 +900,28 @@ impl RequestScheduler {
         }
         self.prefill_catalog = catalog;
         Ok(())
+    }
+
+    /// The shape catalogs of a prepared model, in start-up order: mixed, scored prefill, prefill,
+    /// encoder-only prefill and speculative shapes. TP3 fork: context variants
+    /// (`<base>-split-ctx<N>`) are left out; they share their base's shape and the runtime swaps
+    /// them in at submit.
+    pub fn shape_catalogs(&mut self, graphs: &[crate::execution::GraphDescriptor]) -> Result<()> {
+        let graphs = crate::model::catalog::scheduling_graphs(graphs);
+        let of = |kind: GraphKind| graphs.iter().filter(move |g| g.kind == kind);
+        self.mixed_graphs(&of(GraphKind::Mixed).map(|g| (g.batch_capacity, g.token_capacity, g.prefill_capacity))
+            .collect::<Vec<_>>())?;
+        self.scored_prefill_graphs(&of(GraphKind::ScoredPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
+        self.prefill_graphs(&of(GraphKind::Prefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
+        self.encoder_prefill_graphs(&of(GraphKind::EncoderPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
+        self.speculative_graphs(&of(GraphKind::Speculative).map(|g| (g.batch_capacity, g.token_capacity))
+            .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>())
+    }
+
+    /// TP3 fork: the runtime ran a prefill chunk of `tokens` prompt tokens on a context variant.
+    pub fn record_context_variant(&mut self, tokens: usize) {
+        self.stats.context_variant_chunks += 1;
+        self.stats.context_variant_tokens += tokens as u64;
     }
 
     pub fn scored_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {

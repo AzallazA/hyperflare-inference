@@ -436,8 +436,11 @@ impl LoadOptions {
                     }
                     || (kind == GraphKind::Speculative && graph.token_capacity > 1 && graph.packed_token_capacity > token_capacity)
                     || !names.insert(graph.name.clone())
+                    // TP3 fork: a context variant (`<base>-split-ctx<N>`) shares its base's shape by
+                    // design; its minimum start position keeps the tuple distinct (names stay unique).
                     || !variants.insert((graph.kind.clone(), graph.sampling_mode.clone(), graph.batch_capacity,
-                        graph.token_capacity, graph.prefill_capacity, graph.packed_token_capacity, graph.draft_tokens, graph.draft_source, graph.speculation_enabled)) {
+                        graph.token_capacity, graph.prefill_capacity, graph.packed_token_capacity, graph.draft_tokens, graph.draft_source, graph.speculation_enabled,
+                        crate::model::catalog::context_variant(&graph.name).map(|(_, min)| min))) {
                     return Err(invalid("invalid or duplicate serving graph variant"));
                 }
             }
@@ -751,6 +754,55 @@ mod tests {
 
     fn config() -> Value {
         serde_json::json!({"speculative_token_capacity": 24, "speculative_widths": [1,2,3,4,5,6], "speculative_fixed_width": null})
+    }
+
+    /// TP3 fork: `core()` plus one-lane prefill / encoder-only graphs of 4096 rows named `names`.
+    fn prefill_core(names: &[(&str, &str)]) -> Core {
+        let mut core = core();
+        let function = core.graphs.last().unwrap().functions[0];
+        for (name, kind) in names {
+            core.graphs.push(Graph {
+                name: (*name).into(), flags: 0, resource: (*name).into(), node_count: 1, edge_count: 0,
+                functions: vec![function],
+            });
+            core.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+                name: (*name).into(),
+                kind: (*kind).into(),
+                sampling_mode: "general".into(),
+                estimated_duration_ns: 1000,
+                batch_capacity: 1,
+                token_capacity: 4096,
+                ..Default::default()
+            });
+        }
+        core
+    }
+
+    #[test]
+    fn context_variants_load_beside_their_base_and_plain_duplicates_do_not() {
+        let names = [("prefill4096", "prefill"), ("prefill4096-split-ctx32768", "prefill"),
+            ("encoder_prefill4096", "encoder_prefill"), ("encoder_prefill4096-split-ctx32768", "encoder_prefill")];
+        let mut cores = [prefill_core(&names), prefill_core(&names)];
+        LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(&mut cores, &mut config()).unwrap();
+        for core in &cores {
+            let kept: Vec<_> = core.execution.as_ref().unwrap().graphs.iter().map(|g| g.name.as_str()).collect();
+            for (name, _) in names {
+                assert!(kept.contains(&name), "{name} dropped: {kept:?}");
+            }
+        }
+        // two variants of one base with different minima are distinct too
+        let mut cores = [prefill_core(&[("prefill4096", "prefill"), ("prefill4096-split-ctx32768", "prefill"),
+            ("prefill4096-split-ctx65536", "prefill")])];
+        LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(&mut cores, &mut config()).unwrap();
+        // a second graph of the same shape that is not a context variant is still refused
+        for extra in ["prefill4096-copy", "prefill4096-split-ctx", "prefill4096-split-ctx0x"] {
+            let mut cores = [prefill_core(&[("prefill4096", "prefill"), (extra, "prefill")])];
+            let error = LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
+                .select(&mut cores, &mut config()).unwrap_err();
+            assert!(error.to_string().contains("duplicate serving graph variant"), "{extra}: {error}");
+        }
     }
 
     #[test]

@@ -411,14 +411,17 @@ def parse_context_variant(name: str) -> tuple[str, int] | None:
     return base, int(tail)
 
 
-def split_variants(tp3, *, mode, capacity, scoring, world) -> tuple[bool | None, ...]:
+def split_variants(tp3, *, mode, capacity, scoring, world, graph="prefill") -> tuple[bool | None, ...]:
     """The graphs a prefill capacity builds: ``(None,)`` = one graph, split iff listed (no min context: G2's
     behaviour, and every unlisted / scored / decode graph); ``(False, True)`` = the replicated graph plus its
-    long-context split variant (tp3.index_row_split_min_context set and the capacity listed)."""
+    long-context split variant (tp3.index_row_split_min_context set, the capacity listed and ``graph``, "prefill"
+    or "encoder_prefill", among tp3.index_row_split_variant_graphs, None = both); ``(False,)`` = the replicated
+    graph only (min context set, capacity listed, but this graph kind gets no variant)."""
     listed = (mode == "prefill" and scoring is None and bool(tp3.index_row_split) and capacity in tp3.index_row_split
               and world >= 2)
     if listed and tp3.index_row_split_min_context is not None:
-        return (False, True)
+        kinds = getattr(tp3, "index_row_split_variant_graphs", None)
+        return (False, True) if kinds is None or graph in kinds else (False,)
     return (None,)
 
 
