@@ -66,7 +66,7 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
-| `--rdma` | off; experimental, needs the `rdma` feature and `--listen`, not with TLS |
+| `--rdma` | off; experimental, needs the `rdma` feature and `--listen`, a data address on a RoCE interface, not with TLS |
 | `--max-age` | `off`; expires the manager's records a `DURATION` after last use (see [operating](docs/operating.md#deployment-model)) |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
