@@ -64,6 +64,7 @@ class SpeculativePreparation:
         share_vocabulary_columns=False,
         stage_markov_rows=False,
         logprob_single_exchange=False,
+        markov_tile_rows=None,
     ):
         self.forwards = forwards
         # TP3 fork (DS41 tp3.markov_stage_rows): vocabulary-parallel proposals copy each request's Markov predecessor
@@ -72,6 +73,9 @@ class SpeculativePreparation:
         # TP3 fork (DS41 tp3.logprob_single_exchange): the verification commit's vocabulary-parallel logprob reduction
         # exchanges its statistics once instead of twice (vocabulary_logprobs._finish_single); False = twice.
         self.logprob_single_exchange = logprob_single_exchange
+        # TP3 fork (DS41 tp3.markov_tile_rows): proposal score tiles cover this many request rows per program
+        # (vocabulary_sampling._score_tiles_rows); None = one program per (tile, row).
+        self.markov_tile_rows = markov_tile_rows
         # TP3 fork (DS41 tp3.share_vocab_columns): vocabulary-parallel rounds read one persistent copy of this rank's
         # global vocabulary ids (parallel_draft.vocabulary_columns) instead of one per round; False = one per round.
         self.share_vocabulary_columns = share_vocabulary_columns

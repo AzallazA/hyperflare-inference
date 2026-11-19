@@ -635,6 +635,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if config.dspark:
             from ignition.components.dspark import DSparkForwards, SpeculativePreparation
 
+            if tp3.markov_tile_rows is not None and not config.vocabulary_parallel_sampling:
+                raise ValueError("tp3.markov_tile_rows needs --vocabulary-parallel-sampling (it changes the "
+                                 "vocabulary-parallel proposal tiles)")
             if tp3.markov_stage_rows and not config.vocabulary_parallel_sampling:
                 raise ValueError("tp3.markov_stage_rows needs --vocabulary-parallel-sampling (the staged rows feed the "
                                  "vocabulary-parallel proposal tiles)")
@@ -649,6 +652,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 share_vocabulary_columns=tp3.share_vocab_columns,
                 stage_markov_rows=tp3.markov_stage_rows,
                 logprob_single_exchange=tp3.logprob_single_exchange,
+                markov_tile_rows=tp3.markov_tile_rows,
                 forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 

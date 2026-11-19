@@ -133,6 +133,139 @@ def _score_tiles(
 
 
 @triton.jit
+def _score_tiles_rows(
+    VocabularyOffset,
+    Logits,
+    Probabilities,
+    Partials,
+    Embedding,
+    Head,
+    HeadScale,
+    Pending,
+    Drafts,
+    Histogram,
+    Slots,
+    Generations,
+    LiveRows,
+    Generation,
+    Status,
+    Params,
+    TopK,
+    Grammar,
+    GrammarEnabled,
+    Seeds,
+    Offsets,
+    logit_row_stride,
+    logit_step_stride,
+    hist_stride,
+    mask_stride,
+    LOCAL: tl.constexpr,
+    VOCAB: tl.constexpr,
+    WIDTH: tl.constexpr,
+    DRAFTS: tl.constexpr,
+    PREFIX: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    BATCH: tl.constexpr,
+    RUNNING: tl.constexpr,
+    RANK: tl.constexpr,
+    FP8: tl.constexpr,
+    STEP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STAGED: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """TP3 fork (DS41 tp3.markov_tile_rows): Markov proposal scores (``_score_tiles`` with SAMPLE and MARKOV) for
+    ROWS request rows per program instead of one. Grid (tiles, cdiv(BATCH, ROWS)).
+
+    ``_score_tiles`` re-reads the 256-token x RANK head tile for every request row (one program per (tile, row)): at
+    16 rows that is 16 x 11 MB per draft step from L2 on a TP3 shard. Here each RANK chunk of the head tile is loaded
+    once and applied to every row of the program. Bit-identical to ``_score_tiles``: every row's partial sums use the
+    same [BLOCK, 64] product and reduction, chunk by chunk in the same order; the running FP32 sum lives in the row's
+    own Probabilities region between chunks (exact FP32 round trip, ``0.0 + part`` for the first chunk as the original
+    accumulator starts at 0.0), and the FP8 scale, logit add and everything after it are ``_score_tiles``' code."""
+    tile, group = tl.program_id(0), tl.program_id(1)
+    local_id = tile * BLOCK + tl.arange(0, BLOCK)
+    global_id = tl.load(VocabularyOffset) + local_id
+    stored = local_id < LOCAL
+    present_tile = stored & (global_id < VOCAB)
+    # Phase 1: transition bias partial sums, head chunk outer, rows inner.
+    for start in tl.static_range(0, RANK, 64):
+        column = start + tl.arange(0, 64)
+        weights = tl.load(Head + local_id[:, None].to(tl.int64) * RANK + column[None, :],
+                          present_tile[:, None], other=0.0).to(tl.float32)
+        for index in range(ROWS):
+            request_row = group * ROWS + index
+            if request_row < BATCH:
+                if STAGED:
+                    source = request_row
+                else:
+                    source = (tl.load(Pending + request_row) if STEP == 0
+                              else tl.load(Drafts + request_row * DRAFTS + STEP - 1))
+                    source = tl.minimum(tl.maximum(source, 0), VOCAB - 1)
+                embedding = tl.load(Embedding + source.to(tl.int64) * RANK + column).to(tl.float32)
+                part = tl.sum(weights * embedding[None, :], 1)
+                running = Probabilities + (request_row * WIDTH + STEP) * LOCAL + local_id
+                if start == 0:
+                    total = tl.full((BLOCK,), 0.0, tl.float32) + part
+                else:
+                    total = tl.load(running, stored, other=0.0) + part
+                tl.store(running, total, stored)
+        tl.debug_barrier()
+    # Phase 2: per row, _score_tiles' body after the transition bias.
+    for index in range(ROWS):
+        request_row = group * ROWS + index
+        if request_row < BATCH:
+            position = STEP
+            present = present_tile
+            running = Probabilities + (request_row * WIDTH + position) * LOCAL + local_id
+            bias = tl.load(running, stored, other=0.0)
+            if FP8:
+                bias *= tl.load(HeadScale + local_id, present, other=0.0).to(tl.float32)
+            value = tl.load(
+                Logits + request_row * logit_row_stride + position * logit_step_stride + local_id, present, other=0
+            ).to(tl.float32)
+            value += bias
+            slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
+            temperature = tl.load(Params + slot * 6)
+            repeat = tl.load(Params + slot * 6 + 3)
+            presence = tl.load(Params + slot * 6 + 4)
+            frequency = tl.load(Params + slot * 6 + 5)
+            if (repeat != 1) | (presence.to(tl.int32, bitcast=True) != 0) | (frequency.to(tl.int32, bitcast=True) != 0):
+                count = tl.load(Histogram + slot * hist_stride + global_id, present, other=0)
+                for preceding in tl.static_range(PREFIX):
+                    if preceding < position:
+                        count += (global_id == tl.load(Drafts + request_row * DRAFTS + preceding)).to(tl.int32)
+                repeated = tl.where(value > 0, tl.div_rn(value, repeat), value * repeat)
+                value = tl.where(count > 0, repeated, value)
+                value -= (count > 0).to(tl.float32) * presence
+                value -= count.to(tl.float32) * frequency
+            value = tl.div_rn(value, tl.where(temperature > 0, temperature, 1.0))
+            if tl.load(GrammarEnabled + slot) != 0:
+                allowed = tl.load(Grammar + slot * mask_stride + global_id // 32, present, other=0)
+                present &= ((allowed >> (global_id % 32)) & 1) != 0
+            value = tl.where(present, value, -float("inf"))
+            invalid = tl.sum(((value != value) | (value == float("inf"))).to(tl.int32), 0) != 0
+            if tile == 0:
+                invalid |= ~_row_live(Slots, Generations, LiveRows, Generation, Status, request_row, CAPACITY, BATCH,
+                                      RUNNING)
+            maximum = tl.max(value, 0)
+            stable_max = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
+            mass = tl.sum(tl.exp(value - stable_max), 0)
+            choice = value + _token_noise(tl.load(Seeds + request_row), tl.load(Offsets + request_row) + 4 * STEP,
+                                          global_id)
+            winner = tl.argmax(choice, 0, tie_break_left=True)
+            tl.debug_barrier()  # every thread's bias read precedes the score store over the same region
+            tl.store(running, value, stored)
+            partial = Partials + request_row * 5 * BLOCKS + tile
+            tl.store(partial, maximum)
+            tl.store(partial + BLOCKS, mass)
+            tl.store(partial + 2 * BLOCKS, tl.max(choice, 0))
+            tl.store(partial + 3 * BLOCKS, (tl.load(VocabularyOffset) + tile * BLOCK + winner).to(tl.float32))
+            tl.store(partial + 4 * BLOCKS, invalid.to(tl.float32))
+
+
+@triton.jit
 def _stage_markov_rows(Embedding, Pending, Drafts, Staged, DRAFTS: tl.constexpr, VOCAB: tl.constexpr,
                        RANK: tl.constexpr, RANK_PAD: tl.constexpr, STEP: tl.constexpr):
     """TP3 fork (PreparedVocabularySoftmax stage_rows): copy each request's Markov predecessor row (the predecessor
@@ -504,6 +637,7 @@ class PreparedVocabularySoftmax:
         offsets=None,
         tokens=None,
         stage_rows=False,
+        tile_rows=None,
     ):
         if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
             raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
@@ -563,6 +697,13 @@ class PreparedVocabularySoftmax:
         if stage_rows and not (sample and self.markov):
             raise ValueError("stage_rows needs Markov proposals")
         self.stage_rows = stage_rows
+        # TP3 fork: ``tile_rows`` (DS41 tp3.markov_tile_rows) scores ``tile_rows`` request rows per program with one read
+        # of each head tile (_score_tiles_rows); bit-identical. None = one program per (tile, row) (base).
+        if tile_rows is not None and (type(tile_rows) is not int or tile_rows < 1):
+            raise ValueError("tile_rows must be a positive integer or None")
+        if tile_rows is not None and not (sample and self.markov):
+            raise ValueError("tile_rows needs Markov proposals")
+        self.tile_rows = tile_rows
         self.logits, self.probabilities, self.valid = logits, probabilities, valid
         self.state, self.slots, self.generations, self.live_rows = requests, slots, generations, live_rows
         self.candidates, self.start, self.world, self.batch, self.width, self.local = (
@@ -606,7 +747,9 @@ class PreparedVocabularySoftmax:
         steps = []
         for step in range(w if self.sample else 1):
             summary_rows = b if self.sample else b * w
-            score = prepare_triton(
+            # One row per program is _score_tiles' own work plus extra round trips: keep the production kernel.
+            tiled = self.tile_rows is not None and min(self.tile_rows, b) > 1
+            score = self._prepare_tile_rows(step) if tiled else prepare_triton(
                 _score_tiles,
                 (
                     self.vocabulary_offset,
@@ -707,6 +850,60 @@ class PreparedVocabularySoftmax:
             # (score, summary, normalize) as upstream; stage_rows appends the step's row copy (run before score).
             steps.append((score, summary, normalize) if stage is None else (score, summary, normalize, stage))
         self.steps = tuple(steps)
+
+    def _prepare_tile_rows(self, step):
+        from .sampling import RUNNING
+
+        b, local, s, state = self.batch, self.local, self.scratch, self.state
+        rows = min(self.tile_rows, b)
+        return prepare_triton(
+            _score_tiles_rows,
+            (
+                self.vocabulary_offset,
+                self.logits,
+                self.probabilities,
+                s["partials"],
+                s["staged"] if self.stage_rows else self.embedding,
+                self.head,
+                self.scale,
+                self.pending,
+                self.candidates,
+                state.histogram,
+                self.slots,
+                self.generations,
+                self.live_rows,
+                state.generation,
+                state.status,
+                state.parameters,
+                state.top_k,
+                state.grammar_mask,
+                state.grammar_enabled,
+                self.seeds,
+                self.offsets,
+                self.logits.stride(0),
+                self.logits.stride(1),
+                state.histogram.stride(0),
+                state.grammar_mask.stride(0),
+            ),
+            (triton.cdiv(local, 256), triton.cdiv(b, rows), 1),
+            LOCAL=local,
+            VOCAB=state.vocab_size,
+            WIDTH=self.width,
+            DRAFTS=self.candidates.shape[1],
+            PREFIX=step,
+            BLOCKS=triton.cdiv(local, 256),
+            CAPACITY=state.capacity,
+            BATCH=b,
+            RUNNING=RUNNING,
+            RANK=self.head.shape[1],
+            FP8=self.scale is not None,
+            STEP=step,
+            BLOCK=256,
+            STAGED=self.stage_rows,
+            ROWS=rows,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
 
     def functional(self, *, session):
         if self.steps is None:

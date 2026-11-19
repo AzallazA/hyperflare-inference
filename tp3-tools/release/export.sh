@@ -20,6 +20,11 @@
 #            needs B12X_OVERLAY); 0 = upstream candidate set, no overlay
 #   ATTN     1 (default) = each attention decode's 16-head grid on a side stream beside the 8-head remainder grid
 #            (B12X_MLA_DECODE_REMAINDER_STREAM; ignition hook, no b12x change); 0 = serial
+#   MLA_SPLITS  ROWS:SPLITS,... = DSV41 decode split count per prepared row count (FLARE_DS41_MLA_DECODE_SPLITS;
+#            ignition hook, no b12x change; e.g. 9:10,18:5,28:10,37:5); unset = b12x's tuned split geometry
+#   H24      ROWS:0|1,... = prepared row counts whose DSV41 decode runs all 24 heads in one launch (FLARE_DS41_MLA_H24;
+#            ignition kernel, no b12x change; same values as 16 + 8 at the same split count; e.g. 9:0,80:1);
+#            unset = b12x's 16-head + 8-head grids
 #   MHC_PDL  1 (default) = programmatic dependent launch in b12x's mHC norm kernels (B12X_MHC_PDL); 0 = off
 #   AR_PART_ROWS, ENGRAM_PART_ROWS  prefill all-reduce part caps for the decoder and the Engram projection (default
 #            768 each = 5 x 768 + 256 per 4096-row chunk instead of 4 x 1024; 0 = halving, the 20261111 layout)
@@ -39,6 +44,8 @@
 #            default 0 (VRAM map 2026-11-15 item 3)
 #   MARKOV_HOST  1 = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory (FLARE_DS41_MARKOV_EMBED_HOST);
 #            default 0 (VRAM map item 6)
+#   MARKOV_TILE N = Markov proposal score tiles cover N request rows per program, one head-tile read for all of them
+#            (FLARE_DS41_MARKOV_TILE_ROWS; bit-identical); unset = one program per (tile, row)
 #   MARKOV_STAGE 1 = with MARKOV_HOST=1, copy each request's Markov predecessor row into VRAM once per draft step
 #            (FLARE_DS41_MARKOV_STAGE_ROWS); keeps MARKOV_HOST's ~74K KV without its decode cost (11-18 microbench:
 #            b1 +0.01 ms, b16 -0.00 ms per round vs the table in VRAM); default 0
@@ -130,6 +137,9 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
 [ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
 [ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
+[ -n "${MARKOV_TILE:-}" ] && export FLARE_DS41_MARKOV_TILE_ROWS=$MARKOV_TILE
+[ -n "${MLA_SPLITS:-}" ] && export FLARE_DS41_MLA_DECODE_SPLITS=$MLA_SPLITS
+[ -n "${H24:-}" ] && export FLARE_DS41_MLA_H24=$H24
 [ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ -n "${IDX_SPLIT:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT=$IDX_SPLIT

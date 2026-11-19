@@ -359,7 +359,8 @@ class PreparedParallelDraftRound:
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head,
                 pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
-                stage_rows=getattr(o, "stage_markov_rows", False))
+                stage_rows=getattr(o, "stage_markov_rows", False),
+                tile_rows=getattr(o, "markov_tile_rows", None))
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None
