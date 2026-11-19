@@ -150,9 +150,21 @@ def _check_export_speed(args) -> None:
         raise UsageError(f"{export_speed.TUNE_ONLY_ENV}=1 does not combine with --tuning-gpus")
 
 
+# Debug switches whose counters live in Python ops: a debug-serve reads them; an exported core must never carry them.
+DEBUG_SERVE_ONLY_ENV = ("FLARE_DS41_INDEX_ROW_SPLIT_CHECK",)  # TP3 tp3.index_row_split_check (index_row_split.py)
+
+
+def _refuse_debug_serve_only(environ=None) -> None:
+    environ = os.environ if environ is None else environ
+    found = [name for name in DEBUG_SERVE_ONLY_ENV if environ.get(name, "") not in ("", "0")]
+    if found:
+        raise UsageError(f"{', '.join(found)} is debug-serve only; unset it to export")
+
+
 def export(args) -> int:
     from ignition.preparation.core_snapshot import export_options
     from .publishing import validate_repository
+    _refuse_debug_serve_only()
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
     _check_export_speed(args)

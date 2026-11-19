@@ -564,6 +564,19 @@ def test_check_switch_needs_the_split_and_never_reaches_an_export():
     assert result.returncode == 2 and "debug-serve only" in result.stderr
     mini = (EXPORT_SH.parent.parent / "mini-export.sh").read_text()
     assert mini.index("FLARE_DS41_INDEX_ROW_SPLIT_CHECK") < mini.index("ignition export")
+    # ignition export itself refuses it too (G1 review: a chain may call ignition export directly)
+    from ignition.cli import serve
+    from ignition.errors import UsageError
+
+    assert "FLARE_DS41_INDEX_ROW_SPLIT_CHECK" in serve.DEBUG_SERVE_ONLY_ENV
+    serve._refuse_debug_serve_only({})
+    serve._refuse_debug_serve_only({"FLARE_DS41_INDEX_ROW_SPLIT_CHECK": "0"})
+    with pytest.raises(UsageError, match="debug-serve only"):
+        serve._refuse_debug_serve_only({"FLARE_DS41_INDEX_ROW_SPLIT_CHECK": "1"})
+    import inspect
+
+    body = inspect.getsource(serve.export)
+    assert body.index("_refuse_debug_serve_only()") < body.index("Configuration.load")
 
 
 # --- switch, record, channel sizing, graph selection -----------------------------------------------------------------
