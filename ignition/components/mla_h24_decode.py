@@ -141,6 +141,46 @@ def check_traits(traits):
         raise ValueError("H24 decode: b12x DSV41 shared-memory strides changed")
 
 
+# b12x keys a CuTe program by its explicit spec *and* a fingerprint of the compiled function. Functions outside b12x get
+# compiler._function_fingerprint = sha256(inspect.getsource(inspect.unwrap(f))), which is not stable within a process:
+# CuTe's first real compile of a @cute.jit method rewrites the function's __code__ (decorator stripped, first line + 1),
+# so later getsource calls return other text. A planning process (no real compile yet) and a compile worker (after one)
+# then disagree on the key (E2 seq348: "factory program keys changed between planning and compilation"). For our kernel
+# module the fingerprint is the module file's bytes instead (the spec also carries flare_source).
+STABLE_FINGERPRINT_MODULES = ("ignition.components.mla_h24_kernel",)
+
+
+@functools.lru_cache(maxsize=None)
+def _module_digest(module):
+    import sys
+    return hashlib.sha256(Path(sys.modules[module].__file__).read_bytes()).hexdigest()
+
+
+class _StableFingerprint:
+    def __init__(self, original):
+        self.original = original
+
+    def __call__(self, func):
+        target = inspect.unwrap(func)
+        module = getattr(target, "__module__", "") or ""
+        if module in STABLE_FINGERPRINT_MODULES:
+            qualname = getattr(target, "__qualname__", getattr(target, "__name__", type(target).__qualname__))
+            return module, qualname, _module_digest(module)
+        return self.original(func)
+
+
+def install_stable_fingerprint(compiler=None):
+    """Wrap b12x's compile-target fingerprint for our kernel module (idempotent). Returns the wrapper."""
+    if compiler is None:
+        from b12x._lib import compiler
+    current = compiler._function_fingerprint
+    if isinstance(current, _StableFingerprint):
+        return current
+    wrapper = _StableFingerprint(current)
+    compiler._function_fingerprint = wrapper
+    return wrapper
+
+
 def launch_h24(q_all, kv_flat, swa_indices, mid_out, mid_lse, swa_len_t, extra_kv_flat, extra_indices_t,
                extra_len_t, sm_scale, latent_scale, swa_page_size, topk, extra_topk, num_main_chunks, num_splits,
                chunks_per_split, stride_kv_block, pbs_extra, stride_extra_kv_block, indexed_page_table,
@@ -203,6 +243,7 @@ def launch_h24(q_all, kv_flat, swa_indices, mid_out, mid_lse, swa_len_t, extra_k
         tensor_key("topk_length", swa_len_t, dims=(DimKey.dynamic(),)),
         tensor_key("extra_topk_length", extra_len_t, dims=(DimKey.dynamic(),)),
     )
+    install_stable_fingerprint()
     return launch(kernel.call_mapped_extra_pertok, compile_spec=spec, compile_args=args, runtime_args=args)
 
 
@@ -313,6 +354,7 @@ def install(policy, kernel=None, launcher=launch_h24):
     setattr(kernel, _TARGET, wrapper)
     from . import mla_discovery_key  # the H24 program is ours: key b12x's persisted discovery to policy and source
     mla_discovery_key.install()
+    install_stable_fingerprint()
     return wrapper
 
 
