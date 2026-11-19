@@ -263,10 +263,14 @@ def check_state(device) -> torch.Tensor:
     return _CHECK_STATE[key]
 
 
-def check_paths(index) -> tuple[str, str]:
-    """(request file, dump file) of device ``index``: touch the request, wait for it to vanish, read the dump."""
+def check_paths(index) -> tuple[str, str, str]:
+    """(dump request, dump file, reset request) of device ``index``: touch a request, wait for it to vanish (then read
+    the dump). A reset zeroes the counters: preparation's warm-up and capture runs count example data, so a check
+    resets while the server is idle, sends its prompts, then dumps."""
     root = os.environ.get("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", "/tmp")
-    return os.path.join(root, f"flare_idxsplit_check_req-dev{index}"), os.path.join(root, f"flare_idxsplit_check-dev{index}.pt")
+    return (os.path.join(root, f"flare_idxsplit_check_req-dev{index}"),
+            os.path.join(root, f"flare_idxsplit_check-dev{index}.pt"),
+            os.path.join(root, f"flare_idxsplit_check_reset-dev{index}"))
 
 
 def check_dump(counters: torch.Tensor, path: str) -> None:
@@ -274,15 +278,23 @@ def check_dump(counters: torch.Tensor, path: str) -> None:
     os.replace(path + ".tmp", path)
 
 
+def check_reset(counters: torch.Tensor) -> None:
+    counters.zero_()
+    if counters.is_cuda:
+        torch.cuda.synchronize(counters.device)
+
+
 def _check_dumper(counters, index):
-    request, path = check_paths(index)
-    while True:
-        if os.path.exists(request):
-            try:
-                check_dump(counters, path)
-            finally:
-                os.remove(request)
-        time.sleep(0.2)
+    request, path, reset = check_paths(index)
+    with torch.cuda.device(index):
+        while True:
+            for trigger, action in ((reset, lambda: check_reset(counters)), (request, lambda: check_dump(counters, path))):
+                if os.path.exists(trigger):
+                    try:
+                        action()
+                    finally:
+                        os.remove(trigger)
+            time.sleep(0.2)
 
 
 @torch.library.custom_op("flare_debug::index_split_check", mutates_args=("counters",))

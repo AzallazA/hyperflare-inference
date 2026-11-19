@@ -524,13 +524,16 @@ def test_check_mode_counts_a_corrupted_exchange(monkeypatch):
 
 def test_check_mode_dump_round_trips(tmp_path, monkeypatch):
     monkeypatch.setenv("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", str(tmp_path))
-    request, path = split_module.check_paths(1)
+    request, path, reset = split_module.check_paths(1)
     assert request == str(tmp_path / "flare_idxsplit_check_req-dev1") and path.endswith("flare_idxsplit_check-dev1.pt")
+    assert reset == str(tmp_path / "flare_idxsplit_check_reset-dev1")
     counters = torch.arange(split_module.CHECK_LAYERS * 4, dtype=torch.int64).view(-1, 4)
     split_module.check_dump(counters, path)
     dumped = torch.load(path)
     assert dumped["fields"] == ("calls", "transport_rows", "invalid_rows", "tail_rows")
     assert torch.equal(dumped["counters"], counters)
+    split_module.check_reset(counters)
+    assert counters.sum().item() == 0
 
 
 def test_check_switch_needs_the_split_and_never_reaches_an_export():
