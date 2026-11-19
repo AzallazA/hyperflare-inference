@@ -85,7 +85,7 @@ least `--memory + --staging`. Budgets cover record and window extents, not total
 ```sh
 docker build -f selene-manager/Dockerfile -t selene .   # from the Flare repository root
 docker run --rm --name selene \
-  --user "$(id -u):$(id -g)" --pid=host --network=host --ipc=host \
+  --user "$(id -u):$(id -g)" --network=host --ipc=host \
   --security-opt seccomp=selene-manager/deploy/seccomp-io-uring.json \
   -v /run/selene:/run/selene \
   -v /var/lib/selene:/var/lib/selene \
