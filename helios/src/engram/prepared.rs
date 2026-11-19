@@ -123,6 +123,7 @@ impl PreparedTables {
                 hashes: source.hashes.clone(),
                 event: source.event.clone(),
                 request: source.request.clone(),
+                hash: None,
             });
         }
         Ok(Arc::new(Index { tables }))

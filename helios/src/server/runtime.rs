@@ -1014,6 +1014,91 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    /// TP3 fork (perf/engram-readahead): Some only when a disk-backed Engram table reads ahead
+    /// (FLARE_ENGRAM_READ_AHEAD=1); None with every table in RAM, so `submit` does nothing more.
+    read_ahead: Option<ReadAhead>,
+}
+
+/// TP3 fork (perf/engram-readahead, after c2606aae `prefetch_rows`): hands prompt positions of
+/// prefill lanes to the disk-backed Engram tables' reader threads before each step is launched,
+/// so their rows are read while earlier steps replay instead of while this step's graph waits.
+/// Prompt tokens are host-known at admission; decode, speculative and draft rows are graph-
+/// produced and are not predicted. All ranks of the TP3/TP2 process share one table set and its
+/// readers, so rank zero's binding reaches every rank. The graph stays the authority: it
+/// publishes the ids its lookup consumes and the gather serves exactly those.
+struct ReadAhead {
+    shared: Arc<crate::engram::Shared>,
+    /// Per request slot, the prompt position through which rows were handed to the readers.
+    progress: Vec<Option<(RequestHandle, usize)>>,
+    /// Per table, the read-ahead tokens this step's prefill lanes have left to share.
+    budget: Vec<usize>,
+}
+
+impl ReadAhead {
+    fn new(shared: &Arc<crate::engram::Shared>, slots: usize) -> Option<Self> {
+        shared.reads_ahead().then(|| Self {
+            shared: shared.clone(),
+            progress: vec![None; slots],
+            budget: Vec::new(),
+        })
+    }
+
+    fn submit(
+        &mut self,
+        step: &ScheduledPlan,
+        scheduler: &RequestScheduler,
+        admissions: &[Option<crate::model::Admission>],
+    ) {
+        if !crate::engram::consumes(step.kind) {
+            return;
+        }
+        let shared = &*self.shared;
+        let tables = shared.index.tables.len();
+        // One bound per table for every prompt of the step together, so several requests
+        // prefilling at once cannot each pin a full share of the row cache.
+        self.budget.clear();
+        self.budget.extend((0..tables).map(|table| shared.read_ahead_tokens(table)));
+        for (row, lane) in step.lanes.iter().enumerate() {
+            if !step.lane_kind(row).is_prefill() {
+                continue;
+            }
+            let slot = lane.request.slot as usize;
+            let Ok(live) = scheduler.request(lane.request) else {
+                continue;
+            };
+            let tokens = live.tokens();
+            let admission = admissions.get(slot).and_then(Option::as_ref);
+            let excluded = |position: usize| {
+                admission.is_some_and(|admission| admission.data.is_image_position(position))
+            };
+            let first = lane.start_position as usize;
+            let launched = (first + lane.tokens).min(tokens.len());
+            let progress = match self.progress.get(slot) {
+                Some(Some((request, end))) if *request == lane.request => (*end).max(first),
+                _ => first,
+            };
+            let mut reached = usize::MAX;
+            for table in (0..tables).filter(|table| shared.table_reads_ahead(*table)) {
+                let share = self.budget[table];
+                // Never stop short of the launching chunk: its rows are needed now.
+                let limit = (first + share).max(launched).min(tokens.len());
+                let position = if progress < limit {
+                    shared.read_ahead(table, tokens, progress, limit, excluded)
+                } else {
+                    progress
+                };
+                reached = reached.min(position);
+                // Rows queued in earlier steps stay pinned until used, so the lane's whole
+                // extent past the graph's position counts against the step's bound.
+                self.budget[table] = share.saturating_sub(position.saturating_sub(first));
+            }
+            if reached != usize::MAX {
+                if let Some(entry) = self.progress.get_mut(slot) {
+                    *entry = Some((lane.request, reached));
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Worker<'a> {
@@ -1045,6 +1130,7 @@ impl<'a> Worker<'a> {
             inputs: None,
             prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
+            read_ahead: None,
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
@@ -1054,6 +1140,11 @@ impl<'a> Worker<'a> {
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
         // Input construction stays inside the worker's unwind and drain boundary.
         self.inputs = Some(crate::model::Inputs::new(self.config, executor.manifest())?);
+        self.read_ahead = executor
+            .manifest()
+            .engram
+            .as_ref()
+            .and_then(|binding| ReadAhead::new(&binding.shared, self.config.limits.max_active));
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
@@ -2143,6 +2234,11 @@ impl<'a> Worker<'a> {
             SamplingMode::General,
         )?;
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
+        // TP3 fork (perf/engram-readahead): before the launch, so the readers start while the
+        // previous step still replays. A no-op unless a disk-backed table reads ahead.
+        if let Some(read_ahead) = &mut self.read_ahead {
+            read_ahead.submit(step, &self.scheduler, &self.admissions);
+        }
         if step
             .lanes
             .iter()

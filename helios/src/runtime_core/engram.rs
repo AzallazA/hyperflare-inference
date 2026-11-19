@@ -10,9 +10,9 @@ use super::{
 };
 use crate::{
     Result,
-    engram::{Index, Plane, Table},
+    engram::{Index, Plane, RowHash, Table},
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 /// Payload ownership follows the table layout; absent partitions retain shared storage.
 pub(super) fn spans(
@@ -110,6 +110,13 @@ pub(super) fn decode<F: super::payload::Files>(
     let mut buffers = HashSet::new();
     let mut events = HashSet::new();
     let mut tables = Vec::new();
+    // TP3 fork (perf/engram-readahead): one copy of the token map for every table's row hash,
+    // made only when read-ahead is requested.
+    let token_map: Arc<[u32]> = if crate::engram::read_ahead_requested() {
+        value.token_map.clone().into()
+    } else {
+        Arc::from([])
+    };
     for table in value.tables {
         validate_shards(&table, world)?;
         let gpu = !table.request_buffer.is_empty();
@@ -177,6 +184,23 @@ pub(super) fn decode<F: super::payload::Files>(
         {
             return Err(invalid("invalid Engram hash geometry"));
         }
+        // TP3 fork (perf/engram-readahead): unpartitioned XOR_MODULO tables (the DS41 TP3/TP2
+        // shared tables) can have their prefill rows predicted on the host; others never read ahead.
+        let hash = (crate::engram::read_ahead_requested()
+            && table.shards.is_empty()
+            && order == 4
+            && !token_map.is_empty())
+        .then(|| {
+            Arc::new(RowHash {
+                orders: geometry.orders.clone(),
+                multipliers: geometry.multipliers.clone(),
+                primes: geometry.primes.clone(),
+                offsets: geometry.offsets.clone(),
+                rows: table.rows,
+                token_map: token_map.clone(),
+                pad_token_id: value.pad_token_id,
+            })
+        });
         let (stored_rows, weights, scales) = if table.shards.is_empty() {
             (table.rows, table.weights.clone(), table.scales.clone())
         } else {
@@ -295,6 +319,7 @@ pub(super) fn decode<F: super::payload::Files>(
             hashes: table.hash_buffer,
             event: table.ready_event,
             request: gpu.then_some(table.request_buffer),
+            hash,
         });
     }
     Ok(Index { tables })
