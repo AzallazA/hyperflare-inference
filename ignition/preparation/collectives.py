@@ -4,8 +4,10 @@
 
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
-from contextlib import contextmanager
 import json
+import pickle
+import struct
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -256,6 +258,25 @@ class CollectivePreparation:
         # Each rank's host, in group order; ranks on one host share its CPUs and CUDA IPC.
         self.hosts = tuple(hosts)
         self.local_ranks = self.hosts.count(host_identity())
+        self._progress_packet = torch.zeros(2048, dtype=torch.uint8, device="cpu")
+        self._progress_received = list(torch.empty((len(self.ranks), 2048), dtype=torch.uint8, device="cpu").unbind())
+
+    def _exchange_progress(self, value):
+        data = pickle.dumps(value, protocol=pickle.DEFAULT_PROTOCOL)
+        outgoing = memoryview(self._progress_packet.numpy())
+        incoming = [memoryview(packet.numpy()) for packet in self._progress_received]
+        capacity = len(outgoing) - 8
+        struct.pack_into("<Q", outgoing, 0, len(data))
+        if len(data) <= capacity:
+            outgoing[8:8 + len(data)] = data
+        dist.all_gather(self._progress_received, self._progress_packet, group=self.group)
+        sizes = [struct.unpack_from("<Q", packet, 0)[0] for packet in incoming]
+        if any(size > capacity for size in sizes):
+            states = [None] * len(self.ranks)
+            dist.all_gather_object(states, value, group=self.group)
+            return states
+        return [pickle.loads(packet[8:8 + size])
+                for packet, size in zip(incoming, sizes, strict=True)]
 
     def register_group(self, ranks, group):
         """Retain a control subgroup used by hybrid TP/DCP collective barriers."""
@@ -388,8 +409,7 @@ class CollectivePreparation:
             raise ValueError("collective preparation does not shard tuning candidates")
         pending = tuple((item.key, item.ranks) for item in progress.ready_collectives)
         local = (pending, progress.ready_collective_tuning)
-        states = [None] * len(self.ranks)
-        dist.all_gather_object(states, local, group=self.group)
+        states = self._exchange_progress(local)
         self._remember_operation_ranks(states)
         if not all(item[0] or item[1] is not None for item in states):
             return None
@@ -437,8 +457,7 @@ class CollectivePreparation:
                          None if error is None else f"{type(error).__name__}: {error}",
                          None if state is None else state.ready_cache, () if state is None else tuple(state.ready_tuning),
                          None if state is None else state.ready_collective_tuning)
-                states = [None] * len(self.ranks)
-                dist.all_gather_object(states, local, group=self.group)
+                states = self._exchange_progress(local)
                 self._remember_operation_ranks(states)
                 failures = [(rank, item[2]) for rank, item in zip(self.ranks, states, strict=True) if item[2] is not None]
                 if failures:
