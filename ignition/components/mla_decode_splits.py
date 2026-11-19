@@ -107,6 +107,8 @@ def install(policy, kernel=None, is_dsv41=_is_dsv41):
     wrapper = _DecodeSplitPolicy(original, tuple(policy), is_dsv41)
     setattr(kernel, _ORIGINAL, original)
     setattr(kernel, _TARGET, wrapper)
+    from . import mla_discovery_key  # other split counts are other programs: key b12x's persisted discovery to them
+    mla_discovery_key.install()
     return wrapper
 
 
