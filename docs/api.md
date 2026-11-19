@@ -391,10 +391,23 @@ DeepSeek reasoning and both DSML tool syntaxes use the pinned official
 `deepseek-recipe` state machine. Helios adapts its actions into the same neutral
 events, validates nonempty tool names and JSON objects with nonempty, unique
 argument names, and publishes each call when its arguments complete. A parameter
-marked `string="false"` carries JSON written by the model. When that text is not
-valid JSON, Helios retains it as a JSON string, so the call reaches the client
-with a well-formed argument object and the client validates the value. Closing the
-outer calls block ends parsed output; subsequent generated text is discarded.
+marked `string="false"` keeps its JSON type if its text decodes as one value
+inside the argument object. If decoding fails, Helios retains the original
+text as a JSON string. This includes valid JSON exceeding 126 levels of array
+or object nesting within the parameter. The combined size of the UTF-8 tool
+name and complete JSON argument object is limited to 1 MiB, including escapes
+and delimiters. Helios rejects a larger call before publishing it.
+In this fork, like the DeepSeek reference stream processor, a call whose
+arguments still do not form a JSON object with nonempty, unique names (an empty
+or duplicate parameter name, or a parameter without its `string` attribute) is
+not an error: it is published with its arguments text as written and ends with
+a raw end event. A named call left open at end-of-sequence is published the
+same way with the arguments written so far; a call whose name never completed
+still fails. Chat Completions and Responses return that text unchanged as the
+`arguments` string, Messages streams it as `input_json_delta`, and a
+non-streaming Messages `tool_use` gets the parsed object when the text parses
+(duplicate names keep the last value) and `{}` otherwise. Closing the
+outer calls block ends parsed output and discards subsequent generated text.
 The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
@@ -473,12 +486,12 @@ undeclared tools are returned with their generated names and arguments in both
 buffered and streaming responses across all three chat APIs. Clients can repair
 or reject these calls and provide feedback in a subsequent turn. Declared schemas
 guide argument conversion where the tool syntax requires it; unknown tools have
-no schema for that conversion. Malformed envelopes and empty names still fail
-parsing. A value that is not valid JSON is retained as a string where the tool
-syntax delimits individual values and the parser has a retention rule: tagged
-parameters, as in GLM, and DeepSeek `string="false"` parameters. Other invalid
-argument syntax fails parsing, including an argument object written as one JSON
-document and an XTML typed value. Required mode needs at least one declared
+no schema for that conversion. Malformed envelopes and empty tool names still
+fail parsing; DeepSeek argument objects that stay invalid pass through raw as
+described above. Tagged parameters, as in GLM, retain malformed JSON values as strings.
+DeepSeek retains the original text of a `string="false"` parameter that cannot
+be decoded inside the argument object. Invalid JSON in a whole argument document
+or a typed XTML value fails parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated

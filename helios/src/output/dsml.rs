@@ -32,13 +32,22 @@ struct Call {
 }
 
 impl Call {
-    /// Keep a completed `string="false"` value that is not JSON as a string of its text.
+    fn check_size(&self) -> Result<()> {
+        if self.name.len().saturating_add(self.arguments.len()) > BUFFER_LIMIT {
+            return Err("DeepSeek tool call exceeds the 1 MiB buffer bound".into());
+        }
+        Ok(())
+    }
+
+    /// Retain the model's text when it cannot be decoded as a value in the argument object.
     fn close_literal(&mut self) {
         let Some(start) = self.literal.take() else {
             return;
         };
         let text = &self.arguments[start..];
-        if serde_json::from_str::<Value>(text).is_err() {
+        // A one-element array consumes the same nesting level as the argument object
+        // and requires the parameter to contain exactly one JSON value.
+        if serde_json::from_str::<[Value; 1]>(&format!("[{text}]")).is_err() {
             let retained = serde_json::to_string(text).expect("serializing a string cannot fail");
             self.arguments.replace_range(start.., &retained);
         }
@@ -157,6 +166,7 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         .ok_or("DeepSeek tool arguments have no call")?;
                     call.close_literal();
                     call.arguments.push_str(closing_text);
+                    call.check_size()?;
                     let index = self.calls;
                     let end = if validate_arguments(&call.arguments).is_ok() {
                         Event::ToolEnd { index }
@@ -188,10 +198,8 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                 }
                 _ => {}
             }
-            if self.call.as_ref().is_some_and(|call| {
-                call.name.len().saturating_add(call.arguments.len()) > BUFFER_LIMIT
-            }) {
-                return Err("DeepSeek tool call exceeds the 1 MiB buffer bound".into());
+            if let Some(call) = &self.call {
+                call.check_size()?;
             }
             consumed = end;
             if self.verbatim {
