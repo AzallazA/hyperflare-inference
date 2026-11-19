@@ -81,6 +81,12 @@
 #            them get HTTP 400; verify_fix/consistency/engram-eval cannot run on it); default 0, owner decision
 #   DRAFT_HEAD_PLANS  JSON file {"<rows>": {gemm.blockscaled_precision config}} of explicit DSpark head projection
 #            plans (FLARE_DS41_DRAFT_HEAD_PLANS; prepared, not measured); default unset = tuned
+#   E3c-a exact levers (perf/ds41-e3c-a, 2026-11-19; default off; analysis/work/e3-comms-levers-20261119):
+#   GATHER_PULL  1 = world-3 DCP column gathers pull instead of push (B12X_PCIE_DCP_GATHER_PULL=auto; needs B12X_OVERLAY
+#            with tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch; copies only, re-keys the head gathers);
+#            default 0 (B12X_PCIE_DCP_GATHER_PULL=0 as before)
+#   ROTARY_PREFILL  1 = prefill graphs read one shared RoPE table per forward (FLARE_DS41_ROTARY_ONCE_PREFILL;
+#            bit-identical)
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
@@ -108,6 +114,12 @@ fi
 if [ -n "${B12X_OVERLAY:-}" ]; then
     [ -d "$B12X_OVERLAY/b12x_tree" ] || { echo "B12X_OVERLAY=$B12X_OVERLAY has no b12x_tree" >&2; exit 1; }
     export PYTHONPATH="$B12X_OVERLAY${PYTHONPATH:+:$PYTHONPATH}" B12X_PCIE_DCP_GATHER_PULL=0
+fi
+# E3c-a: refuse an overlay without the gather-pull patch (b12x would ignore the variable silently).
+if [ "${GATHER_PULL:-0}" = 1 ]; then
+    grep -qs _gather_pull_enabled "${B12X_OVERLAY:-/nonexistent}/b12x_tree/comm/pcie/_dcp_a2a_cute.py" \
+        || { echo "GATHER_PULL=1 needs B12X_OVERLAY with flashinfer-dcp-gather-pull-world3.patch" >&2; exit 1; }
+    export B12X_PCIE_DCP_GATHER_PULL=auto
 fi
 if [ -n "${ORDER:-}" ] && [ -z "${COUNTS:-}" ]; then
     COUNTS=$HERE/expert-orders/$ORDER
@@ -154,6 +166,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${LOGPROB_ONE_EXCHANGE:-0}" = 1 ] && export FLARE_DS41_LOGPROB_SINGLE_EXCHANGE=1
 [ "${NO_GEN_LOGPROBS:-0}" = 1 ] && export FLARE_DS41_NO_GENERATION_LOGPROBS=1
 [ -n "${DRAFT_HEAD_PLANS:-}" ] && export FLARE_DS41_DRAFT_HEAD_PLANS=$DRAFT_HEAD_PLANS
+[ "${ROTARY_PREFILL:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE_PREFILL=1
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \

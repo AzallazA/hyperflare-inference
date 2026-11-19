@@ -519,6 +519,12 @@ def configure_engram_side(layers, engram_side_layers, mode):
         previous.engram_side = engram.enable_side()
 
 
+def shared_rotary_angles(tp3, mode):
+    """Whether ``mode``'s forwards read one shared RoPE table per call (TP3 tp3.rotary_once: decode/verify, the
+    draft gets it through dspark.py; tp3.rotary_once_prefill: prefill, its encoder-only twins and suffix replays)."""
+    return (tp3.rotary_once and mode in ("decode", "verify")) or (tp3.rotary_once_prefill and mode == "prefill")
+
+
 class PreparedDecoder:
     host_rows = None  # TP3 tp3.embed_rows gather (HostRowGather); None = b12x's lookup
     glue_pass2 = concatenated_feedback = False  # TP3 tp3.glue_pass2; set per instance
@@ -596,18 +602,20 @@ class PreparedDecoder:
         ratios = weights.config.text["compress_ratios"][:len(weights.layers)]
         prefix_ratios = ratios if self.packing is None else ratios[:decoder_start + 1]
         # TP3 tp3.rotary_once: decode/verification forwards compute each RoPE table once (AttentionIndices.angles);
-        # prefill keeps per-launch angles (large chunks: table traffic instead of trigonometry).
+        # prefill keeps per-launch angles unless tp3.rotary_once_prefill (E3 d: past ~105.6K positions every per-launch
+        # program takes sinf/cosf's slow range reduction; the table costs one [rows, 32, 2] FP32 write per forward).
         self.window_metadata = AttentionIndices(metadata, mode=mode,
             tokens=metadata.positions.numel(),
             page_size=128 if mode == "decode" else 128 + metadata.max_query_tokens, width=128,
             ratios=set(prefix_ratios) - {0},
-            rotary=self.rotary if tp3.rotary_once and mode in ("decode", "verify") else None)
+            rotary=self.rotary if shared_rotary_angles(tp3, mode) else None)
         self.suffix_window_metadata = None
         if self.packing is not None:
             self.suffix_window_metadata = AttentionIndices(self.output_metadata, mode=mode,
                 tokens=self.output_metadata.positions.numel(),
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
-                replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
+                replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0},
+                rotary=self.rotary if tp3.rotary_once_prefill else None)
         # TP3 tp3.index_row_split: listed prefill capacities (and their encoder-only twins) split the indexer rows of the
         # full-row index layers across ranks and exchange the winners over the vocabulary channel; prompt-logprob
         # graphs keep the replicated indexer (index_row_split.py).

@@ -52,6 +52,12 @@ RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", 
                       "index_row_split_check")
 # Decode small-lever switches (perf/ds41-decode-small-levers, 2026-11-18): on/off, recorded only when on.
 SMALL_LEVERS = ("rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
+# E3c-a exact levers (perf/ds41-e3c-a, 2026-11-19; analysis/work/e3-comms-levers-20261119): on/off, recorded only when
+# on, so a default export's record is unchanged. F = dcp_gather_pull, d = rotary_once_prefill.
+E3C_A = ("rotary_once_prefill", "dcp_gather_pull")
+RECORDED_WHEN_TRUE = RECORDED_WHEN_TRUE + E3C_A
+# b12x's switch of the gather-pull overlay patch (tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch)
+GATHER_PULL_ENV = "B12X_PCIE_DCP_GATHER_PULL"
 
 # tp3.pin_small_qproj: the plan triple pinned for every attention declaration of at most PIN_SMALL_ROWS rows (b12x
 # offers programmatic launch / evict-first / FP32 split-K partials for MXFP8 GEMMs only up to 8 rows,
@@ -400,6 +406,23 @@ class TP3Config:
     logprob exchange channel): Helios answers any generation-logprob request with HTTP 400. Prompt logprobs are not
     affected. The handbook checks that need logprobs (verify_fix, consistency, engram-eval) cannot run on such a
     package. Owner decision (B2). False = generation logprobs kept (base)."""
+    rotary_once_prefill: bool = False
+    """``rotary_once`` for prefill graphs (and their encoder-only twins and decoder-suffix replays): every layer's
+    query, KV-window and index-query rotation, and the inverse rotation of the attention output, read the forward's
+    shared (cos, sin) table instead of evaluating sinf/cosf per (row, head) program (the slow range reduction above
+    ~105.6K positions; seq358 M4: 3.45 ms saved per 21-layer 4,096-row chunk at >= 130K). Bit-identical (same
+    expression on the same clamped positions; tests/components/test_rotary_shared_angles_interpret.py, GPU M4). The
+    ratio-2 compressor and global-KV key/latent rotations keep per-launch angles (their positions can be -2).
+    False = per-launch angles in prefill (base). Export-time only (E3 lever d)."""
+    dcp_gather_pull: bool = False
+    """Record of ``B12X_PCIE_DCP_GATHER_PULL`` != 0 (overlay patch flashinfer-dcp-gather-pull-world3, GLM's since
+    2026-11-09): world-3 DCP column gathers (logprob/sampling/candidate/vocabulary gathers, the indexer row split's
+    winner exchange) pull peers' staging (~40 GB/s) instead of pushing (the push kernel's store pattern makes it slow:
+    seq358 M2 wide 17-row gather 2,326 us push vs 148 us pull); payloads under 4 KiB per rank stay push. Copies only:
+    bit-identical (seq358 M2: eager check + 200-replay in-graph soak, 0 mismatches). Moves 24 b12x module fingerprints
+    (everything importing _dcp_a2a_cute): the head-gather programs re-key and the persisted program discovery of every
+    PCIe collective re-runs. False = push (base: export.sh forces B12X_PCIE_DCP_GATHER_PULL=0). Export-time only
+    (E3 lever F)."""
     draft_head_plans: tuple | None = None
     """Prepared, not measured: explicit plan overrides for the DSpark proposal head projection by row count,
     ((rows, config-json), ...) from FLARE_DS41_DRAFT_HEAD_PLANS=<json file {"40": {...gemm.blockscaled_precision
@@ -521,6 +544,9 @@ class TP3Config:
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         for name in SMALL_LEVERS:  # own line, as mma_pad_once's
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"TP3 config: {name} must be a boolean")
+        for name in E3C_A:  # own line, as mma_pad_once's
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if self.logprob_single_exchange and self.no_generation_logprobs:
@@ -783,6 +809,8 @@ class TP3Config:
             pin_small_qproj=flag("PIN_SMALL_QPROJ"),
             logprob_single_exchange=flag("LOGPROB_SINGLE_EXCHANGE"),
             no_generation_logprobs=flag("NO_GENERATION_LOGPROBS"),
+            rotary_once_prefill=flag("ROTARY_ONCE_PREFILL"),
+            dcp_gather_pull=cls.gather_pull_from_environment(env),
             draft_head_plans=parse_draft_head_plans(get("DRAFT_HEAD_PLANS")),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
@@ -805,6 +833,27 @@ class TP3Config:
             no_engram=truthy("NO_ENGRAM"),
             probe=truthy("PROBE"),
         )
+
+    @staticmethod
+    def gather_pull_from_environment(env) -> bool:
+        """On only when set explicitly to a pulling value ("auto", "1", "on", "pull", "true"; export.sh GATHER_PULL=1
+        sets "auto"). Unset counts as off: without the overlay patch b12x always pushes, and export.sh forces "0".
+        Preparation checks the record against the imported b12x either way (check_b12x_switches)."""
+        return env.get(GATHER_PULL_ENV, "").strip().lower() in ("auto", "1", "on", "pull", "true")
+
+    def check_b12x_switches(self, *, world: int):
+        """Refuse a dcp_gather_pull record the imported b12x cannot honour, or a patched b12x that would pull while
+        the record says push (preparation calls it)."""
+        if world > 1:
+            from b12x.comm.pcie import _dcp_a2a_cute
+            patched = hasattr(_dcp_a2a_cute, "_gather_pull_enabled")
+            if self.dcp_gather_pull and not patched:
+                raise ValueError("TP3 config: dcp_gather_pull needs the b12x overlay patch "
+                                 "flashinfer-dcp-gather-pull-world3 (B12X_OVERLAY)")
+            if patched and _dcp_a2a_cute._gather_pull_enabled(world) != self.dcp_gather_pull:
+                raise ValueError("TP3 config: dcp_gather_pull differs from this process's b12x switch "
+                                 f"({GATHER_PULL_ENV})")
+        return self
 
     def unported(self) -> dict:
         """Switches set to a non-default value whose code has not been ported yet: {field: stage}."""
