@@ -472,7 +472,8 @@ class PreparedParallelDraftRound:
             draft_inputs[:, 0].copy_(candidates[:, 0])
             draft_metadata = Metadata.pack(before, active.int() * block, states,
                 o.inputs.page_tables[safe], draft_inputs, o.inputs.live_rows,
-                token_capacity=b * block, sample_count=b * block)
+                token_capacity=b * block, sample_count=b * block,
+                parameters=o.requests.parameters, row_slot_ids=o.inputs.row_slot_ids[:b])
             result = self.draft(draft_metadata)
             draft_logits, selector_features = result[:2]
             features = result[2] if len(result) == 3 else None
@@ -562,7 +563,8 @@ class PreparedParallelDraftRound:
         states = o.inputs.request_state_rows[safe, 0]
         metadata = Metadata.pack(proposal.before, limits, states, o.inputs.page_tables[safe],
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
-            sample_count=b * w, max_query_tokens=w)
+            sample_count=b * w, max_query_tokens=w,
+            parameters=o.requests.parameters, row_slot_ids=o.inputs.row_slot_ids[:b])
         hidden, logits, auxiliary, records = self.decoder(metadata)
         # A context that can start its projections early (DS41 tp3.context_side_stream) forks them here, beside
         # verification; start() returns None (nothing traced) when it does not.

@@ -189,6 +189,8 @@ message ServingContract {
   // checkpoint; absent when the recipe declares none. Multiplied by steps per second it is the
   // memory bandwidth the model consumes, which integrated GPUs do not measure.
   optional uint64 decode_weight_bytes = 25;
+  // Lowercase SHA-256 of activation constants embedded in steering-enabled graphs.
+  optional string steering_sidecar_sha256 = 26;
 }
 message ModelContract {
   uint32 version = 1;
@@ -446,6 +448,7 @@ message DefaultSamplingParameters {
   optional float frequency_penalty = 8;
   // Absent parameter ranges fix those parameters at their declared defaults.
   SamplingRanges ranges = 9;
+  optional float steering_scale = 10;
 }
 message SamplingFloatRange {
   optional float min = 1;
@@ -463,6 +466,7 @@ message SamplingRanges {
   SamplingFloatRange repetition_penalty = 5;
   SamplingFloatRange presence_penalty = 6;
   SamplingFloatRange frequency_penalty = 7;
+  SamplingFloatRange steering_scale = 8;
 }
 message FrontendSettings {
   TokenizerSettings tokenizer = 1;

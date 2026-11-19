@@ -125,6 +125,27 @@ fn hash_matches_independent_blake2b128_vectors() {
 }
 
 #[test]
+fn steering_events_preserve_stock_hashes_and_isolate_sidecars_and_scales() {
+    assert!(steering_conditioning_event([1; 32], 0.).is_none());
+    assert!(steering_conditioning_event([1; 32], -0.).is_none());
+    let tokens = (0..128).collect::<Vec<_>>();
+    let key = |sidecar, scale| {
+        let mut history = PrefixHistory::new([7; 32]);
+        let events = steering_conditioning_event(sidecar, scale)
+            .into_iter()
+            .collect::<Vec<_>>();
+        history.append(&tokens, &events).unwrap();
+        history.key_at(128).unwrap()
+    };
+    let stock = key([1; 32], 0.);
+    assert_eq!(stock, key([2; 32], 0.));
+    let full = key([1; 32], 1.);
+    assert_ne!(stock, full);
+    assert_ne!(full, key([1; 32], 0.5));
+    assert_ne!(full, key([2; 32], 1.));
+}
+
+#[test]
 fn chunking_retains_partial_tokens_and_conditioning_until_complete() {
     let mut whole = PrefixHistory::new([7; 32]);
     let events = [

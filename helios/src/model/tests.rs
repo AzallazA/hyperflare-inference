@@ -10,7 +10,7 @@ use super::*;
 use crate::{
     cache::Fence,
     execution::{CompletionRecord, GraphKind},
-    scheduler::{RequestScheduler, RequestSpec, SchedulerLimits},
+    scheduler::{RequestHandle, RequestScheduler, RequestSpec, SchedulerLimits},
 };
 
 #[test]
@@ -46,6 +46,7 @@ pub(super) fn config() -> ModelConfig {
         eos_token_ids: vec![248046, 248044],
         sampling_ranges: Default::default(),
         sampling_defaults: SamplingParameters::default(),
+        steering_sidecar_sha256: None,
         max_new_tokens: 256,
         speculative_widths: Vec::new(),
         speculative_fixed_width: None,
@@ -54,6 +55,45 @@ pub(super) fn config() -> ModelConfig {
         history_drafts: true,
         speculative_proposal_source: Default::default(),
     }
+}
+#[test]
+fn steering_capability_selects_legacy_or_extended_parameter_rows() {
+    let stock = config();
+    let stock_manifest = manifest(&stock);
+    let width = |manifest: &crate::execution::ExecutionManifest| {
+        manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "admission_parameters")
+            .unwrap()
+            .shape[1]
+    };
+    assert_eq!(width(&stock_manifest), 6);
+    Inputs::new(&stock, &stock_manifest).unwrap();
+
+    let mut steered = stock;
+    steered.steering_sidecar_sha256 = Some([9; 32]);
+    let steered_manifest = manifest(&steered);
+    assert_eq!(width(&steered_manifest), 7);
+    Inputs::new(&steered, &steered_manifest).unwrap();
+
+    let handle = RequestHandle { slot: 0, generation: 1 };
+    let admission = Admission {
+        handle,
+        sampling: SamplingParameters { steering_scale: 1., ..Default::default() },
+        max_new_tokens: 1,
+        prompt: vec![7],
+        data: PromptData {
+            positions: vec![[0; 3]],
+            vision_token_indices: vec![-1],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    };
+    assert!(admission.validate(&config()).is_err());
+    admission.validate(&steered).unwrap();
 }
 
 #[test]

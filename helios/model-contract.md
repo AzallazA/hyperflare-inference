@@ -66,6 +66,9 @@ are chosen after graph loading and replace preparation's working-set counts.
 History drafting is a startup option that requires enabled learned speculation
 and concrete copied-token inputs in each selected wider graph. Export records
 no history preference. Core defaults fill missing settings; explicit startup options take precedence.
+Steering-enabled cores additionally carry the SHA-256 of their embedded
+activation constants. The hash enables shared request validation and prefix
+conditioning without selecting a model-specific native execution path.
 
 The optional core rebuild manifest and per-rank weight catalogs describe
 preparation inputs and stored tensor views. They do not select serving behavior.

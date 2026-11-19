@@ -78,6 +78,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             top_k: 50,
             ..Default::default()
         },
+        steering_sidecar_sha256: None,
         max_new_tokens: 17,
         speculative_widths: Vec::new(),
         speculative_fixed_width: None,

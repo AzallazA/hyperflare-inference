@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
 pub use flare_selene::{CheckpointId, PageId};
-pub use hash::{ConditioningEvent, HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey};
+pub use hash::{
+    ConditioningEvent, PrefixHistory, PrefixKey, HASH_BLOCK_TOKENS,
+    steering_conditioning_event,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub u32);

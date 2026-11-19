@@ -17,6 +17,7 @@ from ignition.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import active_core_storage, allocated_tensor_bytes, persistent_copy, persistent_empty
 
 from .config import ModelConfig
+from .steering import SteeringSidecar
 from .tp3_config import TP3Config
 
 
@@ -95,11 +96,12 @@ class ModelWeights:
     draft: DSparkWeights | None
     allocated_bytes: int
     vision: dict | None = None
+    steering: SteeringSidecar | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, host_allocator=None, tp3=None):
+             vocabulary_parallel_sampling=False, host_allocator=None, tp3=None, steering_sidecar=None):
         tp3 = TP3Config() if tp3 is None else tp3
         config = ModelConfig.load(manifest.metadata_path, mini=tp3.mini)
         before = allocated_tensor_bytes(device)
@@ -149,8 +151,12 @@ class ModelWeights:
                     # KV (images ~3 s slower each unless tp3.vision_stage copies them into VRAM per block, PreparedVision).
                     from ignition.components.weights import _park_on_host
                     vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
+        steering = (None if steering_sidecar is None
+                    else SteeringSidecar.load(steering_sidecar, device))
+        if steering is not None and len(layers) <= max(steering.layers):
+            raise ValueError("steering sidecar names a layer outside the DeepSeek decoder")
         return cls(config, shard, embedding, norm, head, layers, draft,
-                   allocated_tensor_bytes(device) - before, vision)
+                   allocated_tensor_bytes(device) - before, vision, steering)
 
 
 def draft_vocab_columns(tokens, world, rank, *, k=0, ranking=(), vocab=129280, alignment=64, multiple=128):

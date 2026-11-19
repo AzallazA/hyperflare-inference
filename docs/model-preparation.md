@@ -575,6 +575,16 @@ which must agree with checkpoint `image_token_id`. Cores without explicit
 prompt-encoder metadata use their tokenizer and Jinja template.
 Sampling defaults are temperature 1.0 and top-p 1.0, following the
 [model card](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference).
+`--steering-sidecar PATH` optionally loads per-layer steering constants for
+layers 4 through 36: a BF16 unit-norm `direction`, a BF16 `attn_row_gain`, and
+a positive FP32 `alpha` scalar. A steering-enabled export accepts
+`steering_scale` from 0 through 1 per request and carries it through mixed packed
+batches. Scale zero selects the unmodified BF16 activation after each steering
+calculation. Attention steering runs after the existing output reduction;
+shared-expert steering runs before the existing MLP reduction and adds no
+tensor-parallel collective. Decoder suffix replay gathers the request scale with the
+retained rows. The core records the sidecar SHA-256; an export without the flag
+retains six-column sampling state and contains no steering metadata or constants.
 Target vocabulary projections keep the checkpoint's BF16 weights and produce
 FP32 logits for generation, prompt scoring, and cached-prefix resume. Proposal
 head precision is configured separately with `--draft-head-quantization`.

@@ -116,6 +116,35 @@ impl Bootstrap {
                     ))
                 })?;
         }
+        let steering_sidecar_sha256 = match object.get("steering_sidecar_sha256") {
+            None => None,
+            Some(Value::String(value))
+                if value.len() == 64
+                    && value.bytes().all(|byte| byte.is_ascii_digit()
+                        || (b'a'..=b'f').contains(&byte)) =>
+            {
+                let mut digest = [0u8; 32];
+                for (index, byte) in digest.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                        .map_err(|error| {
+                            crate::ExecutionError::Manifest(crate::Failure::caused_by(
+                                error.to_string(),
+                                error,
+                            ))
+                        })?;
+                }
+                Some(digest)
+            }
+            _ => return Err("steering sidecar SHA-256 must be 64 lowercase hexadecimal characters".into()),
+        };
+        let steering_range = sampling_ranges.steering_scale;
+        if sampling_defaults.steering_scale != 0.
+            || steering_sidecar_sha256.is_some()
+                != (steering_range
+                    == Some(crate::model::SamplingRange { min: 0., max: 1. }))
+        {
+            return Err("steering metadata requires a zero default, a 0..1 range, and a sidecar SHA-256".into());
+        }
         let contract = serde_json::from_value(
             object
                 .get("model_contract")
@@ -169,6 +198,7 @@ impl Bootstrap {
             eos_token_ids: frontend_settings.eos_token_ids.clone(),
             sampling_defaults,
             sampling_ranges,
+            steering_sidecar_sha256,
             speculative_token_capacity: usize::try_from(integer("speculative_token_capacity", Some(0))?).map_err(|_| "speculative token capacity exceeds usize")?,
             decode_weight_bytes: integer("decode_weight_bytes", Some(0))?,
             speculative_fixed_width: object
