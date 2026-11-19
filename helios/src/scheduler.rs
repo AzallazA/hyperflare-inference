@@ -310,6 +310,7 @@ pub struct LiveRequest {
     prefix: Option<CheckpointId>,
     prefix_tokens: u64,
     admission_reused_tokens: u64,
+    inbound_reused_tokens: u64,
     message_boundaries: Vec<usize>,
     checkpoint_budget: usize,
     message_snapshot: Option<SnapshotId>,
@@ -1754,8 +1755,6 @@ impl RequestScheduler {
                     .waiters
                     .push(handle);
             }
-            self.stats.host_hits += 1;
-            self.stats.host_reused_tokens += consumed - lookup.consumed_tokens;
         }
         let mut reserved_pages: Vec<_> = (0..reserved_count)
             .map(|_| self.free_pages.pop_first().unwrap())
@@ -1820,6 +1819,7 @@ impl RequestScheduler {
             prefix,
             prefix_tokens: consumed,
             admission_reused_tokens: consumed,
+            inbound_reused_tokens: consumed - lookup.consumed_tokens,
             message_boundaries,
             checkpoint_budget,
             message_snapshot: None,
@@ -1924,6 +1924,9 @@ impl RequestScheduler {
             request.prefix_snapshot = Some(snapshot);
             request.shared_pages = shared_pages.clone();
             request.phase = RequestPhase::Restore;
+            let reused = request.inbound_reused_tokens;
+            self.stats.host_hits += 1;
+            self.stats.host_reused_tokens += reused;
         }
         Ok(Vec::new())
     }
