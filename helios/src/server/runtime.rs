@@ -2142,6 +2142,14 @@ impl<'a> Worker<'a> {
             step.draft_tokens,
             SamplingMode::General,
         )?;
+        // TP3 fork (DS41 tp3.index_row_split_min_context): a one-lane prefill chunk that starts at
+        // or past a context variant's minimum runs that variant (same shape and uploads).
+        let graph = match (kind, step.lanes.as_slice()) {
+            (GraphKind::Prefill | GraphKind::EncoderPrefill, [lane]) if step.mixed.is_none() => {
+                crate::model::catalog::select_context_variant(executor.manifest(), graph, lane.start_position)
+            }
+            _ => graph,
+        };
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
         if step
             .lanes

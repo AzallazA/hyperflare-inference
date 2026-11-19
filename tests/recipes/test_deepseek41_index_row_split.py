@@ -672,3 +672,69 @@ def test_export_script_knob_reaches_the_switch():
     assert "FLARE_DS41_INDEX_ROW_SPLIT" not in export_environment()  # default export: replicated indexer
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="1")).index_row_split == ROW_SPLIT_DEFAULT
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="4096")).index_row_split == (4096,)
+
+
+# ---- long-context-only split (tp3.index_row_split_min_context, perf/ds41-index-split-longctx) ----
+
+def test_min_context_switch_parses_validates_and_records():
+    off = TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT": "4096"})
+    assert off.index_row_split_min_context is None and "index_row_split_min_context" not in off.to_metadata()
+    on = TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT": "4096", "FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX": "32768"})
+    assert on.index_row_split_min_context == 32768
+    assert on.to_metadata()["index_row_split_min_context"] == 32768
+    with pytest.raises(ValueError, match="needs index_row_split"):
+        TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX": "32768"})
+    with pytest.raises(ValueError, match="positive token count"):
+        TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT": "1", "FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX": "0"})
+
+
+def test_context_variant_names_round_trip_and_match_helios():
+    name = split_module.context_variant_name("encoder_prefill4096", 32768)
+    assert name == "encoder_prefill4096-split-ctx32768"
+    assert split_module.parse_context_variant(name) == ("encoder_prefill4096", 32768)
+    assert split_module.parse_context_variant("prefill4096-no-mtp-split-ctx65536") == ("prefill4096-no-mtp", 65536)
+    for plain in ("prefill4096", "prefill4096-no-mtp", "prefill4096-split-ctx0", "prefill4096-split-ctx", "-split-ctx5"):
+        assert split_module.parse_context_variant(plain) is None
+    with pytest.raises(ValueError):
+        split_module.context_variant_name(name, 65536)
+    # the Rust side parses the same mark (helios/src/model/catalog.rs CONTEXT_VARIANT_MARK)
+    from pathlib import Path
+
+    catalog = (Path(__file__).resolve().parents[2] / "helios/src/model/catalog.rs").read_text()
+    assert f'pub const CONTEXT_VARIANT_MARK: &str = "{split_module.CONTEXT_VARIANT_MARK}";' in catalog
+
+
+@pytest.mark.parametrize("capacity, mode, scoring, world, want", [
+    (4096, "prefill", None, 3, (False, True)),
+    (3584, "prefill", None, 3, (None,)),        # not listed
+    (4096, "prefill", object(), 3, (None,)),    # prompt-logprob graphs keep the replicated indexer
+    (4096, "decode", None, 3, (None,)),
+    (4096, "prefill", None, 1, (None,)),
+])
+def test_split_variants_per_graph(capacity, mode, scoring, world, want):
+    tp3 = TP3Config(index_row_split=(4096,), index_row_split_min_context=32768)
+    assert split_module.split_variants(tp3, mode=mode, capacity=capacity, scoring=scoring, world=world) == want
+    plain = TP3Config(index_row_split=(4096,))
+    assert split_module.split_variants(plain, mode=mode, capacity=capacity, scoring=scoring, world=world) == (None,)
+
+
+def test_split_context_follows_the_variant():
+    shard = SimpleNamespace(world_size=3, rank=1)
+    kw = dict(mode="prefill", capacity=4096, scoring=None, shard=shard, runtime=object(), coordinator=None)
+    longctx = TP3Config(index_row_split=(4096,), index_row_split_min_context=32768)
+    assert split_module.prefill_split_context(tp3=longctx, variant=False, **kw) is None
+    assert split_module.prefill_split_context(tp3=longctx, variant=None, **kw) is None   # e.g. any other prefill-mode graph
+    context = split_module.prefill_split_context(tp3=longctx, variant=True, **kw)
+    assert context is not None and context.split.capacity == 4096 and context.rank == 1
+    # G2 behaviour without the min context: the listed graph itself splits
+    assert split_module.prefill_split_context(tp3=TP3Config(index_row_split=(4096,)), **kw) is not None
+    with pytest.raises(ValueError, match="no indexer row split"):
+        split_module.prefill_split_context(tp3=longctx, variant=True, **{**kw, "capacity": 3584})
+
+
+def test_export_sh_passes_the_min_context_knob():
+    from tests.recipes.test_deepseek41_tp3_config import EXPORT_SH
+
+    text = EXPORT_SH.read_text()
+    assert 'FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX' in text
+    assert text.index("FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX") < text.index("exec .venv/bin/ignition export")

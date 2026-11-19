@@ -664,6 +664,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     # TP3 (tp3.prefill_skip_suffix): encoder-only twins of these prefill capacities (decoder_prefill.py).
     encoders = encoder_capacities(tp3.prefill_skip_suffix, config.prefill_capacities, chunk=config.prefill_chunk_size)
     count += len(modes) * len(encoders)
+    # TP3 tp3.index_row_split_min_context: one more graph per listed prefill capacity and per listed encoder twin
+    # (the long-context split variant; index_row_split.split_variants)
+    from .index_row_split import context_variant_name, split_variants
+    world = len(config.devices)
+    count += len(modes) * sum(len(split_variants(tp3, mode="prefill", capacity=capacity, scoring=None, world=world)) - 1
+                              for capacity in (*config.prefill_capacities, *encoders))
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -687,9 +693,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             mode_weights = weights if enabled else replace(weights, draft=None)
             for kind, mode, capacities in prefill_modes(
                     config.prefill_capacities, () if enabled else config.batch_capacities, scoring):
-                for capacity in capacities:
+                for capacity, variant in ((capacity, variant) for capacity in capacities
+                                          for variant in split_variants(tp3, mode=mode, capacity=capacity,
+                                              scoring=scoring if kind == "scored_prefill" else None, world=world)):
                     rows = 1 if mode == "prefill" else capacity
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
+                    if variant:  # the long-context split twin (same kind, capacity, inputs; helios picks by position)
+                        name = context_variant_name(name, tp3.index_row_split_min_context)
                     metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decoder_storage
                     if kind == "scored_prefill":
@@ -700,7 +710,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         scoring=scoring if kind == "scored_prefill" else None,
                         runtime=prefill_collective if mode == "prefill" and capacity >= 128 else collective,
                         vocabulary_runtime=vocabulary_collective,
-                        coordinator=coordinator, session=session, name=name, workspace=arena)
+                        coordinator=coordinator, session=session, name=name, workspace=arena,
+                        index_split_variant=variant)
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
                         input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
@@ -710,14 +721,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         context_factory=PreparedContext if kind == "scored_prefill" else context_factory)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
-            for capacity in encoders:
+            for capacity, variant in ((capacity, variant) for capacity in encoders
+                                      for variant in split_variants(tp3, mode="prefill", capacity=capacity, scoring=None,
+                                                                    world=world)):
                 # Same metadata, storage, inputs and prefill runtime as prefill<capacity>; no head or sampling.
                 name = f"encoder_prefill{capacity}" + suffix
+                if variant:  # tp3.index_row_split_min_context: the twin's long-context split variant
+                    name = context_variant_name(name, tp3.index_row_split_min_context)
                 metadata[name] = Metadata.allocate(capacity, 1, blocks, device)
                 scratch[name] = prefill_storage.rows(capacity, 1)
                 decoder = decoder_factory(mode_weights, tables, scratch[name], metadata[name], pool, mode="prefill",
                     runtime=prefill_collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name, workspace=arena, encoder_only=True)
+                    coordinator=coordinator, session=session, name=name, workspace=arena, encoder_only=True,
+                    index_split_variant=variant)
                 batch = PreparedBatch(inputs, requests, metadata[name], mode="prefill", shard=shard, pool=pool,
                     input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                     validate_prefill=vision_state.validate_prefill if vision_state is not None else None)

@@ -391,12 +391,50 @@ class IndexRowSplitContext:
         return ExchangeLayout(self.split, lanes, check=self.check)
 
 
-def prefill_split_context(*, mode, capacity, scoring, tp3, shard, runtime, coordinator, examples=None):
+# TP3 tp3.index_row_split_min_context: the long-context split graph of a listed prefill capacity is named
+# ``<base name>-split-ctx<tokens>`` (helios catalog::context_variant parses this suffix; keep the two in step).
+CONTEXT_VARIANT_MARK = "-split-ctx"
+
+
+def context_variant_name(base: str, min_context: int) -> str:
+    """The long-context split graph's name for the replicated graph ``base`` (tp3.index_row_split_min_context)."""
+    if CONTEXT_VARIANT_MARK in base or min_context <= 0:
+        raise ValueError(f"no context variant of {base!r} at {min_context}")
+    return f"{base}{CONTEXT_VARIANT_MARK}{min_context}"
+
+
+def parse_context_variant(name: str) -> tuple[str, int] | None:
+    """(base name, minimum start position) of a context variant graph name, or None (an ordinary graph)."""
+    base, mark, tail = name.rpartition(CONTEXT_VARIANT_MARK)
+    if not mark or not base or not tail.isdigit() or int(tail) <= 0:
+        return None
+    return base, int(tail)
+
+
+def split_variants(tp3, *, mode, capacity, scoring, world) -> tuple[bool | None, ...]:
+    """The graphs a prefill capacity builds: ``(None,)`` = one graph, split iff listed (no min context: G2's
+    behaviour, and every unlisted / scored / decode graph); ``(False, True)`` = the replicated graph plus its
+    long-context split variant (tp3.index_row_split_min_context set and the capacity listed)."""
+    listed = (mode == "prefill" and scoring is None and bool(tp3.index_row_split) and capacity in tp3.index_row_split
+              and world >= 2)
+    if listed and tp3.index_row_split_min_context is not None:
+        return (False, True)
+    return (None,)
+
+
+def prefill_split_context(*, mode, capacity, scoring, tp3, shard, runtime, coordinator, examples=None, variant=None):
     """The split context a ``PreparedDecoder`` hands its full-row layers, or None (replicated indexer): prefill
-    graphs whose capacity ``tp3.index_row_split`` lists, without prompt scoring, on more than one rank."""
+    graphs whose capacity ``tp3.index_row_split`` lists, without prompt scoring, on more than one rank. ``variant``
+    (split_variants): None = decide by the list alone (replicated whenever tp3.index_row_split_min_context is set:
+    then only the named variant graphs split); False = the replicated twin of a long-context split; True = the split
+    graph itself (must be a listed capacity)."""
     if (mode != "prefill" or scoring is not None or not tp3.index_row_split
             or capacity not in tp3.index_row_split or shard.world_size < 2):
+        if variant:
+            raise ValueError(f"no indexer row split for a {mode} graph of {capacity} rows")
         return None
+    if variant is False or (variant is None and tp3.index_row_split_min_context is not None):
+        return None  # the replicated twin; with a min context only the named variant graphs split
     return IndexRowSplitContext(RowSplit(capacity, shard.world_size), shard.rank, runtime, coordinator, examples,
                                 check=tp3.index_row_split_check)
 

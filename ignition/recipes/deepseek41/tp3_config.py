@@ -41,7 +41,8 @@ VRAM_RECLAIM = {
 # Optional tuning switches added after the 2026-11-15 default (151744): recorded in to_metadata only when set, so the
 # record of a default export stays the reference's (the quick/combined chains require an identical record).
 RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_woa_small", "brrr_woa_uneven", "brrr_per_sm",
-                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans", "index_row_split")
+                     "prefill_graphs", "draft_vocab", "prefill_skip_suffix", "draft_head_plans", "index_row_split",
+                     "index_row_split_min_context")
 
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
@@ -295,6 +296,15 @@ class TP3Config:
     Prompt-logprob graphs and decode/verify graphs keep the replicated indexer. Every listed size must be on the
     prefill ladder. None = replicated (base). Export-time only (prepared graphs). Experimental
     (perf/ds41-indexer-row-split, not GPU-proven yet)."""
+    index_row_split_min_context: int | None = None
+    """FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=<tokens> (needs index_row_split): long-context-only split. The listed prefill
+    capacities (and their encoder-only twins) keep the REPLICATED indexer in their ordinary graphs, and each gets one
+    more graph, ``<name>-split-ctx<tokens>`` (same kind, capacity and uploads), with the row split. The server runs
+    the split graph for a one-lane prefill chunk whose start position (the context already indexed) is at least
+    <tokens>, the replicated one below (helios ``catalog::context_variant``). The split's exchange costs a near
+    constant ~2.3 ms per index layer and 4096-row chunk (C2: 17-row channel gather), while the indexer work it saves
+    grows with the context (G2 A/B, 2026-11-19: break-even near 20-30K tokens). None = every listed graph split
+    (G2 behaviour). Export-time only."""
     index_row_split_check: bool = False
     """FLARE_DS41_INDEX_ROW_SPLIT_CHECK=1, debug-serve only (never export with it): the split's exchanges also carry a
     checksum per window row, and a counter op counts per layer the rows whose checksum differs after the gather
@@ -573,6 +583,11 @@ class TP3Config:
                 or tuple(sorted(set(self.index_row_split))) != self.index_row_split):
             raise ValueError("TP3 config: index_row_split must be distinct increasing multiples of 128 from 384 "
                              f"(three ranks of whole 128-row selector blocks; got {self.index_row_split!r})")
+        if self.index_row_split_min_context is not None and (
+                not self.index_row_split or type(self.index_row_split_min_context) is not int
+                or self.index_row_split_min_context <= 0):
+            raise ValueError("TP3 config: index_row_split_min_context must be a positive token count and needs "
+                             f"index_row_split (got {self.index_row_split_min_context!r})")
         if self.index_row_split_check and not self.index_row_split:
             raise ValueError("TP3 config: index_row_split_check needs index_row_split")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
@@ -677,6 +692,7 @@ class TP3Config:
             prefill_graphs=parse_capacities(get("PREFILL_GRAPHS")),
             prefill_skip_suffix=parse_skip_suffix(get("PREFILL_SKIP_SUFFIX")),
             index_row_split=parse_index_row_split(get("INDEX_ROW_SPLIT")),
+            index_row_split_min_context=optional("INDEX_ROW_SPLIT_MIN_CTX"),
             index_row_split_check=flag("INDEX_ROW_SPLIT_CHECK"),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),

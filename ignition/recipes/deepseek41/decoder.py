@@ -527,7 +527,7 @@ class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
-                 tp3=None, encoder_only=False):
+                 tp3=None, encoder_only=False, index_split_variant=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
@@ -612,7 +612,8 @@ class PreparedDecoder:
         # full-row index layers across ranks and exchange the winners over the vocabulary channel; prompt-logprob
         # graphs keep the replicated indexer (index_row_split.py).
         index_split = prefill_split_context(mode=mode, capacity=metadata.positions.numel(), scoring=scoring, tp3=tp3,
-            shard=weights.shard, runtime=vocabulary_runtime, coordinator=coordinator, examples=examples)
+            shard=weights.shard, runtime=vocabulary_runtime, coordinator=coordinator, examples=examples,
+            variant=index_split_variant)
         self.index_split = index_split
         self.layers, carry = [], False
         built = weights.layers[:decoder_start + 1] if encoder_only else weights.layers
