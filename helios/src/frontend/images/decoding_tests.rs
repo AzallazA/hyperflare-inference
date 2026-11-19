@@ -211,6 +211,83 @@ fn lossy_webp_rgb_matches_pillow() {
     assert!(maximum <= 2, "maximum channel error {maximum}");
 }
 
+fn gif_fixtures() -> (PathBuf, Value) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/frontend");
+    let manifest = serde_json::from_slice(&fs::read(root.join("gif.json")).unwrap()).unwrap();
+    (root, manifest)
+}
+
+#[test]
+fn gif_first_frame_matches_pillow_rgb_and_rgba() {
+    use super::{ImageProcessor, ImageSettings};
+    let (root, manifest) = gif_fixtures();
+    // Moonvit and the padded grid keep alpha; the Qwen profile does not.
+    let profiles = [
+        (ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap(), true),
+        (ImageProcessor::load(ImageSettings::PaddedGrid {}, ImageLimits::default()).unwrap(), true),
+        (processor(ImageLimits::default()), false),
+    ];
+    for case in manifest["cases"].as_array().unwrap().iter().filter(|case| case["animated"] == false) {
+        let name = case["name"].as_str().unwrap();
+        let encoded = fs::read(root.join(case["encoded"].as_str().unwrap())).unwrap();
+        let expected = fs::read(root.join(case["rgb"].as_str().unwrap())).unwrap();
+        let expected_rgba = fs::read(root.join(case["rgba"].as_str().unwrap())).unwrap();
+        for (index, (processor, keeps_alpha)) in profiles.iter().enumerate() {
+            let image = processor.decode_encoded(super::ImageEncoding::Gif, &encoded).unwrap();
+            assert_eq!(
+                [image.width(), image.height()],
+                [case["width"].as_u64().unwrap() as usize, case["height"].as_u64().unwrap() as usize],
+                "{name} profile {index}"
+            );
+            assert_eq!(image.pixels(), expected.as_slice(), "{name} profile {index} rgb");
+            // Pillow samples only mode P images with nearest neighbors; MoonViT is profile 0.
+            assert_eq!(image.nearest_resize, index == 0 && case["mode"] == "P", "{name} profile {index} resize");
+            if !keeps_alpha {
+                assert!(image.alpha.is_none(), "{name} profile {index} alpha");
+                continue;
+            }
+            let mut rgba = Vec::with_capacity(expected_rgba.len());
+            for (pixel, rgb) in image.pixels().chunks_exact(3).enumerate() {
+                rgba.extend_from_slice(rgb);
+                rgba.push(image.alpha.as_ref().map_or(255, |alpha| alpha[pixel]));
+            }
+            assert_eq!(rgba, expected_rgba, "{name} profile {index} rgba");
+        }
+    }
+}
+
+#[test]
+fn gif_limits_and_malformed_or_animated_inputs_are_rejected() {
+    let (root, manifest) = gif_fixtures();
+    let read = |name: &str| {
+        let case = manifest["cases"].as_array().unwrap().iter().find(|case| case["name"] == name).unwrap();
+        fs::read(root.join(case["encoded"].as_str().unwrap())).unwrap()
+    };
+    let normal = processor(ImageLimits::default());
+    assert!(normal.decode_gif(&read("two-frames")).err().unwrap().to_string().contains("animated GIF"));
+    let still = read("global-palette");
+    assert!(processor(ImageLimits { max_encoded_bytes: still.len() - 1, ..ImageLimits::default() })
+        .decode_gif(&still).is_err());
+    // The logical screen is 11x7 pixels.
+    assert!(processor(ImageLimits { max_input_pixels: 76, ..ImageLimits::default() })
+        .decode_gif(&still).is_err());
+    assert!(processor(ImageLimits { max_input_pixels: 77, ..ImageLimits::default() })
+        .decode_gif(&still).is_ok());
+    // The logical screen is 8x6 pixels; the frame extends the image to 12x8.
+    let past = read("frame-past-screen");
+    let limited = |pixels| processor(ImageLimits { max_input_pixels: pixels, ..ImageLimits::default() });
+    assert!(limited(95).decode_gif(&past).err().unwrap().to_string().contains("12x8"));
+    assert!(limited(96).decode_gif(&past).is_ok());
+    for end in [0, 3, 6, 13, still.len() / 2] {
+        assert!(normal.decode_gif(&still[..end]).is_err(), "truncated length {end}");
+    }
+    // A 4x3 screen with a 0x0 frame; Pillow 12.3.0 fails to load it.
+    let empty_frame =
+        [b"GIF89a".as_slice(), &[4, 0, 3, 0, 0x80, 0, 0, 255, 0, 0, 0, 0, 255, b','], &[0; 9], &[2, 1, 0x2c, 0, b';']]
+            .concat();
+    assert!(normal.decode_gif(&empty_frame).err().unwrap().to_string().contains("0x0"));
+}
+
 #[test]
 fn exif_reads_both_endian_orders_and_rejects_ambiguous_or_truncated_orientation() {
     for little in [false, true] {
