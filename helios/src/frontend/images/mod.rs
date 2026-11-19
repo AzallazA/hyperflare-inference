@@ -399,7 +399,7 @@ impl ImageProcessor {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"flare-encoded-image-v1\0");
-        hash.update([match encoding { ImageEncoding::Png => 0, ImageEncoding::Jpeg => 1, ImageEncoding::Webp => 2 }]);
+        hash.update([match encoding { ImageEncoding::Png => 0, ImageEncoding::Jpeg => 1, ImageEncoding::Webp => 2, ImageEncoding::Gif => 3 }]);
         hash.update(self.identity_domain);
         hash.update(bytes);
         hash.finalize().into()
@@ -706,6 +706,120 @@ impl ImageProcessor {
         let mut image = RgbImage::new(width as usize, height as usize, rgb)?;
         image.alpha = alpha;
         Ok(orientation::orient(image, orientation))
+    }
+
+    /// Decodes the first frame of a non-animated GIF as Pillow's RGB and RGBA conversions do.
+    /// The frame sits on a canvas that covers the logical screen and the frame; pixels outside
+    /// the frame take the transparent index, or index 0 without one. GIF has no EXIF orientation.
+    pub fn decode_gif(&self, bytes: &[u8]) -> Result<RgbImage> {
+        if bytes.len() > self.limits.max_encoded_bytes {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(
+                "encoded image exceeds the configured byte limit",
+            ))));
+        }
+        let error = |e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid GIF: {e}"),
+                e,
+            )))
+        };
+        // The decoder rejects a frame without a color table; Pillow reads such a frame as gray
+        // levels. When the screen descriptor's packed byte (offset 10) lacks the global-table
+        // flag 0x80, a copy gains a 256-entry (size bits 7) identity gray table after the
+        // 13-byte header and screen descriptor.
+        let patched;
+        let bytes = if bytes.len() >= 13 && bytes[10] & 0x80 == 0 {
+            let mut with_table = bytes[..10].to_vec();
+            with_table.push(bytes[10] | 0x87);
+            with_table.extend_from_slice(&bytes[11..13]);
+            (0..=255u8).for_each(|level| with_table.extend_from_slice(&[level; 3]));
+            with_table.extend_from_slice(&bytes[13..]);
+            patched = with_table;
+            &patched[..]
+        } else {
+            bytes
+        };
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::Indexed);
+        let mut decoder = options.read_info(Cursor::new(bytes)).map_err(error)?;
+        let (screen_width, screen_height) = (usize::from(decoder.width()), usize::from(decoder.height()));
+        let global_table = decoder.global_palette().unwrap_or_default().to_vec();
+        let Some(frame) = decoder.next_frame_info().map_err(error)? else {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "invalid GIF: no image data",
+            ))));
+        };
+        let (left, top) = (usize::from(frame.left), usize::from(frame.top));
+        let (frame_width, frame_height) = (usize::from(frame.width), usize::from(frame.height));
+        let (interlaced, transparent, local_table) = (frame.interlaced, frame.transparent, frame.palette.clone());
+        // Rejects an empty frame, which the canvas extent admits. A zero-size screen is valid:
+        // the canvas then has the frame's size.
+        self.check_input_extent(frame_width, frame_height)?;
+        let (width, height) = (screen_width.max(left + frame_width), screen_height.max(top + frame_height));
+        self.check_input_extent(width, height)?;
+        // The frame is read in one `fill_buffer` call, as the crate's non-interlaced read does,
+        // which yields rows in stored order. Reading a frame in several calls can end it early
+        // (a flat 31x19 frame read 31 pixels per call stops after 496 pixels), and the crate's
+        // interlaced read takes one row per call, so interlaced rows are placed below.
+        let mut frame_indices = vec![0; frame_width * frame_height];
+        if !decoder.fill_buffer(&mut frame_indices).map_err(error)? {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "invalid GIF: image truncated",
+            ))));
+        }
+        // A readable second image makes the file animated. Pillow reads only the first frame,
+        // so a missing trailer, a damaged second image or other bytes after it are accepted.
+        if matches!(decoder.next_frame_info(), Ok(Some(_))) {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "animated GIF is not supported; provide a still image",
+            ))));
+        }
+        let mut indices = vec![transparent.unwrap_or(0); width * height];
+        // An interlaced frame stores rows 0, 8, ...; 4, 12, ...; 2, 6, ...; then the odd rows.
+        let rows: Vec<usize> = if interlaced {
+            [(0, 8), (4, 8), (2, 4), (1, 2)]
+                .into_iter()
+                .flat_map(|(first, step)| (first..frame_height).step_by(step))
+                .collect()
+        } else {
+            (0..frame_height).collect()
+        };
+        for (stored, row) in rows.into_iter().enumerate() {
+            let start = (top + row) * width + left;
+            indices[start..start + frame_width]
+                .copy_from_slice(&frame_indices[stored * frame_width..(stored + 1) * frame_width]);
+        }
+        // Pillow (GifImagePlugin `_is_palette_needed` and `_seek`) reads a frame as mode P only
+        // when its color table is not the identity gray ramp; otherwise the mode is L and a
+        // pixel's level is its index. A local identity table over a global table still takes
+        // the global colors. Pillow's resize samples only mode P images with nearest neighbors.
+        let needed = |table: &[u8]| table.chunks_exact(3).enumerate().any(|(i, c)| c.iter().any(|v| usize::from(*v) != i));
+        let global = needed(&global_table).then_some(global_table);
+        let local = local_table.as_ref().map(|table| needed(table).then_some(table));
+        let is_palette = match &local {
+            Some(local) => local.is_some(),
+            None => global.is_some(),
+        };
+        let table = local.flatten().or(global.as_ref()).map(|table| table.as_slice());
+        let mut rgb = Vec::with_capacity(indices.len() * 3);
+        for index in &indices {
+            match table {
+                Some(table) => {
+                    let start = usize::from(*index) * 3;
+                    rgb.extend_from_slice(table.get(start..start + 3).unwrap_or(&[0; 3]));
+                }
+                None => rgb.extend_from_slice(&[*index; 3]),
+            }
+        }
+        let alpha = transparent
+            .filter(|_| matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid))
+            .map(|transparent| {
+                indices.iter().map(|index| if *index == transparent { 0 } else { 255 }).collect()
+            });
+        let mut image = RgbImage::new(width, height, rgb)?;
+        image.alpha = alpha;
+        image.nearest_resize = is_palette && matches!(self.profile, Profile::Moonvit);
+        Ok(image)
     }
 
     pub fn geometry(&self, width: usize, height: usize) -> Result<ImageGeometry> {
