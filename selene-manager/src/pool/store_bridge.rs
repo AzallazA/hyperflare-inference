@@ -604,7 +604,9 @@ impl Core {
                     offset: grant.offset,
                     length: grant.length,
                     record: grant.record,
-                    first_page: grant.page_first as u32,
+                    // Grant pages count from the accepted record's first page, as the
+                    // writer's coverage and the rank agents read them.
+                    first_page: grant.page_first as u32 - rec.accepted.expect("put accepted").1,
                     page_count: grant.page_count,
                     row: grant.row,
                 };

@@ -812,6 +812,8 @@ writer                          manager
 - For a record not already indexed, if the published parent is absent or has no
   stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
   the complete page chain and endpoint row as a root, over shared memory or the data channel.
+- `PutGrant` window page numbers count from the accepted record's first page
+  (`PutAccept.first_page` is chain-relative), for every writer and rank agent.
 - "Already held means committed": only `Stored` and `PRESENT` confirm a
   committed destination copy. Discarding a refused source under the pressure
   policy does not establish a destination copy.
