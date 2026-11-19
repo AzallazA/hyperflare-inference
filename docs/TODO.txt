@@ -56,10 +56,9 @@
     Cached-forward warmup recovers from 128 MiB allocation failures with less
     than 35 MiB free. Validate cold compilation through capture at these capacities.
 
-[ ] Prevent tensor-parallel shutdown deadlines from discarding completed exports.
-    Kimi K3.1 Pro TP16 DFlash2 captures 129 graphs and writes every rank source,
-    but preparation cleanup exceeds the 60-second rank shutdown deadline under
-    swap pressure. Validate resource drain and final assembly at these capacities.
+[ ] Validate automatic core assembly after a Kimi K3.1 Pro TP16 DFlash2 export
+    with concurrency 8, a 64-token speculative budget, DCP8, and 129 graphs
+    per rank. Capture exhausted host memory on a 251 GiB host without swap.
 
 [ ] Restore loading and serving for cores with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in

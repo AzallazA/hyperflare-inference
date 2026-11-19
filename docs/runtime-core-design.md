@@ -260,9 +260,13 @@ format; incompatible cores must be exported again with Ignition.
 
 Each preparation rank writes its resource file before the model file is
 assembled. After all ranks finish exporting and peer ownership is recorded,
-Ignition drains and closes the prepared models, joins peer processes, and
-releases registered host buffers. Final file assembly requires only rank files
-and their indexes. N-gram table payloads are appended directly from checkpoint
+Ignition leases the payloads referenced by the rank files. In a single-host
+tensor-parallel export, the supervisor monitors peer liveness while the ranks
+close their prepared models. Each peer also releases its registered host buffers
+and acknowledges completion. Rank zero then starts the 60-second deadline for
+Gloo shutdown and peer exit. It joins the peers and releases its host buffers
+before assembly. Final file assembly requires only rank files and their indexes.
+N-gram table payloads are appended directly from checkpoint
 file ranges during rank export, without materializing their contents in
 preparation memory.
 
