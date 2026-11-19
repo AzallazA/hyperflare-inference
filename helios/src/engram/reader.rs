@@ -844,6 +844,45 @@ impl CachedReader {
     }
 }
 
+impl CachedReader {
+    /// TP3 fork (perf/engram-readahead, after c2606aae): warm the row cache with predicted ids,
+    /// without a staging frame. Advisory: ids that are negative, outside the table, already
+    /// resident (those are pinned for their coming use instead) or repeated are skipped, and a
+    /// failed read is returned for the caller to count; the real gather still reads the rows.
+    /// Disk read counters include these reads; gather counters, hits and misses do not.
+    fn prefetch(&mut self, planes: &[Plane; 2], ids: &[i64]) -> Result<usize> {
+        let [weights, scales] = planes.map(|plane| plane.row_bytes);
+        let rows = planes[0].nbytes / planes[0].row_bytes;
+        self.miss_ids.clear();
+        self.miss_ids.extend(ids.iter().copied().filter(|&id| id >= 0 && (id as usize) < rows));
+        self.miss_ids.sort_unstable();
+        self.miss_ids.dedup();
+        self.miss_ids.retain(|&id| !self.cache.pin(id));
+        let stats = &self.disk.stats;
+        if self.miss_ids.len() > self.max_rows {
+            stats.read_ahead_dropped.fetch_add((self.miss_ids.len() - self.max_rows) as u64, Ordering::Relaxed);
+            self.miss_ids.truncate(self.max_rows);
+        }
+        let count = self.miss_ids.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        self.disk.gather(planes, &self.miss_ids, &mut self.miss_output[..count * (weights + scales)])?;
+        let mut admitted = 0usize;
+        for index in 0..count {
+            let id = self.miss_ids[index];
+            let w = &self.miss_output[index * weights..(index + 1) * weights];
+            let s = &self.miss_output[count * weights + index * scales..count * weights + (index + 1) * scales];
+            let inserted = self.cache.insert_ahead(id, w, s);
+            admitted += usize::from(inserted.admitted);
+            self.disk.stats.resident_rows.fetch_add(u64::from(inserted.added), Ordering::Relaxed);
+            self.disk.stats.evictions.fetch_add(u64::from(inserted.evicted), Ordering::Relaxed);
+        }
+        self.disk.stats.read_ahead_loaded.fetch_add(admitted as u64, Ordering::Relaxed);
+        Ok(admitted)
+    }
+}
+
 enum Data {
     Disk(DiskReader),
     Ram([Arc<Resident>; 2]),
@@ -910,7 +949,7 @@ pub(crate) struct Reader {
 }
 impl Reader {
     #[cfg(test)]
-    fn open(
+    pub(super) fn open(
         path: &Path,
         planes: &[Plane; 2],
         resident: bool,
@@ -988,6 +1027,18 @@ impl Reader {
             data: Data::Ram(data),
             stats,
             gather_threads: default_gather_threads(),
+        }
+    }
+    /// Whether rows read ahead can be kept: a disk table with a row cache.
+    pub fn caches_rows(&self) -> bool {
+        matches!(self.data, Data::Cached(_))
+    }
+    /// Warm the row cache with predicted ids (see [`CachedReader::prefetch`]); no work for
+    /// RAM-resident or uncached tables.
+    pub fn prefetch(&mut self, planes: &[Plane; 2], ids: &[i64]) -> Result<usize> {
+        match &mut self.data {
+            Data::Cached(reader) => reader.prefetch(planes, ids),
+            Data::Disk(_) | Data::Ram(_) => Ok(0),
         }
     }
     pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
@@ -1511,6 +1562,61 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         check(&mut reader, &planes, &bytes, &[20]);
         assert_eq!(stats.resident_rows.load(Ordering::Relaxed), 4);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// TP3 fork (perf/engram-readahead).
+    #[test]
+    fn read_ahead_warms_the_cache_so_the_gather_reads_no_disk_and_other_readers_do_nothing() {
+        let path = std::env::temp_dir().join(format!("helios-engram-ahead-{}.bin", std::process::id()));
+        let rows = 256;
+        let second = rows * 80 + 3;
+        let bytes: Vec<u8> = (0..second + rows * 10).map(|i| (i * 7 + i / 131) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane { file: 0, offset: 0, nbytes: rows * 80, row_bytes: 80 },
+            Plane { file: 0, offset: second as u64, nbytes: rows * 10, row_bytes: 10 },
+        ];
+        let expected = |ids: &[i64]| {
+            let mut out = Vec::new();
+            for plane in &planes {
+                for &id in ids {
+                    let start = plane.offset as usize + id as usize * plane.row_bytes;
+                    out.extend_from_slice(&bytes[start..start + plane.row_bytes]);
+                }
+            }
+            out
+        };
+        // RAM-resident and uncached disk readers cannot keep rows: no work, no disk reads.
+        for resident in [true, false] {
+            let stats = Arc::new(Stats::default());
+            let mut other = Reader::open(&path, &planes, resident, 0, 64, stats.clone()).unwrap();
+            assert!(!other.caches_rows());
+            assert_eq!(other.prefetch(&planes, &[1, 2, 3]).unwrap(), 0);
+            assert_eq!(stats.disk_reads.load(Ordering::Relaxed), 0);
+        }
+        let stats = Arc::new(Stats::default());
+        let mut reader = Reader::open(&path, &planes, false, 1 << 20, 64, stats.clone()).unwrap();
+        assert!(reader.caches_rows());
+        // Duplicates, negatives and rows outside the table are skipped without an error.
+        let loaded = reader.prefetch(&planes, &[40, 7, 40, -1, 9999, 200, 7]).unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(stats.read_ahead_loaded.load(Ordering::Relaxed), 3);
+        let reads = stats.disk_reads.load(Ordering::Relaxed);
+        assert!(reads > 0);
+        // Read-ahead is not a use: no hits or misses counted, no gather recorded.
+        assert_eq!(stats.hits.load(Ordering::Relaxed) + stats.misses.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.gathers.load(Ordering::Relaxed), 0);
+        let ids = [200, 7, 40, 7];
+        let mut output = vec![0; ids.len() * 90];
+        reader.gather(&planes, &ids, &mut output).unwrap();
+        assert_eq!(output, expected(&ids));
+        assert_eq!(stats.misses.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.hits.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), reads, "the gather went to disk");
+        // Resident rows are pinned rather than read again.
+        assert_eq!(reader.prefetch(&planes, &[7, 40]).unwrap(), 0);
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), reads);
         std::fs::remove_file(path).unwrap();
     }
 

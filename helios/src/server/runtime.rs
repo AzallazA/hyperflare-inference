@@ -944,6 +944,10 @@ impl Drop for ImagePreparation {
     }
 }
 
+/// TP3 fork (perf/engram-readahead).
+mod read_ahead;
+use read_ahead::ReadAhead;
+
 struct Worker<'a> {
     config: &'a ModelConfig,
     frontend: &'a crate::frontend::Frontend,
@@ -971,6 +975,9 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    /// TP3 fork (perf/engram-readahead): Some only when a disk-backed Engram table reads ahead
+    /// (FLARE_ENGRAM_READ_AHEAD=1); None with every table in RAM, so `submit` does nothing more.
+    read_ahead: Option<ReadAhead>,
 }
 
 impl<'a> Worker<'a> {
@@ -1002,6 +1009,7 @@ impl<'a> Worker<'a> {
             inputs: None,
             prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
+            read_ahead: None,
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
@@ -1011,6 +1019,11 @@ impl<'a> Worker<'a> {
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
         // Input construction stays inside the worker's unwind and drain boundary.
         self.inputs = Some(crate::model::Inputs::new(self.config, executor.manifest())?);
+        self.read_ahead = executor
+            .manifest()
+            .engram
+            .as_ref()
+            .and_then(|binding| ReadAhead::new(&binding.shared, self.config.limits.max_active));
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
@@ -2112,6 +2125,11 @@ impl<'a> Worker<'a> {
             _ => graph,
         };
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
+        // TP3 fork (perf/engram-readahead): before the launch, so the readers start while the
+        // previous step still replays. A no-op unless a disk-backed table reads ahead.
+        if let Some(read_ahead) = &mut self.read_ahead {
+            read_ahead.submit(step, fence.0, &self.scheduler, &self.admissions);
+        }
         if step
             .lanes
             .iter()
