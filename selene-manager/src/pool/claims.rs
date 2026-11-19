@@ -968,12 +968,7 @@ impl Core {
             }
             Ok(GetAnswer::Done) => {
                 attest(&mut claim.parties, Owner::Store, Party::Drained, false);
-                // Every window is queued: the handler ends the transfer after them.
-                if let Some(hub) = self.cfg.channel.as_ref() {
-                    for leg in claim.legs.iter().filter(|leg| !leg.source) {
-                        hub.finish(leg.ch.transfer);
-                    }
-                }
+                self.finish_req_legs_if_delivered(key);
                 self.complete_if_latched(key);
             }
             Ok(GetAnswer::Refused(refused)) => {
