@@ -949,7 +949,7 @@ pub(crate) struct Reader {
 }
 impl Reader {
     #[cfg(test)]
-    fn open(
+    pub(super) fn open(
         path: &Path,
         planes: &[Plane; 2],
         resident: bool,

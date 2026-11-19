@@ -9,6 +9,7 @@
 mod cache;
 #[cfg(unix)]
 mod prepared;
+mod read_ahead;
 mod reader;
 mod row_ids;
 use crate::{
@@ -19,13 +20,14 @@ use crate::{
 #[cfg(unix)]
 pub use prepared::{PlaneSource, PreparedTables, SourceSegment, TableSource};
 pub(crate) use reader::Plane;
+pub(crate) use read_ahead::read_ahead_requested;
 pub(crate) use row_ids::RowHash;
+use read_ahead::Advisory;
 #[cfg(feature = "server")]
 use std::fmt::Write;
 use std::{
-    collections::VecDeque,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
@@ -56,6 +58,7 @@ pub(crate) struct Stats {
     read_ahead_loaded: AtomicU64,
     read_ahead_dropped: AtomicU64,
     read_ahead_errors: AtomicU64,
+    read_ahead_skipped: AtomicU64,
 }
 
 impl Stats {
@@ -166,6 +169,7 @@ impl Stats {
             ("read_ahead_rows_total", "Predicted prefill rows handed to disk-table readers ahead of their graph.", &self.read_ahead_queued),
             ("read_ahead_rows_loaded_total", "Rows read ahead from disk into the row cache (resident rows are pinned, not counted).", &self.read_ahead_loaded),
             ("read_ahead_rows_dropped_total", "Predicted rows not read ahead because the advisory queue or a batch was full.", &self.read_ahead_dropped),
+            ("read_ahead_windows_skipped_total", "Read-ahead windows dropped unread because their gather was already served or their request left.", &self.read_ahead_skipped),
             ("read_ahead_errors_total", "Read-ahead batches that failed; a failure fails the table as a failed gather does.", &self.read_ahead_errors),
         ] {
             let _ = writeln!(
@@ -173,76 +177,6 @@ impl Stats {
                 "# HELP flare_engram_{name} {help}\n# TYPE flare_engram_{name} counter\nflare_engram_{name} {}",
                 counter.load(Ordering::Relaxed)
             );
-        }
-    }
-}
-
-/// TP3 fork (perf/engram-readahead): `FLARE_ENGRAM_READ_AHEAD=1` lets disk-backed tables with a
-/// row cache and a predictable hash read prefill rows ahead of their graph. Default off. Tables in
-/// RAM (both DS41 tables in the TP3 default) never read ahead whatever the switch says.
-pub(crate) fn read_ahead_requested() -> bool {
-    static REQUESTED: OnceLock<bool> = OnceLock::new();
-    *REQUESTED.get_or_init(|| {
-        parse_read_ahead(std::env::var("FLARE_ENGRAM_READ_AHEAD").ok().as_deref())
-    })
-}
-
-fn parse_read_ahead(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1" | "on" | "true" | "yes"))
-}
-
-/// Rows in one advisory batch: a published gather waits at most one batch.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
-const READ_AHEAD_BATCH_ROWS: usize = 4096;
-/// Advisory batches one table may hold queued (about a million rows).
-const READ_AHEAD_SLOTS: usize = 256;
-
-/// One advisory batch: prompt tokens whose rows a coming prefill step will request. `tokens`
-/// holds the query positions from `first` on, preceded by up to the hash's history (fewer only at
-/// the start of the prompt, where the hash reads pad). Excluded positions (images) are stored as
-/// `u32::MAX`, which no token map holds, so they stop n-grams as in the graph. The reader thread
-/// hashes the window itself, which keeps that work off the serving worker's submit path.
-struct Window {
-    tokens: Vec<u32>,
-    first: usize,
-}
-
-/// Fill `window` with the tokens of query positions `[position, next)` and up to `history`
-/// tokens before them, excluded positions as `u32::MAX`; returns where the queries start in it.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
-fn fill_window(
-    history: usize,
-    tokens: &[u32],
-    position: usize,
-    next: usize,
-    excluded: &impl Fn(usize) -> bool,
-    window: &mut Vec<u32>,
-) -> usize {
-    let base = position.saturating_sub(history);
-    window.clear();
-    window.extend((base..next).map(|at| if excluded(at) { u32::MAX } else { tokens[at] }));
-    position - base
-}
-
-/// Advisory read-ahead state of one disk-backed table, shared by its producer (the serving
-/// worker) and its reader thread. Exists only for tables that read ahead.
-#[derive(Default)]
-struct Advisory {
-    queue: Mutex<VecDeque<Window>>,
-    /// Recycled window buffers, so steady-state read-ahead allocates nothing.
-    pool: Mutex<Vec<Vec<u32>>>,
-}
-
-impl Advisory {
-    fn pop(&self) -> Option<Window> {
-        self.queue.lock().unwrap().pop_front()
-    }
-
-    fn recycle(&self, mut tokens: Vec<u32>) {
-        tokens.clear();
-        let mut pool = self.pool.lock().unwrap();
-        if pool.len() < READ_AHEAD_SLOTS {
-            pool.push(tokens);
         }
     }
 }
@@ -355,6 +289,9 @@ const STAGING_FRAMES: usize = 2;
 struct Job {
     frame: usize,
     generation: u32,
+    /// Submission sequence (TP3 fork, perf/engram-readahead: read-ahead drops windows whose
+    /// gather was served).
+    sequence: u64,
     requests: Requests,
 }
 #[derive(Clone, Copy, Default)]
@@ -470,52 +407,6 @@ fn serve(
     }
     // Release failed reads too, so graph shutdown can drain before reporting the error.
     buffers.signal(job.generation);
-}
-
-/// What a read-ahead reader thread does next.
-enum Work {
-    /// A real gather whose ids are readable (or cancelled): always outranks warming.
-    Gather(Job),
-    /// One advisory batch.
-    Warm(Window),
-    /// A held gather still waits for its graph and nothing is queued: spin, as `read` does.
-    Spin,
-    /// Nothing held or queued: park until a producer unparks.
-    Park,
-    /// The submission channel is closed and drained.
-    Stop,
-}
-
-/// TP3 fork (perf/engram-readahead, the c2606aae reader fix): a submission is taken into `held`
-/// as soon as it arrives but gathered only once its ids are readable. Device ids exist only
-/// after the step's graph starts, so a thread blocked on them would idle through the replay that
-/// read-ahead is meant to overlap; while the held gather waits, advisory batches run one at a
-/// time, so the gather starts at most one batch after its ids appear.
-fn next_work(
-    receiver: &mpsc::Receiver<Job>,
-    advisory: &Advisory,
-    held: &mut Option<Job>,
-    cancelled: &AtomicBool,
-) -> Work {
-    if held.is_none() {
-        match receiver.try_recv() {
-            Ok(job) => *held = Some(job),
-            Err(mpsc::TryRecvError::Disconnected) => return Work::Stop,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
-    if let Some(job) = held.as_ref() {
-        if job.requests.ready() || cancelled.load(Ordering::Acquire) {
-            return Work::Gather(held.take().unwrap());
-        }
-        return advisory.pop().map_or(Work::Spin, Work::Warm);
-    }
-    if cancelled.load(Ordering::Acquire) {
-        // A cancelled or failed table warms nothing more; it only releases submissions.
-        advisory.queue.lock().unwrap().clear();
-        return Work::Park;
-    }
-    advisory.pop().map_or(Work::Park, Work::Warm)
 }
 
 pub(crate) struct Shared {
@@ -645,57 +536,22 @@ impl Shared {
             // TP3 fork (perf/engram-readahead): only a disk table with a row cache and a
             // predictable hash, with FLARE_ENGRAM_READ_AHEAD=1, gets advisory state. Every other
             // table (all RAM-resident ones) runs the tp3-main loop below and allocates nothing.
-            let advisory = (read_ahead_requested() && reader.caches_rows() && table.hash.is_some())
-                .then(|| Arc::new(Advisory::default()));
+            let advisory = read_ahead::advisory_for(&reader, table.hash.as_ref());
             let worker_advisory = advisory.clone();
             let hash = advisory.as_ref().and(table.hash.clone());
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
-                    let Some(advisory) = worker_advisory else {
+                    let (Some(advisory), Some(hash)) = (worker_advisory, hash) else {
                         while let Ok(job) = receiver.recv() {
                             serve(&mut reader, &planes, &buffers, row_bytes, &stop, job);
                         }
                         return;
                     };
-                    let mut held = None;
-                    let hash = hash.expect("read-ahead tables carry a row hash");
-                    let (mut history, mut rows) = (Vec::new(), Vec::new());
-                    loop {
-                        match next_work(&receiver, &advisory, &mut held, &stop) {
-                            Work::Gather(job) => {
-                                serve(&mut reader, &planes, &buffers, row_bytes, &stop, job)
-                            }
-                            Work::Warm(batch) => {
-                                rows.clear();
-                                hash.predict(&batch.tokens, batch.first, batch.tokens.len(), |_| false, &mut history, &mut rows);
-                                reader_stats.read_ahead_queued.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                                let warmed = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| reader.prefetch(&planes, &rows)),
-                                );
-                                let failure: Option<Error> = match warmed {
-                                    Ok(Ok(_)) => None,
-                                    Ok(Err(error)) => Some(error),
-                                    Err(_) => Some("Engram read-ahead panicked".into()),
-                                };
-                                if let Some(error) = failure {
-                                    // A failed disk read may leave the reader's ring or staging in a
-                                    // state the next gather must not trust, and the real gather of
-                                    // these rows would meet the same disk condition: fail the table
-                                    // as a failed gather does (c2606aae instead swallows the error).
-                                    reader_stats.read_ahead_errors.fetch_add(1, Ordering::Relaxed);
-                                    for frame in buffers.iter() {
-                                        frame.error.lock().unwrap().get_or_insert_with(|| error.clone());
-                                    }
-                                    stop.store(true, Ordering::Release);
-                                }
-                                advisory.recycle(batch.tokens);
-                            }
-                            Work::Spin => std::hint::spin_loop(),
-                            Work::Park => thread::park(),
-                            Work::Stop => break,
-                        }
-                    }
+                    read_ahead::run_reader(
+                        receiver, &advisory, &hash, &mut reader, &planes, &buffers, row_bytes, &stop,
+                        &reader_stats,
+                    );
                 })
                 .map_err(|e| format!("start Engram reader: {e}"))?;
             let advisory = advisory.map(|advisory| (advisory, worker.thread().clone()));
@@ -774,6 +630,7 @@ impl Shared {
                 .send(Job {
                     frame,
                     generation: state.generation,
+                    sequence,
                     requests,
                 })
                 .map_err(|_| "Engram reader disconnected")?;
@@ -792,84 +649,6 @@ impl Shared {
             error = error.or_else(|| layer.staging[frame].error.lock().unwrap().clone());
         }
         error.map_or(Ok(()), Err)
-    }
-}
-
-/// TP3 fork (perf/engram-readahead): the serving worker's read-ahead entry points.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
-impl Shared {
-    /// TP3 fork (perf/engram-readahead): whether any table of this set reads ahead.
-    pub(crate) fn reads_ahead(&self) -> bool {
-        self.read_ahead
-    }
-
-    /// Whether `table` reads ahead.
-    pub(crate) fn table_reads_ahead(&self, table: usize) -> bool {
-        self.layers.get(table).is_some_and(|layer| layer.advisory.is_some())
-    }
-
-    /// Query positions one advisory batch of `table` covers.
-    pub(crate) fn read_ahead_batch_tokens(&self, table: usize) -> usize {
-        (READ_AHEAD_BATCH_ROWS / self.index.tables[table].heads.max(1)).max(1)
-    }
-
-    /// Query positions `table` may hold read ahead of the step being launched: a quarter of its
-    /// share of the row cache, so pinned rows never crowd out rows in steady use, and no more
-    /// than its advisory queue holds.
-    pub(crate) fn read_ahead_tokens(&self, table: usize) -> usize {
-        let Some(entry) = self.index.tables.get(table) else {
-            return 0;
-        };
-        let disk_tables = self.layers.iter().filter(|layer| layer.advisory.is_some()).count().max(1);
-        let capacity = self.stats.capacity_rows.load(Ordering::Relaxed) as usize / disk_tables;
-        (capacity / 4).min(READ_AHEAD_SLOTS * READ_AHEAD_BATCH_ROWS) / entry.heads.max(1)
-    }
-
-    /// Hand the prompt positions `[first, end)` of `tokens` to `table`'s reader thread, which
-    /// predicts their rows and reads them ahead, in batches of about `READ_AHEAD_BATCH_ROWS`
-    /// rows. `excluded` reports positions that never enter an n-gram (images). Advisory: never
-    /// blocks or fails. Returns the position reached: `end`, or less when the queue is full or
-    /// the table does not read ahead, so the caller retries the rest in a later step.
-    pub(crate) fn read_ahead(
-        &self,
-        table: usize,
-        tokens: &[u32],
-        first: usize,
-        end: usize,
-        excluded: impl Fn(usize) -> bool,
-    ) -> usize {
-        let Some(layer) = self.layers.get(table) else {
-            return first;
-        };
-        let (Some((advisory, _)), Some(hash)) = (&layer.advisory, &self.index.tables[table].hash) else {
-            return first;
-        };
-        if layer.cancelled.load(Ordering::Acquire) {
-            return first;
-        }
-        let end = end.min(tokens.len());
-        let step = self.read_ahead_batch_tokens(table);
-        let mut position = first;
-        while position < end {
-            let next = (position + step).min(end);
-            let mut window = advisory.pool.lock().unwrap().pop().unwrap_or_default();
-            let start = fill_window(hash.history(), tokens, position, next, &excluded, &mut window);
-            {
-                let mut queue = advisory.queue.lock().unwrap();
-                if queue.len() >= READ_AHEAD_SLOTS {
-                    drop(queue);
-                    advisory.recycle(window);
-                    let heads = self.index.tables[table].heads;
-                    self.stats.read_ahead_dropped.fetch_add(((end - position) * heads) as u64, Ordering::Relaxed);
-                    return position;
-                }
-                queue.push_back(Window { tokens: window, first: start });
-            }
-            // Unpark after enqueueing: a park that races this still finds the token.
-            layer.wake();
-            position = next;
-        }
-        position
     }
 }
 
@@ -1144,17 +923,6 @@ mod tests {
         assert!(request().read(&cancelled).is_err());
     }
 
-    // TP3 fork (perf/engram-readahead).
-    #[test]
-    fn read_ahead_switch_is_off_unless_asked() {
-        for value in [None, Some(""), Some("0"), Some("off"), Some("2"), Some("TRUE")] {
-            assert!(!parse_read_ahead(value), "{value:?}");
-        }
-        for value in ["1", " 1 ", "on", "true", "yes"] {
-            assert!(parse_read_ahead(Some(value)), "{value}");
-        }
-    }
-
     #[cfg(feature = "server")]
     #[test]
     fn metrics_are_unchanged_without_read_ahead() {
@@ -1166,127 +934,6 @@ mod tests {
         let mut on = String::new();
         stats.render(&mut on);
         assert!(on.starts_with(&off) && on.contains("flare_engram_read_ahead_rows_total 0"));
-    }
-
-    #[test]
-    fn windows_handed_to_the_reader_predict_the_whole_prompt() {
-        let hash = RowHash {
-            orders: (2..=4).flat_map(|order| [order; 8]).collect(),
-            multipliers: vec![3, 5, 7, 11],
-            primes: (0..24).map(|head| 101 + 2 * head).collect(),
-            offsets: (0..24).map(|head| head * 160).collect(),
-            rows: 24 * 160,
-            token_map: (0..50u32).map(|token| (token * 17) % 41).collect::<Vec<_>>().into(),
-            pad_token_id: 2,
-        };
-        let tokens: Vec<u32> = (0..300).map(|i| (i * 31 + i / 7) % 60).collect();
-        let excluded = |position: usize| (100..104).contains(&position) || position == 7;
-        let (mut history, mut whole) = (Vec::new(), Vec::new());
-        hash.predict(&tokens, 0, tokens.len(), excluded, &mut history, &mut whole);
-        assert!(whole.len() > 24 * 250);
-        for step in [1, 3, 170, 300] {
-            let (mut window, mut rows) = (Vec::new(), Vec::new());
-            for position in (0..tokens.len()).step_by(step) {
-                let next = (position + step).min(tokens.len());
-                let first = fill_window(hash.history(), &tokens, position, next, &excluded, &mut window);
-                hash.predict(&window, first, window.len(), |_| false, &mut history, &mut rows);
-            }
-            assert_eq!(rows, whole, "step {step}");
-        }
-    }
-
-    fn device_job(flag: &AtomicU64, sequence: u64) -> Job {
-        Job {
-            frame: 0,
-            generation: 1,
-            requests: Requests::Device {
-                address: 0,
-                flag: flag as *const AtomicU64 as usize,
-                sequence,
-                rows: 0,
-            },
-        }
-    }
-
-    fn window(first: usize) -> Window {
-        Window { tokens: vec![1, 2, 3], first }
-    }
-
-    #[test]
-    fn reader_warms_while_a_held_gather_waits_and_serves_it_once_published() {
-        let (sender, receiver) = mpsc::sync_channel::<Job>(2);
-        let advisory = Advisory::default();
-        let cancelled = AtomicBool::new(false);
-        let flag = AtomicU64::new(0);
-        let mut held = None;
-        // Idle with nothing queued: park.
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Park));
-        // Warming runs while idle.
-        advisory.queue.lock().unwrap().push_back(window(0));
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Warm(_)));
-        // A submission whose graph has not published yet is held; warming runs meanwhile.
-        sender.send(device_job(&flag, 5)).unwrap();
-        advisory.queue.lock().unwrap().push_back(window(1));
-        advisory.queue.lock().unwrap().push_back(window(2));
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Warm(w) if w.first == 1));
-        assert!(held.is_some());
-        // Published ids outrank queued warming.
-        flag.store(5, Ordering::Release);
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Gather(_)));
-        assert!(held.is_none());
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Warm(w) if w.first == 2));
-        // Held and unpublished with nothing queued: spin on the flag as `read` does.
-        sender.send(device_job(&flag, 6)).unwrap();
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Spin));
-        // Cancellation releases the held gather so it reports the cancellation.
-        cancelled.store(true, Ordering::Release);
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Gather(_)));
-        // A cancelled table drops queued warming and parks until a submission or shutdown.
-        advisory.queue.lock().unwrap().push_back(window(9));
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Park));
-        assert!(advisory.queue.lock().unwrap().is_empty());
-        // Host-produced ids are always readable.
-        cancelled.store(false, Ordering::Release);
-        sender.send(Job { frame: 1, generation: 2, requests: Requests::Host(vec![1]) }).unwrap();
-        advisory.queue.lock().unwrap().push_back(window(3));
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Gather(_)));
-        // A closed submission channel stops the thread once nothing is held; queued warming is
-        // dropped with it (shutdown).
-        drop(sender);
-        assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Stop));
-    }
-
-    #[test]
-    fn a_parked_reader_thread_wakes_for_work_and_for_shutdown() {
-        let (sender, receiver) = mpsc::sync_channel::<Job>(2);
-        let advisory = Arc::new(Advisory::default());
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (done, served) = mpsc::channel();
-        let thread_advisory = advisory.clone();
-        let thread_cancelled = cancelled.clone();
-        let worker = thread::spawn(move || {
-            let mut held = None;
-            loop {
-                match next_work(&receiver, &thread_advisory, &mut held, &thread_cancelled) {
-                    Work::Gather(_) => done.send("gather").unwrap(),
-                    Work::Warm(_) => done.send("warm").unwrap(),
-                    Work::Spin => std::hint::spin_loop(),
-                    Work::Park => thread::park(),
-                    Work::Stop => break,
-                }
-            }
-        });
-        let unpark = || worker.thread().unpark();
-        let wait = || served.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-        advisory.queue.lock().unwrap().push_back(window(0));
-        unpark();
-        assert_eq!(wait(), "warm");
-        sender.send(Job { frame: 0, generation: 1, requests: Requests::Host(vec![]) }).unwrap();
-        unpark();
-        assert_eq!(wait(), "gather");
-        drop(sender);
-        unpark();
-        worker.join().unwrap();
     }
 
 }
