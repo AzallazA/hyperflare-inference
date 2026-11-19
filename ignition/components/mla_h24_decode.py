@@ -254,9 +254,12 @@ class _H24Launch:
     @staticmethod
     def _identity(a):
         def pointer(tensor):
+            from torch._subclasses.fake_tensor import FakeTensor
+            if isinstance(tensor, FakeTensor) or getattr(tensor, "is_meta", False):
+                return id(tensor)  # planning/materialising: no storage pointer (FakeTensor.data_ptr is deprecated)
             try:
                 return int(tensor.data_ptr())
-            except Exception:  # meta/fake tensors during planning
+            except Exception:
                 return id(tensor)
         q = a["q_all"]
         index = getattr(getattr(q, "device", None), "index", None)
@@ -308,6 +311,8 @@ def install(policy, kernel=None, launcher=launch_h24):
     wrapper = _H24Launch(inner, real, policy, launcher)
     setattr(kernel, _ORIGINAL, inner)
     setattr(kernel, _TARGET, wrapper)
+    from . import mla_discovery_key  # the H24 program is ours: key b12x's persisted discovery to policy and source
+    mla_discovery_key.install()
     return wrapper
 
 
