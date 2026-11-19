@@ -34,7 +34,7 @@ row count does not change at 3072 / 3584 / 4096), and after the gather every ran
 partition it received and counts the rows that differ (must be 0); and (b) a structural check of every assembled row
 against this rank's own lengths: the first ``min(length, 512)`` winners distinct and in [0, length) (must be 0), plus an
 informational count of rows whose tail past that prefix is not all -1. Persistent per-device counters
-[layer, (calls, transport rows, invalid rows, tail rows)], dumped like probe.py (``check_dump``).
+[layer, (calls, transport rows, invalid rows, tail rows)], reset and dumped on request (``check_files``).
 """
 
 import os
@@ -263,18 +263,24 @@ def check_state(device) -> torch.Tensor:
     return _CHECK_STATE[key]
 
 
-def check_paths(index) -> tuple[str, str, str]:
-    """(dump request, dump file, reset request) of device ``index``: touch a request, wait for it to vanish (then read
-    the dump). A reset zeroes the counters: preparation's warm-up and capture runs count example data, so a check
-    resets while the server is idle, sends its prompts, then dumps."""
-    root = os.environ.get("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", "/tmp")
-    return (os.path.join(root, f"flare_idxsplit_check_req-dev{index}"),
-            os.path.join(root, f"flare_idxsplit_check-dev{index}.pt"),
-            os.path.join(root, f"flare_idxsplit_check_reset-dev{index}"))
+def check_root() -> str:
+    return os.environ.get("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", "/tmp")
 
 
-def check_dump(counters: torch.Tensor, path: str) -> None:
-    torch.save({"fields": CHECK_FIELDS, "counters": counters.detach().cpu()}, path + ".tmp")
+def check_files(index, pid=None) -> tuple[str, str, str]:
+    """(request file, this process's dump, this process's acknowledgement). The request holds one line
+    ``<reset|dump> <token>``; every process with counters acts once per new line (a reset zeroes them, a dump writes
+    ``flare_idxsplit_check-dev<index>-pid<pid>.pt``) and then writes the line into its acknowledgement file. A client
+    writes a new token and waits for one acknowledgement per rank. Preparation's warm-up and capture runs count
+    example data: a check resets while the server is idle, sends its prompts, then dumps."""
+    root, pid = check_root(), os.getpid() if pid is None else pid
+    return (os.path.join(root, "flare_idxsplit_check.request"),
+            os.path.join(root, f"flare_idxsplit_check-dev{index}-pid{pid}.pt"),
+            os.path.join(root, f"flare_idxsplit_check-dev{index}-pid{pid}.ack"))
+
+
+def check_dump(counters: torch.Tensor, path: str, token: str = "") -> None:
+    torch.save({"fields": CHECK_FIELDS, "counters": counters.detach().cpu(), "token": token}, path + ".tmp")
     os.replace(path + ".tmp", path)
 
 
@@ -284,16 +290,36 @@ def check_reset(counters: torch.Tensor) -> None:
         torch.cuda.synchronize(counters.device)
 
 
+def check_poll(counters: torch.Tensor, index, last: str) -> str:
+    """One poll of the request file: act on a new line, acknowledge it; returns the line handled last."""
+    request, path, ack = check_files(index)
+    try:
+        line = open(request).read().strip()
+    except OSError:
+        return last
+    if not line or line == last:
+        return last
+    kind = line.split()[0]
+    if kind == "reset":
+        check_reset(counters)
+    elif kind == "dump":
+        check_dump(counters, path, line)
+    else:
+        return line
+    with open(ack + ".tmp", "w") as f:
+        f.write(line + "\n")
+    os.replace(ack + ".tmp", ack)
+    return line
+
+
 def _check_dumper(counters, index):
-    request, path, reset = check_paths(index)
+    last = ""
     with torch.cuda.device(index):
         while True:
-            for trigger, action in ((reset, lambda: check_reset(counters)), (request, lambda: check_dump(counters, path))):
-                if os.path.exists(trigger):
-                    try:
-                        action()
-                    finally:
-                        os.remove(trigger)
+            try:
+                last = check_poll(counters, index, last)
+            except Exception:  # a debug aid must never take the server down; the client times out instead
+                pass
             time.sleep(0.2)
 
 

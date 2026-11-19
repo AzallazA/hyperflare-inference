@@ -522,18 +522,26 @@ def test_check_mode_counts_a_corrupted_exchange(monkeypatch):
     assert (calls, transport, tail) == (1, 2, 0)  # the transport check covers rows the unpack drops too
 
 
-def test_check_mode_dump_round_trips(tmp_path, monkeypatch):
+def test_check_mode_reset_and_dump_requests(tmp_path, monkeypatch):
     monkeypatch.setenv("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", str(tmp_path))
-    request, path, reset = split_module.check_paths(1)
-    assert request == str(tmp_path / "flare_idxsplit_check_req-dev1") and path.endswith("flare_idxsplit_check-dev1.pt")
-    assert reset == str(tmp_path / "flare_idxsplit_check_reset-dev1")
+    request, path, ack = split_module.check_files(1, pid=77)
+    assert request == str(tmp_path / "flare_idxsplit_check.request")
+    assert path == str(tmp_path / "flare_idxsplit_check-dev1-pid77.pt") and ack.endswith("-dev1-pid77.ack")
     counters = torch.arange(split_module.CHECK_LAYERS * 4, dtype=torch.int64).view(-1, 4)
-    split_module.check_dump(counters, path)
+    request, path, ack = split_module.check_files(1)
+    assert split_module.check_poll(counters, 1, "") == ""  # no request yet
+    open(request, "w").write("reset 1\n")
+    assert split_module.check_poll(counters, 1, "") == "reset 1" and counters.sum().item() == 0
+    assert open(ack).read() == "reset 1\n"
+    counters[2] = torch.tensor([5, 0, 0, 1])
+    assert split_module.check_poll(counters, 1, "reset 1") == "reset 1"  # the same line is handled once
+    open(request, "w").write("dump 2")
+    assert split_module.check_poll(counters, 1, "reset 1") == "dump 2" and open(ack).read() == "dump 2\n"
     dumped = torch.load(path)
-    assert dumped["fields"] == ("calls", "transport_rows", "invalid_rows", "tail_rows")
+    assert dumped["fields"] == ("calls", "transport_rows", "invalid_rows", "tail_rows") and dumped["token"] == "dump 2"
     assert torch.equal(dumped["counters"], counters)
-    split_module.check_reset(counters)
-    assert counters.sum().item() == 0
+    open(request, "w").write("bogus 3")
+    assert split_module.check_poll(counters, 1, "dump 2") == "bogus 3" and open(ack).read() == "dump 2\n"
 
 
 def test_check_switch_needs_the_split_and_never_reaches_an_export():
