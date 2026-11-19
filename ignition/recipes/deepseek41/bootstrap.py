@@ -416,7 +416,7 @@ def vocabulary_channels(config, sample_rows):
         from .index_row_split import exchange_rows, split_capacities
 
         split = split_capacities(tp3.index_row_split, config.prefill_capacities, chunk=config.prefill_chunk_size)
-        rows = max(rows, exchange_rows(split, len(config.devices)))
+        rows = max(rows, exchange_rows(split, len(config.devices), check=tp3.index_row_split_check))
     return rows, bool(config.dspark) and not (tp3.skip_draft_vocab_gather and parallel)
 
 

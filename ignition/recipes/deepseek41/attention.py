@@ -564,7 +564,7 @@ class PreparedAttention:
                 self.selectors.append(selector)
             if split_here:
                 self.index_exchange = PreparedIndexExchange(index_split, device, session=session,
-                                                            name=f"{name}.index_exchange")
+                                                            name=f"{name}.index_exchange", layer=layer)
         indexed = {} if not self.ratio else dict(indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
             indexed_indices=scratch.selected, indexed_lengths=self.index_lengths,
             page_table=self.page_table,
@@ -742,7 +742,8 @@ class PreparedAttention:
                     outputs.append(result)
                 selected = torch.cat(outputs, dim=0)
                 if self.index_exchange is not None:
-                    selected = self.index_exchange(selected)  # this rank's window -> every row, owners' bits
+                    # this rank's window -> every row, owners' bits (check mode also counts against the lengths)
+                    selected = self.index_exchange(selected, lengths=geometry.lengths)
                 if self.layer == self.candidate_source:
                     candidates = torch.cat(candidate_outputs, dim=0)
                     candidate_counts = torch.cat(count_outputs, dim=0)

@@ -25,8 +25,21 @@ its owner at fixed offsets that are the same on every rank. The slowest rank kee
 
 Pure geometry and the pack/unpack transforms live here (CPU-testable, traceable torch ops); ``PreparedIndexExchange``
 binds them to the channel.
+
+Check mode (``TP3Config.index_row_split_check``, FLARE_DS41_INDEX_ROW_SPLIT_CHECK=1; debug-serve only, never export with
+it: its counter op is plain Python). G0 (2026-11-18, G0-ANALYSIS.md) showed the b12x selector picks different members of
+the top-512 cut's tie class run to run, so a second selector launch cannot serve as a reference. The check is therefore
+(a) a pure transport proof: every rank appends a checksum per window row to its partition (in the padding: the channel
+row count does not change at 3072 / 3584 / 4096), and after the gather every rank recomputes the checksums of every
+partition it received and counts the rows that differ (must be 0); and (b) a structural check of every assembled row
+against this rank's own lengths: the first ``min(length, 512)`` winners distinct and in [0, length) (must be 0), plus an
+informational count of rows whose tail past that prefix is not all -1. Persistent per-device counters
+[layer, (calls, transport rows, invalid rows, tail rows)], dumped like probe.py (``check_dump``).
 """
 
+import os
+import threading
+import time
 from dataclasses import dataclass
 
 import torch
@@ -120,14 +133,19 @@ class ExchangeLayout:
     split: RowSplit
     lanes: int
     width: int = SELECTED_WIDTH
+    check: bool = False  # check mode: one checksum word per window row after the winners (transport proof)
 
     def __post_init__(self):
         if type(self.lanes) is not int or self.lanes <= 0 or self.lanes % 2:
             raise ValueError("an index exchange needs a positive, even lane count per rank (int32 = two BF16 lanes)")
 
     @property
+    def check_words(self) -> int:
+        return self.split.window_rows_count if self.check else 0
+
+    @property
     def channel_rows(self) -> int:
-        return -(-self.split.window_rows_count * self.width * 2 // self.lanes)
+        return -(-(self.split.window_rows_count * self.width + self.check_words) * 2 // self.lanes)
 
     @property
     def payload_bytes(self) -> int:
@@ -144,10 +162,11 @@ def channel_lanes(world: int, vocabulary: int = 129280) -> int:
     return (last - first) * 2
 
 
-def exchange_rows(capacities, world: int, *, lanes: int | None = None) -> int:
+def exchange_rows(capacities, world: int, *, lanes: int | None = None, check: bool = False) -> int:
     """Channel rows the widest split capacity needs (0 when nothing is split)."""
     lanes = channel_lanes(world) if lanes is None else lanes
-    return max((ExchangeLayout(RowSplit(capacity, world), lanes).channel_rows for capacity in capacities), default=0)
+    return max((ExchangeLayout(RowSplit(capacity, world), lanes, check=check).channel_rows for capacity in capacities),
+               default=0)
 
 
 def split_capacities(requested, prefill_capacities, *, chunk) -> tuple[int, ...]:
@@ -176,8 +195,111 @@ def pack(window: torch.Tensor, layout: ExchangeLayout) -> torch.Tensor:
                          f"not {tuple(window.shape)} {window.dtype}")
     columns = layout.lanes // 2
     flat = window.reshape(-1)
-    padding = flat.new_full((layout.channel_rows * columns - flat.numel(),), -1)
-    return torch.cat((flat, padding)).view(layout.channel_rows, columns)
+    parts = (flat, row_checksums(window)) if layout.check else (flat,)
+    used = flat.numel() + layout.check_words
+    padding = flat.new_full((layout.channel_rows * columns - used,), -1)
+    return torch.cat((*parts, padding)).view(layout.channel_rows, columns)
+
+
+# Check mode checksum: per row sum_j (unsigned value_j) * (2 j + 1) mod (2^31 - 1), exact in int64 (< 2^52 for 512
+# lanes), so the traced pack (Inductor) and the eager check compute the same int32 bits.
+_CHECK_MODULUS = 2 ** 31 - 1
+
+
+def row_checksums(rows: torch.Tensor) -> torch.Tensor:
+    """[n, width] int32 -> [n] int32 position-weighted checksums (traceable; integer-exact)."""
+    weights = torch.arange(1, 2 * rows.shape[1], 2, dtype=torch.int64, device=rows.device)
+    unsigned = rows.to(torch.int64) & 0xFFFFFFFF
+    return torch.remainder((unsigned * weights).sum(dim=1), _CHECK_MODULUS).to(torch.int32)
+
+
+def transport_mismatches(gathered: torch.Tensor, layout: ExchangeLayout) -> torch.Tensor:
+    """Check mode: per source rank, the window rows whose received checksum differs from the one recomputed from the
+    received winners -> int64 [world]. Zero on every rank = the exchange moved every partition bit for bit."""
+    if not layout.check:
+        raise ValueError("transport checksums need a check-mode layout")
+    split, columns, rows = layout.split, layout.lanes // 2, layout.split.window_rows_count
+    counts = []
+    for rank in range(split.world):
+        partition = gathered[:, rank * columns:(rank + 1) * columns].reshape(-1)
+        winners = partition[:rows * layout.width].view(rows, layout.width)
+        sent = partition[rows * layout.width:rows * layout.width + rows]
+        counts.append((row_checksums(winners) != sent).sum())
+    return torch.stack(counts)
+
+
+def structural_counts(selected: torch.Tensor, lengths: torch.Tensor, width: int = SELECTED_WIDTH) -> torch.Tensor:
+    """Check mode: rows of an assembled ``selected`` [rows, width] int32 against this rank's own ``lengths`` [rows]
+    -> int64 [2]: (rows whose first min(length, width) winners are not distinct values in [0, length): must be 0,
+    rows whose entries past that prefix are not all -1: informational; the attention reads only the prefix)."""
+    lengths = lengths.to(torch.int64)
+    used = lengths.clamp(min=0, max=width)
+    column = torch.arange(width, device=selected.device)
+    inside = column[None, :] < used[:, None]
+    values = selected.to(torch.int64)
+    ordered = torch.where(inside, values, torch.iinfo(torch.int64).max).sort(dim=1).values  # prefix first, ascending
+    bad = inside & ((ordered < 0) | (ordered >= lengths[:, None]))
+    bad[:, 1:] |= inside[:, 1:] & (ordered[:, 1:] == ordered[:, :-1])
+    tail = ~inside & (values != -1)
+    return torch.stack((bad.any(dim=1).sum(), tail.any(dim=1).sum()))
+
+
+# Check mode counters: [layer, (calls, transport rows, invalid rows, tail rows)] int64 per device, persistent storage.
+CHECK_LAYERS = 64
+CHECK_FIELDS = ("calls", "transport_rows", "invalid_rows", "tail_rows")
+_CHECK_STATE = {}
+
+
+def check_state(device) -> torch.Tensor:
+    """This device's check counters (allocated once, persistent; starts the dumper thread)."""
+    device = torch.device(device)
+    key = (device.type, device.index)
+    if key not in _CHECK_STATE:
+        from ignition.preparation.persistent import persistent_zeros
+
+        _CHECK_STATE[key] = persistent_zeros((CHECK_LAYERS, len(CHECK_FIELDS)), dtype=torch.int64, device=device)
+        if device.type == "cuda":
+            threading.Thread(target=_check_dumper, args=(_CHECK_STATE[key], device.index), daemon=True).start()
+    return _CHECK_STATE[key]
+
+
+def check_paths(index) -> tuple[str, str]:
+    """(request file, dump file) of device ``index``: touch the request, wait for it to vanish, read the dump."""
+    root = os.environ.get("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", "/tmp")
+    return os.path.join(root, f"flare_idxsplit_check_req-dev{index}"), os.path.join(root, f"flare_idxsplit_check-dev{index}.pt")
+
+
+def check_dump(counters: torch.Tensor, path: str) -> None:
+    torch.save({"fields": CHECK_FIELDS, "counters": counters.detach().cpu()}, path + ".tmp")
+    os.replace(path + ".tmp", path)
+
+
+def _check_dumper(counters, index):
+    request, path = check_paths(index)
+    while True:
+        if os.path.exists(request):
+            try:
+                check_dump(counters, path)
+            finally:
+                os.remove(request)
+        time.sleep(0.2)
+
+
+@torch.library.custom_op("flare_debug::index_split_check", mutates_args=("counters",))
+def _check(gathered: torch.Tensor, selected: torch.Tensor, lengths: torch.Tensor, counters: torch.Tensor, layer: int,
+           capacity: int, world: int, lanes: int) -> None:
+    """Check mode (device-side only, no host sync: safe inside a captured graph): add one call's counts to row
+    ``layer`` of ``counters``."""
+    layout = ExchangeLayout(RowSplit(capacity, world), lanes, check=True)
+    row = counters[layer]
+    row[0] += 1
+    row[1] += transport_mismatches(gathered, layout).sum()
+    row[2:4] += structural_counts(selected, lengths, layout.width)
+
+
+@_check.register_fake
+def _check_fake(gathered, selected, lengths, counters, layer, capacity, world, lanes):
+    pass
 
 
 def unpack(gathered: torch.Tensor, layout: ExchangeLayout) -> torch.Tensor:
@@ -225,9 +347,10 @@ class IndexRowSplitContext:
     runtime: object
     coordinator: object
     examples: dict | None = None
+    check: bool = False  # TP3Config.index_row_split_check (debug-serve only)
 
     def layout(self, lanes: int) -> ExchangeLayout:
-        return ExchangeLayout(self.split, lanes)
+        return ExchangeLayout(self.split, lanes, check=self.check)
 
 
 def prefill_split_context(*, mode, capacity, scoring, tp3, shard, runtime, coordinator, examples=None):
@@ -236,7 +359,8 @@ def prefill_split_context(*, mode, capacity, scoring, tp3, shard, runtime, coord
     if (mode != "prefill" or scoring is not None or not tp3.index_row_split
             or capacity not in tp3.index_row_split or shard.world_size < 2):
         return None
-    return IndexRowSplitContext(RowSplit(capacity, shard.world_size), shard.rank, runtime, coordinator, examples)
+    return IndexRowSplitContext(RowSplit(capacity, shard.world_size), shard.rank, runtime, coordinator, examples,
+                                check=tp3.index_row_split_check)
 
 
 class PreparedIndexExchange:
@@ -244,9 +368,10 @@ class PreparedIndexExchange:
 
     ``rows`` is this rank's window as an int64 row-id tensor in persistent storage: the only rank-specific value the
     traced forward reads, and a tensor, so every rank binds the same compiled forward. ``window(tensor)`` gathers a
-    [capacity, ...] operand's window rows; ``__call__(window_winners) -> selected`` exchanges."""
+    [capacity, ...] operand's window rows; ``__call__(window_winners) -> selected`` exchanges. In check mode the call
+    also adds this layer's counts (``layer``) to the device's check counters (``lengths`` = the chunk's own lengths)."""
 
-    def __init__(self, context: IndexRowSplitContext, device, *, session, name):
+    def __init__(self, context: IndexRowSplitContext, device, *, session, name, layer=0):
         from ignition.components.collectives import PreparedAllGather, _roce
         from ignition.preparation.examples import declaration_tensor
         from ignition.preparation.persistent import persistent_copy
@@ -271,6 +396,10 @@ class PreparedIndexExchange:
         self.gather = PreparedAllGather(send.view(torch.bfloat16), receive.view(torch.bfloat16), runtime=runtime,
                                         session=session, coordinator=context.coordinator, name=name)
         self.receive_shape = tuple(receive.shape)
+        self.layer, self.lanes = layer, lanes
+        self.counters = check_state(device) if self.layout.check else None
+        if self.counters is not None and not 0 <= layer < CHECK_LAYERS:
+            raise ValueError("check-mode counters cover layers below CHECK_LAYERS")
 
     def functional(self, *, session):
         self.gather.functional(session=session)
@@ -280,10 +409,16 @@ class PreparedIndexExchange:
         """Traced: this rank's window rows of a [capacity, ...] operand (same shape on every rank)."""
         return tensor.index_select(0, self.rows)
 
-    def __call__(self, window: torch.Tensor) -> torch.Tensor:
+    def __call__(self, window: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         """Traced: this rank's window winners [window_rows_count, 512] -> every row's winners [capacity, 512] (owners'
-        bits)."""
+        bits). ``lengths`` (check mode only): this rank's compressed lengths of the whole chunk."""
         source = pack(window, self.layout)
         output = torch.empty(self.receive_shape, dtype=torch.int32, device=window.device)
         _exchange(source, output, self.gather.handle)
-        return unpack(output, self.layout)
+        selected = unpack(output, self.layout)
+        if self.counters is not None:
+            if lengths is None:
+                raise ValueError("check mode needs the chunk's lengths")
+            split = self.layout.split
+            _check(output, selected, lengths, self.counters, self.layer, split.capacity, split.world, self.lanes)
+        return selected

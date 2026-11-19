@@ -13,7 +13,9 @@
   selection on every rank; with rank-dependent inputs, every rank holds the owners' selections (the identity
   precondition in PLAN.md);
 - ``PreparedIndexExchange`` call path through a stand-in gather; channel and transport refusals;
-- switch parsing, validation, record, vocabulary channel sizing and which graphs split.
+- switch parsing, validation, record, vocabulary channel sizing and which graphs split;
+- check mode (debug-serve): checksums in the padding (channel rows unchanged), transport mismatches found per source
+  rank, structural row check against the lengths, the counter op through the prepared call path (eager and compiled).
 """
 
 from dataclasses import replace
@@ -383,6 +385,176 @@ def test_prepared_exchange_refuses_a_short_channel_and_roce(monkeypatch):
                                            session=None, name="x")
 
 
+# --- check mode (C1: transport checksums + structural rows; G0 ruled out a second-launch reference) ------------------
+
+@pytest.mark.parametrize("capacity,rows", [(4096, 17), (3584, 16), (3072, 13)])
+def test_check_mode_checksums_fit_the_padding(capacity, rows):
+    plain, checked = ExchangeLayout(RowSplit(capacity, WORLD), LANES), ExchangeLayout(RowSplit(capacity, WORLD), LANES,
+                                                                                         check=True)
+    assert plain.channel_rows == checked.channel_rows == rows  # same channel and plans as the export
+    assert checked.check_words == checked.split.window_rows_count
+    assert exchange_rows(ROW_SPLIT_DEFAULT, WORLD, lanes=LANES, check=True) == 17
+    # A layout without spare lanes grows by the checksum words.
+    tight = ExchangeLayout(RowSplit(384, WORLD), 1024, check=True)
+    assert tight.channel_rows == ExchangeLayout(RowSplit(384, WORLD), 1024).channel_rows + 1
+
+
+def test_checksums_are_integer_exact_and_position_weighted():
+    rows = _patterns(64, 21)
+    sums = split_module.row_checksums(rows)
+    assert sums.dtype == torch.int32
+    expected = [sum((int(v) & 0xFFFFFFFF) * (2 * j + 1) for j, v in enumerate(row.tolist())) % (2 ** 31 - 1)
+                for row in rows]
+    assert sums.tolist() == expected
+    swapped = rows.clone()
+    swapped[3, [5, 6]] = swapped[3, [6, 5]]
+    assert (split_module.row_checksums(swapped) != sums).nonzero().flatten().tolist() == [3]
+
+
+@pytest.mark.parametrize("capacity", [4096, 3584, 3072])
+def test_checked_transport_counts_corrupted_rows_per_source_rank(capacity):
+    layout = ExchangeLayout(RowSplit(capacity, WORLD), LANES, check=True)
+    full = _patterns(capacity, capacity + 1)
+    partitions = [pack(window, layout) for window in _windows(full, layout.split)]
+    gathered = emulate_gather(partitions)
+    assert torch.equal(unpack(gathered, layout), full)  # checksums never leak into the winners
+    assert split_module.transport_mismatches(gathered, layout).tolist() == [0, 0, 0]
+    columns, width = LANES // 2, 512
+    bad = gathered.clone()
+    flat = bad[:, columns:2 * columns].reshape(-1).clone()  # rank 1's partition
+    flat[7 * width + 3] ^= 1        # one bit of window row 7
+    flat[100 * width:101 * width] = flat[100 * width:101 * width].flip(0)  # row 100 reversed
+    bad[:, columns:2 * columns] = flat.view(layout.channel_rows, columns)
+    assert split_module.transport_mismatches(bad, layout).tolist() == [0, 2, 0]
+    with pytest.raises(ValueError, match="check-mode"):
+        split_module.transport_mismatches(gathered, ExchangeLayout(layout.split, LANES))
+
+
+def _valid_selection(lengths, seed):
+    """A selector-shaped [rows, 512] int32: min(length, 512) distinct ascending ids in [0, length), then -1."""
+    generator = torch.Generator().manual_seed(seed)
+    rows = []
+    for length in lengths.tolist():
+        used = min(length, 512)
+        ids = torch.randperm(max(length, 1), generator=generator)[:used].sort().values if used else torch.zeros(0)
+        rows.append(torch.cat((ids.to(torch.int32), torch.full((512 - used,), -1, dtype=torch.int32))))
+    return torch.stack(rows)
+
+
+def test_structural_check_finds_invalid_prefixes_and_counts_dirty_tails():
+    lengths = torch.tensor([0, 1, 5, 511, 512, 513, 4000, 70000] * 4, dtype=torch.int32)
+    clean = _valid_selection(lengths, 1)
+    assert split_module.structural_counts(clean, lengths).tolist() == [0, 0]
+    shuffled = clean.clone()
+    shuffled[6, :512] = shuffled[6, torch.randperm(512)]  # order does not matter, the set does
+    assert split_module.structural_counts(shuffled, lengths).tolist() == [0, 0]
+    bad = clean.clone()
+    bad[2, 1] = bad[2, 0]           # duplicate inside the prefix
+    bad[3, 0] = 511                 # = length: out of range
+    bad[6, 9] = -1                  # sentinel inside the prefix
+    bad[8, 0] = 7                   # length 0: tail entry, informational only
+    bad[10, 7] = 99                 # length 5: entry past the prefix, informational only
+    assert split_module.structural_counts(bad, lengths).tolist() == [3, 2]
+
+
+def _checked_exchanges(monkeypatch, split, full, transport_fault=None):
+    layout = ExchangeLayout(split, LANES, check=True)
+    partitions = [pack(window, layout) for window in _windows(full, split)]
+    calling = [0]
+    _stub_channel(monkeypatch, layout.channel_rows, partitions, calling)
+    if transport_fault is not None:
+        from ignition.components import collectives
+
+        clean = collectives._gather_columns
+
+        def faulty(source, output, handle):
+            clean(source, output, handle)
+            transport_fault(output.view(torch.int32))
+
+        monkeypatch.setattr(collectives, "_gather_columns", faulty)
+    counters = {}
+    monkeypatch.setattr(split_module, "_CHECK_STATE", counters)
+    exchanges = []
+    for rank in range(WORLD):
+        context = IndexRowSplitContext(split, rank, _ChannelStub(layout.channel_rows), None, {}, check=True)
+        exchanges.append(split_module.PreparedIndexExchange(context, "cpu", session=None, name="l2.index_exchange",
+                                                            layer=2).functional(session=None))
+    return exchanges, calling
+
+
+def test_check_mode_exchange_counts_through_the_prepared_call(monkeypatch):
+    split = RowSplit(4096, WORLD)
+    lengths = (torch.arange(4096, dtype=torch.int32) * 7 + 100) // 4  # prefill: lengths grow with the row
+    full = _valid_selection(lengths, 2)
+    exchanges, calling = _checked_exchanges(monkeypatch, split, full)
+    counters = exchanges[0].counters
+    assert all(exchange.counters is counters for exchange in exchanges)  # one per device ("cpu" here)
+    for rank, exchange in enumerate(exchanges):
+        calling[0] = rank
+        assert torch.equal(exchange(exchange.window(full), lengths=lengths), full)
+    assert counters[2].tolist() == [3, 0, 0, 0] and counters.sum().item() == 3
+    compiled = torch.compile(lambda value, lengths: exchanges[1](exchanges[1].window(value), lengths=lengths),
+                             fullgraph=True)
+    calling[0] = 1
+    assert torch.equal(compiled(full.clone(), lengths), full)
+    assert counters[2].tolist() == [4, 0, 0, 0]
+    with pytest.raises(ValueError, match="lengths"):
+        exchanges[0](exchanges[0].window(full))
+
+
+def test_check_mode_counts_a_corrupted_exchange(monkeypatch):
+    split = RowSplit(4096, WORLD)
+    lengths = torch.full((4096,), 3000, dtype=torch.int32)
+    full = _valid_selection(lengths, 3)
+
+    columns = LANES // 2
+    owned = split.window_offsets()[2] * 512  # rank 2's first owned row inside its window (block 22 of 21-31)
+
+    def fault(gathered):  # rank 2's partition: one bit of its first owned row, and its window row 0 (not owned)
+        gathered[owned // columns, 2 * columns + owned % columns] ^= 4
+        gathered[0, 2 * columns] ^= 4
+
+    exchanges, calling = _checked_exchanges(monkeypatch, split, full, transport_fault=fault)
+    calling[0] = 0
+    selected = exchanges[0](exchanges[0].window(full), lengths=lengths)
+    assert (selected != full).any(dim=1).nonzero().flatten().tolist() == [22 * 128]
+    calls, transport, invalid, tail = exchanges[0].counters[2].tolist()
+    assert (calls, transport, tail) == (1, 2, 0)  # the transport check covers rows the unpack drops too
+
+
+def test_check_mode_dump_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLARE_DS41_INDEX_ROW_SPLIT_CHECK_DIR", str(tmp_path))
+    request, path = split_module.check_paths(1)
+    assert request == str(tmp_path / "flare_idxsplit_check_req-dev1") and path.endswith("flare_idxsplit_check-dev1.pt")
+    counters = torch.arange(split_module.CHECK_LAYERS * 4, dtype=torch.int64).view(-1, 4)
+    split_module.check_dump(counters, path)
+    dumped = torch.load(path)
+    assert dumped["fields"] == ("calls", "transport_rows", "invalid_rows", "tail_rows")
+    assert torch.equal(dumped["counters"], counters)
+
+
+def test_check_switch_needs_the_split_and_never_reaches_an_export():
+    import os
+    import subprocess
+
+    from tests.recipes.test_deepseek41_tp3_config import EXPORT_SH, OVERLAY_STUB, RELEASE_CKPT
+
+    assert not TP3Config().index_row_split_check and "index_row_split_check" not in TP3Config().to_metadata()
+    on = TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT": "1", "FLARE_DS41_INDEX_ROW_SPLIT_CHECK": "1"})
+    assert on.index_row_split_check and on.to_metadata()["index_row_split_check"] is True
+    with pytest.raises(ValueError, match="index_row_split_check needs index_row_split"):
+        TP3Config.from_environment({"FLARE_DS41_INDEX_ROW_SPLIT_CHECK": "1"})
+    script = EXPORT_SH.read_text()
+    body = script[:script.index("\nexec ")]
+    result = subprocess.run(["bash", "-c", body, str(EXPORT_SH)], capture_output=True, text=True,
+                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT,
+                                 "B12X_OVERLAY": OVERLAY_STUB, "IDX_SPLIT": "1",
+                                 "FLARE_DS41_INDEX_ROW_SPLIT_CHECK": "1"})
+    assert result.returncode == 2 and "debug-serve only" in result.stderr
+    mini = (EXPORT_SH.parent.parent / "mini-export.sh").read_text()
+    assert mini.index("FLARE_DS41_INDEX_ROW_SPLIT_CHECK") < mini.index("ignition export")
+
+
 # --- switch, record, channel sizing, graph selection -----------------------------------------------------------------
 
 def test_switch_parsing_validation_and_record():
@@ -463,7 +635,8 @@ def test_attention_splits_only_index_layers_before_the_candidate_source():
     run = inspect.getsource(attention.PreparedAttention._run)
     assert "index_owned" not in run and ".rank" not in run  # rank-symmetric trace: only the row-id tensor differs
     assert "pages, lengths = exchange.window(pages), exchange.window(lengths)" in run
-    assert run.index("selected = torch.cat(outputs, dim=0)") < run.index("selected = self.index_exchange(selected)")
+    assert (run.index("selected = torch.cat(outputs, dim=0)")
+            < run.index("selected = self.index_exchange(selected, lengths=geometry.lengths)"))
     assert attention.INDEXER_QUERY_ROWS == split_module.BLOCK_ROWS
     layer = inspect.getsource(decoder.PreparedDecoder.__init__)
     assert "index_split=index_split if layer_metadata is metadata else None" in layer  # never the 128-row suffix

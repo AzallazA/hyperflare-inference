@@ -127,6 +127,8 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ -n "${IDX_SPLIT:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT=$IDX_SPLIT
+# the row split's check mode counts in a Python op (debug-serve only): an export must never carry it
+[ -n "${FLARE_DS41_INDEX_ROW_SPLIT_CHECK:-}" ] && { echo "refusing: FLARE_DS41_INDEX_ROW_SPLIT_CHECK is debug-serve only" >&2; exit 2; }
 [ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 [ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
 [ "${ROTARY_ONCE:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE=1

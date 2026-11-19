@@ -23,6 +23,7 @@ OUT=${OUT:-$PWD/mini-$LABEL-$(date +%m%d-%H%M)}
 mkdir -p "$OUT"
 pids(){ ps -eo pid,args | awk '$2 ~ /(^|\/)flare$/ && $3=="run"{print $1}'; }
 [ -z "$(pids)" ] || { echo "a flare server is running: stop it first (export and serving cannot share the GPUs)" >&2; exit 2; }
+[ -z "${FLARE_DS41_INDEX_ROW_SPLIT_CHECK:-}" ] || { echo "refusing: FLARE_DS41_INDEX_ROW_SPLIT_CHECK is debug-serve only" >&2; exit 2; }
 export PYTHONPATH="$ROOT" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.1}" HF_HUB_OFFLINE=1 \
        TORCH_EXTENSIONS_DIR="$ROOT/.brrr-ext" FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_TP3_VOCAB_PARALLEL=1 \
        FLARE_DS41_MINI=1 FLARE_DS41_BRRR_LAYERS="${LAYERS:-}" FLARE_DS41_BRRR_LOG=1 FLARE_DS41_BRRR_CKPT="$SNAP"

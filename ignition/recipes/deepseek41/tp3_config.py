@@ -46,7 +46,8 @@ RECORDED_WHEN_SET = ("brrr_spin_ns", "brrr_two_shot_min", "brrr_ks_wob", "brrr_w
 # On/off switches added for ds41-tp3-next (2026-11-17): recorded only when on, so a default export's record equals the
 # earlier reference record.
 RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", "glue_pass2", "markov_stage_rows",
-                      "rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
+                      "rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs",
+                      "index_row_split_check")
 # Decode small-lever switches (perf/ds41-decode-small-levers, 2026-11-18): on/off, recorded only when on.
 SMALL_LEVERS = ("rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
 
@@ -288,10 +289,18 @@ class TP3Config:
     their encoder-only twins) each rank runs the indexer selectors of a contiguous uneven share of the chunk's 128-row
     blocks (4096: 11/11/10) on the index layers before the candidate source (2, 8, 14), and the int32 winners are
     all-gathered over the FP32 vocabulary channel (one or two more channel rows), so every rank holds the whole
-    ``selected`` (index_row_split.py). Equal to the owner rank's replicated selection bit for bit; equal to today's
-    per-rank selection where the indexer inputs are rank-identical. Prompt-logprob graphs and decode/verify graphs
-    keep the replicated indexer. Every listed size must be on the prefill ladder. None = replicated (base).
-    Export-time only (prepared graphs). Experimental (perf/ds41-indexer-row-split, not GPU-proven yet)."""
+    ``selected`` (index_row_split.py). Equal to the owner rank's replicated selection bit for bit. Not byte-identical
+    to the replicated indexer: the b12x selector fills the top-512 cut's tie class in arrival order, so today's ranks
+    (and runs) already pick different tied members (G0, 2026-11-18); with the split every rank uses the owner's pick.
+    Prompt-logprob graphs and decode/verify graphs keep the replicated indexer. Every listed size must be on the
+    prefill ladder. None = replicated (base). Export-time only (prepared graphs). Experimental
+    (perf/ds41-indexer-row-split, not GPU-proven yet)."""
+    index_row_split_check: bool = False
+    """FLARE_DS41_INDEX_ROW_SPLIT_CHECK=1, debug-serve only (never export with it): the split's exchanges also carry a
+    checksum per window row, and a counter op counts per layer the rows whose checksum differs after the gather
+    (transport, must be 0), the assembled rows whose valid prefix is not distinct values in [0, length) (must be 0) and
+    the rows whose tail is not all -1 (informational); dumped per device on request (index_row_split.check_paths).
+    Needs index_row_split."""
     # --- Engram tables (engram.py Tables) ---
     engram_tables: str = "auto"
     """Engram table layout in the package: ``shared`` = every rank reads the whole tables (the layout of every TP3
@@ -564,6 +573,8 @@ class TP3Config:
                 or tuple(sorted(set(self.index_row_split))) != self.index_row_split):
             raise ValueError("TP3 config: index_row_split must be distinct increasing multiples of 128 from 384 "
                              f"(three ranks of whole 128-row selector blocks; got {self.index_row_split!r})")
+        if self.index_row_split_check and not self.index_row_split:
+            raise ValueError("TP3 config: index_row_split_check needs index_row_split")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
             raise ValueError("TP3 config: tp3_graph_gib must be positive")
 
@@ -666,6 +677,7 @@ class TP3Config:
             prefill_graphs=parse_capacities(get("PREFILL_GRAPHS")),
             prefill_skip_suffix=parse_skip_suffix(get("PREFILL_SKIP_SUFFIX")),
             index_row_split=parse_index_row_split(get("INDEX_ROW_SPLIT")),
+            index_row_split_check=flag("INDEX_ROW_SPLIT_CHECK"),
             engram_tables=get("ENGRAM_TABLES", "auto"),
             engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
             packed_keep_batches=integer("PACKED_KEEP_BATCHES"),
