@@ -91,6 +91,44 @@ fn identical_decoded_pixels_preserve_exact_checkpoint_preprocessing() {
     }
 }
 
+#[test]
+fn sixteen_bit_png_modes_match_pillow() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/frontend");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.join("png_16bit.json")).unwrap()).unwrap();
+    // This fork has no padded-grid profile (Inkling); every profile here keeps PNG alpha
+    // except for RGB sources, as MoonViT does, so check MoonViT and the DeepSeek V4 profile.
+    for settings in [
+        super::ImageSettings::Moonvit {},
+        super::ImageSettings::Deepseek4 {},
+    ] {
+        let processor =
+            super::ImageProcessor::load(settings, ImageLimits::default()).unwrap();
+        for case in manifest["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let encoded = fs::read(root.join(case["encoded"].as_str().unwrap())).unwrap();
+            let image = processor.decode_png(&encoded).unwrap();
+            assert_eq!(
+                [image.width(), image.height()],
+                [
+                    case["width"].as_u64().unwrap() as usize,
+                    case["height"].as_u64().unwrap() as usize
+                ],
+                "{name}"
+            );
+            let expected = fs::read(root.join(case["rgb"].as_str().unwrap())).unwrap();
+            assert_eq!(image.pixels(), expected.as_slice(), "{name} rgb");
+            let expected_rgba = fs::read(root.join(case["rgba"].as_str().unwrap())).unwrap();
+            let mut rgba = Vec::with_capacity(expected_rgba.len());
+            for (index, pixel) in image.pixels().chunks_exact(3).enumerate() {
+                rgba.extend_from_slice(pixel);
+                rgba.push(image.alpha.as_ref().map_or(255, |alpha| alpha[index]));
+            }
+            assert_eq!(rgba, expected_rgba, "{name} rgba");
+        }
+    }
+}
+
 fn exif(value: u16, little: bool) -> Vec<u8> {
     let u16_bytes = |n: u16| {
         if little {

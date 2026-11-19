@@ -439,7 +439,9 @@ impl ImageProcessor {
     }
 
     /// Decodes PNG with the prepared profile’s alpha and orientation semantics.
-    /// Animated PNG and 16-bit samples are rejected.
+    /// Animated PNG is rejected. 16-bit samples follow Pillow's RGB conversion:
+    /// RGB, RGBA, and grayscale-alpha keep the high byte, grayscale clamps, and
+    /// 16-bit tRNS keys are ignored.
     pub fn decode_png(&self, bytes: &[u8]) -> Result<RgbImage> {
         if bytes.len() > self.limits.max_encoded_bytes {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
@@ -459,11 +461,20 @@ impl ImageProcessor {
         })?;
         let info = reader.info();
         self.check_input_extent(info.width as usize, info.height as usize)?;
-        if info.bit_depth == png::BitDepth::Sixteen || info.animation_control.is_some() {
+        if info.animation_control.is_some() {
             return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
-                "PNG requires non-animated, at most 8-bit samples",
+                "animated PNG is not supported",
             ))));
         }
+        let source_gray = info.color_type == png::ColorType::Grayscale;
+        // Pillow ignores 16-bit tRNS keys: convert("RGBA") is opaque, so drop the alpha that
+        // EXPAND derives from them.
+        let drop_trns_alpha = info.bit_depth == png::BitDepth::Sixteen
+            && info.trns.is_some()
+            && matches!(
+                info.color_type,
+                png::ColorType::Rgb | png::ColorType::Grayscale
+            );
         let retain_alpha = info.color_type != png::ColorType::Rgb;
         let nearest =
             info.color_type == png::ColorType::Indexed || info.bit_depth == png::BitDepth::One;
@@ -498,17 +509,45 @@ impl ImageProcessor {
         };
         let mut rgb = Vec::with_capacity(output.width as usize * output.height as usize * 3);
         let mut alpha = Vec::new();
-        for pixel in decoded[..output.buffer_size()].chunks_exact(output.color_type.samples()) {
-            if matches!(
-                output.color_type,
-                png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
-            ) {
-                alpha.push(pixel[pixel.len() - 1]);
+        let sixteen = output.bit_depth == png::BitDepth::Sixteen;
+        let sample_bytes = if sixteen { 2 } else { 1 };
+        let clamp_gray = sixteen && source_gray;
+        let sample = |pixel: &[u8], channel: usize| -> u8 {
+            if sixteen {
+                let value = u16::from_be_bytes([pixel[channel * 2], pixel[channel * 2 + 1]]);
+                if clamp_gray {
+                    value.min(255) as u8
+                } else {
+                    pixel[channel * 2]
+                }
+            } else {
+                pixel[channel]
+            }
+        };
+        for pixel in decoded[..output.buffer_size()]
+            .chunks_exact(output.color_type.samples() * sample_bytes)
+        {
+            if !drop_trns_alpha
+                && matches!(
+                    output.color_type,
+                    png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
+                )
+            {
+                let channel = output.color_type.samples() - 1;
+                alpha.push(if sixteen {
+                    pixel[channel * 2]
+                } else {
+                    pixel[channel]
+                });
             }
             match output.color_type {
-                png::ColorType::Rgb | png::ColorType::Rgba => rgb.extend_from_slice(&pixel[..3]),
+                png::ColorType::Rgb | png::ColorType::Rgba => {
+                    for channel in 0..3 {
+                        rgb.push(sample(pixel, channel));
+                    }
+                }
                 png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => {
-                    rgb.extend_from_slice(&[pixel[0]; 3])
+                    rgb.extend_from_slice(&[sample(pixel, 0); 3]);
                 }
                 png::ColorType::Indexed => {
                     return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
@@ -910,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn png_drops_alpha_without_blending_and_rejects_sixteen_bit_or_truncated() {
+    fn png_drops_alpha_without_blending_and_rejects_truncated() {
         let processor = processor(ImageLimits::default());
         let bytes = png(
             2,
@@ -924,16 +963,5 @@ mod tests {
             &[5, 6, 7, 8, 9, 10]
         );
         assert!(processor.decode_png(&bytes[..bytes.len() - 12]).is_err());
-        let sixteen = png(
-            1,
-            1,
-            png::BitDepth::Sixteen,
-            png::ColorType::Grayscale,
-            &[1, 2],
-        );
-        assert!(matches!(
-            processor.decode_png(&sixteen).err().unwrap(),
-            Error::Frontend(FrontendError::ImageDecode(_))
-        ));
     }
 }
