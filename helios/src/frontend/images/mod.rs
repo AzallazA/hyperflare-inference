@@ -446,7 +446,8 @@ impl ImageProcessor {
 
     /// Decodes PNG with the prepared profile’s alpha and orientation semantics.
     /// Animated PNG is rejected. 16-bit samples follow Pillow's RGB conversion:
-    /// RGB, RGBA, and grayscale-alpha keep the high byte, and grayscale clamps.
+    /// RGB, RGBA, and grayscale-alpha keep the high byte, grayscale clamps, and
+    /// 16-bit tRNS keys are ignored.
     pub fn decode_png(&self, bytes: &[u8]) -> Result<RgbImage> {
         if bytes.len() > self.limits.max_encoded_bytes {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
@@ -472,8 +473,17 @@ impl ImageProcessor {
             ))));
         }
         let source_gray = info.color_type == png::ColorType::Grayscale;
-        // The padded grid composites every PNG transparency form that Pillow reports, including
-        // RGB and grayscale tRNS keys; MoonViT ignores RGB tRNS keys.
+        // Pillow ignores 16-bit tRNS keys: convert("RGBA") is opaque, so drop the alpha that
+        // EXPAND derives from them.
+        let drop_trns_alpha = info.bit_depth == png::BitDepth::Sixteen
+            && info.trns.is_some()
+            && matches!(
+                info.color_type,
+                png::ColorType::Rgb | png::ColorType::Grayscale
+            );
+        // The padded grid composites every 8-bit PNG transparency form that Pillow reports,
+        // including RGB and grayscale tRNS keys. Pillow ignores 16-bit tRNS keys, and MoonViT
+        // ignores RGB tRNS keys.
         let retain_alpha = match self.profile {
             Profile::Moonvit => info.color_type != png::ColorType::Rgb,
             Profile::PaddedGrid => true,
@@ -530,10 +540,12 @@ impl ImageProcessor {
         for pixel in decoded[..output.buffer_size()]
             .chunks_exact(output.color_type.samples() * sample_bytes)
         {
-            if matches!(
-                output.color_type,
-                png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
-            ) {
+            if !drop_trns_alpha
+                && matches!(
+                    output.color_type,
+                    png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
+                )
+            {
                 let channel = output.color_type.samples() - 1;
                 alpha.push(if sixteen {
                     pixel[channel * 2]

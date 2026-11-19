@@ -70,12 +70,16 @@ def main() -> None:
         path.write_bytes(encode(width, height, color, samples(values), trns))
         with Image.open(path) as image:
             rgb = image.convert("RGB")
+            rgba = image.convert("RGBA")
         expected = path.with_suffix(".rgb")
         expected.write_bytes(rgb.tobytes())
+        expected_rgba = path.with_suffix(".rgba")
+        expected_rgba.write_bytes(rgba.tobytes())
         manifest.append({
             "name": name,
             "encoded": str(path.relative_to(root)),
             "rgb": str(expected.relative_to(root)),
+            "rgba": str(expected_rgba.relative_to(root)),
             "width": width,
             "height": height,
         })

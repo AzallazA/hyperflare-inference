@@ -5,6 +5,7 @@
       "name": "gray16",
       "encoded": "png-16bit-inputs/gray16.png",
       "rgb": "png-16bit-inputs/gray16.rgb",
+      "rgba": "png-16bit-inputs/gray16.rgba",
       "width": 2,
       "height": 2
     },
@@ -12,6 +13,7 @@
       "name": "gray16-trns",
       "encoded": "png-16bit-inputs/gray16-trns.png",
       "rgb": "png-16bit-inputs/gray16-trns.rgb",
+      "rgba": "png-16bit-inputs/gray16-trns.rgba",
       "width": 2,
       "height": 2
     },
@@ -19,6 +21,7 @@
       "name": "gray-alpha16",
       "encoded": "png-16bit-inputs/gray-alpha16.png",
       "rgb": "png-16bit-inputs/gray-alpha16.rgb",
+      "rgba": "png-16bit-inputs/gray-alpha16.rgba",
       "width": 2,
       "height": 2
     },
@@ -26,6 +29,7 @@
       "name": "rgb16",
       "encoded": "png-16bit-inputs/rgb16.png",
       "rgb": "png-16bit-inputs/rgb16.rgb",
+      "rgba": "png-16bit-inputs/rgb16.rgba",
       "width": 2,
       "height": 2
     },
@@ -33,6 +37,7 @@
       "name": "rgba16",
       "encoded": "png-16bit-inputs/rgba16.png",
       "rgb": "png-16bit-inputs/rgba16.rgb",
+      "rgba": "png-16bit-inputs/rgba16.rgba",
       "width": 2,
       "height": 2
     },
@@ -40,6 +45,7 @@
       "name": "rgb16-trns",
       "encoded": "png-16bit-inputs/rgb16-trns.png",
       "rgb": "png-16bit-inputs/rgb16-trns.rgb",
+      "rgba": "png-16bit-inputs/rgb16-trns.rgba",
       "width": 2,
       "height": 2
     }
