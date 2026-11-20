@@ -764,7 +764,13 @@ class PreparedAttention:
         if self.inv_rope_output is not None:
             output = self.inv_rope_output(attended, position)
         else:
-            self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
+            if self.mode == "prefill" and self.angle_key is not None:
+                # TP3 tp3.rotary_once_prefill: the inverse rotation from the shared table (same values; decode/verify/
+                # draft keep per-launch inverses so the rotary_once graphs stay E1's).
+                apply_shared_angles(attended, indices.angles[self.angle_key], self.rotary.frequencies[bool(self.ratio)],
+                                    inverse=True)
+            else:
+                self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
             output = self.output_projection(attended.view(source.shape[0], -1, 4096))
         record = window_cache, records
         if self.mode == "prefill":

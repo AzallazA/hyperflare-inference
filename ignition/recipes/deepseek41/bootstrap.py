@@ -497,6 +497,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
     tp3 = config.tp3  # TP3 fork switches: one instance, threaded through weights, Engram tables and the decoder
+    tp3.check_b12x_switches(world=shard.world_size)  # E3c-a: the gather-pull record must match the imported b12x
     if progress is not None:
         progress(tp3.describe())
     with phase(progress, "Inspect checkpoint"):
