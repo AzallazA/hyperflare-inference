@@ -3593,9 +3593,18 @@ fn http_state(
 }
 
 fn http_state_for(
+    fixture: Fixture,
+    sender: mpsc::SyncSender<Vec<Incoming>>,
+    api_key: Option<String>,
+) -> Arc<super::super::HttpState> {
+    http_state_with(fixture, sender, api_key, &[])
+}
+
+fn http_state_with(
     mut fixture: Fixture,
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
+    steering_keys: &[&str],
 ) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
@@ -3641,6 +3650,7 @@ fn http_state_for(
         run: crate::server::run_id(),
         ids: Default::default(),
         api_key,
+        steering_access: super::super::steering_access::SteeringAccess::new(steering_keys),
         thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
@@ -5745,4 +5755,193 @@ fn encoder_only_completions_finish_their_prefill_step_and_only_when_committed_so
     assert_eq!(worker.scheduler.stats().encoder_prefill_chunks, encoder_chunks);
     // Encoder-only chunks count as prompt tokens like any prefill.
     assert_eq!(fixture.metrics.snapshot(false).prefill_tokens, prefill_tokens);
+}
+
+/// A fixture whose core carries a steering sidecar, so `steering_scale` 0..1 is admitted.
+fn steering_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    fixture.config.steering_sidecar_sha256 = Some([7; 32]);
+    fixture.config.sampling_ranges.steering_scale =
+        Some(crate::model::SamplingRange { min: 0., max: 1. });
+    fixture
+}
+
+enum SteeringOutcome {
+    /// The request reached the runtime with this steering scale.
+    Admitted(f32),
+    /// The server answered before admission.
+    Answered(u16, serde_json::Value),
+}
+
+async fn steering_request(
+    keys: &[&str],
+    path: &str,
+    body: serde_json::Value,
+    headers: &[(&str, &str)],
+) -> SteeringOutcome {
+    use axum::{Extension, extract::State};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state_with(steering_fixture(), sender, None, keys);
+    let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request.body(axum::body::Body::from(body.to_string())).unwrap();
+    let mut response = tokio::spawn(super::super::http::generate(State(state), Extension(ingress), request));
+    let mut admitted = tokio::task::spawn_blocking(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    });
+    tokio::select! {
+        incoming = &mut admitted => {
+            let incoming = incoming.unwrap().expect("neither an answer nor an admitted request");
+            let scale = incoming[0].prompt.sampling.steering_scale;
+            response.abort();
+            SteeringOutcome::Admitted(scale)
+        }
+        answered = &mut response => {
+            let answered = answered.unwrap();
+            let status = answered.status().as_u16();
+            let bytes = axum::body::to_bytes(answered.into_body(), 65536).await.unwrap();
+            SteeringOutcome::Answered(status, serde_json::from_slice(&bytes).unwrap())
+        }
+    }
+}
+
+const STEERING_TEST_KEY: &str = "steer-test-key-6f1c";
+
+fn assert_steering_forbidden(outcome: SteeringOutcome, messages: bool, case: &str) {
+    let SteeringOutcome::Answered(status, body) = outcome else {
+        panic!("{case}: steering request without a valid key was admitted");
+    };
+    assert_eq!(status, 403, "{case}: {body}");
+    assert_eq!(body["error"]["type"], "permission_error", "{case}: {body}");
+    if messages {
+        assert_eq!(body["type"], "error", "{case}: {body}");
+    } else {
+        assert_eq!(body["error"]["code"], "permission_error", "{case}: {body}");
+    }
+    let text = body.to_string();
+    assert!(text.contains("X-Steering-Key"), "{case}: {text}");
+    assert!(!text.contains(STEERING_TEST_KEY) && !text.contains("wrong-key"), "{case}: key echoed: {text}");
+}
+
+fn assert_steering_admitted(outcome: SteeringOutcome, expected: f32, case: &str) {
+    match outcome {
+        SteeringOutcome::Admitted(scale) => assert_eq!(scale, expected, "{case}"),
+        SteeringOutcome::Answered(status, body) => panic!("{case}: answered {status}: {body}"),
+    }
+}
+
+#[tokio::test]
+async fn steering_gate_is_open_without_configured_keys() {
+    for stream in [false, true] {
+        let chat = serde_json::json!({"messages":[{"role":"user","content":"a"}],
+            "max_tokens":2, "stream":stream, "steering_scale":1.0});
+        assert_steering_admitted(
+            steering_request(&[], "/v1/chat/completions", chat, &[]).await, 1., "open chat");
+        let completion = serde_json::json!({"prompt":"a", "max_tokens":2, "stream":stream,
+            "steering_scale":1.0});
+        assert_steering_admitted(
+            steering_request(&[], "/v1/completions", completion, &[]).await, 1., "open completion");
+    }
+}
+
+#[tokio::test]
+async fn steering_gate_refuses_missing_or_wrong_keys_and_honors_the_right_one() {
+    let keys = [STEERING_TEST_KEY, "second-steering-key"];
+    let bearer = format!("Bearer {STEERING_TEST_KEY}");
+    for stream in [false, true] {
+        for path in ["/v1/chat/completions", "/v1/completions"] {
+            let body = |scale: serde_json::Value| {
+                let mut body = if path == "/v1/completions" {
+                    serde_json::json!({"prompt":"a"})
+                } else {
+                    serde_json::json!({"messages":[{"role":"user","content":"a"}]})
+                };
+                body["max_tokens"] = 2.into();
+                body["stream"] = stream.into();
+                if !scale.is_null() {
+                    body["steering_scale"] = scale;
+                }
+                body
+            };
+            let case = |what: &str| format!("{path} stream={stream} {what}");
+            assert_steering_forbidden(
+                steering_request(&keys, path, body(1.0.into()), &[]).await, false, &case("no key"));
+            assert_steering_forbidden(
+                steering_request(&keys, path, body(1.0.into()), &[("x-steering-key", "wrong-key")]).await,
+                false, &case("wrong X-Steering-Key"));
+            assert_steering_forbidden(
+                steering_request(&keys, path, body(1.0.into()), &[("authorization", "Bearer wrong-key")]).await,
+                false, &case("wrong Bearer"));
+            assert_steering_forbidden(
+                steering_request(&keys, path, body(0.5.into()), &[("authorization", STEERING_TEST_KEY)]).await,
+                false, &case("key without Bearer scheme"));
+            assert_steering_admitted(
+                steering_request(&keys, path, body(1.0.into()), &[("x-steering-key", STEERING_TEST_KEY)]).await,
+                1., &case("X-Steering-Key"));
+            assert_steering_admitted(
+                steering_request(&keys, path, body(1.0.into()), &[("authorization", bearer.as_str())]).await,
+                1., &case("Bearer"));
+            assert_steering_admitted(
+                steering_request(&keys, path, body(0.5.into()), &[("x-steering-key", "second-steering-key")]).await,
+                0.5, &case("second key"));
+            assert_steering_admitted(
+                steering_request(&keys, path, body(0.0.into()), &[]).await, 0., &case("scale 0 without key"));
+            assert_steering_admitted(
+                steering_request(&keys, path, body(serde_json::Value::Null), &[]).await,
+                0., &case("scale omitted without key"));
+        }
+        // chat_template_kwargs carries the same field for Chat Completions.
+        let nested = serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2,
+            "stream":stream, "chat_template_kwargs":{"steering_scale":0.5}});
+        assert_steering_forbidden(
+            steering_request(&keys, "/v1/chat/completions", nested.clone(), &[]).await, false,
+            "chat_template_kwargs without key");
+        assert_steering_admitted(
+            steering_request(&keys, "/v1/chat/completions", nested, &[("x-steering-key", STEERING_TEST_KEY)]).await,
+            0.5, "chat_template_kwargs with key");
+        let zero = serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2,
+            "stream":stream, "chat_template_kwargs":{"steering_scale":0}});
+        assert_steering_admitted(
+            steering_request(&keys, "/v1/chat/completions", zero, &[]).await, 0.,
+            "chat_template_kwargs scale 0 without key");
+    }
+}
+
+#[tokio::test]
+async fn steering_gate_answers_messages_and_responses_in_their_own_error_shape() {
+    let keys = [STEERING_TEST_KEY];
+    for stream in [false, true] {
+        let messages = serde_json::json!({"model":"m","max_tokens":2,"stream":stream,
+            "messages":[{"role":"user","content":"a"}],"steering_scale":1.0});
+        assert_steering_forbidden(
+            steering_request(&keys, "/v1/messages", messages.clone(), &[]).await, true,
+            "messages without key");
+        // With a key the request reaches decoding, which still refuses steering on Messages.
+        let SteeringOutcome::Answered(status, body) = steering_request(
+            &keys, "/v1/messages", messages, &[("x-steering-key", STEERING_TEST_KEY)]).await
+        else {
+            panic!("Messages admitted a steered request");
+        };
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("steering_scale"), "{body}");
+        let plain = serde_json::json!({"model":"m","max_tokens":2,"stream":stream,
+            "messages":[{"role":"user","content":"a"}],"steering_scale":0});
+        let outcome = steering_request(&keys, "/v1/messages", plain, &[]).await;
+        assert!(
+            !matches!(outcome, SteeringOutcome::Answered(403, _)),
+            "Messages refused steering_scale 0 for a missing key"
+        );
+        let responses = serde_json::json!({"input":"a","max_output_tokens":16,"stream":stream,
+            "steering_scale":1.0});
+        assert_steering_forbidden(
+            steering_request(&keys, "/v1/responses", responses, &[]).await, false,
+            "responses without key");
+    }
 }

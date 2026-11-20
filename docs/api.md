@@ -234,6 +234,8 @@ both to match. `/health` and `/metrics` are unauthenticated. Flare reads its
 serving key from `[server] api_key` in its configuration file, or from
 `--api-key-file`, which overrides it; an empty key disables authentication.
 Client configuration does not affect it.
+Steering keys, which restrict `steering_scale` separately from the serving key,
+are described with the steering parameter under sampling.
 
 Generation request bodies support `identity`, `gzip`, zlib `deflate`, `br`, and `zstd` content
 encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
@@ -657,6 +659,25 @@ value with HTTP 400. Zero scale adds no conditioning event, preserving ordinary
 unsteered prefix identities. A nonzero scale adds a position-zero event derived
 from the sidecar SHA-256 and exact FP32 scale bits, so different scales and
 sidecars cannot reuse one another's KV prefixes.
+
+By default any client may set `steering_scale`. An operator can restrict it to
+holders of steering keys: `flare run --steering-api-keys-file PATH` (preferred:
+keys stay out of the process list, environment and logs; one key per line or
+comma-separated, `#` starts a comment line, the file must hold at least one key
+and should be mode 600), `FLARE_STEERING_API_KEYS_FILE=PATH`,
+`FLARE_STEERING_API_KEYS=KEY1,KEY2`, or the repeatable `--steering-api-key KEY`.
+All sources add up. With keys configured, a request whose body sets a nonzero
+`steering_scale` (top level or in `chat_template_kwargs`, on any generation route)
+must carry one key as `X-Steering-Key: KEY`, or, without that header, as
+`Authorization: Bearer KEY`; otherwise the server answers HTTP 403 with
+`permission_error` in the route's error shape (OpenAI style, or Anthropic style on
+`/v1/messages`) before preparing the request, for streaming and non-streaming
+requests alike. An omitted, null or zero `steering_scale` never needs a key.
+When a serving key is also configured, `Authorization` must still carry the
+serving key (otherwise 401), so send the steering key in `X-Steering-Key`; a
+present `X-Steering-Key` is the only steering credential checked. Keys are
+compared as SHA-256 digests over every configured key, and the server logs only
+their count at startup.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values

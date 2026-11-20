@@ -22,6 +22,7 @@ mod protocol;
 mod request;
 pub use request::{PreparedRequest, prepare as prepare_request};
 mod runtime;
+mod steering_access;
 mod stops;
 #[cfg(feature = "runtime-core")]
 mod session;
@@ -77,6 +78,10 @@ pub struct ServerConfig {
     /// Serving key; Messages also accepts `x-api-key`. `/health` and `/metrics`
     /// are unauthenticated.
     pub api_key: Option<String>,
+    /// Steering keys; when nonempty, a request with a nonzero `steering_scale` must present one
+    /// in `X-Steering-Key` or `Authorization: Bearer` or is refused with 403. Empty = any client
+    /// may steer.
+    pub steering_api_keys: Vec<String>,
     /// Names requests may use for the model in addition to its identifier.
     pub served_names: Vec<String>,
     /// Default reasoning-token cap for conversational requests without a budget.
@@ -97,6 +102,7 @@ impl Default for ServerConfig {
             frontend_workers: 2,
             max_body_bytes: 32 * 1024 * 1024,
             api_key: None,
+            steering_api_keys: Vec::new(),
             served_names: Vec::new(),
             thinking_token_budget: None,
             context_hint: String::new(),
@@ -123,6 +129,7 @@ struct HttpState {
     run: u64,
     ids: AtomicU64,
     api_key: Option<String>,
+    steering_access: steering_access::SteeringAccess,
     thinking_token_budget: Option<u32>,
     context_hint: String,
     capacity_hint: String,
@@ -277,6 +284,7 @@ impl Server {
             run: run_id(),
             ids: AtomicU64::new(1),
             api_key: config.api_key.clone(),
+            steering_access: steering_access::SteeringAccess::new(&config.steering_api_keys),
             thinking_token_budget: config.thinking_token_budget,
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
@@ -284,6 +292,13 @@ impl Server {
             generated: Mutex::new(VecDeque::new()),
             accepting: Mutex::new(true),
         });
+        if config.log_to_stderr && state.steering_access.restricted() {
+            // The count only: keys never reach the log.
+            eprintln!(
+                "steering: steering_scale restricted to holders of {} configured steering key(s)",
+                config.steering_api_keys.len()
+            );
+        }
         let server_state = state.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

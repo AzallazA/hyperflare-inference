@@ -154,6 +154,8 @@ pub(super) async fn generate(
             "anthropic-version must be 2023-06-01",
         );
     }
+    // Decided from the headers before the body is consumed; applied once the body is decoded.
+    let steering_authorized = state.steering_access.authorized(request.headers());
     let encoding = request
         .headers()
         .get("content-encoding")
@@ -180,6 +182,9 @@ pub(super) async fn generate(
         let _permit = permit;
         let _ingress = preparation_ingress;
         let body = decode_body(&bytes, &encoding, prepare_state.max_body_bytes)?;
+        if !steering_authorized && super::steering_access::requested(&body) {
+            return Err((StatusCode::FORBIDDEN, super::steering_access::FORBIDDEN_MESSAGE.into()));
+        }
         let mut decoded = protocol::decode(protocol, body, count)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         if protocol != Protocol::Completions {

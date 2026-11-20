@@ -342,6 +342,20 @@ impl Bootstrap {
                 .ok_or("served_names must contain strings")?,
             Some(_) => return Err("served_names must be an array".into()),
         };
+        // Error messages name the field only, never a key.
+        let steering_api_keys = match object.get("steering_api_keys") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(keys)) => keys
+                .iter()
+                .map(|key| {
+                    key.as_str()
+                        .filter(|key| !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()))
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or("steering_api_keys must contain nonempty printable ASCII strings without spaces")?,
+            Some(_) => return Err("steering_api_keys must be an array".into()),
+        };
         let mut scheduling_policy = match object.get("scheduler_policy") {
             None => crate::scheduler::PolicyConfig::default(),
             Some(Value::String(value)) if value == "balanced" => crate::scheduler::PolicyConfig::default(),
@@ -419,6 +433,7 @@ impl Bootstrap {
                     .ok_or("server configuration thinking_token_budget must be a positive 32-bit integer"))
                 .transpose()?,
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
+            steering_api_keys,
             served_names,
             context_hint: optional_text("context_hint")?,
             capacity_hint: optional_text("capacity_hint")?,

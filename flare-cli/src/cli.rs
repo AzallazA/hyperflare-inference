@@ -481,6 +481,7 @@ impl OrbitPush {
             dry_run: false,
             dry_run_free_memory: Vec::new(),
             api_key_file: None,
+            steering_access: SteeringAccessOptions::default(),
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
@@ -660,6 +661,7 @@ impl OrbitRun {
             dry_run: false,
             dry_run_free_memory: Vec::new(),
             api_key_file: self.api_key_file.clone(),
+            steering_access: SteeringAccessOptions::default(),
             scheduler_policy: self
                 .scheduler_policy
                 .clone()
@@ -796,6 +798,9 @@ pub struct Run {
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub steering_access: SteeringAccessOptions,
+
     /// Favor token throughput or balance it with output cadence; all retain token-service fairness.
     /// Interactive is balanced with a 50 ms first-token target.
     #[arg(long, value_name = "MODE", default_value = "balanced",
@@ -888,6 +893,40 @@ pub struct SchedulerOptions {
     /// graphs is unaffected [default: true].
     #[arg(long, value_name = "BOOL", help_heading = "Scheduler options")]
     pub scheduler_encoder_prefill: Option<bool>,
+}
+
+/// A steering key given on the command line; its `Debug` form never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SteeringKey(pub String);
+
+impl std::fmt::Debug for SteeringKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SteeringKey(<redacted>)")
+    }
+}
+
+/// Accepts any text; `steering_keys::resolve` validates it without echoing it (clap's own
+/// invalid-value errors would print the argument).
+fn steering_key(value: &str) -> Result<SteeringKey, String> {
+    Ok(SteeringKey(value.to_owned()))
+}
+
+/// Who may set `steering_scale`. Without any key every client may; with keys (from these flags,
+/// FLARE_STEERING_API_KEYS and FLARE_STEERING_API_KEYS_FILE together), a request with a nonzero
+/// `steering_scale` must carry one in `X-Steering-Key` or `Authorization: Bearer`, or is refused
+/// with 403.
+#[derive(Debug, Args, Clone, Default, PartialEq)]
+pub struct SteeringAccessOptions {
+    /// Steering key that allows a request to set a nonzero steering_scale (repeatable). Visible in
+    /// the process list; prefer --steering-api-keys-file [default: none = any client may steer].
+    #[arg(long = "steering-api-key", value_name = "KEY", value_parser = steering_key,
+        action = clap::ArgAction::Append, help_heading = "Serving options")]
+    pub steering_api_key: Vec<SteeringKey>,
+
+    /// File of steering keys, one per line or comma-separated ('#' starts a comment line); must
+    /// hold at least one key [default: FLARE_STEERING_API_KEYS_FILE].
+    #[arg(long, value_name = "PATH", help_heading = "Serving options")]
+    pub steering_api_keys_file: Option<PathBuf>,
 }
 
 /// Read by rank zero's `flare run` when `--scheduler-prefill-merge-min-rows` is absent.

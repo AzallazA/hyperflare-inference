@@ -31,6 +31,7 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+mod steering_keys;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -196,6 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = configuration
         .api_key(args.api_key_file.as_deref())
         .map_err(|error| error.to_string())?;
+    // Rank zero serves HTTP; other ranks never see steering keys.
+    let steering_keys = if args.rank.is_some_and(|rank| rank != 0) {
+        Vec::new()
+    } else {
+        steering_keys::resolve(&args.steering_access, |name| std::env::var(name).ok())?
+    };
     let mut progress = StartupProgress::stderr();
     #[cfg(unix)]
     let mut launched = None;
@@ -332,6 +339,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config["served_names"] = serde_json::json!([name]);
     }
     config["api_key"] = key.into();
+    if !steering_keys.is_empty() {
+        config["steering_api_keys"] = serde_json::json!(steering_keys);
+    }
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, routing)?;
