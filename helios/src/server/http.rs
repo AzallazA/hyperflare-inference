@@ -160,9 +160,21 @@ pub(super) async fn generate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("identity")
         .to_owned();
-    let bytes = match axum::body::to_bytes(request.into_body(), state.max_body_bytes).await {
-        Ok(bytes) => bytes,
-        Err(e) => return error(protocol, StatusCode::PAYLOAD_TOO_LARGE, e),
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        axum::body::to_bytes(request.into_body(), state.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return error(protocol, StatusCode::PAYLOAD_TOO_LARGE, e),
+        Err(_) => {
+            return error(
+                protocol,
+                StatusCode::REQUEST_TIMEOUT,
+                "request body read timed out",
+            );
+        }
     };
     let permit = match state.frontend_slots.clone().acquire_owned().await {
         Ok(p) => p,

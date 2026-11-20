@@ -471,6 +471,12 @@ static int open_hca(roce_ctx_t* c, int h, const char* name) {
         set_err(c, "ibv_create_qp", errno);
         return -1;
       }
+      if (attr.cap.max_inline_data < 8) {
+        snprintf(c->err, sizeof(c->err),
+                 "HCA %d granted max_inline_data=%u, need at least 8 bytes",
+                 h, attr.cap.max_inline_data);
+        return -1;
+      }
       struct ibv_qp_attr init;
       memset(&init, 0, sizeof(init));
       init.qp_state = IBV_QPS_INIT;
@@ -675,7 +681,8 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
     for (int k = 0; k < n_rail; k++) {
       int h = routes[(p * n_rail + k) * 2];
       int r = routes[(p * n_rail + k) * 2 + 1];
-      if (h < 0 || h >= c->n_hca || r < 0 || r >= ROCE_MAX_HCAS) {
+      if (h < 0 || h >= c->n_hca || r < 0 || r >= ROCE_MAX_HCAS ||
+          all[p].mtu[r] == 0 || all[p].qp_num[r][c->rank][0] == 0) {
         snprintf(c->err, sizeof(c->err), "invalid route to rank %d rail %d: %d -> %d", p, k, h, r);
         return -1;
       }
@@ -769,11 +776,12 @@ static int drain_cq(roce_ctx_t* c, int h) {
 }
 
 // Wait until lane `lane` of HCA h can take one more stripe to peer p. Direct stripes need two
-// requests and relay packets need three. A quarter of the queue leaves room
-// for provider overhead and per-origin acks posted while draining completions.
+// requests and relay packets chain three. One sixth of the send queue (85 signaled ops, at most
+// 255 chained WRs) leaves room for up to 128 unreserved per-origin ACKs at world=16 plus provider
+// SQE overhead.
 static int reserve(roce_ctx_t* c, int h, int p, int lane) {
   roce_hca_t* hca = &c->hca[h];
-  while (hca->outstanding[p][lane] >= ROCE_SEND_DEPTH / 4) {
+  while (hca->outstanding[p][lane] >= ROCE_SEND_DEPTH / 6) {
     if (drain_all(c) != 0) {
       return -1;
     }
@@ -877,16 +885,17 @@ static int ring_distance(const roce_ctx_t* c, int a, int b) {
 }
 
 static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
-  ring_mailbox_t* box = ring_inbox(c, origin, rail, slot);
-  ring_descriptor_t* d = &box->descriptor;
-  uint64_t serial = __atomic_load_n(&d->serial, __ATOMIC_ACQUIRE);
   int* pending = &c->ring_pending[origin][rail][slot];
   if (*pending == 2) {
-    if (__atomic_load_n(ring_ack(c, origin, rail, slot), __ATOMIC_ACQUIRE) == serial &&
+    uint64_t inflight = c->ring_inflight[origin][rail][slot];
+    if (__atomic_load_n(ring_ack(c, origin, rail, slot), __ATOMIC_ACQUIRE) == inflight &&
         ring_complete(c, origin, rail, slot) != 0)
       return -1;
     return 0;
   }
+  ring_mailbox_t* box = ring_inbox(c, origin, rail, slot);
+  ring_descriptor_t* d = &box->descriptor;
+  uint64_t serial = __atomic_load_n(&d->serial, __ATOMIC_ACQUIRE);
   uint64_t seen = c->ring_seen[origin][rail][slot];
   if (serial == seen) return 1;
   if (*pending) return 0;

@@ -163,6 +163,10 @@ pub(in crate::server) async fn generate(
         .headers()
         .get("typesafe-danger-zone-images")
         .is_some_and(|value| value == "true");
+    let raw = match read_raw_body(state.max_body_bytes, request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let permit = match state.frontend_slots.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -174,13 +178,15 @@ pub(in crate::server) async fn generate(
         }
     };
     let permit = Arc::new(permit);
-    let (body, parts) = match read_body(state.max_body_bytes, request, permit.clone()).await {
+    let (body, parts) = match decode_raw_body(state.max_body_bytes, raw, permit.clone()).await {
         Ok(value) => value,
         Err(response) => return response,
     };
     let prepare_state = state.clone();
+    let preparation_ingress = ingress.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _ingress = preparation_ingress;
         let response_questions = body["questions"].clone();
         let (input, questions, assets) = if decisions {
             let (input, questions) = adapter::parse(body).map_err(|error| {
@@ -285,11 +291,14 @@ fn failure(error: Error) -> Response {
         .into_response()
 }
 
-async fn read_body(
-    limit: usize,
-    request: Request,
-    permit: Arc<OwnedSemaphorePermit>,
-) -> std::result::Result<(Value, Map<String, Value>), Response> {
+struct RawBody {
+    parts: axum::http::request::Parts,
+    bytes: axum::body::Bytes,
+    multipart: bool,
+    encoding: String,
+}
+
+async fn read_raw_body(limit: usize, request: Request) -> std::result::Result<RawBody, Response> {
     let content_type = request
         .headers()
         .get("content-type")
@@ -303,13 +312,57 @@ async fn read_body(
         .unwrap_or("identity")
         .to_owned();
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, limit).await.map_err(|error| {
-        http::error(
-            protocol::Protocol::Chat,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            error,
-        )
-    })?;
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        axum::body::to_bytes(body, limit),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            return Err(http::error(
+                protocol::Protocol::Chat,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error,
+            ));
+        }
+        Err(_) => {
+            return Err(http::error(
+                protocol::Protocol::Chat,
+                StatusCode::REQUEST_TIMEOUT,
+                "request body read timed out",
+            ));
+        }
+    };
+    Ok(RawBody {
+        parts,
+        bytes,
+        multipart,
+        encoding,
+    })
+}
+
+#[cfg(test)]
+async fn read_body(
+    limit: usize,
+    request: Request,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> std::result::Result<(Value, Map<String, Value>), Response> {
+    let raw = read_raw_body(limit, request).await?;
+    decode_raw_body(limit, raw, permit).await
+}
+
+async fn decode_raw_body(
+    limit: usize,
+    raw: RawBody,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> std::result::Result<(Value, Map<String, Value>), Response> {
+    let RawBody {
+        parts,
+        bytes,
+        multipart,
+        encoding,
+    } = raw;
     if !multipart {
         return tokio::task::spawn_blocking(move || {
             let _permit = permit;

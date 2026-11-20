@@ -773,6 +773,12 @@ impl GraphExecutor {
             ))
             .into());
         }
+        if !self.startup_ready {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "startup tuning has not completed",
+            ));
+        }
         let resources = self
             .resources
             .as_mut()

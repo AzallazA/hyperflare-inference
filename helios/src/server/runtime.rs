@@ -1003,7 +1003,15 @@ impl ImagePreparation {
                 let prepared = if cancelled.load(Ordering::Acquire) {
                     Ok(None)
                 } else {
-                    image.materialize_cached(store.as_ref()).map(Some)
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        image.materialize_cached(store.as_ref()).map(Some)
+                    })) {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::execution(
+                            ExecutionError::Worker,
+                            "image preparation panicked",
+                        )),
+                    }
                 };
                 if results.send((handle, prepared)).is_err() {
                     break;

@@ -262,6 +262,9 @@ impl TmlOutput {
                 }
                 State::Header { model } => {
                     let Some((at, marker)) = first(&self.buffer, &CONTROL_MARKERS) else {
+                        if self.buffer.len() > 1 << 20 {
+                            return Err("TML header exceeds the 1 MiB parser bound".into());
+                        }
                         break;
                     };
                     let name = unescape(&self.buffer[..at]);
@@ -581,5 +584,16 @@ mod tests {
         ] {
             assert_eq!(prompt_start(&tail, &controls), start);
         }
+    }
+
+    #[test]
+    fn header_buffer_enforces_one_mib_bound() {
+        let mut p = parser(OutputStart::RecipientHeader);
+        let oversized = "x".repeat((1 << 20) + 1);
+        let error = p
+            .push(Input::Text(&oversized))
+            .err()
+            .expect("oversized TML header must fail");
+        assert!(error.to_string().contains("1 MiB"), "{error}");
     }
 }

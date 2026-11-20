@@ -21,6 +21,11 @@ use std::collections::HashSet;
 
 const BUFFER_LIMIT: usize = 1024 * 1024;
 
+pub(crate) const CONTROL_MARKERS: [&str; 2] = [
+    deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd.default_str(),
+    deepseek_recipe_core::special_tokens::SpecialToken::Dsml.default_str(),
+];
+
 #[derive(Default)]
 struct Call {
     name: String,

@@ -314,9 +314,7 @@ pub fn prepare_output(
         .collect::<Result<Vec<_>>>()?;
     if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
         let tokenizer = frontend.tokenizer();
-        for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,
-                      deepseek_recipe_core::special_tokens::SpecialToken::Dsml] {
-            let name = token.default_str();
+        for name in crate::output::dsml::CONTROL_MARKERS {
             if let Some(&id) = tokenizer.get_added_vocabulary().get_vocab().get(name) {
                 if !delimiters.iter().any(|(existing, _)| *existing == id) {
                     control_tokens.push((id, name.to_owned()));

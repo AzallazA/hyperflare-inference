@@ -343,7 +343,10 @@ impl Drop for HostRegistration {
     fn drop(&mut self) {
         // SAFETY: The registration's context and mapped range outlive this drop.
         let result = unsafe {
-            self.driver
+            let mut previous: Handle = std::ptr::null_mut();
+            let had_previous = (self.driver.get_context)(&mut previous) == 0;
+            let outcome = self
+                .driver
                 .check(
                     "cuCtxSetCurrent",
                     (self.driver.set_context)(self.context as Handle),
@@ -353,7 +356,11 @@ impl Drop for HostRegistration {
                         "cuMemHostUnregister",
                         (self.driver.host_unregister)(self.address as Handle),
                     )
-                })
+                });
+            if had_previous && previous != self.context as Handle {
+                let _ = (self.driver.set_context)(previous);
+            }
+            outcome
         };
         if let Err(error) = result {
             eprintln!(
