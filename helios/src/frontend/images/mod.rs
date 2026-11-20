@@ -808,7 +808,7 @@ impl ImageProcessor {
             }
         }
         let alpha = transparent
-            .filter(|_| matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid))
+            .filter(|_| matches!(self.profile, Profile::Moonvit))
             .map(|transparent| {
                 indices.iter().map(|index| if *index == transparent { 0 } else { 255 }).collect()
             });

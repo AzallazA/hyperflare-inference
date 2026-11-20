@@ -223,10 +223,9 @@ fn gif_fixtures() -> (PathBuf, Value) {
 fn gif_first_frame_matches_pillow_rgb_and_rgba() {
     use super::{ImageProcessor, ImageSettings};
     let (root, manifest) = gif_fixtures();
-    // Moonvit and the padded grid keep alpha; the Qwen profile does not.
+    // Moonvit keeps alpha; the Qwen profile does not (this fork has no Inkling padded-grid profile).
     let profiles = [
         (ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap(), true),
-        (ImageProcessor::load(ImageSettings::PaddedGrid {}, ImageLimits::default()).unwrap(), true),
         (processor(ImageLimits::default()), false),
     ];
     for case in manifest["cases"].as_array().unwrap().iter().filter(|case| case["animated"] == false) {
