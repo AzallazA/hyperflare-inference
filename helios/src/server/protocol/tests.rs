@@ -951,7 +951,7 @@ fn messages_accept_gif_image_sources() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
     assert_eq!(
         native[0]["content"][0]["image_url"]["url"],
         "data:image/gif;base64,AA=="

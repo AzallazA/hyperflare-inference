@@ -803,7 +803,7 @@ mod tests {
             }
             let layout = Layout::new(&geometry, 3, &[alignment; 3], alignment).unwrap();
             owner
-                .allocate_shared_cache(&core, &geometry, &layout, &[], false)
+                .allocate_shared_cache(&core, &geometry, &layout)
                 .unwrap();
             (owner, geometry, layout)
         }
