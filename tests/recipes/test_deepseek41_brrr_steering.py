@@ -59,11 +59,20 @@ def fixed_sum(parts):
     return ints.sum(-1).to(torch.float32) / FIXED
 
 
-def kernel_attention(y, scale, steering):
-    """owna_tile's steered ya: y [m, HID] BF16 (the reduced attention output), scale [m] FP32."""
+def attention_dot(zs, vs):
+    """v2 attention-site dot (finish_woa): per rank r the dequantized E4M3 o-projection input z_r [m, OA] (zq x 2^e)
+    times v_r = Wob_r^T d [OA], one FP32 partial per 64-column finish_woa block, all ranks' blocks summed in fixed
+    point (steer_dot_add into zdot, then the published parts summed by J_XA). Returns [m] FP32."""
+    parts = [(z.view(z.shape[0], -1, 64) * v.view(-1, 64)).sum(-1) for z, v in zip(zs, vs)]
+    return fixed_sum(torch.cat(parts, -1))
+
+
+def kernel_attention(y, scale, steering, dot=None):
+    """owna_tile's steered ya: y [m, HID] BF16 (the reduced attention output), scale [m] FP32, dot [m] FP32 (adot;
+    default: y . d from y's 40 chunks, as v1)."""
     yf, d, g = y.float(), steering.direction.float(), steering.attention_gain_delta.float()
-    parts = (yf.view(-1, HID // CHUNK, CHUNK) * d.view(HID // CHUNK, CHUNK)).sum(-1)  # steer_xa_dot, one per chunk
-    dot = fixed_sum(parts)
+    if dot is None:
+        dot = fixed_sum((yf.view(-1, HID // CHUNK, CHUNK) * d.view(HID // CHUNK, CHUNK)).sum(-1))
     alpha = torch.tensor(steering.alpha, dtype=torch.float32)
     t = (scale * alpha) * dot                                   # __fmul_rn(__fmul_rn(s, alpha), dot)
     v = yf - t[:, None] * d                                     # steer_project: __fsub_rn(x, __fmul_rn(t, d))
@@ -93,7 +102,7 @@ def e4m3_value(byte):
 
 
 def quant_h(a):
-    """finish_sh1: per-32-column E4M3 quantization (quant_exp with AMAX_FLOOR 1e-4, satfinite) and its dequantized
+    """finish_sh1 (and finish_woa's zq): per-32-column E4M3 quantization (quant_exp with AMAX_FLOOR 1e-4, satfinite) and its dequantized
     value e4m3_value(q) * 2^e, which J_SH2 multiplies and the kernel's dot uses."""
     blocks = a.view(a.shape[0], -1, SH_BLOCK)
     amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) * (1.0 / 448.0)
@@ -253,6 +262,48 @@ def test_shared_site_matches_reference(m):
     assert bool(((got[rows].float() - w).abs() <= ulp + 1.01 * t_err[rows] + 1e-30).all())
     assert float((got[rows].float() - w).norm() / w.norm()) < 2.0 ** -9
     assert float((got[rows] == want[rows]).float().mean()) > 0.85
+
+
+@pytest.mark.parametrize("m", [1, 8, 48])
+def test_attention_site_dot_before_the_all_reduce(m):
+    """v2: the kernel takes the attention-site dot from each rank's quantized o-projection input, sum_r z_r . v_r with
+    v_r = Wob_r^T d (FP32, the weights J_WOB multiplies), instead of y . d after the all-reduce. y itself is the BF16
+    sum of the ranks' BF16 partials, so the two dots differ by BF16 rounding of y only; the steered values must stay
+    within one BF16 step plus the projected dot difference of upstream's steer_attention(y)."""
+    OA = 3072
+    g = torch.Generator().manual_seed(800 + m)
+    steering = _steering(30 + m)
+    zs, vs, partials = [], [], []
+    for r in range(3):
+        z = quant_h((torch.randn(m, OA, generator=g) * 0.5).to(torch.bfloat16).float())
+        w = (torch.randn(HID, OA, generator=g) * 0.3).to(torch.float8_e4m3fn)
+        sc = torch.randint(118, 124, (HID // 128, OA // 128), generator=g, dtype=torch.uint8)
+        dense = w.double() * torch.exp2(sc.double() - 127).repeat_interleave(128, 0).repeat_interleave(128, 1)
+        partials.append((z.double() @ dense.T).float().to(torch.bfloat16))  # finish_wob: BF16 into the inbox
+        zs.append(z)
+        vs.append(brrr.shared_down_direction(w, sc, steering.direction))
+    y = sum(p.float() for p in partials).to(torch.bfloat16)  # reduce4: FP32 sum of the BF16 partials, BF16 out
+    scale = torch.tensor([SCALES[(i + 1) % len(SCALES)] for i in range(m)], dtype=torch.float32)
+    if m == 1:
+        scale[0] = 1.0
+    dot = attention_dot(zs, vs)
+    got = kernel_attention(y, scale, steering, dot)
+    want = steer_attention(y, steering, scale[:, None])
+    zero = scale == 0
+    assert torch.equal(got[zero].view(torch.int16), y[zero].view(torch.int16))
+    d = steering.direction.float()
+    dot_ref = y.float() @ d
+    bound = 3 * 2.0 ** -8 * (sum(p.float().abs() for p in partials) @ d.abs()) + 1e-6
+    assert bool(((dot - dot_ref).abs() <= bound).all()), float((dot - dot_ref).abs().max())
+    rows = ~zero
+    gain = (1.0 + scale[:, None] * steering.attention_gain_delta.float()).abs()
+    t_err = (scale.abs() * steering.alpha * (dot - dot_ref).abs())[:, None] * d.abs() * gain
+    w_, k_ = want[rows].float(), got[rows].float()
+    step = lambda x: torch.exp2(torch.floor(torch.log2(x.abs().clamp_min(2.0 ** -126))) - 7)
+    ulp = torch.maximum(step(w_), step(k_))
+    assert bool(((k_ - w_).abs() <= ulp + 1.01 * t_err[rows] + 1e-30).all())
+    assert float((k_ - w_).norm() / w_.norm()) < 2.0 ** -8
+    assert not torch.equal(got[rows], y[rows])
 
 
 def test_rank_partials_project_like_their_sum():

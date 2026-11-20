@@ -3,34 +3,38 @@
 
 """TP3: steering inside the BRRR fused tail (BRRR_STEER build), layer-level, on three GPUs.
 
-Run (three free GPUs, truncated real-weight checkpoint; NOT run yet, written with the implementation 2026-11-19):
+Run (three free GPUs, a truncated real-weight checkpoint):
 
     cd ~/flare-up-steer && CUDA_VISIBLE_DEVICES=0,1,2 FLARE_RUN_CUDA_TESTS=1 \\
-        FLARE_DS41_SNAPSHOT=/m2-2/flare-ckpt/ds41-mini8 PYTHONPATH=$PWD <venv>/bin/pytest -x -s \\
+        FLARE_DS41_SNAPSHOT=/m2-2/flare-ckpt/ds41-mini24-fp8-e1 PYTHONPATH=$PWD <venv>/bin/pytest -x -s \\
         tests/recipes/test_deepseek41_brrr_steering_cuda.py
 
-Optional: FLARE_DS41_BRRR_STEER_TEST_LAYER (default 4), FLARE_DS41_STEERING_SIDECAR (a real sidecar; the layer must
-be in 4..36; default: a seeded synthetic direction / gain / alpha 3.3), FLARE_DS41_BRRR_TEST_ROWS (default
-1,6,8,12,16,17,24,48), FLARE_DS41_BRRR_STEER_TIMING=0 to skip the timing lines.
+Optional: FLARE_DS41_BRRR_STEER_TEST_LAYER (default 4), FLARE_DS41_STEERING_SIDECAR (a real sidecar; layer in 4..36;
+default: a seeded synthetic direction / gain / alpha 3.3), FLARE_DS41_BRRR_TEST_ROWS (default 1,6,8,12,16,17,24,48),
+FLARE_DS41_BRRR_STEER_TIMING=0 skips D. The tuning switches come from the environment (TP3Config.from_environment).
 
-One 3-process world per case builds, for one layer, a plain engine (the serving build, no BRRR_STEER) and a steering
-engine (BRRR_STEER=1, same tuning switches) and checks:
+v2 (2026-11-20, after seq373): the plain kernel is not run-to-run deterministic (its FP32 red.add accumulations have no
+fixed order: 26 of 48 plain repeats differed on the GPU), so one equal plain repeat proved nothing and v1's A / C
+"failures" were that noise. This version builds four engines in one 3-rank world for one layer: plain and steering
+(the serving builds) and their BRRR_ORDERED=1 twins (test-only builds whose FP32 accumulations run in a fixed order, so
+a launch is a pure function of its inputs). Per row count x input profile:
 
-A. scale 0 = the plain kernel bit for bit: every output of the steered tail with an all-zero scale equals the plain
-   tail's on the same inputs (rows sweep x profiles). The kernel's float atomics (zacc / yacc / yracc) are unordered,
-   so each pair is first checked for run-to-run identity of the plain kernel itself (two plain launches): A is
-   asserted bitwise whenever the plain kernel repeats bitwise, and otherwise within the plain kernel's own
-   run-to-run difference (both counts printed).
-B. attention site: with scales 1 / 0.5 / mixed (0, 1, 0.5, 0, 0.25, ...), the kernel's FFN mHC outputs (ffn_residual,
-   post, comb, pre_mix: no routing in them) against Flare's reference path with upstream's steer_attention on the
-   all-reduced attention output (cosine >= TOLERANCE per tensor, as the main layer test); steered rows must move vs the
-   unsteered reference; scale-0 rows of a mixed batch equal the plain kernel's rows bit for bit (same determinism
-   rule as A).
-C. shared site: with a zero attention input (yattn = 0, so the attention site and the routing are unchanged by the
-   scale), delta = mlp_output(s) - mlp_output(0) must lie along d with coefficient -s * alpha * sum_r (sh_r . d)
-   (the reference's per-rank BF16 shared partials sh_r from Flare's MLP): relative coefficient error <= 5% (two
-   independent FP8 activation quantizers) and an off-direction part <= 5% of |delta|; scale-0 rows: delta == 0.
-D. timing (informational): plain / steered-at-0 / steered-at-1 launches per row count, us per launch.
+A. (gate) ordered plain twice -> bitwise equal (the twins really are deterministic), and ordered steering at scale 0
+   -> bitwise equal to ordered plain (the steering code changes nothing at scale 0), and in a mixed batch (scales 0 / 1 /
+   0.5 / ...) every scale-0 row bitwise equal to ordered plain's row. (info) serving builds: K plain and K steering@0
+   launches, how many distinct results each and how many steering@0 results equal some plain result.
+B. attention site, serving steering build vs Flare's reference + upstream steer_attention (FFN mHC outputs, no routing
+   in them): (gate) cosine >= TOLERANCE as the main layer test (this is steered-vs-steered-reference; the plain kernel
+   sits at the same ~0.9994-0.9997 against its reference: FP8 activation quantization of the o-projections); (gate) the
+   steering EFFECT, ordered steering - ordered plain vs reference(s) - reference(0), cosine >= DELTA_COS on the
+   steered rows' ffn_residual (and its relative norm error printed); the reference must move.
+C. shared site, ordered builds, zero attention input (attention site and routing independent of the scale):
+   delta = mlp_output(s) - mlp_output(0); (gate) scale-0 rows: delta == 0 bitwise; (gate) the per-row coefficient
+   delta . d against want = -s * alpha * sum_r (sh_r . d) (the reference's per-rank BF16 shared partials): least-squares
+   slope in [1 - C_SLOPE, 1 + C_SLOPE] and Pearson >= C_CORR over the steered rows (rows with tiny dots are dominated by
+   BF16 rounding of mlp_output, so v1's per-row max relative error was not a usable gate); off-direction share printed.
+D. (info) kernel time per launch from CUDA-graph replays (20 launches per graph, 5 interleaved rounds, median), plain /
+   steering@0 / steering@1, serving builds; eager fallback (labelled) if capture fails.
 """
 
 import os
@@ -57,6 +61,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 WORLD, COMPARED, INPUTS = tail_test.WORLD, tail_test.COMPARED, tail_test.INPUTS
 MHC = ("ffn_residual", "ffn_post", "ffn_comb", "pre_mix")
 MIXED = (0.0, 1.0, 0.5, 0.0, 0.25, 1.0, 0.0, 0.75)
+ORDERED = ("BRRR_ORDERED=1",)
+SERVING_REPEATS = 4
+DELTA_COS = 0.98
+C_SLOPE, C_CORR = 0.10, 0.95
 
 
 def _scales(kind, m, device):
@@ -73,6 +81,15 @@ def _bits(t):
 
 def _mismatch(a, b):
     return int((_bits(a) != _bits(b)).sum())
+
+
+def _mismatches(a, b, names=COMPARED, rows=None):
+    pick = (lambda t: t) if rows is None else (lambda t: t[rows])
+    return {name: _mismatch(pick(a[name]), pick(b[name])) for name in names}
+
+
+def _key(out):
+    return tuple(_bits(out[name]).cpu().numpy().tobytes() for name in COMPARED)
 
 
 def _steering(layer, device):
@@ -96,9 +113,14 @@ def _run(tail, inputs, positions, scale=None):
     return dict(mlp_output=mlp_output, ffn_residual=residual, ffn_post=post, ffn_comb=comb, pre_mix=pre_mix)
 
 
+def _cos(a, b):
+    a, b = a.double().flatten(), b.double().flatten()
+    return float((a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-30))
+
+
 class _SteeredReference(tail_test._Reference):
-    """Flare's reference tail with upstream's hooks: steer_attention after the attention all-reduce, steer_shared_expert
-    on this rank's shared partial before the MLP all-reduce."""
+    """Flare's reference tail with upstream's hooks: steer_attention after the attention all-reduce (the shared-site
+    hook is not needed: C reads the per-rank shared partials directly)."""
 
     steering = scale = None
 
@@ -116,7 +138,26 @@ class _SteeredReference(tail_test._Reference):
             inputs["comb"], pre_mix=inputs["attn_mix"], pre_out=next_mix)
         self.normalized = normalized
         self.shared_partial = self.shared(normalized)  # this rank's BF16 partial (sh_r)
-        return dict(ffn_residual=residual, ffn_post=post, ffn_comb=comb, pre_mix=next_mix)
+        return dict(ffn_residual=residual.clone(), ffn_post=post.clone(), ffn_comb=comb.clone(), pre_mix=next_mix.clone())
+
+
+def _graph_time(tail, inputs, positions, scale, launches=20):
+    """us per launch from one CUDA graph of `launches` tail launches (static inputs; outputs graph-local)."""
+    args = [inputs[name].clone() for name in INPUTS]
+    kwargs = {} if scale is None else {"token_scale": scale}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            tail(*args, positions, **kwargs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(launches):
+            tail(*args, positions, **kwargs)
+    torch.cuda.synchronize()
+    return graph, launches
 
 
 def _rank(rank, rendezvous, snapshot, env, layer):
@@ -144,7 +185,7 @@ def _rank(rank, rendezvous, snapshot, env, layer):
     tp3 = TP3Config.from_environment()
     rows_sweep = tail_test._rows()
     capacity = max(rows_sweep)
-    failures, lines = [], []
+    failures = []
     try:
         with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             manifest = inspect_indexed_checkpoint(Path(snapshot))
@@ -152,9 +193,14 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                                       expert_scale_compression="csf", tp3=tp3) as loader:
                 weights, config = loader.load_layer(layer), loader.config
             steering = _steering(layer, device)
-            plain = brrr.Engine(group, device, storage.peer_storage, tp3, steering=False)
-            steered = brrr.Engine(group, device, storage.peer_storage, tp3, steering=True)
-            assert plain.ext.STEER == 0 and steered.ext.STEER == 1 and plain.ext is not steered.ext
+            ipc = storage.peer_storage
+            engines = {"plain": brrr.Engine(group, device, ipc, tp3, steering=False),
+                       "steer": brrr.Engine(group, device, ipc, tp3, steering=True),
+                       "plain_ord": brrr.Engine(group, device, ipc, tp3, steering=False, test_defines=ORDERED),
+                       "steer_ord": brrr.Engine(group, device, ipc, tp3, steering=True, test_defines=ORDERED)}
+            assert [e.ext.STEER for e in engines.values()] == [0, 1, 0, 1]
+            assert [e.ext.ORDERED for e in engines.values()] == [0, 0, 1, 1]
+            assert len({id(e.ext) for e in engines.values()}) == 4
             compressed = bool(config.text["compress_ratios"][layer])
             rotary = Rotary(config, device)
             frequencies = rotary.frequencies[compressed]
@@ -168,9 +214,9 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                 refs = {m: _SteeredReference(m, weights, config, declarations.rows(m, m), rotary, compressed,
                                              session=session, workspace=arena, name=f"layer{layer}.m{m}") for m in rows_sweep}
                 session.tune(show_progress=False)
-                plain_tail = brrr.PreparedBRRRTail(layer, weights, torch.int64, frequencies, engine_=plain, **kwargs)
-                steer_tail = brrr.PreparedBRRRTail(layer, weights, torch.int64, frequencies, engine_=steered,
-                                                   steering=steering, **kwargs)
+                tails = {name: brrr.PreparedBRRRTail(layer, weights, torch.int64, frequencies, engine_=engine,
+                                                     **({"steering": steering} if engine.steering else {}), **kwargs)
+                         for name, engine in engines.items()}
 
                 def note(text):
                     if rank == 0:
@@ -180,6 +226,9 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                     torch.cuda.synchronize(device)
                     dist.barrier(group=group)
 
+                def fail(*what):
+                    failures.append((rank, *what))
+
                 seed = 7000 + 100 * layer
                 for m in rows_sweep:
                     ref = refs[m]
@@ -187,52 +236,68 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                         seed += 1
                         inputs, positions = tail_test._make_inputs(m, heads, seed=seed, rank=rank, profile=profile,
                                                                    resid_scale=resid_scale, device=device)
-                        # A. scale 0 vs the plain kernel, with the plain kernel's own repeat as the determinism control.
-                        p1 = _run(plain_tail, inputs, positions)
-                        p2 = _run(plain_tail, inputs, positions)
-                        s0 = _run(steer_tail, inputs, positions, _scales("zero", m, device))
+                        zero = _scales("zero", m, device)
+                        # A. ordered twins: determinism, then scale 0 == plain bit for bit.
+                        o1 = _run(tails["plain_ord"], inputs, positions)
+                        o2 = _run(tails["plain_ord"], inputs, positions)
+                        s0 = _run(tails["steer_ord"], inputs, positions, zero)
+                        mixed = _scales("mixed", m, device)
+                        sm = _run(tails["steer_ord"], inputs, positions, mixed)
                         sync()
-                        repeat = {name: _mismatch(p1[name], p2[name]) for name in COMPARED}
-                        zero = {name: _mismatch(s0[name], p1[name]) for name in COMPARED}
-                        deterministic = not any(repeat.values())
-                        ok = (not any(zero.values())) if deterministic else all(
-                            float((s0[n].float() - p1[n].float()).abs().max()) <= float((p2[n].float() - p1[n].float()).abs().max())
-                            for n in COMPARED)
-                        note(f"m={m} {profile} A scale-0 mismatches {zero} (plain repeat {repeat})" + ("" if ok else " FAIL"))
-                        if not ok:
-                            failures.append((rank, m, profile, "A", zero, repeat))
-                        # B. attention site against the reference with steer_attention.
+                        repeat, zero_mm = _mismatches(o1, o2), _mismatches(s0, o1)
+                        idle = (mixed[:, 0] == 0)
+                        mixed_mm = _mismatches(sm, o1, rows=idle) if bool(idle.any()) else {name: 0 for name in COMPARED}
+                        bad = []
+                        if any(repeat.values()):
+                            bad.append("ordered plain not deterministic")
+                        if any(zero_mm.values()):
+                            bad.append("scale 0 differs from plain")
+                        if any(mixed_mm.values()):
+                            bad.append("scale-0 rows of a mixed batch differ from plain")
+                        # Serving builds (info): K plain and K steering@0 results.
+                        plain_keys = [_key(_run(tails["plain"], inputs, positions)) for _ in range(SERVING_REPEATS)]
+                        steer_keys = [_key(_run(tails["steer"], inputs, positions, zero)) for _ in range(SERVING_REPEATS)]
+                        sync()
+                        info = (f"serving: plain distinct {len(set(plain_keys))}/{SERVING_REPEATS}, steer@0 distinct "
+                                f"{len(set(steer_keys))}/{SERVING_REPEATS}, steer@0 results equal to a plain result "
+                                f"{sum(k in set(plain_keys) for k in steer_keys)}/{SERVING_REPEATS}")
+                        note(f"m={m} {profile} A ordered: scale-0 mismatches {zero_mm}, mixed scale-0 rows {mixed_mm}, "
+                             f"plain repeat {repeat} | {info}" + (f" FAIL {bad}" if bad else ""))
+                        if bad:
+                            fail(m, profile, "A", bad, zero_mm, mixed_mm, repeat)
+                        # B. attention site against the reference.
                         ref.steering = None
-                        unsteered = {name: value.clone() for name, value in ref(inputs, positions).items()}
+                        unsteered = ref(inputs, positions)
                         for kind in ("one", "half", "mixed"):
                             scale = _scales(kind, m, device)
-                            got = _run(steer_tail, inputs, positions, scale)
+                            got = _run(tails["steer"], inputs, positions, scale)
+                            effect = _run(tails["steer_ord"], inputs, positions, scale)
                             ref.steering, ref.scale = steering, scale
                             want = ref(inputs, positions)
                             sync()
                             stats = {name: tail_test._stats(got[name], want[name]) for name in MHC}
                             bad = [name for name, st in stats.items() if not st["finite"] or st["cosine"] < tail_test.TOLERANCE]
-                            live = (scale[:, 0] != 0).cpu()
-                            moved = not torch.equal(want["ffn_residual"][live.to(device)], unsteered["ffn_residual"][live.to(device)])
-                            if not moved:
+                            live = scale[:, 0] != 0
+                            dk = (effect["ffn_residual"].float() - o1["ffn_residual"].float())[live]
+                            dr = (want["ffn_residual"].float() - unsteered["ffn_residual"].float())[live]
+                            if not bool(dr.ne(0).any()):
                                 bad.append("reference did not move (steering had no effect)")
-                            if kind == "mixed" and deterministic:
-                                idle = (~live).to(device)
-                                same = {name: _mismatch(got[name][idle], p1[name][idle]) for name in MHC}
-                                if any(same.values()):
-                                    bad.append(f"scale-0 rows differ from the plain kernel {same}")
+                            dcos = _cos(dk, dr)
+                            drel = float((dk - dr).norm() / dr.norm().clamp_min(1e-30))
+                            if not dcos >= DELTA_COS:
+                                bad.append(f"steering effect cosine {dcos:.4f} < {DELTA_COS}")
                             note(f"m={m} {profile} B {kind}: " + " ".join(
                                 f"{n} cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f}" for n, st in stats.items())
-                                + (f" FAIL {bad}" if bad else ""))
+                                + f" effect ffn_residual cos={dcos:.6f} relerr={drel:.4f}" + (f" FAIL {bad}" if bad else ""))
                             if bad:
-                                failures.append((rank, m, profile, "B", kind, bad))
-                # C. shared site with a zero attention input (routing and attention site unchanged by the scale).
+                                fail(m, profile, "B", kind, bad)
+                # C. shared site, ordered builds, zero attention input.
                 m, ref = capacity, refs[capacity]
                 seed += 1
                 inputs, positions = tail_test._make_inputs(m, heads, seed=seed, rank=rank, profile="random",
                                                            resid_scale=1.0, device=device)
                 inputs["attended"].zero_()
-                base = _run(steer_tail, inputs, positions, _scales("zero", m, device))
+                base = _run(tails["steer_ord"], inputs, positions, _scales("zero", m, device))
                 ref.steering = None
                 ref(inputs, positions)
                 d = steering.direction.float()
@@ -240,42 +305,58 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                 dist.all_reduce(partial_dot)  # sum_r sh_r . d
                 for kind in ("one", "mixed"):
                     scale = _scales(kind, m, device)
-                    got = _run(steer_tail, inputs, positions, scale)
+                    got = _run(tails["steer_ord"], inputs, positions, scale)
                     sync()
                     delta = got["mlp_output"].float() - base["mlp_output"].float()
-                    coefficient = (delta @ d).cpu()
-                    want = -(scale[:, 0].cpu() * steering.alpha * partial_dot)
-                    off = (delta - (delta @ d)[:, None] * d[None, :]).norm(dim=1).cpu()
-                    live = scale[:, 0].cpu() != 0
+                    live = (scale[:, 0] != 0)
+                    coefficient = (delta @ d).cpu()[live.cpu()]
+                    want = -(scale[:, 0].cpu() * steering.alpha * partial_dot)[live.cpu()]
+                    slope = float((coefficient * want).sum() / (want * want).sum().clamp_min(1e-30))
+                    corr = float(torch.corrcoef(torch.stack([coefficient, want]))[0, 1]) if int(live.sum()) > 2 else 1.0
+                    off = (delta - (delta @ d)[:, None] * d[None, :])[live].norm() / delta[live].norm().clamp_min(1e-30)
                     bad = []
-                    if bool((delta[~live.to(device)] != 0).any()):
+                    if _mismatch(got["mlp_output"][~live], base["mlp_output"][~live]):
                         bad.append("scale-0 rows changed")
-                    rel = ((coefficient - want).abs() / want.abs().clamp_min(1e-6))[live]
-                    if live.any() and float(rel.max()) > 0.05:
-                        bad.append(f"coefficient rel error {float(rel.max()):.3e}")
-                    if live.any() and float((off[live] / delta[live.to(device)].norm(dim=1).cpu().clamp_min(1e-12)).max()) > 0.05:
-                        bad.append("delta not along the direction")
-                    note(f"m={m} C {kind}: coefficient rel err max {float(rel.max()) if live.any() else 0:.3e}"
+                    if not abs(slope - 1.0) <= C_SLOPE:
+                        bad.append(f"slope {slope:.4f}")
+                    if not corr >= C_CORR:
+                        bad.append(f"pearson {corr:.4f}")
+                    note(f"m={m} C {kind}: slope {slope:.4f} pearson {corr:.4f} off-direction share {float(off):.4f}"
                          + (f" FAIL {bad}" if bad else ""))
                     if bad:
-                        failures.append((rank, m, "C", kind, bad))
-                # D. timing (informational).
+                        fail(m, "C", kind, bad)
+                # D. timing (information): CUDA-graph replays, interleaved rounds.
                 if os.environ.get("FLARE_DS41_BRRR_STEER_TIMING", "1") != "0":
                     for m in rows_sweep:
                         inputs, positions = tail_test._make_inputs(m, heads, seed=99, rank=rank, profile="random",
                                                                    resid_scale=1.0, device=device)
-                        timings = {}
-                        for name, tail, scale in (("plain", plain_tail, None), ("steer0", steer_tail, _scales("zero", m, device)),
-                                                  ("steer1", steer_tail, _scales("one", m, device))):
-                            for _ in range(20):
-                                _run(tail, inputs, positions, scale)
+                        variants = (("plain", tails["plain"], None), ("steer0", tails["steer"], _scales("zero", m, device)),
+                                    ("steer1", tails["steer"], _scales("one", m, device)))
+                        mode, graphs = "graph", {}
+                        try:
+                            for name, tail, scale in variants:
+                                graphs[name] = _graph_time(tail, inputs, positions, scale)
+                                sync()
+                        except Exception as error:  # noqa: BLE001 - informational timing only
+                            mode, graphs = f"eager ({type(error).__name__})", {}
                             sync()
-                            start = time.perf_counter()
-                            for _ in range(200):
-                                _run(tail, inputs, positions, scale)
-                            sync()
-                            timings[name] = (time.perf_counter() - start) / 200 * 1e6
-                        note(f"m={m} D us/launch (incl. input clones) " + " ".join(f"{k}={v:.1f}" for k, v in timings.items()))
+                        samples = {name: [] for name, _, _ in variants}
+                        for _ in range(5):
+                            for name, tail, scale in variants:
+                                sync()
+                                start = time.perf_counter()
+                                if graphs:
+                                    graph, launches = graphs[name]
+                                    graph.replay()
+                                else:
+                                    launches = 20
+                                    for _ in range(launches):
+                                        _run(tail, inputs, positions, scale)
+                                torch.cuda.synchronize(device)
+                                samples[name].append((time.perf_counter() - start) / launches * 1e6)
+                        med = {name: sorted(v)[len(v) // 2] for name, v in samples.items()}
+                        note(f"m={m} D us/launch ({mode}) " + " ".join(f"{k}={v:.1f}" for k, v in med.items()))
+                        del graphs
                 gathered = [None] * WORLD
                 dist.all_gather_object(gathered, failures, group=group)
                 every = [f for part in gathered for f in part]
