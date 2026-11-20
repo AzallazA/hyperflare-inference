@@ -5804,6 +5804,11 @@ async fn steering_request(
         incoming = &mut admitted => Raced::Admitted(incoming.unwrap()),
         answered = &mut response => Raced::Answered(answered.unwrap()),
     };
+    // An early answer drops the state and so the sender: the receiver then sees a closed channel first.
+    let raced = match raced {
+        Raced::Admitted(None) => Raced::Answered((&mut response).await.unwrap()),
+        raced => raced,
+    };
     match raced {
         Raced::Admitted(incoming) => {
             let incoming = incoming.expect("neither an answer nor an admitted request");
