@@ -5796,15 +5796,22 @@ async fn steering_request(
     let mut admitted = tokio::task::spawn_blocking(move || {
         receiver.recv_timeout(std::time::Duration::from_secs(5)).ok()
     });
-    tokio::select! {
-        incoming = &mut admitted => {
-            let incoming = incoming.unwrap().expect("neither an answer nor an admitted request");
+    enum Raced {
+        Admitted(Option<Vec<Incoming>>),
+        Answered(axum::response::Response),
+    }
+    let raced = tokio::select! {
+        incoming = &mut admitted => Raced::Admitted(incoming.unwrap()),
+        answered = &mut response => Raced::Answered(answered.unwrap()),
+    };
+    match raced {
+        Raced::Admitted(incoming) => {
+            let incoming = incoming.expect("neither an answer nor an admitted request");
             let scale = incoming[0].prompt.sampling.steering_scale;
             response.abort();
             SteeringOutcome::Admitted(scale)
         }
-        answered = &mut response => {
-            let answered = answered.unwrap();
+        Raced::Answered(answered) => {
             let status = answered.status().as_u16();
             let bytes = axum::body::to_bytes(answered.into_body(), 65536).await.unwrap();
             SteeringOutcome::Answered(status, serde_json::from_slice(&bytes).unwrap())
