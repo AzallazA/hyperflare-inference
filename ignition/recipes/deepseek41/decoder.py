@@ -365,6 +365,14 @@ class PreparedLayer:
                 self.brrr = PreparedBRRRTail(index, weights, metadata.positions.dtype,
                                              rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
             record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
+        # TP3 steering port (feat/ds41-steering-sidecar): the BRRR fused tail has no steering projection yet (it would
+        # skip the attention and shared-expert projection silently), and the EXL3 merged epilogue folds the shared
+        # expert into the routed output before the projection could run. Refuse both combinations.
+        if steering is not None and self.brrr is not None:
+            raise ValueError(f"steering sidecar: layer {index} in {name} runs the BRRR fused tail, which has no steering "
+                             "projection; leave steering layers out of tp3.brrr_layers")
+        if steering is not None and self.exl3_merge_epilogue:
+            raise ValueError("steering sidecar: the EXL3 merged epilogue (MERGE_EPILOGUE) cannot project the shared expert")
 
         if self.attention_hc is not None:
             self.attention_hc.functional()

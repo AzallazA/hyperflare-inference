@@ -175,6 +175,7 @@ def _score_tiles_rows(
     BLOCK: tl.constexpr,
     STAGED: tl.constexpr,
     ROWS: tl.constexpr,
+    PARAMETERS: tl.constexpr = 6,
 ):
     """TP3 fork (DS41 tp3.markov_tile_rows): Markov proposal scores (``_score_tiles`` with SAMPLE and MARKOV) for
     ROWS request rows per program instead of one. Grid (tiles, cdiv(BATCH, ROWS)).
@@ -228,10 +229,10 @@ def _score_tiles_rows(
             ).to(tl.float32)
             value += bias
             slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
-            temperature = tl.load(Params + slot * 6)
-            repeat = tl.load(Params + slot * 6 + 3)
-            presence = tl.load(Params + slot * 6 + 4)
-            frequency = tl.load(Params + slot * 6 + 5)
+            temperature = tl.load(Params + slot * PARAMETERS)
+            repeat = tl.load(Params + slot * PARAMETERS + 3)
+            presence = tl.load(Params + slot * PARAMETERS + 4)
+            frequency = tl.load(Params + slot * PARAMETERS + 5)
             if (repeat != 1) | (presence.to(tl.int32, bitcast=True) != 0) | (frequency.to(tl.int32, bitcast=True) != 0):
                 count = tl.load(Histogram + slot * hist_stride + global_id, present, other=0)
                 for preceding in tl.static_range(PREFIX):
@@ -905,6 +906,7 @@ class PreparedVocabularySoftmax:
             BLOCK=256,
             STAGED=self.stage_rows,
             ROWS=rows,
+            PARAMETERS=state.parameters.shape[1],
             num_warps=4,
             enable_fp_fusion=False,
         )
