@@ -1415,18 +1415,21 @@ flare-cli/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.sa
 ## Inkling 2 Small NVFP4
 
 The `inkling-2-small-nvfp4` alias selects the local checkpoint
-`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs and
-the bundled DSpark weights in `mtp.safetensors`. Target experts retain the
+`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs on
+one host, or four SM121 GPUs with one rank per host, and the bundled DSpark
+weights in `mtp.safetensors`. Target experts retain the
 checkpoint's static NVFP4 scales, with A4 activations for prefill and A16
 activations for decoding and speculative verification. DSpark uses MXFP8
 feed-forward projections and BF16 attention and recurrent state. Target and
 draft attention use b12x. The pinned FlashInfer dependency provides relative
 bias, private paged-attention tails, and explicit expert activation selection.
 
-The recipe declares a 1048576-token context, eight concurrent requests,
-4096-token prefill chunks, and seven draft tokens per round. Adaptive packed
-verification has 64 target rows and a 64-graph budget, plus width-one graphs
-that preserve DSpark context. The vision encoder accepts padded 20-pixel
+The recipe declares a 1048576-token context, a default of eight concurrent
+requests (maximum 32), 4096-token prefill chunks, and seven draft tokens per
+round. Adaptive packed verification defaults to a 128-token capacity (at most
+64 packed target rows at the default eight-request concurrency) and a 64-graph
+budget, plus width-one graphs that preserve DSpark context. The vision encoder
+accepts padded 20-pixel
 patches, merges each 2-by-2 group, and supports four images per request and
 four concurrent image requests. Native TMLv0 encoding and parsing provide
 reasoning, tool calls, and structured responses. Sampling defaults are
@@ -1466,6 +1469,72 @@ serving checks with:
 FLARE_RUN_CUDA_TESTS=1 FLARE_INKLING2_TEST_URL=http://127.0.0.1:8000 \
   .venv/bin/python -m pytest tests/server/test_inkling2.py -k default-effort -q
 ```
+
+Each rank holds a quarter of the 344 GB checkpoint, so four-host DGX Spark
+serving runs one rank on each of four GB10 (SM121) hosts, reducing through
+RoCEnante over their ConnectX-7 ports. Ranks on one host reduce FP32 partial
+sums; ranks on separate hosts round each partial sum to BF16 before the
+reduction, because RoCEnante reduces BF16. One runtime carries the hidden
+reductions, the vocabulary gathers of FP32 logits as BF16 column pairs, the
+sampling and log-probability gathers, and the sampling broadcasts. Multi-host
+export requires the checkpoint directory on rank zero only; peers read their
+tensor ranges from it.
+
+The 32-request, 8192-token configuration was qualified on four DGX Sparks
+(the recipe defaults `--speculative-token-capacity` to 128, matching this
+export). On rank zero, whose preparation address is `10.200.0.13`, with
+`[memory] reserve = "4G"`:
+
+```sh
+ulimit -Sn 65536
+.venv/bin/ignition export /data/models/Inkling-2-Small-NVFP4 \
+  --ranks 4 --rendezvous 10.200.0.13:29630 --gpus 0 \
+  --max-concurrency 32 --image-concurrency 4 \
+  --prefill-chunk-size 8192 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 128 --speculative-graph-budget 64 \
+  --autotune-effort default
+```
+
+On each peer, with its rank from 1 through 3:
+
+```sh
+.venv/bin/ignition join 10.200.0.13:29630 --rank 1 --ranks 4
+```
+
+Serve with `flare run CACHE_ENTRY --rank 0 --rendezvous 10.200.0.13:29800
+--gpus 0 --mtp-draft-tokens 7 --no-history-drafts --memory-limit=-0G` on rank
+zero and `flare run --rank R --rendezvous 10.200.0.13:29800 --gpus 0` with the
+same serving options on each peer. `--memory-limit=-0G` replaces the exported
+4 GiB reserve, so the cache takes everything outside the integrated-memory
+allowances, which leave about 8 GiB available on each host. Follow the
+[multi-host guide](multi-host.md) for preparation authentication, rank
+placement, and publisher acceptance. Hosts that share a switch need neither
+`--roce-ring` nor `--roce-chain`.
+
+Disk: rank zero holds the complete core, 351 GB for this configuration. Each
+peer needs about 87 GB for the payloads it prepares and another 87 GB for the
+rank core it receives when serving; the prepared payloads can be removed after
+export. Drop the page cache on every host before export and before serving so
+cached checkpoint and peer rank-core files do not exhaust unified memory.
+
+On four DGX Sparks (GB10, SM121, 121 GiB each) joined by a switch, with one
+pair also cabled directly, this configuration compiled and captured all 152
+graphs in 1 h 26 min. The lowest available memory during export was 11.5 GiB on
+rank zero and 12.5 to 13.1 GiB on the peers; the captured graph pool uses
+2840 MiB per rank. Native loading used 90.1 to 90.2 GiB per rank and, with
+`--memory-limit=-0G`, allocated a 16.5 GiB cache: 3,252,224 KV-token slots and
+106 shared snapshot slots, limited by memory, leaving 7.8 to 8.3 GiB available
+per host after loading and at least 7.6 GiB during 32 concurrent requests. With
+the exported 4 GiB reserve the cache is 12.4 GiB, 2,392,064 KV-token slots and
+78 snapshot slots, with 12.0 to 12.5 GiB available. The service passed the
+seven default-effort tests of `tests/server/test_inkling2.py`, 32 concurrent
+requests, streaming, and an 18,832-token prompt with a 2048-token output limit,
+with no change in the RoCE loss counters. A core without drafting and vision,
+prepared for one request with 512-token chunks, loaded 82.9 GiB per rank and
+passed text, streaming, and a 7,150-token prompt. Not run: single-host SM120
+preparation after the multi-host changes or at 32 concurrent requests,
+effort-zero tests on Sparks, `--roce-ring`, `--roce-chain`, and a numerical
+comparison of BF16 cross-host reductions against single-host FP32 output.
 
 ## Muse Spark Open
 
