@@ -479,3 +479,39 @@ def test_fake_steered_op_accepts_the_tail_arguments():
     from torch._subclasses.fake_tensor import FakeTensorMode
     with FakeTensorMode(allow_non_fake_inputs=True):
         OP_STEERED(*args)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# The GPU layer test's effect gate (seq375: a cosine gate on BF16 outputs failed on correct small effects)
+
+
+@pytest.mark.parametrize("y_scale", [0.5, 0.05])
+@pytest.mark.parametrize("s", [1.0, 0.5])
+def test_effect_gate_passes_rounding_and_catches_wrong_steering(s, y_scale):
+    import test_deepseek41_brrr_steering_cuda as layer_test
+
+    g = torch.Generator().manual_seed(int(100 * s + 1000 * y_scale))
+    m, hc = 6, 4
+    resid = torch.randn(m, hc, HID, generator=g)
+    y = torch.randn(m, HID, generator=g) * y_scale
+    d = torch.randn(HID, generator=g)
+    d = d / d.norm()
+    gd = 0.02 * torch.randn(HID, generator=g)
+    post = torch.rand(m, hc, generator=g) + 0.5
+    live = torch.ones(m, dtype=torch.bool)
+
+    def out(v):
+        return (resid + post[:, :, None] * v.to(torch.bfloat16).float()[:, None, :]).to(torch.bfloat16)
+
+    def steer(v, dot_error=0.0, gain=1.0):
+        return (v - (s * 3.3 * (v @ d) * (1 + dot_error))[:, None] * d) * (1 + s * gd * gain)
+
+    def gate(v_kernel):
+        coeff, _ = layer_test._effect(out(v_kernel), out(yk), out(steer(y)), out(y), live, {"projection": d, "gain": gd[None] * y})
+        return all(e <= layer_test.EFFECT_REL * n + layer_test.EFFECT_NOISE * z for e, n, z in coeff.values())
+
+    yk = y + 0.01 * torch.randn(m, HID, generator=g) * y.abs()  # the kernel's y differs from the reference's (FP8)
+    assert gate(steer(yk))
+    assert not gate(steer(yk, gain=0.0))  # gain term missing
+    if y_scale == 0.5:
+        assert not gate(steer(yk, dot_error=0.2))  # dot 20 % off
