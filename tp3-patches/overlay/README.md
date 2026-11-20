@@ -26,3 +26,11 @@ Patches applied only to the b12x overlay (`tp3-tools/make-b12x-overlay.sh` -> `.
   pull-gather patch, so DS41's 21 head-gather races keep their keys):
   `VENV=<fork>/.venv B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch tp3-tools/make-b12x-overlay.sh <out>`,
   export with `B12X_OVERLAY=<out> B12X_PCIE_TWOSHOT_PULL=1 tp3-tools/release/export.sh`.
+- `flashinfer-glm-pool-negative-slot.patch` (GLM, 2026-11-20, upstream sync): backport of FlashInfer #113 (pin 598c8547,
+  upstream Flare #403). The GLM DCP decode pooling kernel (`_decode_update_kernel`, packed main slots) mapped a
+  non-owner token's slot -1 to pool location 0, so on every 4th decode position the non-owning ranks overwrote page 0
+  slot 0 of their local indexer cache with a pooled key. The patch validates the slot before the conversion. CPU proof
+  under `TRITON_INTERPRET=1` (unpatched: 132 bytes of page 0 change; patched: 0, valid slots still written):
+  `~/ds41-tp3/analysis/work/upstream-sync-20261120/fi113/`. Not in the default patch list: a GLM re-export opts in with
+  `B12X_OVERLAY_PATCHES="$PWD/tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch $PWD/tp3-patches/overlay/flashinfer-glm-pool-negative-slot.patch" tp3-tools/make-b12x-overlay.sh`.
+  GPU validation (re-export + DCP3 vs DCP1 consistency) is tabled; plan in the same folder (GLM-FI113-PLAN.md).

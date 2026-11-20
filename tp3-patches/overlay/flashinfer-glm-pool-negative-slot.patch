@@ -1,0 +1,39 @@
+GLM-only overlay patch (2026-11-20, upstream sync): backport of FlashInfer PR #113 (local-inference-lab/flashinfer
+598c8547 pin, upstream Flare #403) onto our pin aa6c4221. _decode_update_kernel (PACKED_MAIN_SLOTS, the GLM DCP decode
+pooling path) converted the main slot to a packed pool location BEFORE checking it; Triton's // truncates toward zero,
+so a non-owner token's slot -1 became pool location 0 and, on every 4th decode position, ranks that do not own the
+token wrote a pooled indexer key over page 0 slot 0 of their local indexer cache. The fix validates slot >= 0 and
+state slot >= 0 before the conversion. Kernel source only (DS41 never runs this kernel); changes the GLM pool program
+keys, so it takes effect at the next GLM export built with this overlay. Applies with -p4 onto the venv b12x, on its
+own or after flashinfer-dcp-gather-pull-world3.patch. CPU proof (TRITON_INTERPRET=1):
+~/ds41-tp3/analysis/work/upstream-sync-20261120/fi113/test_glm_pool_negative_slot_cpu.py.
+
+diff --git a/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py b/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py
+index 82e86314949..a9f0901b373 100644
+--- a/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py
++++ b/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py
+@@ -161,7 +161,10 @@ def _decode_update_kernel(
+             gate + row * gate_stride_0 + dim, mask=dim_mask, other=0.0
+         ).to(tl.float32)
+         cache_location = tl.load(slot_mapping + row).to(tl.int64)
++        # Validate the slot before converting it: the conversion maps -1 to page 0.
++        write_pool = (cache_location >= 0) & (state_slot >= 0)
+         if PACKED_MAIN_SLOTS:
++            write_pool &= position % POOL_SIZE == POOL_SIZE - 1
+             parent_page = cache_location // model_block_size
+             model_page_offset = cache_location - parent_page * model_block_size
+             pool_offset = model_page_offset // POOL_SIZE
+@@ -170,13 +173,6 @@ def _decode_update_kernel(
+             cache_location = (
+                 parent_page * parent_stride_pages + child_page
+             ) * PAGE_SIZE + child_offset
+-            write_pool = (
+-                (position % POOL_SIZE == POOL_SIZE - 1)
+-                & (cache_location >= 0)
+-                & (state_slot >= 0)
+-            )
+-        else:
+-            write_pool = (cache_location >= 0) & (state_slot >= 0)
+         pool_mask = (dim < HEAD_DIM) & write_pool
+         maximum = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+         for slot in tl.static_range(0, POOL_SIZE):
