@@ -683,6 +683,7 @@ mod tests {
                                 hashes: "hashes".into(),
                                 event: "ready".into(),
                                 request: Some("requests".into()),
+                                hash: None,
                             }],
                         },
                         if partitioned { 1 } else { 4 },
@@ -784,7 +785,7 @@ mod tests {
                             nbytes: (100 + rank) * row_bytes, row_bytes,
                         }),
                         heads: 24, weights: "weights".into(), scales: "scales".into(),
-                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
+                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()), hash: None,
                     }] }, if partitioned { 1 } else { 4 })
                 }).collect();
                 let ranks: Vec<_> = (0..4).map(|rank| {
