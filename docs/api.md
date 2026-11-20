@@ -647,6 +647,16 @@ Malformed types return HTTP 400; `top_k` must be an integer. `seed` is
 request-controlled and uses its prepared default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe,
 except for DeepSeek V4.1's repetition-penalty range based on measured use.
+Steering-enabled DeepSeek V4.1 cores accept `steering_scale` on Chat Completions
+and raw Completions. Supply `steering_scale` as a top-level extension field on the OpenAI-compatible request body;
+`chat_template_kwargs.steering_scale` is also consumed when the top-level field
+is absent, and conflicting duplicate values return HTTP 400. Values are clamped
+to the prepared inclusive interval `[0, 1]`, with a default of zero. A core exported
+without steering metadata accepts omitted or zero scale and rejects a nonzero
+value with HTTP 400. Zero scale adds no conditioning event, preserving ordinary
+unsteered prefix identities. A nonzero scale adds a position-zero event derived
+from the sidecar SHA-256 and exact FP32 scale bits, so different scales and
+sidecars cannot reuse one another's KV prefixes.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values

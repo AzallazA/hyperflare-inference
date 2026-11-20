@@ -29,6 +29,7 @@ def test_tile_rows_score_bit_identically_in_the_cpu_interpreter():
                                cwd=root, env=env, capture_output=True, text=True, timeout=3600)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "markov tile rows ok 80" in completed.stdout, completed.stdout + completed.stderr
+    assert "markov tile rows seven-column ok 8" in completed.stdout, completed.stdout + completed.stderr
 
 
 def test_tile_rows_is_off_by_default_and_recorded_only_when_set():
@@ -83,7 +84,7 @@ def _inputs(b, fp8, generator):
                 grammar_enabled=grammar_enabled, seeds=seeds, offsets=offsets, running=RUNNING)
 
 
-def _run(x, b, step, fp8, staged, rows):
+def _run(x, b, step, fp8, staged, rows, parameters=6):
     from ignition.components import vocabulary_sampling as v
 
     block = 256
@@ -102,7 +103,7 @@ def _run(x, b, step, fp8, staged, rows):
             x["logits"].stride(0), x["logits"].stride(1), x["histogram"].stride(0), x["grammar"].stride(0))
     common = dict(LOCAL=x["local"], VOCAB=x["vocab"], WIDTH=x["width"], DRAFTS=x["drafts"], PREFIX=step,
                   BLOCKS=blocks, CAPACITY=x["capacity"], BATCH=b, RUNNING=x["running"], RANK=x["rank"], FP8=fp8,
-                  STEP=step, BLOCK=block, STAGED=staged)
+                  STEP=step, BLOCK=block, STAGED=staged, PARAMETERS=parameters)
     if rows is None:
         v._score_tiles[(blocks, b)](*args, **common, MARKOV=True, SAMPLE=True)
     else:
@@ -124,6 +125,25 @@ def _case(b, step, fp8, staged, x):
     # Not vacuous: the Markov bias moves the scores (a zero table gives others).
     zero = dict(x, table=torch.zeros_like(x["table"]))
     assert not torch.equal(_run(zero, b, step, fp8, staged, ROWS_FOR_BATCH[b][-1])[0][:, step], base[0][:, step])
+
+
+def _seven_columns(x):
+    """Steering cores (PR #404 port) carry a seventh request parameter column; the sampling values are unchanged."""
+    params = x["params"].view(x["capacity"], 6)
+    scale = torch.linspace(0.0, 1.0, x["capacity"]).unsqueeze(1)
+    return dict(x, params=torch.cat((params, scale), 1).contiguous().flatten())
+
+
+def _case_seven(b, step, staged, x):
+    """Both Markov score kernels read slot parameters with the request-state stride: a 7-column state scores exactly
+    as its 6-column twin (before the port, _score_tiles_rows read a fixed stride of 6)."""
+    seven = _seven_columns(x)
+    for rows in (None, *ROWS_FOR_BATCH[b]):
+        a = _run(x, b, step, False, staged, rows)
+        c = _run(seven, b, step, False, staged, rows, parameters=7)
+        for name, u, w in zip(("probabilities", "partials"), a, c):
+            assert torch.equal(u.view(torch.int32), w.view(torch.int32)), (
+                f"seven columns b {b} step {step} staged {staged} rows {rows}: {name} differ")
 
 
 @triton.jit
@@ -151,6 +171,14 @@ def main():
                     count += 1
         print(f"batch {b} ok", flush=True)
     print(f"markov tile rows ok {count}")
+    seven = 0
+    for b in (4, 16):
+        x = _inputs(b, False, generator)
+        for step in (0, 2):
+            for staged in (False, True):
+                _case_seven(b, step, staged, x)
+                seven += 1
+    print(f"markov tile rows seven-column ok {seven}")
 
 
 if __name__ == "__main__":

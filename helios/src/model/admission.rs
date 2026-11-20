@@ -74,6 +74,8 @@ impl Admission {
             || self.handle.generation == 0
             || self.handle.generation > i64::MAX as u64
             || self.sampling.top_k > config.contract.vocabulary as i32
+            || (self.sampling.steering_scale != 0.
+                && config.steering_sidecar_sha256.is_none())
             || (self.max_new_tokens == 0 && !self.prompt_logprobs)
             || self.max_new_tokens > i32::MAX as u32
             || self.prompt.is_empty()
@@ -129,6 +131,12 @@ impl Admission {
 #[cfg(feature = "server")]
 pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> Result<()> {
     prompt.sampling.validate()?;
+    if prompt.sampling.steering_scale != 0. && config.steering_sidecar_sha256.is_none() {
+        return Err(crate::Error::admission(
+            crate::AdmissionError::Feature,
+            "steering_scale is not available in this model core",
+        ));
+    }
     if !prompt.logprob_token_ids.is_empty() {
         if config.logprob_token_id_capacity == 0 {
             return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());
@@ -170,8 +178,10 @@ pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> 
         || prompt.sampling.top_k > config.contract.vocabulary as i32
         || (prompt.max_new_tokens == 0 && !prompt.prompt_logprobs)
         || prompt.max_new_tokens > i32::MAX as u32
+        || (!config.contract.vision.enabled() && !prompt.conditioned_inputs.is_empty())
         || (!config.contract.vision.enabled()
-            && (!prompt.conditioned_inputs.is_empty() || !prompt.conditioning.is_empty()))
+            && config.steering_sidecar_sha256.is_none()
+            && !prompt.conditioning.is_empty())
     {
         return Err("prompt, output limit, or inputs violate the prepared model contract".into());
     }

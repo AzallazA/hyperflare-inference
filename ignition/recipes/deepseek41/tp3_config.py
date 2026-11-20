@@ -56,6 +56,9 @@ SMALL_LEVERS = ("rotary_once", "pin_small_qproj", "logprob_single_exchange", "no
 # on, so a default export's record is unchanged. F = dcp_gather_pull, d = rotary_once_prefill.
 E3C_A = ("rotary_once_prefill", "dcp_gather_pull")
 RECORDED_WHEN_TRUE = RECORDED_WHEN_TRUE + E3C_A
+# Steering inside BRRR (feat/ds41-steering-brrr, analysis/work/steering-sidecar-20261119/optionB): on/off, recorded
+# only when on.
+RECORDED_WHEN_TRUE = RECORDED_WHEN_TRUE + ("steering_plain_identity",)
 # b12x's switch of the gather-pull overlay patch (tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch)
 GATHER_PULL_ENV = "B12X_PCIE_DCP_GATHER_PULL"
 
@@ -414,6 +417,12 @@ class TP3Config:
     expression on the same clamped positions; tests/components/test_rotary_shared_angles_interpret.py, GPU M4). The
     ratio-2 compressor and global-KV key/latent rotations keep per-launch angles (their positions can be -2).
     False = per-launch angles in prefill (base). Export-time only (E3 lever d)."""
+    steering_plain_identity: bool = False
+    """With a steering sidecar: tune under the checkpoint's plain preparation identity instead of upstream PR #404's
+    sha256(identity || sidecar sha), so the export reuses (and races against) the sidecar-free package's tuning
+    records and selects the same plans; the scale-0 output of the sidecar package can then be compared bit for bit
+    with the sidecar-free one. The served config still records the sidecar sha. Needs a sidecar
+    (PreparationConfig refuses it otherwise). False = upstream's sidecar identity (base)."""
     dcp_gather_pull: bool = False
     """Record of ``B12X_PCIE_DCP_GATHER_PULL`` != 0 (overlay patch flashinfer-dcp-gather-pull-world3, GLM's since
     2026-11-09): world-3 DCP column gathers (logprob/sampling/candidate/vocabulary gathers, the indexer row split's
@@ -810,6 +819,7 @@ class TP3Config:
             logprob_single_exchange=flag("LOGPROB_SINGLE_EXCHANGE"),
             no_generation_logprobs=flag("NO_GENERATION_LOGPROBS"),
             rotary_once_prefill=flag("ROTARY_ONCE_PREFILL"),
+            steering_plain_identity=flag("STEERING_PLAIN_IDENTITY"),
             dcp_gather_pull=cls.gather_pull_from_environment(env),
             draft_head_plans=parse_draft_head_plans(get("DRAFT_HEAD_PLANS")),
             **{field_name: reclaim(env_name) for field_name, env_name in VRAM_RECLAIM.items()},

@@ -64,6 +64,14 @@ impl ModelCatalog {
                 .ok()
             })
             .flatten();
+        let mut sampling_defaults =
+            serde_json::to_value(&model.sampling_defaults).unwrap_or_else(|_| json!({}));
+        if model.steering_sidecar_sha256.is_none() {
+            sampling_defaults
+                .as_object_mut()
+                .unwrap()
+                .remove("steering_scale");
+        }
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
         let card = json!({
@@ -94,7 +102,7 @@ impl ModelCatalog {
                 "max_concurrency": model.limits.max_active,
                 "prefill_chunk_size": model.limits.prefill_chunk_size,
                 "default_max_tokens": model.max_new_tokens,
-                "sampling_defaults": model.sampling_defaults,
+                "sampling_defaults": sampling_defaults,
                 "thinking_token_budget": thinking_token_budget,
                 "sampling_ranges": model.sampling_ranges,
                 "max_images_per_prompt": limits.map_or(0, |l| l.max_images),
@@ -289,6 +297,7 @@ mod tests {
                 top_k: -1,
                 ..Default::default()
             },
+            steering_sidecar_sha256: None,
             max_new_tokens: 2048,
             speculative_widths: vec![],
             speculative_fixed_width: None,
@@ -309,10 +318,10 @@ mod tests {
         assert_eq!(text["flare"]["vocab_size"], 1024);
         assert_eq!(text["flare"]["default_max_tokens"], 2048);
         assert_eq!(text["flare"]["thinking_token_budget"], Value::Null);
-        assert_eq!(
-            text["flare"]["sampling_defaults"],
-            json!(model.sampling_defaults)
-        );
+        // Cores without a steering sidecar keep the pre-steering wire form (no steering_scale key).
+        let mut unsteered = json!(model.sampling_defaults);
+        unsteered.as_object_mut().unwrap().remove("steering_scale");
+        assert_eq!(text["flare"]["sampling_defaults"], unsteered);
         assert_eq!(
             text["flare"]["sampling_ranges"],
             json!(model.sampling_ranges)

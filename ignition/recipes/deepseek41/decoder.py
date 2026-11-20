@@ -11,17 +11,24 @@ import torch
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
-from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
+from ignition.components.mhc import MHCScratch, MHCWeights, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
-from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
-from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.ring_commit import PreparedRingCommit
+from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import register_finalizer
 
-from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
+from .attention import (
+    AttentionIndices,
+    AttentionScratch,
+    PreparedAttention,
+    PreparedGlobalKV,
+    Rotary,
+    normalize,
+)
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 from .index_row_split import prefill_split_context
@@ -29,6 +36,7 @@ from .host_embedding import HostRowGather
 from .probe import Probe
 from .routecapture import RouteCapture
 from .routecount import RouteCounter
+from .steering import steer_attention, steer_shared_expert
 from .tp3_config import TP3Config
 
 
@@ -217,6 +225,7 @@ class PreparedLayer:
     # TP3 fork attributes; class defaults keep the upstream behaviour (one router-ID-ordered bank, no debug hooks).
     hot_map = None
     brrr = None
+    steering = None  # steering sidecar constants of this layer (PR #404 port); None = unsteered
     no_engram = False
     # TP3 tp3.engram_side_layers: the NEXT layer's PreparedEngram whose hidden-state-free part this layer runs on a
     # side stream (started before this layer's attention, joined before its tail); None = none (base).
@@ -230,7 +239,7 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
-                 window_metadata=None, examples=None, tp3=None, probe=None, index_split=None):
+                 window_metadata=None, examples=None, tp3=None, probe=None, index_split=None, steering=None):
         tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches; the decoder shares one instance per graph
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
@@ -251,6 +260,7 @@ class PreparedLayer:
             self.route_counter.allocate(s.residual.device, self.route_experts)
         self.no_engram = tp3.no_engram
         self.metadata = metadata
+        self.steering = steering
         self.image_mask = (torch.zeros(metadata.token_ids.shape, dtype=torch.bool, device=metadata.token_ids.device)
                            if mode == "prefill" and weights.experts.vision_correction is not None else None)
         self.boundary = boundary
@@ -355,9 +365,16 @@ class PreparedLayer:
                                      f"takes at most {MAX_ROWS}: lower the speculative widths or concurrency, or leave the layer "
                                      "out of brrr_layers")
                 self.attention.external_tail = True
+                # A steered layer (sidecar package) runs the BRRR_STEER tail: PR #404's projections inside the kernel.
                 self.brrr = PreparedBRRRTail(index, weights, metadata.positions.dtype,
-                                             rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
+                                             rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3,
+                                             **({} if steering is None else {"steering": steering}))
             record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
+        # TP3 steering port: a BRRR layer steers inside the fused tail (feat/ds41-steering-brrr, PreparedBRRRTail
+        # above). The EXL3 merged epilogue folds the shared expert into the routed output before the projection could
+        # run: refused.
+        if steering is not None and self.exl3_merge_epilogue:
+            raise ValueError("steering sidecar: the EXL3 merged epilogue (MERGE_EPILOGUE) cannot project the shared expert")
 
         if self.attention_hc is not None:
             self.attention_hc.functional()
@@ -382,14 +399,14 @@ class PreparedLayer:
             self.shared = None
 
     def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-                 engram_projected=None, engram_handoff=None, mma_pads=None):
+                 engram_projected=None, engram_handoff=None, mma_pads=None, token_scale=None):
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
             selection, boundary=boundary, window_cache=window_cache, engram_projected=engram_projected,
-            engram_handoff=engram_handoff, mma_pads=mma_pads)
+            engram_handoff=engram_handoff, mma_pads=mma_pads, token_scale=token_scale)
         return incoming, next_mix, records, selection
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-             engram_projected=None, engram_handoff=None, mma_pads=None):
+             engram_projected=None, engram_handoff=None, mma_pads=None, token_scale=None):
         """TP3 tp3.engram_side_layers: ``engram_projected`` = this layer's Engram projection, already reduced on the
         side stream by the previous layer; ``engram_handoff`` = a list that receives the next layer's (when this
         layer is the one that starts it, ``engram_side``). TP3 tp3.mma_pad_once: ``mma_pads`` = the forward's
@@ -406,6 +423,9 @@ class PreparedLayer:
             incoming = (self.engram(incoming[0], metadata, projected=engram_projected),)
         if len(incoming) == 1:
             probe.record(incoming[0], layer, 0, mode)
+        steering = self.steering
+        if steering is not None and token_scale is None:
+            raise ValueError("steering-enabled decoder layer requires per-token scale")
         if boundary is None:
             attn_mix = torch.empty_like(pre_mix)  # written whole by the lagged mHC (see PreparedBoundary)
             residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
@@ -422,13 +442,16 @@ class PreparedLayer:
             # TP3 BRRR: ``attended`` is the attention output before inverse RoPE (attention.external_tail); the kernel
             # runs inverse RoPE .. MLP all-reduce and returns what Flare's path below would.
             output, (residual, post, comb), next_mix = self.brrr(attended, residual, post, comb, attn_mix,
-                                                                 indices.position)
+                                                                 indices.position,
+                                                                 **({} if steering is None else {"token_scale": token_scale}))
             incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                         else (output, residual, post, comb))
             observations = {"attention." + key: value for key, value in observations.items()}
             observations.update({"attention_hc.normalized": attention_normalized, "output": incoming[0]})
             return incoming, next_mix, records, selection, observations
         attention_output = self.attention_reduce(attended)
+        if steering is not None:
+            attention_output = steer_attention(attention_output, steering, token_scale)
         probe.record(attention_output, layer, 1, mode)
         next_mix = torch.empty_like(attn_mix)  # written whole by the lagged mHC
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
@@ -468,6 +491,10 @@ class PreparedLayer:
         if not joins_early:
             shared = (self.shared(normalized) if self.concurrent_shared is None
                       else self.concurrent_shared.finish(pending, routed))
+        if steering is not None:
+            # Rank-local shared-expert partial: the projection is linear, so projecting each rank's partial before the
+            # MLP all-reduce equals projecting the reduced sum (upstream PR #404; up to BF16 rounding of the partials).
+            shared = steer_shared_expert(shared, steering, token_scale)
         probe.record(routed, layer, 3, mode)
         probe.record(shared, layer, 4, mode)
         partial = routed if summed else routed + shared    # MERGE_EPILOGUE: routed already holds routed + shared
@@ -648,7 +675,8 @@ class PreparedDecoder:
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, tp3=tp3, probe=self.probe,
-                index_split=index_split if layer_metadata is metadata else None))
+                index_split=index_split if layer_metadata is metadata else None,
+                steering=None if getattr(weights, "steering", None) is None else weights.steering.layers.get(index)))
             carry = defer
         configure_engram_side(self.layers, tp3.engram_side_layers, mode)
         self.route_capture = RouteCapture()
@@ -704,6 +732,9 @@ class PreparedDecoder:
         self.probe.positions(metadata.positions, self.mode)
         if self.route_capture.enabled:
             self.route_capture.step(metadata.positions, self.mode)
+        token_scale = getattr(metadata, "steering_scale", None)
+        if getattr(self.weights, "steering", None) is not None and token_scale is None:
+            raise ValueError("steering-enabled decoder requires per-token scale metadata")
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
                   if self.vision is not None else metadata.token_ids)
@@ -739,6 +770,8 @@ class PreparedDecoder:
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
+                if token_scale is not None:
+                    token_scale = suffix.gather(token_scale)
                 metadata = suffix.metadata
                 indices = self.suffix_window_metadata(metadata, replay_start=suffix.replay_start)
                 boundary = state, attn_mix
@@ -757,7 +790,7 @@ class PreparedDecoder:
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
                 boundary=boundary, window_cache=None if staging is None else staging[index],
                 engram_projected=engram_projected, engram_handoff=handoff,
-                **({} if mma_pads is None else {"mma_pads": mma_pads}))
+                token_scale=token_scale, **({} if mma_pads is None else {"mma_pads": mma_pads}))
             engram_projected = handoff[0] if handoff else None
             records.append(record)
         if self.encoder_only:

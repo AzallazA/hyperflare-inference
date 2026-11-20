@@ -141,6 +141,14 @@ pub(super) fn prepare_inference_cached(
 ) -> Result<PreparedInference> {
     use super::inference::{Constraint, Input, RawPrompt, ToolChoice};
     let opts = &request.options;
+    if opts.sampling.steering_scale.unwrap_or(0.) != 0.
+        && config.steering_sidecar_sha256.is_none()
+    {
+        return Err(crate::Error::admission(
+            AdmissionError::Feature,
+            "steering_scale is not available in this model core",
+        ));
+    }
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
             return Err("prompt logprobs are not available in this model core; export with --prompt-logprobs".into());
@@ -344,7 +352,7 @@ pub(super) fn prepare_inference_cached(
         tokens,
         token_expansions,
         data,
-        conditioning,
+        mut conditioning,
         conditioned_inputs,
     } = crate::model::prepare_image_inputs(config, frontend, processor, &rendered, images)?;
     let mut expansions = token_expansions.iter().peekable();
@@ -372,6 +380,15 @@ pub(super) fn prepare_inference_cached(
     }
     let mut sampling = sampling_parameters(object, &config.sampling_defaults, &config.sampling_ranges)?;
     sampling.seed = sampling.seed.wrapping_add(index as u64);
+    if let Some(event) = config
+        .steering_sidecar_sha256
+        .and_then(|digest| crate::cache::steering_conditioning_event(
+            digest,
+            sampling.steering_scale,
+        ))
+    {
+        conditioning.insert(0, event);
+    }
     let stop_sequences = opts.token_stops.clone();
     super::stops::TokenStops::new(stop_sequences.clone(), config.contract.vocabulary)?;
     let stop_strings = opts.stops.clone();
@@ -569,6 +586,12 @@ pub(super) fn sampling_parameters(
             "frequency_penalty",
             defaults.frequency_penalty,
             ranges.frequency_penalty,
+        )?,
+        steering_scale: sampling_number(
+            object,
+            "steering_scale",
+            defaults.steering_scale,
+            ranges.steering_scale,
         )?,
         top_k: object
             .get("top_k")
@@ -900,21 +923,22 @@ mod tests {
             presence_penalty: Some(SamplingRange { min: -2., max: 2. }),
             frequency_penalty: Some(SamplingRange { min: -1., max: 1. }),
             top_k: Some(SamplingRange { min: 1, max: 100 }),
+            steering_scale: Some(SamplingRange { min: 0., max: 1. }),
         };
         for (value, top_k, expected, expected_k) in [
             (
                 -1e100,
                 serde_json::json!(i64::MIN),
-                [0.5, 0.5, 0., 0.5, -2., -1.],
+                [0.5, 0.5, 0., 0.5, -2., -1., 0.],
                 1,
             ),
             (
                 1e100,
                 serde_json::json!(u64::MAX),
-                [1.5, 1., 0.5, 2., 2., 1.],
+                [1.5, 1., 0.5, 2., 2., 1., 0.],
                 100,
             ),
-            (0.5, serde_json::json!(50), [0.5; 6], 50),
+            (0.5, serde_json::json!(50), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.], 50),
         ] {
             let body = serde_json::json!({"seed":u64::MAX,"temperature":value,"top_p":value,
                 "min_p":value,"repetition_penalty":value,"presence_penalty":value,"frequency_penalty":value,"top_k":top_k});
@@ -922,6 +946,21 @@ mod tests {
             assert_eq!(result.values(), expected);
             assert_eq!(result.top_k, expected_k);
             assert_eq!(result.seed, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn steering_scale_clamps_to_the_prepared_interval() {
+        let defaults = SamplingParameters::default();
+        let ranges = SamplingRanges {
+            steering_scale: Some(SamplingRange { min: 0., max: 1. }),
+            ..Default::default()
+        };
+        for (requested, expected) in [(-10., 0.), (0.5, 0.5), (10., 1.)] {
+            let body = serde_json::json!({"steering_scale":requested});
+            let sampling =
+                sampling_parameters(body.as_object().unwrap(), &defaults, &ranges).unwrap();
+            assert_eq!(sampling.steering_scale, expected);
         }
     }
 

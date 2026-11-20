@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.draft_sampling import PreparedDraftDistribution
-from ignition.components.paged_batch import Metadata, PreparedBatch
+from ignition.components.paged_batch import Metadata, PreparedBatch, steering_parameters
 from ignition.components.speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
@@ -139,8 +139,14 @@ class PreparedCausalDraftRound:
             self.draft_generation.copy_(torch.where(matches.any(1), self.requests.generation, self.draft_generation))
         self.draft.finish(draft_state, before, states, active)
         candidates[:, 1:].copy_(drafts)
-        metadata = Metadata.allocate(b * w, b, self.blocks, slots.device, samples=b * w)
-        metadata.set(before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows)
+        metadata = Metadata.allocate(
+            b * w, b, self.blocks, slots.device, samples=b * w,
+            steering=steering_parameters(self.requests) is not None,
+        )
+        metadata.set(
+            before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows,
+            parameters=steering_parameters(self.requests), row_slot_ids=self.inputs.row_slot_ids[:b],
+        )
         hidden, logits, auxiliary, records = self.decoder(metadata)
         p = target.run(scratch["target"], logits.view(b, w, -1), candidates=drafts)
         target_valid = scratch["target"]["valid"]

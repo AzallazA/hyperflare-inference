@@ -246,7 +246,9 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         for b in &graph.inputs {
             use ValueSource::*;
             let width = match b.source {
-                SamplingParameters => 6,
+                SamplingParameters => {
+                    if config.steering_sidecar_sha256.is_some() { 7 } else { 6 }
+                }
                 EosTokenIds | LiveStateRows => 8,
                 PromptHistogram => config.contract.vocabulary,
                 GrammarMask => config.contract.vocabulary.div_ceil(32),

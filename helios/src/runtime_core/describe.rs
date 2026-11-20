@@ -106,6 +106,7 @@ pub(super) fn describe_index(
             }),
             "max_new_tokens": contract.max_new_tokens,
             "decode_weight_bytes": contract.decode_weight_bytes,
+            "steering_sidecar_sha256": contract.steering_sidecar_sha256,
             "reserve_bytes": contract.reserve_bytes,
             "queue_capacity": contract.queue_capacity,
             "frontend_workers": contract.frontend_workers,
