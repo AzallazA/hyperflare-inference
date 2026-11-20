@@ -123,8 +123,8 @@ mod tests {
     #[test]
     fn no_source_leaves_steering_open() {
         assert!(resolve(&SteeringAccessOptions::default(), env(&[])).unwrap().is_empty());
-        let blank = env(&[(KEYS_ENV, "  ".into()), (KEYS_FILE_ENV, String::new())]);
-        assert!(resolve(&SteeringAccessOptions::default(), blank).unwrap().is_empty());
+        let blank = [(KEYS_ENV, "  ".to_string()), (KEYS_FILE_ENV, String::new())];
+        assert!(resolve(&SteeringAccessOptions::default(), env(&blank)).unwrap().is_empty());
     }
 
     #[test]
@@ -161,8 +161,8 @@ mod tests {
         ] {
             assert!(resolve(&options, env(&[])).is_err());
         }
-        let from_env = env(&[(KEYS_FILE_ENV, empty.display().to_string())]);
-        assert!(resolve(&SteeringAccessOptions::default(), from_env).is_err());
+        let from_env = [(KEYS_FILE_ENV, empty.display().to_string())];
+        assert!(resolve(&SteeringAccessOptions::default(), env(&from_env)).is_err());
     }
 
     #[test]
