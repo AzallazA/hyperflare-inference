@@ -390,11 +390,9 @@ class Engine:
 
     def register_steering(self, index, steering):
         """Hand layer ``index``'s steering constants (a steering.LayerSteering: alpha, unit direction d and attention
-        gain minus one, both BF16[5120] persistent copies) to the kernel, plus this rank's u = W2_rank^T d (FP32[768]) and
-        v = Wob_rank^T d (FP32[3072]), persistent copies computed from the checkpoint's shared-expert down projection
-        and attention output projection shards (the same bytes and padded groups the kernel's sh2 / wob read) and their
-        E8M0 block scales: the kernel's shared-site dot is h . u, its attention-site dot sum_r z_r . v_r (DESIGN.md).
-        Once per layer; the layer must be registered."""
+        gain minus one, both BF16[5120] persistent copies) to the kernel, plus this rank's u = W2_rank^T d (FP32[768], a
+        persistent copy) from the checkpoint's shared-expert down projection shard and its E8M0 block scales: the
+        kernel's shared-site dot is h . u (DESIGN.md). Once per layer; the layer must be registered."""
         if not self.steering:
             raise RuntimeError(f"BRRR layer {index}: the engine was built without steering (BRRR_STEER); create it "
                                "with steering=True for a sidecar package")
@@ -413,16 +411,11 @@ class Engine:
             weight = self.raw(f"{p}.ffn.shared_experts.w2.weight", cols=_shard(self.rank, inter))
             scale = self.raw_u8(f"{p}.ffn.shared_experts.w2.scale", cols=_shard(self.rank, inter // 32))
             u = shared_down_direction(weight, scale, steering.direction)
-            # The kernel's wob / wob_s (_register): this rank's OA columns of wo_b, zero beyond the 8 real o-groups.
-            oa = ext.OA
-            weight = self.raw_padded(f"{p}.attn.wo_b.weight", cols=_shard(self.rank, oa))
-            scale = self.raw_padded(f"{p}.attn.wo_b.scale", cols=_shard(self.rank, oa // 32))
-            v = shared_down_direction(weight, scale, steering.direction)
-        u, v = persistent_copy(u.contiguous()), persistent_copy(v.contiguous())
-        ext.set_steering(self.local_handle, self.slots[index], steering.direction, steering.attention_gain_delta, u, v,
+        u = persistent_copy(u.contiguous())
+        ext.set_steering(self.local_handle, self.slots[index], steering.direction, steering.attention_gain_delta, u,
                          float(steering.alpha))
-        self.steered[index] = (steering, u, v)
-        self.keep += [u, v]
+        self.steered[index] = (steering, u)
+        self.keep.append(u)
         return self.steered[index]
 
 

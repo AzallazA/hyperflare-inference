@@ -1,6 +1,5 @@
 #include <type_traits>
 #include <cstdlib>
-#include <cstring>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
@@ -128,16 +127,15 @@ static_assert(SPIN_TRAP == 0 || SPIN_TRAP == 1, "BRRR switch values");
 // BRRR_STEER=1 for packages exported with a steering sidecar (its own extension build). Every steering line below is
 // inside #if BRRR_STEER, so the default build (no define) preprocesses to the previous source and compiles to the same
 // layer kernel. At run time a launch steers only when the layer has steering constants (set_steering), the op passes
-// a per-token scale (run_steered) and some row's scale is nonzero (Ctx::steer, the same on every CTA and rank); rows
+// a per-token scale (run_steered) and some row's scale is nonzero (Smem::steer, the same on every CTA and rank); rows
 // with scale 0 keep their unsteered values bit for bit, and a launch without a nonzero row runs the unsteered job graph
 // (no extra wait, no extra write).
-// Two ways to get the attention-site dot y . d, chosen per launch by Params::steer_pre (host: set_steer_dot):
-//  * post (0, default, v3): from the reduced BF16 yattn chunk right after each exchange (one fixed-point add per row
-//    and chunk into adot, C_YD), as upstream (y_bf16 . d); OWNA waits for all CHUNKS dots after loading its tile.
-//  * pre (1, v2): before the all-reduce, y . d = sum_r z_r . (Wob_r^T d) from each rank's quantized WO-A output
-//    (finish_woa), published next to the attention inbox and summed by J_XA, so OWNA keeps its per-chunk wait.
-// seq375 measured v2 (pre) at +38..+50 us per launch on the GPU (cause not yet located: the layer test's profile stage
-// compares both); the switch lets one run measure both.
+// Attention-site dot y . d: from the reduced BF16 yattn chunk right after each exchange (one fixed-point add per row
+// and chunk into adot, C_YD), as upstream (y_bf16 . d); OWNA waits for all CHUNKS dots after loading its tile.
+// (v2's dot before the all-reduce, published next to the attention inbox, cost +38..+50 us per launch on the GPU,
+// seq375 / seq377, and was removed in v4 together with everything it added to the shared exchange code.)
+// v4: the steering flag lives in shared memory (Smem::steer, read where a job branches), not in a register of Ctx,
+// so the persistent loop's register allocation and the exchange code (share / reduce4 / gather) match the plain build.
 #ifndef BRRR_STEER
 #define BRRR_STEER 0
 #endif
@@ -326,10 +324,8 @@ constexpr int C_NHOT = C_R1D + ENTRIES;
 constexpr int C_NCOLD = C_NHOT + 1;
 constexpr int C_ECOUNT = C_NCOLD + 1;
 #if BRRR_STEER
-// Steering: finish_woa blocks (of WOA_BLOCKS) that added their part of the attention-site dot, per token group; the
-// last one publishes the group's dots (steer_pub). Past CACHED (arrive only, never waited on).
-constexpr int C_ZD = C_ECOUNT + EXPERTS;
-constexpr int C_YD = C_ZD + GROUPS;  // post mode: attention exchange jobs whose row dots are in adot (OWNA waits CHUNKS)
+// Steering: attention exchange jobs whose row dots are in adot (OWNA waits for CHUNKS). Past CACHED: polled.
+constexpr int C_YD = C_ECOUNT + EXPERTS;
 constexpr int COUNTERS = C_YD + 1;
 #else
 constexpr int COUNTERS = C_ECOUNT + EXPERTS;
@@ -377,11 +373,8 @@ struct Scratch {
   float* yracc;
 #if BRRR_STEER
   // Per-token steering dots in fixed point (x 2^32, like gacc: integer adds, so the sum is independent of the order
-  // of the partial contributions). zdot = z_rank . v_rank (this rank's part of the attention-site dot, cleared by the
-  // block that publishes it); adot = sum over ranks of the published parts (written by every J_XA, same value, read by
-  // OWNA; identical on every rank); sdot = h . (W2_rank^T d) (this rank's shared-expert partial . d, cleared by the
-  // launch's last CTA when it steered).
-  long long* zdot;
+  // of the partial contributions). adot = yattn . d (replicated rows, identical on every rank), sdot = h . (W2^T d)
+  // (this rank's shared-expert partial . d). Cleared by the launch's last CTA when it steered.
   long long* adot;
   long long* sdot;
 #endif
@@ -439,7 +432,6 @@ struct Weights {
   const __nv_bfloat16* steer_dir;
   const __nv_bfloat16* steer_gain;
   const float* steer_u;
-  const float* steer_v;  // v = Wob_rank^T d [OA] fp32 (this rank's dequantized WO-B shard, padded groups zero)
   float steer_alpha;
 #endif
 };
@@ -473,7 +465,6 @@ struct Params {
   float* ffn_pre;
 #if BRRR_STEER
   const float* steer_scale;  // per-token steering scale [m] fp32 (run_steered on a steered layer), else null
-  int steer_pre;             // attention-site dot: 1 = before the all-reduce (published z . v), 0 = after it (adot)
 #endif
 };
 
@@ -495,7 +486,7 @@ struct Smem {
   int last;
   int ready;
 #if BRRR_STEER
-  int steer;  // this launch steers (Ctx::steer), for the last CTA's clear of the steering dots
+  int steer;  // some row of this launch has a nonzero steering scale (written once per CTA before the job loop)
 #endif
 };
 
@@ -646,9 +637,6 @@ struct Ctx {
   int tid;
   int it;
   unsigned epoch;
-#if BRRR_STEER
-  int steer;  // some row of this launch has a nonzero steering scale (computed once per CTA after pdl_wait)
-#endif
   __device__ __forceinline__ unsigned* ctr() const { return p.s.counters; }
 
   __device__ __forceinline__ void sync() const { asm volatile("bar.sync 1, %0;" ::"n"(GT) : "memory"); }
@@ -849,32 +837,7 @@ __device__ void mix_finish(int lane, int tok, float mine, const float* scale, co
   if (lane < HC * HC) comb[tok * HC * HC + lane] = cm;
 }
 
-#if BRRR_STEER
-// Steering: rank r's published attention-site dot parts (one fixed-point value per token), next to its inboxes in its
-// peer buffer, double-buffered by epoch parity like the inboxes. Written by r's last finish_woa of each token group,
-// before any of r's attention exchange flags (they all follow every finish_woa: C_Z -> J_WOB -> C_YC -> J_XA).
-__device__ __forceinline__ long long* steer_pub(const Params& p, int r, unsigned epoch) {
-  return reinterpret_cast<long long*>(p.peers.pub[r] + 8 * PUB_SLOT) + (epoch & 1) * MAXM;
-}
-
-// The row's whole attention-site dot: the sum of every rank's published part (integer adds: identical on every rank).
-// Called right after the exchange's await (a peer's flag, or the owner's, which the owner posts after seeing every
-// peer's), so the loads are ordered after the parts were written and overlap the chunk's reduction.
-__device__ __forceinline__ long long steer_parts(const Ctx& c) {
-  long long sum = 0;
-  if (c.tid < c.p.m) {
-#pragma unroll
-    for (int r = 0; r < RANKS; ++r) sum += r == c.p.rank ? __ldcg(steer_pub(c.p, r, c.epoch) + c.tid) : __ldcv(steer_pub(c.p, r, c.epoch) + c.tid);
-  }
-  return sum;
-}
-#endif
-
-#if BRRR_STEER
-__device__ void share(Ctx& c, int which, int k, __nv_bfloat16* out, bool dots = false) {
-#else
 __device__ void share(Ctx& c, int which, int k, __nv_bfloat16* out) {
-#endif
   const Params& p = c.p;
   const unsigned epoch = c.epoch;
   const int nv = p.m * CHUNK_VECS;
@@ -884,37 +847,22 @@ __device__ void share(Ctx& c, int which, int k, __nv_bfloat16* out) {
   // single flag (per = CHUNKS, g = 0) is the last chunk's CTA posting once for all. Flags stay within flag_index's
   // [0, 2 * 2 * RANKS * CHUNKS) words; the epoch compare in await() is unchanged.
   const int per = which == 0 && p.m < TWO_SHOT_MIN && !p.attn_per_chunk_flags ? CHUNKS : 1, g = k / per;
-#if BRRR_STEER
-#define STEER_FETCH const long long parts = dots ? steer_parts(c) : 0;
-#define STEER_STORE if (dots && c.tid < p.m) p.s.adot[c.tid] = parts;
-#else
-#define STEER_FETCH
-#define STEER_STORE
-#endif
   if (p.m < TWO_SHOT_MIN) {
     post(c, which, 0, g, per, epoch, peers);
     await(c, which, 0, g, epoch, peers);
-    STEER_FETCH
     reduce4(c, which, k, epoch, nv, out, nullptr);
-    STEER_STORE
     return;
   }
   const int owner = k % RANKS;
   post(c, which, 0, g, per, epoch, per == 1 ? 1u << owner : peers);
   if (p.rank != owner) {
     await(c, which, 1, g, epoch, 1u << owner);
-    STEER_FETCH
     gather(c, inbox(p, owner, which, 1, epoch), k, nv, out);
-    STEER_STORE
     return;
   }
   await(c, which, 0, g, epoch, peers);
-  STEER_FETCH
   reduce4(c, which, k, epoch, nv, out, inbox(p, p.rank, which, 1, epoch));
   post(c, which, 1, g, per == 1 ? 1 : per / RANKS, epoch, peers);
-  STEER_STORE
-#undef STEER_FETCH
-#undef STEER_STORE
 }
 
 __device__ __forceinline__ void red4(float* dst, float4 v) {
@@ -1189,49 +1137,15 @@ __device__ void finish_woa(Ctx& c, int rb, int tg) {
 #pragma unroll
     for (int e = 0; e < 8; ++e) z[u][e] = bf(v[e]);
   }
-#if BRRR_STEER
-  float part[PER] = {};
-#endif
 #pragma unroll
   for (int u = 0; u < PER; ++u) {
     const int i = c.tid + u * GT, tok = sp.first + i / 8, col = rb * 64 + i % 8 * 8;
     const int e = block_exp(z[u], AMAX_FLOOR);
     if (i / 8 >= sp.count) continue;
     clear8(p.s.zacc + long(tok) * OA + col);
-#if BRRR_STEER
-    const uint2 q = quant8(z[u], e);
-    *reinterpret_cast<uint2*>(p.s.zq + long(tok) * OA + col) = q;
-    if (c.steer && p.steer_pre) {  // this block's 8 columns of z . v, with the E4M3 values J_WOB multiplies
-      const unsigned w[2] = {q.x, q.y};
-#pragma unroll
-      for (int j = 0; j < 8; ++j) part[u] += e4m3_value((w[j / 4] >> (8 * (j % 4))) & 0xffu) * pow2(e) * __ldg(p.w.steer_v + col + j);
-    }
-#else
     *reinterpret_cast<uint2*>(p.s.zq + long(tok) * OA + col) = quant8(z[u], e);
-#endif
     if (i % 4 == 0) p.s.zse[tok * (OA / 32) + col / 32] = uint8_t(e + 127);
   }
-#if BRRR_STEER
-  if (c.steer && p.steer_pre) {
-    // Steering, attention site: y . d = sum_r z_r . (Wob_r^T d). The 8 threads of a token sum their columns, one
-    // fixed-point add per token and block into zdot; the last of the WOA_BLOCKS blocks of this token group publishes the
-    // group's dots (steer_pub) and clears zdot, before its C_Z signal (so before any exchange flag of this rank).
-#pragma unroll
-    for (int u = 0; u < PER; ++u) {
-      const int i = c.tid + u * GT;
-      float v = part[u];
-      v += __shfl_xor_sync(0xffffffffu, v, 1);
-      v += __shfl_xor_sync(0xffffffffu, v, 2);
-      v += __shfl_xor_sync(0xffffffffu, v, 4);
-      if (i % 8 == 0 && i / 8 < sp.count) steer_dot_add(p.s.zdot + sp.first + i / 8, v);
-    }
-    if (c.arrive(C_ZD + tg, WOA_BLOCKS) && c.tid < sp.count) {
-      const int tok = sp.first + c.tid;
-      steer_pub(p, p.rank, c.epoch)[tok] = __ldcg(p.s.zdot + tok);
-      __stcg(p.s.zdot + tok, 0LL);
-    }
-  }
-#endif
   c.signal(C_Z + rb * 2 / KS_WOB * GROUPS + tg);
 }
 
@@ -1411,13 +1325,13 @@ __device__ void steer_xa_dot(Ctx& c, int k) {
 __device__ void job_xa(Ctx& c, int k) {
   c.release();
 #if BRRR_STEER
-  share(c, 0, k, c.p.s.yattn, c.steer && c.p.steer_pre);  // pre mode: also sums the ranks' published dot parts into adot
+  share(c, 0, k, c.p.s.yattn);
 #else
   share(c, 0, k, c.p.s.yattn);
 #endif
   c.signal(C_YR + k);
 #if BRRR_STEER
-  if (c.steer && !c.p.steer_pre) steer_xa_dot(c, k);
+  if (c.sm.steer) steer_xa_dot(c, k);
 #endif
 }
 
@@ -1443,10 +1357,9 @@ __device__ void owna_tile(Ctx& c, int s, int t8, const float* fn0, const float* 
   }
 #if BRRR_STEER
   // Steering, attention site (PR #404 steer_attention on the replicated post-all-reduce row): a row with scale 0 keeps
-  // its loaded value untouched. pre mode: adot holds the row's whole dot (J_XA of this chunk wrote it before C_YR);
-  // post mode: wait (after this tile's loads were issued) until every chunk added its part.
-  if (c.steer) {
-    if (!p.steer_pre) c.wait(C_YD, CHUNKS);
+  // its loaded value untouched. Wait (after this tile's loads were issued) until every chunk added its part of adot.
+  if (c.sm.steer) {
+    c.wait(C_YD, CHUNKS);
     const float d = __bfloat162float(__ldg(p.w.steer_dir + col)), g = __bfloat162float(__ldg(p.w.steer_gain + col));
 #pragma unroll
     for (int u = 0; u < PER; ++u) {
@@ -1628,7 +1541,7 @@ __device__ void finish_sh1(Ctx& c, int b, int tg) {
     // Steering, shared site: this rank's shared partial sh = W2_rank h (h = the E4M3 activation J_SH2 multiplies), so
     // sh . d = h . (W2_rank^T d) = h . u. The 32 columns of this block go into sdot now; J_XF reads it after C_SF,
     // which every J_SH2 of the row's group signals after C_HS (all of these blocks), so no extra wait.
-    if (c.steer) {
+    if (c.sm.steer) {
       const float part = warp_sum(e4m3_value(q) * pow2(e) * __ldg(p.w.steer_u + col));
       if (c.lane == 0) steer_dot_add(p.s.sdot + tok, part);
     }
@@ -1849,13 +1762,13 @@ __device__ __forceinline__ Acc8 routed_rows(const Params& p, long off, bool live
 }
 #endif
 
+#if BRRR_STEER
 // STEERED (steering builds, a launch with a nonzero scale only): the shared-site projection in the loop; the false
-// instantiation is the unsteered job.
+// instantiation is the unsteered loop. Only the loop is instantiated twice: the exchange (share) after it is one copy
+// (v3 instantiated share twice, which duplicated reduce4 / gather and added spills to them).
 template <bool STEERED>
-__device__ void job_xf_run(Ctx& c, int k) {
+__device__ void xf_mix(Ctx& c, int k, __nv_bfloat16* mine) {
   const Params& p = c.p;
-  c.release();
-  __nv_bfloat16* mine = inbox(p, p.rank, 1, 0, c.epoch);
   constexpr int XU = 2;
   for (int base = 0; base < p.m * CHUNK_VECS; base += GT * XU) {
     Acc8 rv[XU], sv[XU];
@@ -1905,15 +1818,59 @@ __device__ void job_xf_run(Ctx& c, int k) {
       *reinterpret_cast<uint4*>(mine + off) = pack8(y);
     }
   }
-  share(c, 1, k, p.y_ffn);
 }
 
 __device__ void job_xf(Ctx& c, int k) {
+  const Params& p = c.p;
+  c.release();
+  __nv_bfloat16* mine = inbox(p, p.rank, 1, 0, c.epoch);
 #if BRRR_STEER
-  if (c.steer) return job_xf_run<true>(c, k);
+  if (c.sm.steer) xf_mix<true>(c, k, mine);
+  else
 #endif
-  job_xf_run<false>(c, k);
+    xf_mix<false>(c, k, mine);
+  share(c, 1, k, p.y_ffn);
 }
+#else
+__device__ void job_xf(Ctx& c, int k) {
+  const Params& p = c.p;
+  c.release();
+  __nv_bfloat16* mine = inbox(p, p.rank, 1, 0, c.epoch);
+  constexpr int XU = 2;
+  for (int base = 0; base < p.m * CHUNK_VECS; base += GT * XU) {
+    Acc8 rv[XU], sv[XU];
+#pragma unroll
+    for (int u = 0; u < XU; ++u) {
+      const int i = base + c.tid + u * GT;
+      const bool live = i < p.m * CHUNK_VECS;
+      const long off = chunk_off(live ? i : 0, k);
+#if BRRR_ORDERED
+      rv[u] = routed_rows(p, off, live);
+#else
+      rv[u] = load8(p.s.yracc + off, live);
+#endif
+      sv[u] = load8(p.s.shacc + off, live);
+    }
+#pragma unroll
+    for (int u = 0; u < XU; ++u) {
+      const int i = base + c.tid + u * GT;
+      if (i >= p.m * CHUNK_VECS) break;
+      const long off = chunk_off(i, k);
+      clear8(p.s.yracc + off);
+      clear8(p.s.shacc + off);
+      float routed[8], shared[8], y[8];
+      unpack8(rv[u], routed);
+      unpack8(sv[u], shared);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) shared[e] = bf(shared[e]);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) y[e] = bf(routed[e]) + shared[e];
+      *reinterpret_cast<uint4*>(mine + off) = pack8(y);
+    }
+  }
+  share(c, 1, k, p.y_ffn);
+}
+#endif
 
 __device__ void deps(Ctx& c, const Job& job) {
   const Params& p = c.p;
@@ -2207,8 +2164,9 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
     bool nonzero = false;
 #pragma unroll
     for (int j = 0; j < MAXM / 32; ++j) nonzero |= scale[j] != 0.0f;
-    c.steer = __any_sync(0xffffffffu, nonzero);
-    if (tid == 0) sm.steer = c.steer;
+    nonzero = __any_sync(0xffffffffu, nonzero);
+    if (tid == 0) sm.steer = nonzero;
+    c.sync();  // every consumer warp reads sm.steer only after this
 #endif
     unsigned long long t_begin = 0, t0 = 0, t1 = 0, t2 = 0;
     if (p.prof && tid == 0) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_begin));
@@ -2260,8 +2218,7 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   __threadfence();
   for (int i = threadIdx.x; i < COUNTERS; i += THREADS) p.s.counters[i] = 0;
 #if BRRR_STEER
-  // Every CTA has finished (C_FIN), so no job reads sdot / adot any more; the next launch starts from zero. (zdot is
-  // cleared by its publishing block; in pre mode adot is overwritten whole, in post mode accumulated.)
+  // Every CTA has finished (C_FIN), so no job reads sdot / adot any more; the next launch starts from zero.
   if (sm.steer)
     for (int i = threadIdx.x; i < p.m; i += THREADS) p.s.sdot[i] = 0, p.s.adot[i] = 0;
 #endif
@@ -2338,21 +2295,6 @@ void csf_expand_all(torch::Tensor storage, torch::Tensor gdesc, std::vector<int6
 }
 
 static unsigned long long* g_prof = nullptr;
-#if BRRR_STEER
-// Attention-site dot mode of steered launches (Params::steer_pre): BRRR_STEER_DOT=pre|post at load (default post), or
-// set_steer_dot() (layer test). Read at each launch, so a CUDA graph keeps the mode it was captured with.
-static int g_steer_pre = [] {
-  const char* v = getenv("BRRR_STEER_DOT");
-  if (!v || !*v || !strcmp(v, "post")) return 0;
-  TORCH_CHECK(!strcmp(v, "pre"), "BRRR_STEER_DOT must be 'pre' or 'post', got '", v, "'");
-  return 1;
-}();
-void set_steer_dot(std::string mode) {
-  TORCH_CHECK(mode == "pre" || mode == "post", "steering dot mode must be 'pre' or 'post'");
-  g_steer_pre = mode == "pre";
-}
-std::string get_steer_dot() { return g_steer_pre ? "pre" : "post"; }
-#endif
 static const bool* g_pad = nullptr;
 void set_pad(torch::Tensor t) { TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kBool); g_pad = t.data_ptr<bool>(); }
 // Rows 0..15: accumulators [acquire wait, dependency wait, run, count] per job type (row 15: consumer loop total);
@@ -2386,6 +2328,17 @@ std::vector<torch::Tensor> route_state(int64_t handle) {
   return {w, r};
 }
 
+// TP3 test hook (host only): the last launch's reduced attention output yattn [m, HID] BF16 (replicated; steering never
+// writes it: OWNA steers its registers), so the layer test can apply upstream's steer_attention to the kernel's own y.
+torch::Tensor last_yattn(int64_t handle, int64_t m) {
+  const auto& e = engines.at(handle);
+  TORCH_CHECK(m >= 1 && m <= MAXM, "last_yattn: rows");
+  TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  auto out = torch::empty({m, HID}, torch::kBFloat16);
+  TORCH_CHECK(cudaMemcpy(out.data_ptr(), e.s.yattn, size_t(m) * HID * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost) == cudaSuccess);
+  return out;
+}
+
 void clear_routes(int64_t handle) {
   const auto& e = engines.at(handle);
   TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
@@ -2395,8 +2348,7 @@ void clear_routes(int64_t handle) {
 }
 
 
-// Steering builds append the published attention-site dot parts (steer_pub: 2 parities x MAXM fixed-point values).
-int64_t inbox_bytes() { return 2L * 2 * 2 * PUB_SLOT * sizeof(__nv_bfloat16) + (STEER ? 2L * MAXM * sizeof(long long) : 0L); }
+int64_t inbox_bytes() { return 2L * 2 * 2 * PUB_SLOT * sizeof(__nv_bfloat16); }
 
 int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, int64_t attn_per_chunk_flags) {
   TORCH_CHECK(buffers.size() == RANKS);
@@ -2436,7 +2388,6 @@ int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, i
   e.s.yroute = zeroed<float>(long(ROUTES) * HID);
 #endif
 #if BRRR_STEER
-  e.s.zdot = zeroed<long long>(MAXM);
   e.s.adot = zeroed<long long>(MAXM);
   e.s.sdot = zeroed<long long>(MAXM);
 #endif
@@ -2555,20 +2506,18 @@ int64_t add_layer(int64_t handle, torch::Tensor woa, torch::Tensor woa_s, torch:
 #if BRRR_STEER
 // Steering constants of one registered layer (brrr.Engine.register_steering): the kernel keeps raw pointers, the
 // layer keeps the tensors (persistent-arena copies on the Flare side).
-void set_steering(int64_t handle, int64_t layer, torch::Tensor direction, torch::Tensor gain_delta, torch::Tensor u, torch::Tensor v, double alpha) {
+void set_steering(int64_t handle, int64_t layer, torch::Tensor direction, torch::Tensor gain_delta, torch::Tensor u, double alpha) {
   auto& l = engines.at(handle).layers.at(layer);
   for (const auto& t : {direction, gain_delta})
     TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kBFloat16 && t.numel() == HID, "steering direction/gain: contiguous bf16 [", HID, "]");
   TORCH_CHECK(u.is_cuda() && u.is_contiguous() && u.scalar_type() == at::kFloat && u.numel() == INTER, "steering u = W2^T d: contiguous fp32 [", INTER, "]");
-  TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == at::kFloat && v.numel() == OA, "steering v = Wob^T d: contiguous fp32 [", OA, "]");
   TORCH_CHECK(std::isfinite(alpha) && alpha > 0.0, "steering alpha must be finite and positive");
-  for (const auto& t : {direction, gain_delta, u, v}) TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "steering constants must be 16-byte aligned");
+  for (const auto& t : {direction, gain_delta, u}) TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "steering constants must be 16-byte aligned");
   l.w.steer_dir = ptr<__nv_bfloat16>(direction);
   l.w.steer_gain = ptr<__nv_bfloat16>(gain_delta);
   l.w.steer_u = ptr<float>(u);
-  l.w.steer_v = ptr<float>(v);
   l.w.steer_alpha = float(alpha);
-  for (const auto& t : {direction, gain_delta, u, v}) l.keep.push_back(t);
+  for (const auto& t : {direction, gain_delta, u}) l.keep.push_back(t);
 }
 #endif
 
@@ -2656,7 +2605,6 @@ static void launch(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor
                 "BRRR tail: steering scale must be a contiguous fp32 tensor of >= ", m, " rows on the layer's device");
     p.steer_scale = ptr<float>(*steer_scale);
   }
-  p.steer_pre = g_steer_pre;
 #else
   TORCH_CHECK(!steer_scale, "BRRR tail: this build has no steering (BRRR_STEER)");
 #endif
@@ -2706,12 +2654,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("SPIN_TRAP") = SPIN_TRAP;
   m.attr("STEER") = STEER;
   m.attr("ORDERED") = ORDERED;
-#if BRRR_STEER
-  m.def("set_steer_dot", &set_steer_dot);
-  m.def("steer_dot", &get_steer_dot);
-#endif
   m.def("route_state", &route_state);
   m.def("clear_routes", &clear_routes);
+  m.def("last_yattn", &last_yattn);
   m.def("flag_bytes", &flag_bytes);
   m.def("prof_read", &prof_read);
   m.def("set_pad", &set_pad);

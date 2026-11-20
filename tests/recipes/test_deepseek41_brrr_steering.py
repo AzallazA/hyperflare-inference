@@ -59,14 +59,6 @@ def fixed_sum(parts):
     return ints.sum(-1).to(torch.float32) / FIXED
 
 
-def attention_dot(zs, vs):
-    """v2 attention-site dot (finish_woa): per rank r the dequantized E4M3 o-projection input z_r [m, OA] (zq x 2^e)
-    times v_r = Wob_r^T d [OA], one FP32 partial per 64-column finish_woa block, all ranks' blocks summed in fixed
-    point (steer_dot_add into zdot, then the published parts summed by J_XA). Returns [m] FP32."""
-    parts = [(z.view(z.shape[0], -1, 64) * v.view(-1, 64)).sum(-1) for z, v in zip(zs, vs)]
-    return fixed_sum(torch.cat(parts, -1))
-
-
 def kernel_attention(y, scale, steering, dot=None):
     """owna_tile's steered ya: y [m, HID] BF16 (the reduced attention output), scale [m] FP32, dot [m] FP32 (adot;
     default: y . d from y's 40 chunks, as v1)."""
@@ -264,48 +256,6 @@ def test_shared_site_matches_reference(m):
     assert float((got[rows] == want[rows]).float().mean()) > 0.85
 
 
-@pytest.mark.parametrize("m", [1, 8, 48])
-def test_attention_site_dot_before_the_all_reduce(m):
-    """v2: the kernel takes the attention-site dot from each rank's quantized o-projection input, sum_r z_r . v_r with
-    v_r = Wob_r^T d (FP32, the weights J_WOB multiplies), instead of y . d after the all-reduce. y itself is the BF16
-    sum of the ranks' BF16 partials, so the two dots differ by BF16 rounding of y only; the steered values must stay
-    within one BF16 step plus the projected dot difference of upstream's steer_attention(y)."""
-    OA = 3072
-    g = torch.Generator().manual_seed(800 + m)
-    steering = _steering(30 + m)
-    zs, vs, partials = [], [], []
-    for r in range(3):
-        z = quant_h((torch.randn(m, OA, generator=g) * 0.5).to(torch.bfloat16).float())
-        w = (torch.randn(HID, OA, generator=g) * 0.3).to(torch.float8_e4m3fn)
-        sc = torch.randint(118, 124, (HID // 128, OA // 128), generator=g, dtype=torch.uint8)
-        dense = w.double() * torch.exp2(sc.double() - 127).repeat_interleave(128, 0).repeat_interleave(128, 1)
-        partials.append((z.double() @ dense.T).float().to(torch.bfloat16))  # finish_wob: BF16 into the inbox
-        zs.append(z)
-        vs.append(brrr.shared_down_direction(w, sc, steering.direction))
-    y = sum(p.float() for p in partials).to(torch.bfloat16)  # reduce4: FP32 sum of the BF16 partials, BF16 out
-    scale = torch.tensor([SCALES[(i + 1) % len(SCALES)] for i in range(m)], dtype=torch.float32)
-    if m == 1:
-        scale[0] = 1.0
-    dot = attention_dot(zs, vs)
-    got = kernel_attention(y, scale, steering, dot)
-    want = steer_attention(y, steering, scale[:, None])
-    zero = scale == 0
-    assert torch.equal(got[zero].view(torch.int16), y[zero].view(torch.int16))
-    d = steering.direction.float()
-    dot_ref = y.float() @ d
-    bound = 3 * 2.0 ** -8 * (sum(p.float().abs() for p in partials) @ d.abs()) + 1e-6
-    assert bool(((dot - dot_ref).abs() <= bound).all()), float((dot - dot_ref).abs().max())
-    rows = ~zero
-    gain = (1.0 + scale[:, None] * steering.attention_gain_delta.float()).abs()
-    t_err = (scale.abs() * steering.alpha * (dot - dot_ref).abs())[:, None] * d.abs() * gain
-    w_, k_ = want[rows].float(), got[rows].float()
-    step = lambda x: torch.exp2(torch.floor(torch.log2(x.abs().clamp_min(2.0 ** -126))) - 7)
-    ulp = torch.maximum(step(w_), step(k_))
-    assert bool(((k_ - w_).abs() <= ulp + 1.01 * t_err[rows] + 1e-30).all())
-    assert float((k_ - w_).norm() / w_.norm()) < 2.0 ** -8
-    assert not torch.equal(got[rows], y[rows])
-
-
 def test_rank_partials_project_like_their_sum():
     """TP3: the shared site projects each rank's partial (linear map), the all-reduce sums them: equal to projecting
     the summed shared output up to the BF16 rounding of the partials (as upstream's TP4)."""
@@ -482,36 +432,29 @@ def test_fake_steered_op_accepts_the_tail_arguments():
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# The GPU layer test's effect gate (seq375: a cosine gate on BF16 outputs failed on correct small effects)
+# The GPU layer test's own-y expectation (v4 B gate)
 
 
-@pytest.mark.parametrize("y_scale", [0.5, 0.05])
-@pytest.mark.parametrize("s", [1.0, 0.5])
-def test_effect_gate_passes_rounding_and_catches_wrong_steering(s, y_scale):
+def test_own_y_residual_is_the_hc_mix_of_the_steered_rows():
     import test_deepseek41_brrr_steering_cuda as layer_test
 
-    g = torch.Generator().manual_seed(int(100 * s + 1000 * y_scale))
+    g = torch.Generator().manual_seed(17)
     m, hc = 6, 4
-    resid = torch.randn(m, hc, HID, generator=g)
-    y = torch.randn(m, HID, generator=g) * y_scale
-    d = torch.randn(HID, generator=g)
-    d = d / d.norm()
-    gd = 0.02 * torch.randn(HID, generator=g)
-    post = torch.rand(m, hc, generator=g) + 0.5
-    live = torch.ones(m, dtype=torch.bool)
-
-    def out(v):
-        return (resid + post[:, :, None] * v.to(torch.bfloat16).float()[:, None, :]).to(torch.bfloat16)
-
-    def steer(v, dot_error=0.0, gain=1.0):
-        return (v - (s * 3.3 * (v @ d) * (1 + dot_error))[:, None] * d) * (1 + s * gd * gain)
-
-    def gate(v_kernel):
-        coeff, _ = layer_test._effect(out(v_kernel), out(yk), out(steer(y)), out(y), live, {"projection": d, "gain": gd[None] * y})
-        return all(e <= layer_test.EFFECT_REL * n + layer_test.EFFECT_NOISE * z for e, n, z in coeff.values())
-
-    yk = y + 0.01 * torch.randn(m, HID, generator=g) * y.abs()  # the kernel's y differs from the reference's (FP8)
-    assert gate(steer(yk))
-    assert not gate(steer(yk, gain=0.0))  # gain term missing
-    if y_scale == 0.5:
-        assert not gate(steer(yk, dot_error=0.2))  # dot 20 % off
+    steering = _steering(17)
+    y = (torch.randn(m, HID, generator=g) * 0.5).to(torch.bfloat16)
+    inputs = {"residual": (torch.randn(m, hc, HID, generator=g)).to(torch.bfloat16),
+              "post": 1 + 0.1 * torch.randn(m, hc, generator=g), "comb": 0.25 + 0.05 * torch.randn(m, hc, hc, generator=g)}
+    scale = torch.tensor(SCALES[:m], dtype=torch.float32)[:, None]
+    got = layer_test._own_y_residual(y, inputs, scale, steering)
+    ya = steer_attention(y, steering, scale).float()
+    terms = [inputs["post"][:, :, None] * ya[:, None, :]] + [inputs["comb"][:, k, :, None] * inputs["residual"][:, k, None, :].float()
+                                                              for k in range(hc)]
+    want = sum(terms)
+    bound = 2.0 ** -8 * sum(t.abs() for t in terms) + 1e-30  # BF16 output rounding + FP32 sums, against their magnitudes
+    assert bool(((got.float() - want).abs() <= bound).all())
+    assert float((layer_test._bf16_steps(got, want.to(torch.bfloat16)) > 0).float().mean()) < 0.02
+    zero = scale[:, 0] == 0
+    plain = layer_test._own_y_residual(y, inputs, torch.zeros_like(scale), steering)
+    assert torch.equal(got[zero].view(torch.int16), plain[zero].view(torch.int16))
+    assert not torch.equal(got[~zero], plain[~zero])
+    assert int(layer_test._bf16_steps(torch.tensor([1.0], dtype=torch.bfloat16), torch.tensor([1.0078125], dtype=torch.bfloat16)).max()) == 1

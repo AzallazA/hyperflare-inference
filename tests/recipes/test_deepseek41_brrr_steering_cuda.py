@@ -23,21 +23,19 @@ A. (gate) ordered plain twice -> bitwise equal (the twins really are determinist
    -> bitwise equal to ordered plain (the steering code changes nothing at scale 0), and in a mixed batch (scales 0 / 1 /
    0.5 / ...) every scale-0 row bitwise equal to ordered plain's row. (info) serving builds: K plain and K steering@0
    launches, how many distinct results each and how many steering@0 results equal some plain result.
-B. attention site, serving steering build vs Flare's reference + upstream steer_attention (FFN mHC outputs, no routing
-   in them): (gate) cosine >= TOLERANCE as the main layer test (this is steered-vs-steered-reference; the plain kernel
-   sits at the same ~0.9994-0.9997 against its reference: FP8 activation quantization of the o-projections); (gate) the
-   steering EFFECT, ordered steering - ordered plain vs reference(s) - reference(0) on the steered rows' ffn_residual:
-   |dk - dr| <= EFFECT_REL |dr| + EFFECT_NOISE x the BF16 output rounding noise (v3: seq375's cosine >= 0.98 gate failed
-   where the effect is close to that noise: scale 0.5, 'uniform' rows); cosine, relative error and noise / |dr| printed.
-   v3 runs B for both attention-dot modes (set_steer_dot: post = from the reduced BF16 chunk, pre = before the
-   all-reduce).
+B. attention site, serving steering build: (gate) the kernel's ffn_residual against upstream PR #404's steer_attention
+   applied to the kernel's OWN reduced attention output (last_yattn) and owna_tile's hc mix (FP32, the kernel's
+   operation order): at most 1 BF16 step and <= OWN_Y_OFF of the elements off, steered and scale-0 rows (v4: seq377's
+   comparison with Flare's reference measured the BRRR-vs-Flare attention difference, which the projection amplifies
+   for rows with a small y . d, not steering: pre and post dot modes gave the same error); (gate) the MHC outputs
+   against Flare's reference + steer_attention, cosine >= TOLERANCE as the main layer test.
 C. shared site, ordered builds, zero attention input (attention site and routing independent of the scale):
    delta = mlp_output(s) - mlp_output(0); (gate) scale-0 rows: delta == 0 bitwise; (gate) the per-row coefficient
    delta . d against want = -s * alpha * sum_r (sh_r . d) (the reference's per-rank BF16 shared partials): least-squares
    slope in [1 - C_SLOPE, 1 + C_SLOPE] and Pearson >= C_CORR over the steered rows (rows with tiny dots are dominated by
    BF16 rounding of mlp_output, so v1's per-row max relative error was not a usable gate); off-direction share printed.
 D. (info) kernel time per launch from CUDA-graph replays (20 launches per graph, 5 interleaved rounds, median), plain /
-   steering@0 / steering@1 (post) / steering@1 (pre), serving builds; eager fallback (labelled) if capture fails.
+   steering@0 / steering@1 / steering@1 with zero constants (null), serving builds; eager fallback (labelled).
 E. FLARE_DS41_BRRR_STEER_PROF=1 (with DS41_FUSED_PROF=1; replaces A-D): per row count and variant the kernel span and per
    job type 'first run start - last run end / mean run / mean dependency wait' in us (eager launches, median of 5).
 """
@@ -68,38 +66,41 @@ MHC = ("ffn_residual", "ffn_post", "ffn_comb", "pre_mix")
 MIXED = (0.0, 1.0, 0.5, 0.0, 0.25, 1.0, 0.0, 0.75)
 ORDERED = ("BRRR_ORDERED=1",)
 SERVING_REPEATS = 4
-EFFECT_REL, EFFECT_NOISE = 0.05, 4.0
 C_SLOPE, C_CORR = 0.10, 0.95
-DOT_MODES = ("post", "pre")
+OWN_Y_OFF = 0.01  # B: at most this share of ffn_residual elements one BF16 step off the own-y expectation
 JOBS = ("WOA", "AMIX", "WOB", "XA", "OWNA", "XNORM", "GATE", "ROUTE", "SH1", "SH2", "MIX", "R1", "R2", "XF")
 
 
-def _ulp(t):
-    """BF16 spacing at each value of a BF16 tensor (as FP64)."""
-    a = t.double().abs().clamp_min(2.0 ** -126)
-    return torch.exp2(torch.floor(torch.log2(a)) - 7)
+def _bf16_steps(a, b):
+    """Distance in BF16 steps between two BF16 tensors (monotone integer map of the bit patterns)."""
+    def key(t):
+        i = t.contiguous().view(torch.int16).int()
+        return torch.where(i < 0, -(i & 0x7FFF), i)
+    return (key(a) - key(b)).abs()
 
 
-def _effect(k_s, k_0, r_s, r_0, live, directions):
-    """Steering effect of the kernel (dk = k_s - k_0) against the reference's (dr = r_s - r_0) on the steered rows of a
-    [m, HC, HID] output. The four are BF16 with steps comparable to the effect itself (the projection moves a row by
-    s alpha (y . d) d, the gain by s (g - 1) y: a few BF16 steps of the residual), so an element-wise comparison measures
-    mostly output rounding: seq375's cosine >= 0.98 gate failed on small effects (scale 0.5, 'uniform' rows) while
-    the kernel was right. The gate instead compares the effect's coefficients along the two directions steering
-    moves a row, per row and hc stream: c[row, h] = delta[row, h, :] . v[row, :] for v = d (projection) and
-    v = (g - 1) * y_ref (gain); a 5120-long dot averages the rounding away (noise = its standard deviation, from the
-    four outputs' ulp^2 / 12, an upper bound). Returns {direction: (|ck - cr|, |cr|, noise)} and the element-wise
-    cosine (information)."""
-    dk = (k_s.double() - k_0.double())[live]
-    dr = (r_s.double() - r_0.double())[live]
-    var = sum(_ulp(t)[live] ** 2 for t in (k_s, k_0, r_s, r_0)) / 12.0
-    out = {}
-    for name, v in directions.items():
-        v = v.double()[live][:, None, :] if v.dim() == 2 else v.double()[None, None, :]
-        ck, cr = (dk * v).sum(-1), (dr * v).sum(-1)
-        noise = float((var * v * v).sum(-1).sum().sqrt())
-        out[name] = (float((ck - cr).norm()), float(cr.norm()), noise)
-    return out, _cos(dk, dr)
+def _f32(x):
+    return x.float().double()
+
+
+def _own_y_residual(y, inputs, scale, steering):
+    """The steered layer's ffn_residual as the kernel must produce it from its own reduced attention output y [m, HID]
+    BF16 (last_yattn): upstream PR #404's steer_attention(y) (rows with scale 0: y itself), then owna_tile's hc mix in
+    FP32 with the kernel's operation order, r1[j] = bf16(fma(comb[3][j], rk[3], ... fma(comb[0][j], rk[0],
+    post[j] * ya))), emulated in FP64 with one FP32 rounding per operation. [m, HC, HID] BF16."""
+    from ignition.recipes.deepseek41.steering import steer_attention
+
+    ya = _f32(steer_attention(y, steering, scale))          # [m, HID]
+    post, comb = inputs["post"].float(), inputs["comb"].float()  # [m, HC], [m, HC, HC] (comb[t, k, j])
+    rk = inputs["residual"].float()                           # [m, HC, HID]
+    hc = post.shape[1]
+    out = []
+    for j in range(hc):
+        v = _f32(post[:, j, None].double() * ya)
+        for k in range(hc):
+            v = _f32(comb[:, k, j, None].double() * rk[:, k].double() + v)
+        out.append(v)
+    return torch.stack(out, 1).to(torch.bfloat16)
 
 
 def _scales(kind, m, device):
@@ -183,20 +184,19 @@ def _variants(tails, m, device):
     steer1 - steer1null is the data-dependent part of steer1's cost, steer1null - steer0 the code paths'."""
     zero, one = _scales("zero", m, device), _scales("one", m, device)
     return (("plain", tails["plain"], None, "post", False), ("steer0", tails["steer"], zero, "post", False),
-            ("steer1", tails["steer"], one, "post", False), ("steer1pre", tails["steer"], one, "pre", False),
-            ("steer1null", tails["steer"], one, "post", True))
+            ("steer1", tails["steer"], one, "post", False), ("steer1null", tails["steer"], one, "post", True))
 
 
 def _set_constants(engine, layer, null):
     """Re-register layer's steering constants: the real ones, or a no-op steering (zero direction, u, v and gain delta;
     set_steering requires alpha > 0, so alpha stays): every steering code path runs and the values stay those of scale 0
     (up to the sign of a zero)."""
-    steering, u, v = engine.steered[layer]
+    steering, u = engine.steered[layer]
     if null:
-        consts = [torch.zeros_like(t) for t in (steering.direction, steering.attention_gain_delta, u, v)]
+        consts = [torch.zeros_like(t) for t in (steering.direction, steering.attention_gain_delta, u)]
         engine.keep += consts
     else:
-        consts = [steering.direction, steering.attention_gain_delta, u, v]
+        consts = [steering.direction, steering.attention_gain_delta, u]
     engine.ext.set_steering(engine.local_handle, engine.slots[layer], *consts, float(steering.alpha))
 
 
@@ -294,7 +294,6 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                     for m in rows_sweep:
                         inputs, positions = tail_test._make_inputs(m, heads, seed=99, rank=rank, profile="random", resid_scale=1.0, device=device)
                         for name, tail, scale, dot, null in _variants(tails, m, device):
-                            engines["steer"].ext.set_steer_dot(dot)
                             _set_constants(engines["steer"], layer, null)
                             ext = engines["plain" if name == "plain" else "steer"].ext
                             runs = []
@@ -313,7 +312,6 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                                     parts.append(f"{job}={(pr[16 + j, 1] - t0) / 1e3:.1f}-{(pr[16 + j, 2] - t0) / 1e3:.1f}"
                                                  f"/{pr[j, 2] / pr[j, 3] / 1e3:.2f}/{pr[j, 1] / pr[j, 3] / 1e3:.2f}")
                             note(f"m={m} E prof {name}: span={float(span):.1f} " + " ".join(parts))
-                        engines["steer"].ext.set_steer_dot("post")
                         _set_constants(engines["steer"], layer, False)
                 else:
                     seed = 7000 + 100 * layer
@@ -352,41 +350,32 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                                  f"plain repeat {repeat} | {info}" + (f" FAIL {bad}" if bad else ""))
                             if bad:
                                 fail(m, profile, "A", bad, zero_mm, mixed_mm, repeat)
-                            # B. attention site against the reference, both dot modes.
-                            ref.steering = None
-                            unsteered = ref(inputs, positions)
-                            directions = {"projection": steering.direction,
-                                          "gain": steering.attention_gain_delta.float()[None, :] * ref.attention_output.float()}
+                            # B. attention site: (gate) against upstream's formula on the kernel's own attention output; (gate)
+                            # the MHC outputs against Flare's reference + steer_attention (cosine, as the main layer test).
                             for kind in ("one", "half", "mixed"):
                                 scale = _scales(kind, m, device)
                                 ref.steering, ref.scale = steering, scale
                                 want = ref(inputs, positions)
+                                got = _run(tails["steer"], inputs, positions, scale)
+                                y = engines["steer"].ext.last_yattn(engines["steer"].local_handle, m).to(device)
+                                sync()
+                                stats = {name: tail_test._stats(got[name], want[name]) for name in MHC}
+                                bad = [name for name, st in stats.items() if not st["finite"] or st["cosine"] < tail_test.TOLERANCE]
+                                steps = _bf16_steps(got["ffn_residual"], _own_y_residual(y, inputs, scale, steering))
                                 live = scale[:, 0] != 0
-                                for mode in DOT_MODES:
-                                    for name in ("steer", "steer_ord"):
-                                        engines[name].ext.set_steer_dot(mode)
-                                    got = _run(tails["steer"], inputs, positions, scale)
-                                    effect = _run(tails["steer_ord"], inputs, positions, scale)
-                                    sync()
-                                    stats = {name: tail_test._stats(got[name], want[name]) for name in MHC}
-                                    bad = [name for name, st in stats.items() if not st["finite"] or st["cosine"] < tail_test.TOLERANCE]
-                                    coeff, dcos = _effect(effect["ffn_residual"], o1["ffn_residual"], want["ffn_residual"],
-                                                          unsteered["ffn_residual"], live, directions)
-                                    text = []
-                                    for dname, (err, norm, noise) in coeff.items():
-                                        text.append(f"{dname} relerr={err / max(norm, 1e-30):.4f} noise={noise / max(norm, 1e-30):.4f}")
-                                        if not norm > 0:
-                                            bad.append(f"reference did not move along {dname}")
-                                        elif not err <= EFFECT_REL * norm + EFFECT_NOISE * noise:
-                                            bad.append(f"effect along {dname}: error {err / norm:.4f} of the reference's > {EFFECT_REL} + "
-                                                       f"{EFFECT_NOISE} x noise {noise / norm:.4f}")
-                                    note(f"m={m} {profile} B {kind} {mode}: " + " ".join(
-                                        f"{n} cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f}" for n, st in stats.items())
-                                        + f" effect ffn_residual cos={dcos:.6f} " + " ".join(text) + (f" FAIL {bad}" if bad else ""))
-                                    if bad:
-                                        fail(m, profile, "B", kind, mode, bad)
-                            for name in ("steer", "steer_ord"):
-                                engines[name].ext.set_steer_dot("post")
+                                own = []
+                                for label, rows in (("steered", live), ("scale-0", ~live)):
+                                    if bool(rows.any()):
+                                        st_ = steps[rows]
+                                        mx, off = int(st_.max()), float((st_ > 0).float().mean())
+                                        own.append(f"{label} rows max {mx} off {off:.5f}")
+                                        if mx > 1 or off > OWN_Y_OFF:
+                                            bad.append(f"own-y {label}: max {mx} BF16 steps, {off:.4f} of elements off (limit 1, {OWN_Y_OFF})")
+                                note(f"m={m} {profile} B {kind}: " + " ".join(
+                                    f"{n} cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f}" for n, st in stats.items())
+                                    + " own-y ffn_residual: " + ", ".join(own) + (f" FAIL {bad}" if bad else ""))
+                                if bad:
+                                    fail(m, profile, "B", kind, bad)
                     # C. shared site, ordered builds, zero attention input.
                     m, ref = capacity, refs[capacity]
                     seed += 1
@@ -430,7 +419,6 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                             mode, graphs = "graph", {}
                             try:
                                 for name, tail, scale, dot, null in variants:
-                                    engines["steer"].ext.set_steer_dot(dot)
                                     _set_constants(engines["steer"], layer, null)
                                     graphs[name] = _graph_time(tail, inputs, positions, scale)
                                     sync()
@@ -440,8 +428,7 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                             samples = {name: [] for name, *_ in variants}
                             for _ in range(5):
                                 for name, tail, scale, dot, null in variants:
-                                    if not graphs:  # a graph keeps its capture's mode and constants
-                                        engines["steer"].ext.set_steer_dot(dot)
+                                    if not graphs:  # a graph keeps its capture's constants
                                         _set_constants(engines["steer"], layer, null)
                                     sync()
                                     start = time.perf_counter()
@@ -457,7 +444,6 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                             med = {name: sorted(v)[len(v) // 2] for name, v in samples.items()}
                             note(f"m={m} D us/launch ({mode}) " + " ".join(f"{k}={v:.1f}" for k, v in med.items()))
                             del graphs
-                            engines["steer"].ext.set_steer_dot("post")
                             _set_constants(engines["steer"], layer, False)
                 gathered = [None] * WORLD
                 dist.all_gather_object(gathered, failures, group=group)
