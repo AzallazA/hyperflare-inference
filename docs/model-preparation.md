@@ -139,9 +139,12 @@ IDs with upstream when changing encoder behavior.
 
 The preparation dependency tracks the `main` branch of
 `local-inference-lab/flashinfer` in `pyproject.toml`; `uv.lock` records the
-resolved commit. `python scripts/setup_preparation.py` advances the locked
-commit and rebuilds FlashInfer automatically. To advance `uv.lock` alone, run
-`uv lock --upgrade-package flashinfer-python`, then sync the environment.
+resolved commit. `.github/workflows/track-flashinfer-main.yml` checks
+`local-inference-lab/flashinfer` `main` every 15 minutes and updates `uv.lock`
+on `main` when it advances, so `uv sync --locked --extra prepare --extra test`
+tracks `main` without manual pin edits. To pull an unmerged commit ahead of the
+scheduled refresh, run `uv lock --upgrade-package flashinfer-python` or
+`python scripts/setup_preparation.py`.
 For local FlashInfer development, install the sibling
 checkout explicitly with `uv pip install --python .venv/bin/python --no-deps -e ../flashinfer`;
 `uv sync --locked --extra prepare --extra test` restores the Git dependency.
