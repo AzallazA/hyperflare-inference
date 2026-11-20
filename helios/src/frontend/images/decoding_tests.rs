@@ -96,11 +96,11 @@ fn sixteen_bit_png_modes_match_pillow() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/frontend");
     let manifest: Value =
         serde_json::from_slice(&fs::read(root.join("png_16bit.json")).unwrap()).unwrap();
-    // This fork has no padded-grid profile (Inkling); every profile here keeps PNG alpha
-    // except for RGB sources, as MoonViT does, so check MoonViT and the DeepSeek V4 profile.
-    for settings in [
-        super::ImageSettings::Moonvit {},
-        super::ImageSettings::Deepseek4 {},
+    // This fork has no padded-grid profile (Inkling). Only MoonViT keeps PNG alpha (non-RGB
+    // sources); the DeepSeek V4 profile drops it, so its RGB is checked and its alpha absent.
+    for (settings, keeps_alpha) in [
+        (super::ImageSettings::Moonvit {}, true),
+        (super::ImageSettings::Deepseek4 {}, false),
     ] {
         let processor =
             super::ImageProcessor::load(settings, ImageLimits::default()).unwrap();
@@ -118,6 +118,10 @@ fn sixteen_bit_png_modes_match_pillow() {
             );
             let expected = fs::read(root.join(case["rgb"].as_str().unwrap())).unwrap();
             assert_eq!(image.pixels(), expected.as_slice(), "{name} rgb");
+            if !keeps_alpha {
+                assert!(image.alpha.is_none(), "{name} alpha");
+                continue;
+            }
             let expected_rgba = fs::read(root.join(case["rgba"].as_str().unwrap())).unwrap();
             let mut rgba = Vec::with_capacity(expected_rgba.len());
             for (index, pixel) in image.pixels().chunks_exact(3).enumerate() {
