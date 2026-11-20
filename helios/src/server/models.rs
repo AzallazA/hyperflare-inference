@@ -318,10 +318,10 @@ mod tests {
         assert_eq!(text["flare"]["vocab_size"], 1024);
         assert_eq!(text["flare"]["default_max_tokens"], 2048);
         assert_eq!(text["flare"]["thinking_token_budget"], Value::Null);
-        assert_eq!(
-            text["flare"]["sampling_defaults"],
-            json!(model.sampling_defaults)
-        );
+        // Cores without a steering sidecar keep the pre-steering wire form (no steering_scale key).
+        let mut unsteered = json!(model.sampling_defaults);
+        unsteered.as_object_mut().unwrap().remove("steering_scale");
+        assert_eq!(text["flare"]["sampling_defaults"], unsteered);
         assert_eq!(
             text["flare"]["sampling_ranges"],
             json!(model.sampling_ranges)
