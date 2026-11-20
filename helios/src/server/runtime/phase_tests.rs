@@ -5811,6 +5811,12 @@ async fn steering_request(
             response.abort();
             SteeringOutcome::Admitted(scale)
         }
+        Raced::Answered(answered) if answered.status().is_success() => {
+            // A streaming request answers 200 with its SSE head once admitted; the body only ends with tokens.
+            drop(answered);
+            let incoming = admitted.await.unwrap().expect("a 200 answer without an admitted request");
+            SteeringOutcome::Admitted(incoming[0].prompt.sampling.steering_scale)
+        }
         Raced::Answered(answered) => {
             let status = answered.status().as_u16();
             let bytes = axum::body::to_bytes(answered.into_body(), 65536).await.unwrap();
