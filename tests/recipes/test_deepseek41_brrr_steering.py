@@ -458,3 +458,45 @@ def test_own_y_residual_is_the_hc_mix_of_the_steered_rows():
     assert torch.equal(got[zero].view(torch.int16), plain[zero].view(torch.int16))
     assert not torch.equal(got[~zero], plain[~zero])
     assert int(layer_test._bf16_steps(torch.tensor([1.0], dtype=torch.bfloat16), torch.tensor([1.0078125], dtype=torch.bfloat16)).max()) == 1
+
+
+def test_own_y_check_passes_rounding_and_catches_row_and_element_errors():
+    """v5 B gate: an exact kernel passes; a kernel whose hc mix runs in another FP32 order (here: the terms summed in
+    reverse) passes; a row steered with a 10 % wrong dot (a missed chunk / wrong row's scale) fails the projection check;
+    one element off by many BF16 steps where the terms do not cancel fails the element bound."""
+    import test_deepseek41_brrr_steering_cuda as layer_test
+
+    g = torch.Generator().manual_seed(23)
+    m, hc = 8, 4
+    steering = _steering(23)
+    y = (torch.randn(m, HID, generator=g) * 0.5).to(torch.bfloat16)
+    inputs = {"residual": torch.randn(m, hc, HID, generator=g).to(torch.bfloat16),
+              "post": 1 + 0.1 * torch.randn(m, hc, generator=g), "comb": 0.25 + 0.05 * torch.randn(m, hc, hc, generator=g)}
+    scale = torch.tensor(SCALES[:m], dtype=torch.float32)[:, None]
+    exact = layer_test._own_y_residual(y, inputs, scale, steering)
+
+    def ok(got):
+        r = layer_test._own_y_check(got, y, inputs, scale, steering)
+        return all(v["out"] == 0 for k, v in r.items() if k != "proj") and r["proj"][2] == 0, r
+
+    good, r = ok(exact)
+    assert good and r["proj"][0] >= 3, r
+    ya = steer_attention(y, steering, scale).float().double()
+    post, comb, rk = inputs["post"].double(), inputs["comb"].double(), inputs["residual"].double()
+    rev = torch.stack([(sum(comb[:, k, j, None] * rk[:, k] for k in reversed(range(hc))) + post[:, j, None] * ya).float()
+                       for j in range(hc)], 1).to(torch.bfloat16)
+    assert ok(rev)[0], ok(rev)[1]
+    wrong = steering.alpha * 1.1
+    bad_ya = ya.clone()
+    row = int(torch.nonzero(scale[:, 0] == 1.0)[0])
+    yd = (y[row].float().double() @ steering.direction.double())
+    bad_ya[row] = ((y[row].float().double() - wrong * yd * steering.direction.double())
+                   * (1 + steering.attention_gain_delta.double())).to(torch.bfloat16).double()
+    bad = torch.stack([(post[:, j, None] * bad_ya + sum(comb[:, k, j, None] * rk[:, k] for k in range(hc))).float()
+                       for j in range(hc)], 1).to(torch.bfloat16)
+    good, r = ok(bad)
+    assert not good and r["proj"][2] >= 1, r
+    poke = exact.clone()
+    poke[1, 2, 100] = (poke[1, 2, 100].float() * 1.25 + 0.5).to(torch.bfloat16)
+    good, r = ok(poke)
+    assert not good, r

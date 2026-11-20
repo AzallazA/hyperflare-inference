@@ -25,7 +25,9 @@ A. (gate) ordered plain twice -> bitwise equal (the twins really are determinist
    launches, how many distinct results each and how many steering@0 results equal some plain result.
 B. attention site, serving steering build: (gate) the kernel's ffn_residual against upstream PR #404's steer_attention
    applied to the kernel's OWN reduced attention output (last_yattn) and owna_tile's hc mix (FP32, the kernel's
-   operation order): at most 1 BF16 step and <= OWN_Y_OFF of the elements off, steered and scale-0 rows (v4: seq377's
+   operation order): every element within a derived rounding bound and every steered row's projection along d within
+   1 % (_own_y_check; v5: seq379's 'at most 1 BF16 step' failed only at elements where the five hc terms cancel, on
+   scale-0 rows too, i.e. FP32 operation order, not steering), steered and scale-0 rows (v4: seq377's
    comparison with Flare's reference measured the BRRR-vs-Flare attention difference, which the projection amplifies
    for rows with a small y . d, not steering: pre and post dot modes gave the same error); (gate) the MHC outputs
    against Flare's reference + steer_attention, cosine >= TOLERANCE as the main layer test.
@@ -67,7 +69,8 @@ MIXED = (0.0, 1.0, 0.5, 0.0, 0.25, 1.0, 0.0, 0.75)
 ORDERED = ("BRRR_ORDERED=1",)
 SERVING_REPEATS = 4
 C_SLOPE, C_CORR = 0.10, 0.95
-OWN_Y_OFF = 0.01  # B: at most this share of ffn_residual elements one BF16 step off the own-y expectation
+FP32_ORDER_ULPS = 8   # B: FP32 rounding allowance of the hc mix (5 terms, any order), in units of 2^-24 x sum |terms|
+PROJ_REL, PROJ_SIGMA, PROJ_MIN_SIGMA = 0.01, 4.0, 50.0  # B projection check: 1 % + 4 sigma, rows with |c| >= 50 sigma
 JOBS = ("WOA", "AMIX", "WOB", "XA", "OWNA", "XNORM", "GATE", "ROUTE", "SH1", "SH2", "MIX", "R1", "R2", "XF")
 
 
@@ -83,24 +86,75 @@ def _f32(x):
     return x.float().double()
 
 
-def _own_y_residual(y, inputs, scale, steering):
+def _own_y_residual(y, inputs, scale, steering, detail=False):
     """The steered layer's ffn_residual as the kernel must produce it from its own reduced attention output y [m, HID]
     BF16 (last_yattn): upstream PR #404's steer_attention(y) (rows with scale 0: y itself), then owna_tile's hc mix in
     FP32 with the kernel's operation order, r1[j] = bf16(fma(comb[3][j], rk[3], ... fma(comb[0][j], rk[0],
-    post[j] * ya))), emulated in FP64 with one FP32 rounding per operation. [m, HC, HID] BF16."""
+    post[j] * ya))), emulated in FP64 with one FP32 rounding per operation. [m, HC, HID] BF16; with ``detail`` also
+    sum |terms| [m, HC, HID] (FP64) and the steered BF16 attention row ya' [m, HID] (FP64)."""
     from ignition.recipes.deepseek41.steering import steer_attention
 
     ya = _f32(steer_attention(y, steering, scale))          # [m, HID]
     post, comb = inputs["post"].float(), inputs["comb"].float()  # [m, HC], [m, HC, HC] (comb[t, k, j])
     rk = inputs["residual"].float()                           # [m, HC, HID]
     hc = post.shape[1]
-    out = []
+    out, mag = [], []
     for j in range(hc):
         v = _f32(post[:, j, None].double() * ya)
+        a = (post[:, j, None].double() * ya).abs()
         for k in range(hc):
             v = _f32(comb[:, k, j, None].double() * rk[:, k].double() + v)
+            a = a + (comb[:, k, j, None].double() * rk[:, k].double()).abs()
         out.append(v)
-    return torch.stack(out, 1).to(torch.bfloat16)
+        mag.append(a)
+    res = torch.stack(out, 1).to(torch.bfloat16)
+    return (res, torch.stack(mag, 1), ya) if detail else res
+
+
+def _half_ulp(x):
+    """Half a BF16 step at |x| (FP64; 0 at 0)."""
+    a = x.double().abs()
+    return torch.where(a > 0, torch.exp2(torch.floor(torch.log2(a.clamp_min(2.0 ** -126))) - 8), torch.zeros_like(a))
+
+
+def _own_y_check(got, y, inputs, scale, steering):
+    """B (v5): the kernel's ffn_residual `got` [m, HC, HID] against upstream's steer_attention on the kernel's own y and
+    owna_tile's hc mix (_own_y_residual), element-wise within a derived bound, plus a projection check per row.
+
+    Element bound |got - want| <= half a BF16 step of each (output rounding) + FP32_ORDER_ULPS x 2^-24 x sum |terms|
+    (the hc mix in another FP32 operation order: seq379's scale-0 rows were up to 4 BF16 steps off at elements where the
+    five terms cancel, i.e. a result far below its terms) + on steered rows |post_j| x one BF16 step of ya' (the kernel's
+    dot is a fixed-point sum, upstream's an FP32 GEMV; a last-bit difference of t can move ya' across a BF16 rounding
+    boundary). An element outside it is an error no rounding explains.
+    Projection: per steered row and hc stream, c = (out - mix(y unsteered)) . d for the kernel and the expectation; rows
+    with |c_want| >= PROJ_MIN_SIGMA sigma (sigma from the BF16 rounding of the outputs along d) must agree within
+    PROJ_REL + PROJ_SIGMA sigma. A wrong / incomplete dot for a row (a missed chunk, a race on adot, the scale of another
+    row) moves the whole row along d and fails here, while element-wise it could hide below the bound.
+    Returns a dict per label ('steered', 'scale-0'): out (elements beyond the bound), max_steps (information), worst
+    (|got - want| / bound, information); and proj: (rows checked, rows total, rows failed, worst relative error)."""
+    want, mag, ya = _own_y_residual(y, inputs, scale, steering, detail=True)
+    base = _own_y_residual(y, inputs, torch.zeros_like(scale), steering)
+    post = inputs["post"].double()
+    live = scale[:, 0] != 0
+    flip = torch.where(live[:, None, None], post.abs()[:, :, None] * 2 * _half_ulp(ya)[:, None, :], torch.zeros_like(mag))
+    bound = _half_ulp(got) + _half_ulp(want) + FP32_ORDER_ULPS * 2.0 ** -24 * mag + flip
+    err = (got.double() - want.double()).abs()
+    steps = _bf16_steps(got, want)
+    out = {}
+    for label, rows in (("steered", live), ("scale-0", ~live)):
+        if bool(rows.any()):
+            out[label] = dict(out=int((err[rows] > bound[rows]).sum()), max_steps=int(steps[rows].max()),
+                              worst=float((err[rows] / bound[rows].clamp_min(1e-30)).max()))
+    d = steering.direction.double()
+    ck = ((got.double() - base.double()) * d).sum(-1)[live]
+    cr = ((want.double() - base.double()) * d).sum(-1)[live]
+    var = ((2 * _half_ulp(got)) ** 2 + (2 * _half_ulp(want)) ** 2 + 2 * (2 * _half_ulp(base)) ** 2) / 12.0 + flip ** 2 / 3.0
+    sigma = ((var * d * d).sum(-1)[live]).sqrt()
+    use = cr.abs() >= PROJ_MIN_SIGMA * sigma
+    rel = (ck - cr).abs() / cr.abs().clamp_min(1e-30)
+    badrows = use & ((ck - cr).abs() > PROJ_REL * cr.abs() + PROJ_SIGMA * sigma)
+    out["proj"] = (int(use.sum()), int(use.numel()), int(badrows.sum()), float(rel[use].max()) if bool(use.any()) else 0.0)
+    return out
 
 
 def _scales(kind, m, device):
@@ -361,16 +415,17 @@ def _rank(rank, rendezvous, snapshot, env, layer):
                                 sync()
                                 stats = {name: tail_test._stats(got[name], want[name]) for name in MHC}
                                 bad = [name for name, st in stats.items() if not st["finite"] or st["cosine"] < tail_test.TOLERANCE]
-                                steps = _bf16_steps(got["ffn_residual"], _own_y_residual(y, inputs, scale, steering))
-                                live = scale[:, 0] != 0
+                                chk = _own_y_check(got["ffn_residual"], y, inputs, scale, steering)
                                 own = []
-                                for label, rows in (("steered", live), ("scale-0", ~live)):
-                                    if bool(rows.any()):
-                                        st_ = steps[rows]
-                                        mx, off = int(st_.max()), float((st_ > 0).float().mean())
-                                        own.append(f"{label} rows max {mx} off {off:.5f}")
-                                        if mx > 1 or off > OWN_Y_OFF:
-                                            bad.append(f"own-y {label}: max {mx} BF16 steps, {off:.4f} of elements off (limit 1, {OWN_Y_OFF})")
+                                for label in ("steered", "scale-0"):
+                                    if label in chk:
+                                        r = chk[label]
+                                        own.append(f"{label} rows out {r['out']} max {r['max_steps']} worst {r['worst']:.3f}"
+                                                   + (" proj {} of {} rows checked bad {} worst {:.5f}".format(*chk["proj"]) if label == "steered" else ""))
+                                        if r["out"]:
+                                            bad.append(f"own-y {label}: {r['out']} element(s) beyond the rounding bound")
+                                if chk["proj"][2]:
+                                    bad.append(f"own-y projection: {chk['proj'][2]} row(s) off along d")
                                 note(f"m={m} {profile} B {kind}: " + " ".join(
                                     f"{n} cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f}" for n, st in stats.items())
                                     + " own-y ffn_residual: " + ", ".join(own) + (f" FAIL {bad}" if bad else ""))
