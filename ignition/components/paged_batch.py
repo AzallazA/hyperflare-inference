@@ -45,6 +45,13 @@ class BatchInputs:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
 
+def steering_parameters(requests):
+    """The request parameter table when it carries the steering column (7 columns), else None. TP3 fork: request
+    stand-ins without ``parameters`` (unit-test fakes) and 6-column states both mean no steering."""
+    parameters = getattr(requests, "parameters", None)
+    return parameters if parameters is not None and parameters.ndim == 2 and parameters.shape[1] == 7 else None
+
+
 def gather_token_steering_scale(parameters, row_slot_ids, token_requests, token_positions):
     """Gather one request-owned steering scale for every packed token row."""
     if parameters.ndim != 2 or parameters.shape[1] != 7:
@@ -317,8 +324,8 @@ class PreparedBatch:
         tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else pending_tokens[request]
         token_positions = torch.where(live, positions[request] + offsets - starts[request], -1)
         steering_scale = (gather_token_steering_scale(
-            r.parameters, b.row_slot_ids[:self.rows], request, token_positions)
-            if r.parameters.shape[1] == 7 else None)
+            steering_parameters(r), b.row_slot_ids[:self.rows], request, token_positions)
+            if steering_parameters(r) is not None else None)
         return Metadata(
             torch.where(live, tokens, 0),
             (ends - 1).clamp(min=0).to(torch.int64).expand(self.sample_count),

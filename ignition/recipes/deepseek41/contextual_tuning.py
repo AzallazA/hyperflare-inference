@@ -33,7 +33,7 @@ class _LayerTrial:
         indices = f.indices(f.metadata, replay_start=f.replay_start)
         incoming, _, _, _ = self.layer(
             f.incoming, f.pre_mix, f.metadata, indices, f.selection,
-            token_scale=f.token_scale)
+            **({} if f.token_scale is None else {"token_scale": f.token_scale}))
         f.output.copy_(incoming[0])
 
 
@@ -46,7 +46,7 @@ class _LayerObservation:
         indices = f.indices(f.metadata, replay_start=f.replay_start)
         *_, observations = self.layer._run(
             f.incoming, f.pre_mix, f.metadata, indices, f.selection,
-            token_scale=f.token_scale)
+            **({} if f.token_scale is None else {"token_scale": f.token_scale}))
         for name, destination in f.observations.items():
             source = observations[name]
             if isinstance(destination, tuple):
@@ -96,7 +96,7 @@ class CatalogLayerFixture:
         self.tokens = self.metadata.positions.numel()
         self.batch = self.metadata.starts.numel()
         self.width = self.metadata.max_query_tokens
-        self.token_scale = (None if self.layer.steering is None else
+        self.token_scale = (None if getattr(self.layer, "steering", None) is None else
                             torch.ones((self.tokens, 1), dtype=torch.float32,
                                        device=self.metadata.positions.device))
         self.label = f"{name}.layer{layer_index}"

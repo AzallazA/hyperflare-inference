@@ -16,6 +16,8 @@ from ignition.components.mhc import MHCScratch, MHCWeights, PreparedMHC, Prepare
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.ring_commit import PreparedRingCommit
+from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import register_finalizer
 
@@ -223,6 +225,7 @@ class PreparedLayer:
     # TP3 fork attributes; class defaults keep the upstream behaviour (one router-ID-ordered bank, no debug hooks).
     hot_map = None
     brrr = None
+    steering = None  # steering sidecar constants of this layer (PR #404 port); None = unsteered
     no_engram = False
     # TP3 tp3.engram_side_layers: the NEXT layer's PreparedEngram whose hidden-state-free part this layer runs on a
     # side stream (started before this layer's attention, joined before its tail); None = none (base).
@@ -673,7 +676,7 @@ class PreparedDecoder:
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, tp3=tp3, probe=self.probe,
                 index_split=index_split if layer_metadata is metadata else None,
-                steering=None if weights.steering is None else weights.steering.layers.get(index)))
+                steering=None if getattr(weights, "steering", None) is None else weights.steering.layers.get(index)))
             carry = defer
         configure_engram_side(self.layers, tp3.engram_side_layers, mode)
         self.route_capture = RouteCapture()
@@ -729,8 +732,8 @@ class PreparedDecoder:
         self.probe.positions(metadata.positions, self.mode)
         if self.route_capture.enabled:
             self.route_capture.step(metadata.positions, self.mode)
-        token_scale = metadata.steering_scale
-        if self.weights.steering is not None and token_scale is None:
+        token_scale = getattr(metadata, "steering_scale", None)
+        if getattr(self.weights, "steering", None) is not None and token_scale is None:
             raise ValueError("steering-enabled decoder requires per-token scale metadata")
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
