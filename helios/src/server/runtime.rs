@@ -1610,8 +1610,8 @@ impl<'a> Worker<'a> {
         kind: GraphKind,
         mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
-        self.scheduler
-            .advance_to(super::observation::monotonic_ns())?;
+        let completed_at_ns = super::observation::monotonic_ns();
+        self.scheduler.advance_to(completed_at_ns)?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
         let selection = self.scheduler.submitted_timing(completion.fence)?;
         if measured_step.kind != kind {
@@ -1687,7 +1687,7 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
-        self.metrics.replay_completed(completion.timing);
+        self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
         }

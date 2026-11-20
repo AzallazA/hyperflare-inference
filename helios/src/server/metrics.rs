@@ -211,6 +211,7 @@ const HOST_TOKEN_BUCKETS: [u64; 8] = [64, 256, 1024, 4096, 16384, 65536, 262144,
 #[derive(Default)]
 pub(super) struct Metrics {
     pub scheduler_trace: scheduler::SchedulerMetrics,
+    pub prefill_plot: std::sync::OnceLock<Box<super::dashboard::PrefillPlot>>,
     pub history_drafts: bool,
     total_pages: u64,
     page_tokens: u64,
@@ -376,9 +377,12 @@ impl Metrics {
         snapshot
     }
 
-    pub fn replay_completed(&self, timing: crate::execution::ExecutionTiming) {
+    pub fn replay_completed(&self, completed_at_ns: u64, timing: crate::execution::ExecutionTiming, prefill: u64) {
         let raw = timing.gpu_ns.into_iter().flatten().max().unwrap_or(0);
         self.replay_gpu_ns.fetch_add(raw, Ordering::Relaxed);
+        if prefill > 0 && self.scheduler_trace.is_enabled() && let Some(plot) = self.prefill_plot.get() {
+            plot.record(completed_at_ns, raw, prefill);
+        }
         if let Some(intervals) = timing.readiness {
             self.replay_readiness_wait_ns.fetch_add(intervals.wait_ns(), Ordering::Relaxed);
             self.replay_readiness_samples.fetch_add(1, Ordering::Relaxed);
@@ -1446,10 +1450,10 @@ mod tests {
         let mut timing = crate::execution::ExecutionTiming::default();
         timing.gpu_ns[0] = Some(10_000);
         timing.gpu_ns[1] = Some(9_000);
-        metrics.replay_completed(timing);
+        metrics.replay_completed(0, timing, 0);
         let bytes = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
         timing.readiness = Some(crate::execution::ReadinessIntervals::decode(&bytes).unwrap());
-        metrics.replay_completed(timing);
+        metrics.replay_completed(0, timing, 0);
         let snapshot = metrics.snapshot(false);
         assert_eq!(snapshot.replay_gpu_ns, 20_000);
         assert_eq!(snapshot.replay_readiness_wait_ns, 2_000);

@@ -259,6 +259,12 @@
     latency measurements; measure GPU replay, queueing, and host planning separately.
     See scheduling-runtime-design.md#funded-timing-refresh.
 
+[ ] Account for useful prompt tokens when estimating prefill graph duration.
+    On Kimi K3.1 Pro TP16, a 128-token tail on the 3,584-token graph takes
+    1.51 s. Helios uses that estimate for a full 3,584-token chunk that takes
+    7.81 s and displaces a 4,096-token graph taking 1.76 s. Exercise both
+    loads on the same graph when validating cost updates and selection.
+
 [ ] Extend the two-frame submission window to nonterminal prefill with
     device-owned continuation positions and fenced cache reservations.
 
