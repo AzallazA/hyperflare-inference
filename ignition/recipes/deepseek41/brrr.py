@@ -24,6 +24,12 @@ The kernel (brrr/kernels/decoder.cu, Apache-2.0, fraserprice/DeepSeek-4.1-Flash-
 
 Every switch arrives through the ``TP3Config`` the engine and the prepared tails hold; nothing here reads the
 environment (``TORCH_EXTENSIONS_DIR`` is set for the extension build only).
+
+Steering (upstream PR #404 inside the tail, feat/ds41-steering-brrr): a package exported with a steering sidecar
+creates the engine with ``steering=True`` (the BRRR_STEER kernel build, its own extension), registers each steered
+layer's constants (``Engine.register_steering``: direction, attention gain minus one, alpha, and this rank's
+u = W2_rank^T d for the shared site) and launches ``flare::brrr_layer_tail_steered`` with the per-token scale. A launch
+whose rows all have scale 0 runs the unsteered job graph; packages without a sidecar keep the plain build and op.
 """
 
 import ctypes as C
@@ -73,16 +79,24 @@ def _tuning(tp3: TP3Config) -> dict:
             for field, _, attr, default in TUNING}
 
 
-def kernel_defines(tp3: TP3Config) -> tuple[str, ...]:
-    """Compile-time defines of the layer kernel for this config (all off/default = the serving build)."""
+# Steering build (feat/ds41-steering-brrr): packages exported with a steering sidecar compile the kernel with
+# BRRR_STEER=1 (attention / shared-expert projections inside the tail, optional per launch); without a sidecar the
+# define is absent and the extension is the plain serving build.
+STEER_DEFINE = "BRRR_STEER=1"
+
+
+def kernel_defines(tp3: TP3Config, steering: bool = False) -> tuple[str, ...]:
+    """Compile-time defines of the layer kernel for this config (all off/default = the serving build); ``steering``
+    (a sidecar package) adds the steering build's define."""
     flags = tuple(f"{define}=1" for field, define, _ in SWITCHES if getattr(tp3, field))
     values = _tuning(tp3)
-    return flags + tuple(f"{define}={values[attr]}" for _, define, attr, default in TUNING if values[attr] != default)
+    return (flags + tuple(f"{define}={values[attr]}" for _, define, attr, default in TUNING if values[attr] != default)
+            + ((STEER_DEFINE,) if steering else ()))
 
 
-def engine_key(tp3: TP3Config):
+def engine_key(tp3: TP3Config, steering: bool = False):
     """What makes two engines differ: the kernel build."""
-    return kernel_defines(tp3)
+    return kernel_defines(tp3, steering)
 
 
 @cache
@@ -91,11 +105,13 @@ def extension(defines: tuple[str, ...] = ()):
     return _cuext().extension("decoder", tuple(defines))
 
 
-def check_switches(ext, tp3: TP3Config):
+def check_switches(ext, tp3: TP3Config, steering: bool = False):
     """Contract check: the loaded build's compile-time switches are the ones the config asked for."""
     want = {attr: int(bool(getattr(tp3, field))) for field, _, attr in SWITCHES}
     want.update(_tuning(tp3))
-    got = {attr: int(getattr(ext, attr, -1)) for attr in want}
+    want["STEER"] = int(bool(steering))
+    # A build from before the steering switch has no STEER attribute: it is the plain (unsteered) build.
+    got = {attr: int(getattr(ext, attr, 0 if attr == "STEER" else -1)) for attr in want}
     if got != want:
         raise RuntimeError(f"BRRR kernel build switches {got} do not match the TP3 config {want}")
 
@@ -173,11 +189,12 @@ class Checkpoint:
 class Engine:
     """One per rank: the kernel's peer buffers, scratch and registered layers, configured by one TP3Config."""
 
-    def __init__(self, group, device, ipc, tp3: TP3Config):
+    def __init__(self, group, device, ipc, tp3: TP3Config, steering: bool = False):
         if tp3.brrr_ckpt is None:
             raise ValueError("TP3 config: BRRR needs brrr_ckpt (the checkpoint view it reads dense copies from)")
-        self.ext = ext = extension(kernel_defines(tp3))
-        check_switches(ext, tp3)
+        self.steering = bool(steering)
+        self.ext = ext = extension(kernel_defines(tp3, self.steering))
+        check_switches(ext, tp3, self.steering)
         if ext.MAXM != MAX_ROWS:
             raise RuntimeError(f"BRRR kernel MAXM {ext.MAXM} differs from brrr.MAX_ROWS {MAX_ROWS}")
         self.group, self.device, self.ipc, self.tp3 = group, device, ipc, tp3
@@ -186,7 +203,7 @@ class Engine:
             raise ValueError(f"BRRR kernel is built for {ext.RANKS} ranks, group has {world}")
         # Same kernel build on every rank (handbook D.3.4): a mixed build is a configuration error.
         builds = [None] * world
-        dist.all_gather_object(builds, engine_key(tp3), group=group)
+        dist.all_gather_object(builds, engine_key(tp3, self.steering), group=group)
         if any(b != builds[0] for b in builds):
             raise RuntimeError(f"BRRR kernel builds differ between ranks: {builds}")
         nbytes = ext.flag_bytes() + ext.inbox_bytes()
@@ -207,6 +224,7 @@ class Engine:
         self.checkpoint = Checkpoint(tp3.brrr_ckpt)
         self.frequencies = None
         self.slots = {}
+        self.steered = {}  # layer index -> its steering constants as handed to the kernel (register_steering)
         self.keep = []
         # Stand-in for the expanded scale planes of CSF layers: add_layer requires the tensors, the kernel reads the
         # compact payload instead (issue_csf), and b12x releases its expanded planes after preparation.
@@ -364,6 +382,59 @@ class Engine:
         return self.slots[index]
 
 
+    def register_steering(self, index, steering):
+        """Hand layer ``index``'s steering constants (a steering.LayerSteering: alpha, unit direction d and attention
+        gain minus one, both BF16[5120] persistent copies) to the kernel, plus this rank's u = W2_rank^T d (FP32[768],
+        a persistent copy), from the checkpoint's shared-expert down projection shard and its E8M0 block scales: the
+        kernel's shared-site dot is h . u (DESIGN.md). Once per layer; the layer must be registered."""
+        if not self.steering:
+            raise RuntimeError(f"BRRR layer {index}: the engine was built without steering (BRRR_STEER); create it "
+                               "with steering=True for a sidecar package")
+        if index in self.steered:
+            return self.steered[index]
+        if index not in self.slots:
+            raise RuntimeError(f"BRRR layer {index}: register the layer before its steering constants")
+        from .weights import _parking_pool
+
+        ext, inter, p = self.ext, self.ext.INTER, f"layers.{index}"
+        for name in ("direction", "attention_gain_delta"):
+            t = getattr(steering, name)
+            _require_persistent(t, f"BRRR layer {index}: steering {name}")
+        with _parking_pool():
+            # The same shard and scale columns as the kernel's sh2 / sh2_s (_register: 32-column E8M0 blocks).
+            weight = self.raw(f"{p}.ffn.shared_experts.w2.weight", cols=_shard(self.rank, inter))
+            scale = self.raw_u8(f"{p}.ffn.shared_experts.w2.scale", cols=_shard(self.rank, inter // 32))
+            u = shared_down_direction(weight, scale, steering.direction)
+        u = persistent_copy(u.contiguous())
+        ext.set_steering(self.local_handle, self.slots[index], steering.direction, steering.attention_gain_delta, u,
+                         float(steering.alpha))
+        self.steered[index] = (steering, u)
+        self.keep.append(u)
+        return self.steered[index]
+
+
+def shared_down_direction(weight, scale, direction):
+    """u = W^T d for one rank's shared-expert down projection: ``weight`` [HID, INTER] E4M3 values (float8_e4m3fn or
+    their bytes), ``scale`` [HID / br, INTER / bc] E8M0 bytes of br x bc blocks (shapes must tile exactly),
+    ``direction`` [HID]. Dequantized and accumulated in FP64, returned as FP32 [INTER] on the weight's device.
+    The kernel's shared-site dot is then h . u for the E4M3 activation h it multiplies by W (sh . d = h . W^T d)."""
+    if weight.dtype == torch.uint8:
+        weight = weight.view(torch.float8_e4m3fn)
+    if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+        raise ValueError(f"shared down projection must be 2-D E4M3, got {weight.dtype} {tuple(weight.shape)}")
+    scale = scale.view(torch.uint8) if scale.dtype != torch.uint8 else scale
+    rows, cols = weight.shape
+    if (scale.ndim != 2 or not scale.shape[0] or not scale.shape[1] or rows % scale.shape[0] or cols % scale.shape[1]
+            or direction.numel() != rows):
+        raise ValueError(f"shared down projection {tuple(weight.shape)}: scale {tuple(scale.shape)} or direction "
+                         f"{tuple(direction.shape)} does not tile it")
+    if bool((scale == 255).any()):
+        raise ValueError("shared down projection scale holds an E8M0 NaN (255)")
+    factor = torch.exp2(scale.to(torch.float64) - 127.0)
+    factor = factor.repeat_interleave(rows // scale.shape[0], 0).repeat_interleave(cols // scale.shape[1], 1)
+    return (direction.to(device=weight.device, dtype=torch.float64) @ (weight.to(torch.float64) * factor)).float()
+
+
 def _require_persistent(tensor, what):
     """A tensor the kernel reads in place must outlive preparation: inside the core's persistent arena. No-op without
     core storage (unit tests, eager runs)."""
@@ -431,12 +502,15 @@ def _csf_args(scales):
 _ENGINE = []
 
 
-def create_engine(group, device, ipc, tp3: TP3Config):
-    """Create the rank's engine once; None (no-op) unless ``tp3.brrr_layers`` selects layers."""
+def create_engine(group, device, ipc, tp3: TP3Config, steering: bool = False):
+    """Create the rank's engine once; None (no-op) unless ``tp3.brrr_layers`` selects layers. ``steering``: the package
+    has a steering sidecar (the BRRR_STEER kernel build)."""
     if not tp3.brrr_layers:
         return None
     if not _ENGINE:
-        _ENGINE.append(Engine(group, device, ipc, tp3))
+        _ENGINE.append(Engine(group, device, ipc, tp3, steering=steering))
+    elif _ENGINE[0].steering != bool(steering):
+        raise RuntimeError(f"BRRR engine exists with steering={_ENGINE[0].steering}, requested {bool(steering)}")
     return _ENGINE[0]
 
 
@@ -467,6 +541,24 @@ def _fake_brrr_layer_tail(handle, slot, o, positions, frequencies, resid0, attn_
     pass
 
 
+# Steered layers (BRRR_STEER build, a layer with sidecar constants): the same tail plus the per-token steering scale
+# ([m, 1] or [m] FP32, read only). A separate op, so packages without a sidecar keep the plain op and graph.
+@torch.library.custom_op("flare::brrr_layer_tail_steered", mutates_args=("y", "resid1", "post1", "comb1", "pre1"))
+def brrr_layer_tail_steered(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
+                            resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor,
+                            attn_pre: torch.Tensor, token_scale: torch.Tensor, y: torch.Tensor, resid1: torch.Tensor,
+                            post1: torch.Tensor, comb1: torch.Tensor, pre1: torch.Tensor) -> None:
+    ext, local = _RUNNERS[handle]
+    ext.run_steered(local, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre, token_scale,
+                    y, resid1, post1, comb1, pre1)
+
+
+@brrr_layer_tail_steered.register_fake
+def _fake_brrr_layer_tail_steered(handle, slot, o, positions, frequencies, resid0, attn_post, attn_comb, attn_pre,
+                                  token_scale, y, resid1, post1, comb1, pre1):
+    pass
+
+
 class PreparedBRRRTail:
     """Layer tail through the BRRR kernel, from the pre-inverse-RoPE attention output to the MLP all-reduce.
 
@@ -476,9 +568,14 @@ class PreparedBRRRTail:
     FFN mHC and its pre-mix output. The outputs are forward-local (``torch.empty``; the kernel writes every row) unless
     ``out`` names destinations (the layer test). The kernel also writes the attention mHC post/comb/pre-mix
     (``mutates_args``); the caller must not read them afterwards.
+
+    ``steering`` (a steering.LayerSteering; the engine must be the BRRR_STEER build): the tail projects the attention
+    output and the shared-expert partial like upstream PR #404, and ``__call__`` then requires ``token_scale``.
     """
 
-    def __init__(self, index, weights, positions_dtype, frequencies, config=None, tp3=None, engine_=None):
+    steered = False
+
+    def __init__(self, index, weights, positions_dtype, frequencies, config=None, tp3=None, engine_=None, steering=None):
         e = engine() if engine_ is None else engine_  # engine_: an explicit engine (test A/B of kernel variants)
         if e is None:
             raise RuntimeError("BRRR engine was not created")
@@ -490,13 +587,26 @@ class PreparedBRRRTail:
             self.frequencies = persistent_copy(frequencies.flip(0).contiguous())
         if positions_dtype != torch.int64:
             raise ValueError("BRRR tail expects int64 positions")
+        if steering is not None:
+            e.register_steering(index, steering)
+            self.steered = True
 
-    def __call__(self, attended, residual, post, comb, attn_mix, positions, *, out=None):
+    def __call__(self, attended, residual, post, comb, attn_mix, positions, *, out=None, token_scale=None):
+        if self.steered != (token_scale is not None):
+            raise ValueError("a steered BRRR tail needs the per-token steering scale, an unsteered one takes none")
         if out is None:
             mlp_output = torch.empty((residual.shape[0], residual.shape[2]), dtype=residual.dtype, device=residual.device)
             out = (mlp_output, torch.empty_like(residual), torch.empty_like(post), torch.empty_like(comb),
                    torch.empty_like(attn_mix))
         mlp_output, ffn_residual, ffn_post, ffn_comb, pre_mix = out
+        if self.steered:
+            if token_scale.dtype != torch.float32 or token_scale.shape[0] != residual.shape[0] or token_scale.numel() != residual.shape[0]:
+                raise ValueError(f"steering scale {tuple(token_scale.shape)} {token_scale.dtype}: one FP32 value per row "
+                                 f"({residual.shape[0]})")
+            brrr_layer_tail_steered(self.handle, self.slot, attended, positions, self.frequencies, residual, post, comb,
+                                    attn_mix, token_scale.contiguous(), mlp_output, ffn_residual, ffn_post, ffn_comb,
+                                    pre_mix)
+            return mlp_output, (ffn_residual, ffn_post, ffn_comb), pre_mix
         brrr_layer_tail(self.handle, self.slot, attended, positions, self.frequencies, residual, post, comb, attn_mix,
                         mlp_output, ffn_residual, ffn_post, ffn_comb, pre_mix)
         return mlp_output, (ffn_residual, ffn_post, ffn_comb), pre_mix

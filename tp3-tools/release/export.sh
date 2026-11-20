@@ -90,8 +90,11 @@
 #   Steering sidecar (feat/ds41-steering-sidecar, upstream PR #404 port; analysis/work/steering-sidecar-20261119):
 #   STEERING  path of a DS41 steering sidecar (.safetensors, layers 4-36) = --steering-sidecar; the package then takes
 #            a per-request steering_scale in [0, 1] (0 = unsteered). Default unset = no sidecar (6-column requests)
-#   BRRR_LAYERS  FLARE_DS41_BRRR_LAYERS (default 0-39). The BRRR fused tail has no steering projection yet, so a
-#            STEERING export must leave layers 4-36 out (e.g. BRRR_LAYERS=0-3,37-39); the export refuses otherwise
+#            BRRR layers steer inside the fused tail (feat/ds41-steering-brrr: the BRRR_STEER kernel build)
+#   STEERING_PLAIN_ID  1 = with STEERING, tune under the checkpoint's plain identity (FLARE_DS41_STEERING_PLAIN_IDENTITY):
+#            the same tuning records and plan selections as the sidecar-free package, for scale-0 bit comparisons;
+#            default 0 = upstream's sidecar-keyed identity
+#   BRRR_LAYERS  FLARE_DS41_BRRR_LAYERS (default 0-39)
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
@@ -172,6 +175,7 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
 [ "${NO_GEN_LOGPROBS:-0}" = 1 ] && export FLARE_DS41_NO_GENERATION_LOGPROBS=1
 [ -n "${DRAFT_HEAD_PLANS:-}" ] && export FLARE_DS41_DRAFT_HEAD_PLANS=$DRAFT_HEAD_PLANS
 [ "${ROTARY_PREFILL:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE_PREFILL=1
+[ "${STEERING_PLAIN_ID:-0}" = 1 ] && export FLARE_DS41_STEERING_PLAIN_IDENTITY=1
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \

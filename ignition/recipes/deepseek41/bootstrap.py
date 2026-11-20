@@ -185,6 +185,8 @@ class PreparationConfig:
             # Joint tuning observes Flare's layer tail (attention output, router ids) in every decode graph, which a
             # BRRR layer does not run; tp3-main never combined the two (export.sh does not use --joint-tuning).
             raise ValueError("TP3 config: brrr_layers cannot be combined with --joint-tuning")
+        if self.tp3.steering_plain_identity and self.steering_sidecar is None:
+            raise ValueError("TP3 config: steering_plain_identity needs a steering sidecar (--steering-sidecar)")
         if self.steering_sidecar is not None:
             path = Path(self.steering_sidecar).expanduser().resolve()
             if not path.is_file():
@@ -466,7 +468,8 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
     from ignition.recipes.deepseek41.brrr import create_engine
-    create_engine(group, device, ipc, config.tp3)  # TP3 BRRR: no-op unless tp3.brrr_layers is set
+    # TP3 BRRR: no-op unless tp3.brrr_layers is set; a steering sidecar selects the BRRR_STEER kernel build.
+    create_engine(group, device, ipc, config.tp3, steering=getattr(config, "steering_sidecar", None) is not None)
     # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world size to
     # divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between decode and
     # prefill: graph capture enters only the main collective's capture() context, so a second runtime's reductions
@@ -588,7 +591,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         preparation_identity = identity
-        if weights.steering is not None:
+        if weights.steering is not None and not tp3.steering_plain_identity:
             preparation_identity = hashlib.sha256(
                 bytes.fromhex(identity) + weights.steering.sha256
             ).hexdigest()

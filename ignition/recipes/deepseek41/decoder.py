@@ -365,15 +365,14 @@ class PreparedLayer:
                                      f"takes at most {MAX_ROWS}: lower the speculative widths or concurrency, or leave the layer "
                                      "out of brrr_layers")
                 self.attention.external_tail = True
+                # A steered layer (sidecar package) runs the BRRR_STEER tail: PR #404's projections inside the kernel.
                 self.brrr = PreparedBRRRTail(index, weights, metadata.positions.dtype,
-                                             rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
+                                             rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3,
+                                             **({} if steering is None else {"steering": steering}))
             record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
-        # TP3 steering port (feat/ds41-steering-sidecar): the BRRR fused tail has no steering projection yet (it would
-        # skip the attention and shared-expert projection silently), and the EXL3 merged epilogue folds the shared
-        # expert into the routed output before the projection could run. Refuse both combinations.
-        if steering is not None and self.brrr is not None:
-            raise ValueError(f"steering sidecar: layer {index} in {name} runs the BRRR fused tail, which has no steering "
-                             "projection; leave steering layers out of tp3.brrr_layers")
+        # TP3 steering port: a BRRR layer steers inside the fused tail (feat/ds41-steering-brrr, PreparedBRRRTail
+        # above). The EXL3 merged epilogue folds the shared expert into the routed output before the projection could
+        # run: refused.
         if steering is not None and self.exl3_merge_epilogue:
             raise ValueError("steering sidecar: the EXL3 merged epilogue (MERGE_EPILOGUE) cannot project the shared expert")
 
@@ -443,7 +442,8 @@ class PreparedLayer:
             # TP3 BRRR: ``attended`` is the attention output before inverse RoPE (attention.external_tail); the kernel
             # runs inverse RoPE .. MLP all-reduce and returns what Flare's path below would.
             output, (residual, post, comb), next_mix = self.brrr(attended, residual, post, comb, attn_mix,
-                                                                 indices.position)
+                                                                 indices.position,
+                                                                 **({} if steering is None else {"token_scale": token_scale}))
             incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                         else (output, residual, post, comb))
             observations = {"attention." + key: value for key, value in observations.items()}
