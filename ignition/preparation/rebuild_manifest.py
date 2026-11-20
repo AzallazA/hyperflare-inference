@@ -38,12 +38,30 @@ CONTAINER_TUNED: dict[str, frozenset[str]] = {}
 MODULE_BUFFER_FIELDS: dict[str, frozenset[str]] = {}
 
 
-def declare_container_fields(type_key, fields, *, tuned=()):
+def declare_container_fields(type_key, field_names, *, tuned=()):
     """Declare the weight-bearing fields of an external container type."""
     if not isinstance(type_key, str) or not type_key:
         raise ValueError('declared container types need a module-qualified name')
-    CONTAINER_FIELDS[type_key] = tuple(fields)
+    CONTAINER_FIELDS[type_key] = tuple(field_names)
     CONTAINER_TUNED[type_key] = frozenset(tuned)
+
+
+def weight_container(field_names, *, tuned=()):
+    """Register the weight-bearing fields of a container class at definition time."""
+    names = tuple(field_names)
+
+    def decorator(cls):
+        if is_dataclass(cls):
+            defined = {item.name for item in fields(cls)}
+            absent = [name for name in names if name not in defined]
+            if absent:
+                raise ValueError(
+                    f'{cls.__module__}.{cls.__qualname__}: unknown declared weight fields {absent}'
+                )
+        declare_container_fields(f'{cls.__module__}.{cls.__qualname__}', names, tuned=tuned)
+        return cls
+
+    return decorator
 
 
 def declare_module_buffers(type_key, fields):
