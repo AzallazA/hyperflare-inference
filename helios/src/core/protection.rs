@@ -211,7 +211,7 @@ fn resolve_publisher<'a>(
             continue;
         }
         match found {
-            Some(previous) if previous.namespace != publisher.namespace => {
+            Some(previous) if previous != publisher => {
                 return Err(invalid(
                     "conflicting publisher profiles for the signing key",
                 ));
@@ -2027,5 +2027,28 @@ mod tests {
         let mut bad_chunk = stored.clone();
         bad_chunk[0] ^= 1;
         assert!(authorized.open_resource(&resource, &bad_chunk).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_conflicting_duplicate_publisher_profiles() {
+        let fixture = fixture();
+        let original = fixture.publishers[0].clone();
+        let mut renamed = original.clone();
+        renamed.name = "Other Display Name".into();
+        let error = verify(
+            &fixture.envelope,
+            &[original.clone(), renamed],
+            Selection::Catalog,
+        )
+        .err()
+        .expect("conflicting display name must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting publisher profiles for the signing key"),
+            "{error}"
+        );
+
+        assert!(verify(&fixture.envelope, &[original.clone(), original], Selection::Catalog).is_ok());
     }
 }

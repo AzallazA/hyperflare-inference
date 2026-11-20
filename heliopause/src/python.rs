@@ -137,7 +137,8 @@ impl GraphReplayWorker {
 #[cfg(feature = "qualification")]
 impl Drop for GraphReplayWorker {
     fn drop(&mut self) {
-        let shutdown = self.worker.close();
+        let shutdown = Python::try_attach(|py| py.detach(|| self.worker.close()))
+            .unwrap_or_else(|| self.worker.close());
         if shutdown.drained {
             let owner = self
                 .owner
@@ -566,7 +567,8 @@ impl NativeCliSignals {
 
 impl Drop for PreparedGraphExecutor {
     fn drop(&mut self) {
-        let shutdown = self.worker.close();
+        let shutdown = Python::try_attach(|py| py.detach(|| self.worker.close()))
+            .unwrap_or_else(|| self.worker.close());
         if shutdown.drained {
             let owner = self
                 .owner
@@ -765,7 +767,8 @@ impl NativeServer {
 #[cfg(all(feature = "server", feature = "qualification"))]
 impl Drop for NativeServer {
     fn drop(&mut self) {
-        let shutdown = self.server.close();
+        let shutdown = Python::try_attach(|py| py.detach(|| self.server.close()))
+            .unwrap_or_else(|| self.server.close());
         if shutdown.drained {
             let owner = self
                 .owner

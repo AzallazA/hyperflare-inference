@@ -252,15 +252,22 @@ pub(super) fn node(value: wire::Node) -> Result<Node> {
     })
 }
 
-pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
-    if let Some(execution) = &mut value.execution {
+fn normalize_execution(execution: &mut Option<wire::Execution>) -> Result<()> {
+    if let Some(execution) = execution {
         for graph in &mut execution.graphs {
             if graph.kind == "speculative" && graph.packed_token_capacity == 0 {
-                graph.packed_token_capacity = graph.batch_capacity.checked_mul(graph.token_capacity)
+                graph.packed_token_capacity = graph
+                    .batch_capacity
+                    .checked_mul(graph.token_capacity)
                     .ok_or_else(|| invalid("rectangular speculative capacity overflow"))?;
             }
         }
     }
+    Ok(())
+}
+
+pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
+    normalize_execution(&mut value.execution)?;
     let context = required(value.context, "CUDA context")?;
     let core = Core {
         resources: value.resources,
@@ -1126,6 +1133,8 @@ pub(super) fn payload_rank(
         .context
         .clone()
         .ok_or_else(|| invalid("rank has no CUDA context description"))?;
+    let mut execution = rank.execution.clone();
+    normalize_execution(&mut execution)?;
     let core = Core {
         resources,
         architecture,
@@ -1139,7 +1148,7 @@ pub(super) fn payload_rank(
                 nbytes: size(value.nbytes)?,
             })
         })?,
-        execution: rank.execution.clone(),
+        execution,
         context: Context {
             flags: context.flags,
             cache: context.cache,
@@ -1388,5 +1397,36 @@ mod payload_tests {
             (vec![4u8; 32], placement("globals", 0, 32)),
         ]);
         payload_rank(&rank(), [12, 0], &placements).unwrap();
+    }
+
+    #[test]
+    fn payload_rank_normalizes_zero_packed_token_capacity_for_speculative_graphs() {
+        let mut body = rank();
+        body.execution = Some(wire::Execution {
+            abi_version: 6,
+            max_active: 4,
+            input_frame_bytes: 64,
+            completion_token_capacity: 8,
+            graphs: vec![wire::ExecutionGraph {
+                name: "spec_b4_w6".into(),
+                kind: "speculative".into(),
+                sampling_mode: "general".into(),
+                batch_capacity: 4,
+                token_capacity: 6,
+                draft_tokens: Some(5),
+                packed_token_capacity: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 0, 4096)),
+            (vec![2u8; 32], placement("weights-b", 0, 8192)),
+            (vec![3u8; 32], placement("graphs", 0, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        let core = payload_rank(&body, [12, 0], &placements).unwrap();
+        let graph = &core.execution.unwrap().graphs[0];
+        assert_eq!(graph.packed_token_capacity, 24);
     }
 }

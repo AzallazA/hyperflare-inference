@@ -50,7 +50,10 @@ mod selection;
 mod serving;
 #[cfg(test)]
 mod shared_memory_tests;
-pub use archive::{CoreFile, core_companions};
+pub use archive::{
+    CoreFile, LegacyHeader, LegacyLayout, MAX_LEGACY_HEADER, MAX_LEGACY_INDEX, MAX_LEGACY_PAYLOAD,
+    core_companions, is_snapshot_blob_name, read_legacy_header, validate_companion_filename,
+};
 pub use limits::{KvCacheLimit, MemoryLimit};
 pub use model::{
     CacheAgreement, ClusterRank, NativeModel, RankNeeds, RoceSpec, core_cluster, rank_needs,
@@ -1144,30 +1147,35 @@ impl NativeResources {
     }
 }
 
-impl Drop for NativeResources {
-    fn drop(&mut self) {
-        // SAFETY: This owner is the sole resource destroyer. On a failed drain,
-        // retain the driver and all GPU resources until process termination.
+impl NativeResources {
+    /// Phase 1 of teardown: synchronize this rank's context and destroy all graphs, modules,
+    /// events, and device/host mappings while peer contexts and shared VA reservations stay alive.
+    /// Returns `false` when the context cannot be drained, retaining the driver until process exit.
+    pub(super) fn release_execution_resources(&mut self) -> bool {
+        if self.context.is_null() {
+            return true;
+        }
         unsafe {
             let mut previous = null_mut();
             (self.driver.context_get)(&mut previous);
             if (self.driver.context_set)(self.context) != 0 || (self.driver.context_sync)() != 0 {
                 std::mem::forget(self.driver.clone());
-                return;
+                self.context = null_mut();
+                return false;
             }
-            for executable in self.executables.iter().rev() {
-                (self.driver.executable_destroy)(*executable);
+            for executable in self.executables.drain(..).rev() {
+                (self.driver.executable_destroy)(executable);
             }
-            for graph in self.templates.iter().rev() {
-                (self.driver.graph_destroy)(*graph);
+            for graph in self.templates.drain(..).rev() {
+                (self.driver.graph_destroy)(graph);
             }
-            for event in self.events.values() {
-                (self.driver.event_destroy)(*event);
+            for (_, event) in std::mem::take(&mut self.events) {
+                (self.driver.event_destroy)(event);
             }
-            for module in self.modules.iter().rev() {
-                (self.driver.module_unload)(*module);
+            for module in self.modules.drain(..).rev() {
+                (self.driver.module_unload)(module);
             }
-            for allocation in self.allocations.values() {
+            for (_, allocation) in std::mem::take(&mut self.allocations) {
                 if allocation.nbytes == 0 {
                     continue;
                 }
@@ -1191,16 +1199,46 @@ impl Drop for NativeResources {
                 }
             }
             #[cfg(windows)]
-            for &(address, bytes) in self.host_mappings.iter().rev() {
+            for (address, bytes) in self.host_mappings.drain(..).rev() {
                 (self.driver.unmap)(address, bytes);
             }
-            for (address, size) in self.reservations.iter().rev() {
-                (self.driver.release_address)(*address, *size);
-            }
-            (self.driver.context_destroy)(self.context);
             if previous != self.context {
                 (self.driver.context_set)(previous);
             }
+            true
+        }
+    }
+
+    /// Phase 2 of teardown: release VA reservations and destroy this rank's CUDA context.
+    pub(super) fn release_reservations_and_context(&mut self) {
+        if self.context.is_null() {
+            return;
+        }
+        let context = std::mem::replace(&mut self.context, null_mut());
+        unsafe {
+            let mut previous = null_mut();
+            (self.driver.context_get)(&mut previous);
+            if (self.driver.context_set)(context) != 0 {
+                std::mem::forget(self.driver.clone());
+                return;
+            }
+            for (address, size) in self.reservations.drain(..).rev() {
+                (self.driver.release_address)(address, size);
+            }
+            (self.driver.context_destroy)(context);
+            if previous != context {
+                (self.driver.context_set)(previous);
+            }
+        }
+    }
+}
+
+impl Drop for NativeResources {
+    fn drop(&mut self) {
+        // SAFETY: This owner is the sole resource destroyer. On a failed drain,
+        // retain the driver and all GPU resources until process termination.
+        if self.release_execution_resources() {
+            self.release_reservations_and_context();
         }
     }
 }

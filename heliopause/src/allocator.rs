@@ -8,7 +8,7 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::{CString, c_char, c_void},
+    ffi::{CStr, CString, c_char, c_void},
     ptr::null_mut,
     sync::Mutex,
 };
@@ -198,7 +198,7 @@ struct Arena {
     retained_mappings: RetainedMappingPool,
 }
 static ARENA: Mutex<Option<Arena>> = Mutex::new(None);
-static ERROR: Mutex<Option<CString>> = Mutex::new(None);
+static ERROR: Mutex<Option<&'static CStr>> = Mutex::new(None);
 
 pub(crate) struct MemoryInventory {
     pub device: i32,
@@ -255,7 +255,12 @@ fn failure(error: impl ToString) {
     ERROR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(|| CString::new(error.to_string().replace('\0', " ")).unwrap());
+        .get_or_insert_with(|| {
+            let owned = CString::new(error.to_string().replace('\0', " ")).unwrap();
+            // Retained for process lifetime so `flare_core_error()` hands out a stable
+            // `'static` pointer after releasing `ERROR`.
+            Box::leak(owned.into_boxed_c_str())
+        });
 }
 
 /// The host base for `world` device windows of `extent` bytes from `base`,
@@ -324,7 +329,15 @@ extern "C" fn flare_core_initialize_window(
                 (driver.granularity)(&mut granularity, &properties(device, gpudirect != 0), 0),
             )?;
             let granule = granularity as u64;
-            if base % granule != 0 || extent % (2 * granule) != 0 {
+            let two_granules = granule
+                .checked_mul(2)
+                .filter(|_| granule != 0)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "invalid CUDA allocation granularity {granule:#x}"
+                    ))
+                })?;
+            if base % granule != 0 || extent % two_granules != 0 {
                 return Err(invalid(format!(
                     "native core device window {base:#x}+{extent:#x} is not aligned to the {granule:#x}-byte allocation granularity"
                 )));
@@ -395,6 +408,9 @@ extern "C" fn flare_core_transient_allocate(
 }
 
 fn core_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
+    if size == 0 {
+        return null_mut();
+    }
     let allocate = || -> Result<u64> {
         let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         let a = guard
@@ -488,6 +504,9 @@ extern "C" fn flare_core_transient_free(
 }
 
 fn core_free(pointer: *mut c_void, transient: bool) {
+    if pointer.is_null() {
+        return;
+    }
     let release = || -> Result<()> {
         let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         let a = guard
@@ -1331,6 +1350,33 @@ mod tests {
             0x200000000000
         };
         assert!(window_host_base(host - (1 << 30), 2 << 30, 1).is_err());
+    }
+
+    #[test]
+    fn zero_byte_allocate_and_null_free_do_not_poison_error() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        assert!(flare_core_allocate(0, 0, null_mut()).is_null());
+        assert!(flare_core_transient_allocate(0, 0, null_mut()).is_null());
+        flare_core_free(null_mut(), 0, 0, null_mut());
+        flare_core_transient_free(null_mut(), 0, 0, null_mut());
+        assert!(flare_core_error().is_null());
+    }
+
+    #[test]
+    fn core_error_pointer_remains_valid_after_error_slot_reset() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        failure("first allocator failure");
+        let pointer = flare_core_error();
+        assert!(!pointer.is_null());
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        let text = unsafe { CStr::from_ptr(pointer) }.to_str().unwrap();
+        assert_eq!(text, "first allocator failure");
     }
 
     /// Prints device 0's WDDM GPU virtual address width; run with --ignored on a CUDA host.

@@ -276,12 +276,15 @@ impl NativeModel {
             return Err(invalid("GPU label count must match selected devices"));
         }
         let phase = progress.phase("Prepare model", None);
-        let (mut descriptor, mut ready_cores, files) = match authorized.kind {
-            AuthorizedKind::Legacy { archive, index } => (index, None, FilesRef::Legacy(archive)),
+        let (mut descriptor, mut legacy_bundles, mut ready_cores, files) = match authorized.kind {
+            AuthorizedKind::Legacy { archive, index } => {
+                let (descriptor, bundles) = super::protection::LoadedModelDescriptor::from_legacy(index);
+                (descriptor, Some(bundles), None, FilesRef::Legacy(archive))
+            }
             AuthorizedKind::Payload(core) => {
-                let descriptor = core.descriptor()?;
+                let descriptor = core.loaded_descriptor()?;
                 let (source, cores) = core.into_parts();
-                (descriptor, Some(cores), FilesRef::Payload(source))
+                (descriptor, None, Some(cores), FilesRef::Payload(source))
             }
         };
         let root = files.path();
@@ -297,14 +300,20 @@ impl NativeModel {
                     ));
                 }
                 let position = files.rank_position(rank)?;
-                if rank >= c.world as usize || position >= descriptor.ranks.len() {
+                if rank >= c.world as usize || position >= descriptor.rank_roce.len() {
                     return Err(invalid(format!(
                         "rank {rank} is outside the core's {} ranks",
                         c.world
                     )));
                 }
-                let bundle = descriptor.ranks.swap_remove(position);
-                descriptor.ranks = vec![bundle];
+                let selected_roce = descriptor.rank_roce.swap_remove(position);
+                descriptor.rank_roce = vec![selected_roce];
+                if let Some(bundles) = legacy_bundles.as_mut()
+                    && position < bundles.len()
+                {
+                    let bundle = bundles.swap_remove(position);
+                    *bundles = vec![bundle];
+                }
                 if let Some(cores) = ready_cores.as_mut()
                     && position < cores.len()
                 {
@@ -323,12 +332,8 @@ impl NativeModel {
             }
             (None, None) => None,
         };
-        let transports: Vec<_> = descriptor
-            .ranks
-            .iter_mut()
-            .map(|bundle| bundle.roce.take())
-            .collect();
-        if devices.len() != descriptor.ranks.len()
+        let transports = std::mem::take(&mut descriptor.rank_roce);
+        if devices.len() != transports.len()
             || devices.iter().collect::<HashSet<_>>().len() != devices.len()
         {
             return Err(invalid(
@@ -337,9 +342,9 @@ impl NativeModel {
         }
         let mut cores = match ready_cores {
             Some(cores) => cores,
-            None => descriptor
-                .ranks
-                .drain(..)
+            None => legacy_bundles
+                .unwrap_or_default()
+                .into_iter()
                 .map(protobuf::decode)
                 .collect::<Result<Vec<_>>>()?,
         };
@@ -954,8 +959,22 @@ impl Drop for NativeModel {
     fn drop(&mut self) {
         self.offload.reset();
         self.engram.clear();
-        // Rank zero owns the shared reservations and releases them after every peer.
-        while self.ranks.pop().is_some() {}
+        // Phase 1: destroy graphs, modules, and peer-accessible mappings across every rank
+        // before any rank releases shared VA reservations or destroys its CUDA context.
+        let mut all_drained = true;
+        for rank in self.ranks.iter_mut().rev() {
+            all_drained &= rank.release_execution_resources();
+        }
+        // Phase 2: release shared VA reservations and destroy CUDA contexts (rank zero last).
+        // If any rank failed context drain, retain remaining contexts until process exit.
+        if all_drained {
+            while let Some(mut rank) = self.ranks.pop() {
+                rank.release_reservations_and_context();
+            }
+        } else {
+            let retained = std::mem::take(&mut self.ranks);
+            std::mem::forget(retained);
+        }
     }
 }
 

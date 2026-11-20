@@ -1827,6 +1827,39 @@ fn derivation_uses_target(recipe: &derivation::Derivation) -> bool {
     })
 }
 
+/// Whether adding `candidate` to `emitted` would introduce a dependency cycle (including a
+/// direct self-loop) among derivation targets and their copy sources.
+fn derivation_introduces_cycle(
+    emitted: &BTreeMap<PayloadId, derivation::Derivation>,
+    candidate: &derivation::Derivation,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<PayloadId> = candidate
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            derivation::Operation::Copy(copy) => Some(copy.source),
+            derivation::Operation::Fill(_) => None,
+        })
+        .collect();
+    while let Some(id) = stack.pop() {
+        if id == candidate.target {
+            return true;
+        }
+        if !visited.insert(id) {
+            continue;
+        }
+        if let Some(existing) = emitted.get(&id) {
+            for operation in &existing.operations {
+                if let derivation::Operation::Copy(copy) = operation {
+                    stack.push(copy.source);
+                }
+            }
+        }
+    }
+    false
+}
+
 fn owner_targets(owners: &[PreparedOwner], name: &str) -> BTreeSet<PayloadId> {
     owners
         .iter()
@@ -3039,6 +3072,7 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::core::export::Publ
         let mut used_paths = BTreeSet::new();
         let mut emitted: BTreeMap<PayloadId, derivation::Derivation> = BTreeMap::new();
         let mut conflicting: BTreeSet<PayloadId> = BTreeSet::new();
+        let mut imported_derivations: Vec<derivation::Derivation> = Vec::new();
         let mut total_exception_operations = 0usize;
         let mut total_exception_runs = 0usize;
         let mut exception_targets: BTreeMap<PayloadId, PayloadId> = BTreeMap::new();
@@ -3047,15 +3081,7 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::core::export::Publ
                 for recipe in
                     derivation::from_wire(set, &source.catalog, &derivation::Limits::default())?
                 {
-                    match emitted.get(&recipe.target) {
-                        Some(previous) if previous != &recipe => {
-                            conflicting.insert(recipe.target);
-                        }
-                        Some(_) => {}
-                        None => {
-                            emitted.insert(recipe.target, recipe);
-                        }
-                    }
+                    imported_derivations.push(recipe);
                 }
             }
         }
@@ -3134,7 +3160,11 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::core::export::Publ
                         }
                         Some(_) => {}
                         None => {
-                            emitted.insert(recipe.target, recipe.clone());
+                            if derivation_introduces_cycle(&emitted, recipe) {
+                                conflicting.insert(recipe.target);
+                            } else {
+                                emitted.insert(recipe.target, recipe.clone());
+                            }
                         }
                     }
                 }
@@ -3235,6 +3265,31 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::core::export::Publ
             });
         }
         emitted.retain(|target, _| !conflicting.contains(target));
+        // Merge pre-existing derivations from input cores only when they do not conflict with
+        // freshly planned canonical derivations or introduce multi-step dependency cycles.
+        let mut imported_conflicts: BTreeSet<PayloadId> = BTreeSet::new();
+        for recipe in imported_derivations {
+            if conflicting.contains(&recipe.target) || derivation_uses_target(&recipe) {
+                continue;
+            }
+            match emitted.get(&recipe.target) {
+                Some(previous) if previous != &recipe => {
+                    // Freshly planned canonical derivations take precedence over stale imported
+                    // recipes; only conflicts between imported recipes themselves drop the target.
+                    if imported_conflicts.contains(&recipe.target) {
+                        continue;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if !derivation_introduces_cycle(&emitted, &recipe) {
+                        emitted.insert(recipe.target, recipe);
+                    } else {
+                        imported_conflicts.insert(recipe.target);
+                    }
+                }
+            }
+        }
         let planned: Vec<derivation::Derivation> = emitted.values().cloned().collect();
         validate_planned_derivations(&planned)?;
         let accepted_sources: BTreeSet<PayloadId> = emitted
@@ -9226,5 +9281,44 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
         assert!(pack(&clean.directory, &scratch.join("closure.safetensors")).is_err());
+    }
+
+    #[test]
+    fn derivation_cycle_detection_catches_multistep_cycles_and_allows_dags() {
+        let id = |byte: u8| PayloadId::from_bytes([byte; 32]);
+        let copy_recipe = |target: u8, sources: &[u8]| derivation::Derivation {
+            target: id(target),
+            length: 16,
+            operations: sources
+                .iter()
+                .map(|&source| {
+                    derivation::Operation::Copy(derivation::Copy {
+                        source: id(source),
+                        source_offset: 0,
+                        destination_offset: 0,
+                        contiguous: 16,
+                        outer: vec![],
+                    })
+                })
+                .collect(),
+        };
+        let mut emitted = BTreeMap::new();
+        let a_from_b = copy_recipe(1, &[2]);
+        assert!(!derivation_introduces_cycle(&emitted, &a_from_b));
+        emitted.insert(a_from_b.target, a_from_b);
+
+        // Two-step cycle: B -> A when A -> B already exists.
+        assert!(derivation_introduces_cycle(&emitted, &copy_recipe(2, &[1])));
+
+        // Acyclic chain: B -> C.
+        let b_from_c = copy_recipe(2, &[3]);
+        assert!(!derivation_introduces_cycle(&emitted, &b_from_c));
+        emitted.insert(b_from_c.target, b_from_c);
+
+        // Three-step cycle: C -> A when A -> B -> C exists.
+        assert!(derivation_introduces_cycle(&emitted, &copy_recipe(3, &[1])));
+
+        // Acyclic diamond: D -> B and D -> C.
+        assert!(!derivation_introduces_cycle(&emitted, &copy_recipe(4, &[2, 3])));
     }
 }

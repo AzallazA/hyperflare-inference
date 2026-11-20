@@ -54,7 +54,7 @@ pub fn unverified_metadata_selected(
         ));
     }
     let path = &primary;
-    let (file, _, payload_bytes, bytes) = Archive::envelope(path)?;
+    let (file, _, payload_bytes, bytes, _) = Archive::envelope(path)?;
     let envelope = wire::ProtectedIndex::decode(bytes.as_slice())
         .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
     super::protection::ExecutableEncoding::from_version(envelope.version)?;
