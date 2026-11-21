@@ -223,3 +223,27 @@ def test_export_explicit_switches_override_inherited_settings(tmp_path, index_sp
         assert env[name] == "0"
     assert env["FLARE_DS41_MARKOV_TILE_ROWS"] == "4"
     assert env["FLARE_DS41_MLA_DECODE_SPLITS"] == env["FLARE_DS41_ENGRAM_SIDE_LAYERS"] == ""
+
+
+@pytest.mark.parametrize("mode", ["1", "layer1", "0"])
+def test_serve_resolves_storage_and_explicit_off_switches(tmp_path, mode):
+    probe = tmp_path / "flare"
+    probe.write_text("#!/usr/bin/python3\nimport json, os, sys\nprint(json.dumps([sys.argv[1:], dict(os.environ)]))\n")
+    probe.chmod(0o755)
+    inherited = {
+        "FLARE_ENGRAM_RAM_TABLES": "0", "FLARE_ENGRAM_RAM_LAYERS": "99",
+        "FLARE_ENGRAM_PRIVATE_TABLES": "1", "FLARE_FAST_EXIT": "1",
+        "FLARE_CUDA_STACK_LIMIT": "256", "FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS": "512",
+        "FLARE_ENGRAM_READ_AHEAD": "1",
+    }
+    result = run_script("release/serve.sh", tmp_path, FLARE=str(probe), ENGRAM_RAM=mode,
+                        FAST="0", STACK_LIMIT="", PREFILL_MERGE="", READ_AHEAD="", **inherited)
+    assert result.returncode == 0, result.stderr
+    argv, env = json.loads(result.stdout)
+    selectors = {"1": {"FLARE_ENGRAM_RAM_TABLES": "0"}, "layer1": {"FLARE_ENGRAM_RAM_LAYERS": "0"}, "0": {}}
+    assert {key: env[key] for key in inherited if key in env} == selectors[mode]
+    if mode == "1":
+        assert "--embedding-table-cache-size" not in argv
+    else:
+        assert argv[argv.index("--embedding-table-storage") + 1] == "disk"
+        assert argv[argv.index("--embedding-table-cache-size") + 1] == "32GiB"
