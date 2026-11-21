@@ -28,25 +28,28 @@ def test_completion_shape_rejects_malformed_records(shape, dtype):
 
 
 @pytest.mark.parametrize("fields", [17, 24, 29, 32, 48])
-def test_actual_completion_kernels_with_cpu_interpreter(fields):
+@pytest.mark.parametrize("parameter_columns", [6, 7])
+def test_actual_completion_kernels_with_cpu_interpreter(fields, parameter_columns):
     env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(fields)],
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(fields), str(parameter_columns)],
         env=env, text=True, capture_output=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA device")
 @pytest.mark.parametrize("fields", [17, 24, 29, 32, 48])
-def test_actual_completion_kernels_cuda(fields):
+@pytest.mark.parametrize("parameter_columns", [6, 7])
+def test_actual_completion_kernels_cuda(fields, parameter_columns):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"
-    _kernel_cases(fields, "cuda")
+    _kernel_cases(fields, parameter_columns, "cuda")
 
 
-def _kernel_cases(fields, device="cpu"):
-    from ignition.components.sampling import AdmissionBuffers, _admission_finish, _complete
+def _kernel_cases(fields, parameter_columns, device="cpu"):
+    from ignition.components.sampling import (
+        AdmissionBuffers, DeviceRequestState, RequestAdmission, _admission_finish, _complete,
+    )
     from ignition.recipes.qwen38 import vision_state
     from ignition.recipes.qwen38.maintenance import _snapshot_complete
-    from ignition.recipes.qwen38.sampling import DeviceRequestState, RequestAdmission
     from ignition.recipes.qwen38.vision_state import _vision_finish
     if os.environ.get("TRITON_INTERPRET") == "1":
         # The interpreter cannot add a global tl.constexpr to its tensor wrapper.
@@ -57,9 +60,10 @@ def _kernel_cases(fields, device="cpu"):
 
     # Strided live counts exercise the hybrid-state view contract.
     backing = torch.zeros((8, 19), dtype=torch.int64, device=device)
-    state = DeviceRequestState.allocate(device, vocab_size=32, consumed_tokens=backing[:4, 0])
+    steering = parameter_columns == 7
+    state = DeviceRequestState.allocate(device, vocab_size=32, consumed_tokens=backing[:4, 0], steering=steering)
     state.admit(2, RequestAdmission(7, 11, temperature=1., max_new_tokens=2, eos_token_ids=()), [3] * 64 + [4],
-        consumed_tokens=65, ple_history=(3, 4))
+        consumed_tokens=65)
     records = torch.full((2, 4, fields), -99, dtype=torch.int64, device=device)
     frame, sequence = tensor([1], torch.int32), tensor([91])
     slots, epochs, live = tensor([2], torch.int32), tensor([7]), tensor([1], torch.int32)
@@ -97,9 +101,12 @@ def _kernel_cases(fields, device="cpu"):
     _complete[(4,)](*args[:-1], False)
     check(2, [0, 0, 0, 0, -1, 0, 0, 0])
 
-    admission = AdmissionBuffers.allocate(device, vocab_size=32)
-    admission.stage(0, 2, RequestAdmission(8, 19, temperature=1., eos_token_ids=()), [3, 4])
-    admission.admission_count.fill_(1)
+    admission = AdmissionBuffers.allocate(device, vocab_size=32, steering=steering)
+    request = RequestAdmission(8, 19, temperature=.7, top_p=.95, min_p=.1, repetition_penalty=1.3,
+        presence_penalty=-.2, frequency_penalty=.1, steering_scale=.5 if steering else 0., eos_token_ids=())
+    admission_row = 1
+    admission.stage(admission_row, 2, request, [3, 4])
+    admission.admission_count.fill_(admission_row + 1)
     errors = torch.zeros(4, dtype=torch.int32, device=device)
     a = admission
     finish_args = (a.admission_count, a.admission_slots, a.admission_generations, a.admission_seed_bits,
@@ -107,10 +114,11 @@ def _kernel_cases(fields, device="cpu"):
         a.admission_eos_count, a.admission_grammar_enabled, errors, state.generation, state.seed, state.rng_counter,
         state.parameters, state.top_k, state.max_new_tokens, state.eos_token_ids, state.eos_count, state.grammar_enabled,
         state.generated_tokens, state.pending_token, state.status, state.error_code, state.consumed_tokens,
-        records, frame, sequence, 4, state.consumed_tokens.stride(0), fields)
+        records, frame, sequence, 4, state.consumed_tokens.stride(0), fields, parameter_columns)
     _admission_finish[(4,)](*finish_args)
     check(2, [8, 91, 65, 0, -1, 1, 0, 0])
-    errors[0] = 2
+    assert torch.equal(state.parameters[2], tensor(request.parameter_values(parameter_columns), torch.float32))
+    errors[admission_row] = 2
     _admission_finish[(4,)](*finish_args)
     check(2, [8, 91, 65, 0, -1, 3, 4, 0])
     errors.zero_()
@@ -118,7 +126,7 @@ def _kernel_cases(fields, device="cpu"):
         state.generation, state.consumed_tokens, state.generated_tokens, state.status, state.error_code,
         records, frame, sequence, 4, state.consumed_tokens.stride(0), fields)
     check(2, [8, 91, 65, 0, -1, 1, 0, 0])
-    errors[0] = 9
+    errors[admission_row] = 9
     _snapshot_complete[(4,)](a.admission_slots, a.admission_generations, a.admission_count, errors,
         state.generation, state.consumed_tokens, state.generated_tokens, state.status, state.error_code,
         records, frame, sequence, 4, state.consumed_tokens.stride(0), fields)
@@ -139,5 +147,5 @@ def _kernel_cases(fields, device="cpu"):
 
 
 if __name__ == "__main__":
-    _kernel_cases(int(sys.argv[1]))
+    _kernel_cases(int(sys.argv[1]), int(sys.argv[2]))
     assert not torch.cuda.is_initialized()

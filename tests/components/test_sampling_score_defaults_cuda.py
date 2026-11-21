@@ -26,8 +26,8 @@ class ScoreForward:
         self.kernel()
 
 
-def fixture(batch, vocabulary, dtype):
-    state = DeviceRequestState.allocate('cuda:0', vocab_size=vocabulary, capacity=batch)
+def fixture(batch, vocabulary, dtype, steering):
+    state = DeviceRequestState.allocate('cuda:0', vocab_size=vocabulary, capacity=batch, steering=steering)
     state.generation.fill_(7)
     state.status.fill_(RUNNING)
     generator = torch.Generator(device='cuda').manual_seed(7139)
@@ -41,7 +41,7 @@ def fixture(batch, vocabulary, dtype):
     output = [torch.empty_like(logits, dtype=torch.float32) for _ in range(2)]
     arguments = [(logits, scores, slots, epochs, live, state.generation, state.status,
         state.histogram, state.parameters, state.grammar_mask, state.grammar_enabled,
-        vocabulary, state.grammar_mask.shape[1], 1024, batch) for scores in output]
+        vocabulary, state.grammar_mask.shape[1], 1024, state.parameters.shape[1], state.capacity) for scores in output]
     grid = (batch, (vocabulary + 1023) // 1024, 1)
     forwards = [ScoreForward(_compile(kernel, args, grid))
         for kernel, args in zip((scores_reference, _scores), arguments, strict=True)]
@@ -55,8 +55,12 @@ def assert_exact(actual, expected):
 @pytest.mark.parametrize('batch,vocabulary', [(1, 17), (8, 129280), (32, 129280)])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('compiled', [False, True])
-def test_neutral_and_dynamic_scores_native_replay(batch, vocabulary, dtype, compiled):
-    state, slots, epochs, live, logits, outputs, forwards = fixture(batch, vocabulary, dtype)
+@pytest.mark.parametrize('steering', [False, True], ids=['six-columns', 'seven-columns'])
+def test_neutral_and_dynamic_scores_native_replay(batch, vocabulary, dtype, compiled, steering):
+    state, slots, epochs, live, logits, outputs, forwards = fixture(batch, vocabulary, dtype, steering)
+    sampling_parameters = state.parameters[:, :6]
+    if steering:
+        state.parameters[:, 6].fill_(.5)
     calls = [compile_forward(forward) if compiled else forward for forward in forwards]
     graphs = {}
     for label, call in zip(('reference', 'candidate'), calls, strict=True):
@@ -76,7 +80,7 @@ def test_neutral_and_dynamic_scores_native_replay(batch, vocabulary, dtype, comp
     try:
         for mode in ('neutral', 'temperature_only', 'tiny_temperature', 'mixed', 'nondefault',
                      'negative_zero', 'extremes', 'invalid', 'neutral'):
-            state.parameters.copy_(torch.tensor([1., 1., 0., 1., 0., 0.], device='cuda'))
+            sampling_parameters.copy_(torch.tensor([1., 1., 0., 1., 0., 0.], device='cuda'))
             state.grammar_enabled.zero_()
             state.status.fill_(RUNNING)
             slots.copy_(torch.arange(batch, dtype=torch.int32, device='cuda'))
@@ -86,7 +90,7 @@ def test_neutral_and_dynamic_scores_native_replay(batch, vocabulary, dtype, comp
                 selected = torch.arange(batch, device='cuda').remainder(2) == 1
                 if mode == 'nondefault':
                     selected.fill_(True)
-                state.parameters[selected] = torch.tensor([.7, .95, .1, 1.3, -.2, .1], device='cuda')
+                sampling_parameters[selected] = torch.tensor([.7, .95, .1, 1.3, -.2, .1], device='cuda')
                 state.grammar_enabled[selected] = 1
             if mode == 'negative_zero':
                 state.parameters[:, 4:6] = -0.
