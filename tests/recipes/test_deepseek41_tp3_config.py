@@ -16,7 +16,7 @@ from ignition.recipes.deepseek41.tp3_config import (TP3Config, describe_checkpoi
 # host-row embedding gather, VRAM reclaim, mHC PDL): the script's environment block runs in bash (everything before
 # ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE / B12X_* values are read back, so a change to the script's defaults
 # reaches these tests. The default two-shot pull and gather pull need B12X_OVERLAY (a directory with ``b12x_tree`` and
-# the gather-pull patch's marker): a stub is passed.
+# both patches): the test supplies an overlay layout with the required capability markers.
 EXPORT_SH = Path(__file__).resolve().parents[2] / "tp3-tools" / "release" / "export.sh"
 RELEASE_CKPT = "/models/ds41-1017-engram-fp8"
 
@@ -27,9 +27,15 @@ def _overlay_stub():
     import tempfile
 
     root = Path(tempfile.mkdtemp(prefix="b12x-overlay-stub-"))
-    (root / "b12x_tree" / "comm" / "pcie").mkdir(parents=True)
-    # the gather pull default (GATHER_PULL=1) checks the overlay for the gather-pull patch's marker
-    (root / "b12x_tree" / "comm" / "pcie" / "_dcp_a2a_cute.py").write_text("_gather_pull_enabled\n")
+    pcie = root / "b12x_tree" / "comm" / "pcie"
+    pcie.mkdir(parents=True)
+    (root / "b12x").mkdir()
+    (root / "b12x" / "__init__.py").touch()
+    (pcie / "_collective_tuning.py").write_text("def twoshot_pull_enabled(): ...\n")
+    (pcie / "pcie_allreduce.py").write_text("if twoshot_pull_enabled(): ...\n")
+    (pcie / "_dcp_a2a_cute.py").write_text(
+        "def _gather_pull_enabled(world_size): ...\ngather_pull = _gather_pull_enabled(world_size)\n"
+    )
     atexit.register(shutil.rmtree, root, True)
     return str(root)
 
@@ -85,7 +91,20 @@ def test_export_script_sets_the_b12x_switches_of_the_release():
          "B12X_PCIE_DCP_GATHER_PULL": "auto"}
     off = export_variables(TWOSHOT="0", ATTN="0", MHC_PDL="0", GATHER_PULL="0", B12X_OVERLAY="")
     assert (off["B12X_PCIE_TWOSHOT_PULL"], off["B12X_MLA_DECODE_REMAINDER_STREAM"], off["B12X_MHC_PDL"]) == ("0",) * 3
-    assert "B12X_PCIE_DCP_GATHER_PULL" not in off
+    assert off["B12X_PCIE_DCP_GATHER_PULL"] == "0"
+
+
+def test_export_script_config_overrides_preserve_dependencies():
+    config = TP3Config.from_environment(export_environment(
+        IDX_SPLIT="", FLARE_DS41_INDEX_ROW_SPLIT="4096", FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX="32768",
+        FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS="prefill", NO_GEN_LOGPROBS="0", FLARE_DS41_NO_GENERATION_LOGPROBS="1",
+        RECLAIM="1", FLARE_DS41_SHARE_VOCAB_COLUMNS="0",
+    ))
+    assert config.index_row_split is None
+    assert config.index_row_split_min_context is None
+    assert config.index_row_split_variant_graphs is None
+    assert not config.no_generation_logprobs
+    assert config.share_engram_token_map and not config.share_vocab_columns
 
 
 def test_export_script_environment_is_parsed_not_copied():
