@@ -13,17 +13,17 @@ from ignition.recipes.deepseek41.tp3_config import (TP3Config, describe_checkpoi
 # release: PARK 20-39, HOT=355, COUNTS = the blended order in expert-orders/order-mix-provisional-exl3S, the round-3
 # switches and GATHER_PULL/ROTARY_PREFILL on; before: HOT=342, COUNTS=$HERE/expert-order), VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1, and since the
 # 20261116 release PARKED_ROWS 0, 768-row prefill all-reduce parts, index/context side streams, uneven wo_a split,
-# host-row embedding gather, VRAM reclaim, mHC PDL): the script's environment block runs in bash (everything before
-# ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE / B12X_* values are read back, so a change to the script's defaults
-# reaches these tests. The default two-shot pull and gather pull need B12X_OVERLAY (a directory with ``b12x_tree`` and
+# host-row embedding gather, VRAM reclaim, mHC PDL). A stub Ignition executable reports the environment
+# passed by the release wrapper. The default two-shot pull and gather pull need B12X_OVERLAY (a directory with ``b12x_tree`` and
 # both patches): the test supplies an overlay layout with the required capability markers.
 EXPORT_SH = Path(__file__).resolve().parents[2] / "tp3-tools" / "release" / "export.sh"
 RELEASE_CKPT = "/models/ds41-1017-engram-fp8"
 
 
-def _overlay_stub():
+def _export_stubs():
     import atexit
     import shutil
+    import sys
     import tempfile
 
     root = Path(tempfile.mkdtemp(prefix="b12x-overlay-stub-"))
@@ -36,11 +36,20 @@ def _overlay_stub():
     (pcie / "_dcp_a2a_cute.py").write_text(
         "def _gather_pull_enabled(world_size): ...\ngather_pull = _gather_pull_enabled(world_size)\n"
     )
+    venv_bin = root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    exporter = venv_bin / "ignition"
+    exporter.write_text(
+        "#!/bin/bash\n"
+        'for name in ${!FLARE_DS41_@} ${!B12X_@} HF_HUB_OFFLINE; do printf "%s=%s\\0" "$name" "${!name}"; done\n'
+    )
+    exporter.chmod(0o755)
     atexit.register(shutil.rmtree, root, True)
     return str(root)
 
 
-OVERLAY_STUB = _overlay_stub()
+OVERLAY_STUB = _export_stubs()
 
 
 def export_environment(**variables):
@@ -53,12 +62,11 @@ def export_variables(**variables):
     import os
     import subprocess
 
-    script = EXPORT_SH.read_text()
-    body = script[:script.index("\nexec ")]
-    dump = '\nfor name in ${!FLARE_DS41_@} ${!B12X_@} HF_HUB_OFFLINE; do printf "%s=%s\\0" "$name" "${!name}"; done'
-    output = subprocess.run(["bash", "-c", body + dump, str(EXPORT_SH)], check=True, capture_output=True,
-                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT,
-                                 "B12X_OVERLAY": OVERLAY_STUB, **variables})
+    output = subprocess.run(
+        ["bash", str(EXPORT_SH)], cwd=OVERLAY_STUB, check=True, capture_output=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CKPT": RELEASE_CKPT,
+             "PYTHONPATH": str(EXPORT_SH.parents[2]), "B12X_OVERLAY": OVERLAY_STUB, **variables},
+    )
     pairs = (item.split("=", 1) for item in output.stdout.decode().split("\0") if "=" in item)
     return {key: value for key, value in pairs
             if key.startswith(("FLARE_DS41_", "B12X_")) or key == "HF_HUB_OFFLINE"}
@@ -105,6 +113,46 @@ def test_export_script_config_overrides_preserve_dependencies():
     assert config.index_row_split_variant_graphs is None
     assert not config.no_generation_logprobs
     assert config.share_engram_token_map and not config.share_vocab_columns
+
+
+@pytest.mark.parametrize(("chunk", "ladder", "includes_4096"), [
+    (2048, "", False),
+    (8192, "128,2048,8192", False),
+    (24576, "", False),
+    (8192, "128, 04096, 8192", True),
+])
+def test_export_script_prefill_defaults_follow_captured_capacities(chunk, ladder, includes_4096):
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    config = TP3Config.from_environment(export_environment(
+        PREFILL=str(chunk), FLARE_DS41_PREFILL_GRAPHS=ladder, IDX_SPLIT_VARIANTS="prefill",
+    ))
+    preparation = PreparationConfig(max_active=4, devices=(0, 1, 2), prefill_chunk_size=chunk, tp3=config)
+    assert (4096 in preparation.prefill_capacities) == includes_4096
+    assert config.prefill_skip_suffix == config.index_row_split == ((4096,) if includes_4096 else None)
+    assert config.index_row_split_min_context == (32768 if includes_4096 else None)
+    assert config.index_row_split_variant_graphs == (("prefill",) if includes_4096 else None)
+
+
+def test_export_script_preserves_explicit_prefill_capacities():
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    config = TP3Config.from_environment(export_environment(PREFILL="2048", SKIP_SUFFIX="2048", IDX_SPLIT="1024"))
+    assert config.prefill_skip_suffix == (2048,)
+    assert config.index_row_split == (1024,)
+    PreparationConfig(max_active=4, devices=(0, 1, 2), prefill_chunk_size=2048, tp3=config)
+
+
+@pytest.mark.parametrize(("switch", "error"), [
+    ("SKIP_SUFFIX", "FLARE_DS41_PREFILL_SKIP_SUFFIX"),
+    ("IDX_SPLIT", "FLARE_DS41_INDEX_ROW_SPLIT"),
+])
+def test_export_script_rejects_explicit_uncaptured_prefill_capacity(switch, error):
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    config = TP3Config.from_environment(export_environment(PREFILL="2048", **{switch: "4096"}))
+    with pytest.raises(ValueError, match=rf"{error}.*not captured"):
+        PreparationConfig(max_active=4, devices=(0, 1, 2), prefill_chunk_size=2048, tp3=config)
 
 
 def test_export_script_environment_is_parsed_not_copied():

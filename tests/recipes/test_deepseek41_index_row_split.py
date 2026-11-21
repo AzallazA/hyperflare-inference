@@ -669,9 +669,12 @@ def test_attention_splits_only_index_layers_before_the_candidate_source():
 def test_export_script_knob_reaches_the_switch():
     from tests.recipes.test_deepseek41_tp3_config import export_environment
 
-    assert export_environment()["FLARE_DS41_INDEX_ROW_SPLIT"] == "4096"  # 20261121 default: split from 32K tokens
-    assert export_environment()["FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX"] == "32768"
-    assert "FLARE_DS41_INDEX_ROW_SPLIT" not in export_environment(IDX_SPLIT="", IDX_SPLIT_MIN_CTX="")  # replicated
+    default = TP3Config.from_environment(export_environment())
+    assert default.index_row_split == (4096,)
+    assert default.index_row_split_min_context == 32768
+    off = TP3Config.from_environment(export_environment(IDX_SPLIT="", IDX_SPLIT_MIN_CTX=""))
+    assert off.index_row_split is None
+    assert off.index_row_split_min_context is None
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="1")).index_row_split == ROW_SPLIT_DEFAULT
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="4096")).index_row_split == (4096,)
 
@@ -734,12 +737,15 @@ def test_split_context_follows_the_variant():
         split_module.prefill_split_context(tp3=longctx, variant=True, **{**kw, "capacity": 3584})
 
 
-def test_export_sh_passes_the_min_context_knob():
-    from tests.recipes.test_deepseek41_tp3_config import EXPORT_SH
+def test_export_script_overrides_the_index_split_min_context():
+    from tests.recipes.test_deepseek41_tp3_config import export_environment
 
-    text = EXPORT_SH.read_text()
-    assert 'FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX' in text
-    assert text.index("FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX") < text.index("exec .venv/bin/ignition export")
+    custom = TP3Config.from_environment(export_environment(IDX_SPLIT_MIN_CTX="65536"))
+    assert custom.index_row_split_min_context == 65536
+    off = TP3Config.from_environment(export_environment(IDX_SPLIT_MIN_CTX="", IDX_SPLIT_VARIANTS="prefill"))
+    assert off.index_row_split == (4096,)
+    assert off.index_row_split_min_context is None
+    assert off.index_row_split_variant_graphs is None
 
 
 def test_variant_graph_kinds_switch_parses_validates_records_and_selects():
