@@ -655,7 +655,8 @@ and raw Completions. Supply `steering_scale` as a top-level extension field on t
 is absent, and conflicting duplicate values return HTTP 400. Values are clamped
 to the prepared inclusive interval `[0, 1]`, with a default of zero. A core exported
 without steering metadata accepts omitted or zero scale and rejects a nonzero
-value with HTTP 400. Zero scale adds no conditioning event, preserving ordinary
+value with HTTP 400. Messages and Responses also accept an explicit zero.
+Zero scale adds no conditioning event, preserving ordinary
 unsteered prefix identities. A nonzero scale adds a position-zero event derived
 from the sidecar SHA-256 and exact FP32 scale bits, so different scales and
 sidecars cannot reuse one another's KV prefixes.
@@ -666,7 +667,11 @@ keys stay out of the process list, environment and logs; one key per line or
 comma-separated, `#` starts a comment line, the file must hold at least one key
 and should be mode 600), `FLARE_STEERING_API_KEYS_FILE=PATH`,
 or `FLARE_STEERING_API_KEYS=KEY1,KEY2`. Keys are never accepted as command-line
-arguments (they would show in the process list). All sources add up. With keys configured, a request whose body sets a nonzero
+arguments (they would show in the process list). In Orbit, pass
+`--steering-api-keys-file` to `flare orbit run` with a path readable on rank zero's node.
+For the inline environment variable, a leading `#` is a key character, and a
+nonblank list must contain at least one key. All sources add up.
+With keys configured, a request whose body sets a nonzero
 `steering_scale` (top level or in `chat_template_kwargs`, on any generation route)
 must carry one key as `X-Steering-Key: KEY`, or, without that header, as
 `Authorization: Bearer KEY`; otherwise the server answers HTTP 403 with

@@ -592,6 +592,9 @@ pub struct OrbitRun {
     pub api_key_file: Option<PathBuf>,
 
     #[command(flatten)]
+    pub steering_access: SteeringAccessOptions,
+
+    #[command(flatten)]
     pub scheduler: SchedulerOptions,
 
     #[command(flatten)]
@@ -639,6 +642,9 @@ impl OrbitRun {
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
+        if let Some(path) = &self.steering_access.steering_api_keys_file {
+            options.extend(["--steering-api-keys-file".into(), path.display().to_string()]);
+        }
         options
     }
 
@@ -661,7 +667,7 @@ impl OrbitRun {
             dry_run: false,
             dry_run_free_memory: Vec::new(),
             api_key_file: self.api_key_file.clone(),
-            steering_access: SteeringAccessOptions::default(),
+            steering_access: self.steering_access.clone(),
             scheduler_policy: self
                 .scheduler_policy
                 .clone()
@@ -1471,6 +1477,8 @@ mod tests {
             let mut arguments = vec!["flare", "orbit", "run", "--name", "service", "--persistent"];
             if explicit {
                 arguments.extend([
+                    "--steering-api-keys-file",
+                    "/new.keys",
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -1524,12 +1532,16 @@ mod tests {
                 "context".into(),
                 "--embedding-table-cache-size".into(),
                 "1G".into(),
+                "--steering-api-keys-file".into(),
+                "/saved.keys".into(),
             ];
             saved.extend(orbit.rank_options(run_matches));
             saved.extend(orbit.rank_zero_options());
             let Command::Run(effective) = Cli::try_parse_from(saved).unwrap().command else {
                 panic!()
             };
+            assert_eq!(effective.steering_access.steering_api_keys_file.as_deref(),
+                       Some(Path::new(if explicit { "/new.keys" } else { "/saved.keys" })));
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
             assert_eq!(
                 effective.scheduler_terminal_value,

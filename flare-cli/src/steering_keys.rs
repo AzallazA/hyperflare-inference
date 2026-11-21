@@ -16,13 +16,12 @@ pub const KEYS_ENV: &str = "FLARE_STEERING_API_KEYS";
 /// process list and the environment.
 pub const KEYS_FILE_ENV: &str = "FLARE_STEERING_API_KEYS_FILE";
 
-/// Splits `text` into keys at commas and line ends; blank entries and lines starting with '#'
-/// are skipped. A key must be printable ASCII without spaces.
-fn parse(text: &str, source: &str) -> Result<Vec<String>, String> {
+/// Split keys at commas and line ends. Only key files support comment lines.
+fn parse(text: &str, source: &str, file_comments: bool) -> Result<Vec<String>, String> {
     let mut keys = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') {
+        if file_comments && line.starts_with('#') {
             continue;
         }
         for key in line.split(',').map(str::trim).filter(|key| !key.is_empty()) {
@@ -53,7 +52,7 @@ fn read_file(path: &Path, source: &str) -> Result<Vec<String>, String> {
             }
         }
     }
-    let keys = parse(&text, &format!("{source} {}", path.display()))?;
+    let keys = parse(&text, &format!("{source} {}", path.display()), true)?;
     if keys.is_empty() {
         // A named key file that holds nothing must not silently leave steering open.
         return Err(format!("{source} {}: no steering key in the file", path.display()));
@@ -73,7 +72,11 @@ pub fn resolve(
         keys.extend(read_file(path, "--steering-api-keys-file")?);
     }
     if let Some(value) = environment(KEYS_ENV).filter(|value| !value.trim().is_empty()) {
-        keys.extend(parse(&value, KEYS_ENV)?);
+        let configured = parse(&value, KEYS_ENV, false)?;
+        if configured.is_empty() {
+            return Err(format!("{KEYS_ENV}: no steering key in the configured list"));
+        }
+        keys.extend(configured);
     }
     if let Some(path) = environment(KEYS_FILE_ENV).filter(|value| !value.trim().is_empty()) {
         keys.extend(read_file(Path::new(path.trim()), KEYS_FILE_ENV)?);
@@ -118,6 +121,14 @@ mod tests {
         assert!(resolve(&SteeringAccessOptions::default(), env(&[])).unwrap().is_empty());
         let blank = [(KEYS_ENV, "  ".to_string()), (KEYS_FILE_ENV, String::new())];
         assert!(resolve(&SteeringAccessOptions::default(), env(&blank)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn environment_keys_allow_hash_and_require_a_key_for_nonblank_input() {
+        let options = SteeringAccessOptions::default();
+        assert_eq!(resolve(&options, env(&[(KEYS_ENV, "#first,second".into())])).unwrap(),
+                   ["#first", "second"]);
+        assert!(resolve(&options, env(&[(KEYS_ENV, ", ,".into())])).is_err());
     }
 
     #[test]

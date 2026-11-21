@@ -141,6 +141,8 @@ def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
     assert "--graph-times applies only to --direct" in failure(capsys)[0]
     assert main(["debug-serve", "glm-5.3-flash", "--direct", "--eager", "--graph-times", "/nonexistent/times.json"]) == 2
     assert "graph replay with --graph-times saves it" in failure(capsys)[0]
+    assert main(["debug-serve", "deepseek-v4.1-flash", "--direct", "--steering-sidecar", "sidecar"]) == 2
+    assert "--steering-sidecar requires native serving" in failure(capsys)[0]
     for arguments in (["export", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--eager"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2", "--direct"]):
         with pytest.raises(SystemExit) as exit:

@@ -570,7 +570,7 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
         }
         options.template.extend(template);
     }
-    if options.sampling.steering_scale.is_some()
+    if options.sampling.steering_scale.is_some_and(|scale| scale != 0.0)
         && !matches!(protocol, Protocol::Chat | Protocol::Completions)
     {
         return Err(unsupported(
@@ -925,6 +925,16 @@ mod tests {
             assert!(normalize_tool_arguments(&mut message).is_err());
         }
     }
+    #[test]
+    fn zero_steering_is_accepted_on_messages_and_responses() {
+        for protocol in [Protocol::Messages, Protocol::Responses] {
+            for body in [json!({"steering_scale":0}), json!({"chat_template_kwargs":{"steering_scale":0}})] {
+                assert_eq!(options(&body, protocol).unwrap().sampling.steering_scale, Some(0.0));
+            }
+            assert!(options(&json!({"steering_scale":0.5}), protocol).is_err());
+        }
+    }
+
     #[test]
     fn steering_scale_accepts_openai_and_template_extension_fields() {
         let chat = |extra: Value| {

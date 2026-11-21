@@ -476,6 +476,8 @@ def debug_serve(args) -> int:
         raise UsageError("--graph-times applies only to --direct execution")
     if args.eager and args.graph_times is not None and not args.graph_times.is_file():
         raise UsageError(f"--graph-times {args.graph_times} does not exist; graph replay with --graph-times saves it")
+    if args.direct and args.steering_sidecar is not None:
+        raise UsageError("--steering-sidecar requires native serving; direct execution cannot apply steering")
     if args.direct and args.history_drafts:
         raise UsageError("--history-drafts requires native serving; it does not apply to --direct")
     if not args.direct:
