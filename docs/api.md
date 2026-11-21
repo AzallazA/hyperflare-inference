@@ -665,8 +665,8 @@ holders of steering keys: `flare run --steering-api-keys-file PATH` (preferred:
 keys stay out of the process list, environment and logs; one key per line or
 comma-separated, `#` starts a comment line, the file must hold at least one key
 and should be mode 600), `FLARE_STEERING_API_KEYS_FILE=PATH`,
-`FLARE_STEERING_API_KEYS=KEY1,KEY2`, or the repeatable `--steering-api-key KEY`.
-All sources add up. With keys configured, a request whose body sets a nonzero
+or `FLARE_STEERING_API_KEYS=KEY1,KEY2`. Keys are never accepted as command-line
+arguments (they would show in the process list). All sources add up. With keys configured, a request whose body sets a nonzero
 `steering_scale` (top level or in `chat_template_kwargs`, on any generation route)
 must carry one key as `X-Steering-Key: KEY`, or, without that header, as
 `Authorization: Bearer KEY`; otherwise the server answers HTTP 403 with

@@ -895,36 +895,15 @@ pub struct SchedulerOptions {
     pub scheduler_encoder_prefill: Option<bool>,
 }
 
-/// A steering key given on the command line; its `Debug` form never shows the key.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SteeringKey(pub String);
-
-impl std::fmt::Debug for SteeringKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SteeringKey(<redacted>)")
-    }
-}
-
-/// Accepts any text; `steering_keys::resolve` validates it without echoing it (clap's own
-/// invalid-value errors would print the argument).
-fn steering_key(value: &str) -> Result<SteeringKey, String> {
-    Ok(SteeringKey(value.to_owned()))
-}
-
-/// Who may set `steering_scale`. Without any key every client may; with keys (from these flags,
+/// Who may set `steering_scale`. Without any key every client may; with keys (from this file,
 /// FLARE_STEERING_API_KEYS and FLARE_STEERING_API_KEYS_FILE together), a request with a nonzero
 /// `steering_scale` must carry one in `X-Steering-Key` or `Authorization: Bearer`, or is refused
 /// with 403.
 #[derive(Debug, Args, Clone, Default, PartialEq)]
 pub struct SteeringAccessOptions {
-    /// Steering key that allows a request to set a nonzero steering_scale (repeatable). Visible in
-    /// the process list; prefer --steering-api-keys-file [default: none = any client may steer].
-    #[arg(long = "steering-api-key", value_name = "KEY", value_parser = steering_key,
-        action = clap::ArgAction::Append, help_heading = "Serving options")]
-    pub steering_api_key: Vec<SteeringKey>,
-
     /// File of steering keys, one per line or comma-separated ('#' starts a comment line); must
-    /// hold at least one key [default: FLARE_STEERING_API_KEYS_FILE].
+    /// hold at least one key. Keys are never taken on the command line (they would show in the
+    /// process list) [default: FLARE_STEERING_API_KEYS_FILE; none = any client may steer].
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub steering_api_keys_file: Option<PathBuf>,
 }
@@ -1438,6 +1417,24 @@ impl ServingOptions {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn steering_keys_are_not_accepted_on_the_command_line() {
+        for flag in ["--steering-api-key", "--steering-api-key=x"] {
+            let mut argv = vec!["flare", "run", "core.safetensors", flag];
+            if !flag.contains('=') {
+                argv.push("x");
+            }
+            let error = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument, "{flag}");
+        }
+        let cli = Cli::try_parse_from([
+            "flare", "run", "core.safetensors", "--steering-api-keys-file", "/keys",
+        ])
+        .unwrap();
+        let Command::Run(run) = cli.command else { panic!("expected run") };
+        assert_eq!(run.steering_access.steering_api_keys_file.as_deref(), Some(Path::new("/keys")));
+    }
 
     #[test]
     fn canonical_core_cache_flag_accepts_hidden_legacy_aliases() {

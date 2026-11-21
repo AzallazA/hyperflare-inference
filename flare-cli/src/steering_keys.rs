@@ -61,7 +61,7 @@ fn read_file(path: &Path, source: &str) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
-/// Gathers the keys of every configured source: `--steering-api-key`, `--steering-api-keys-file`,
+/// Gathers the keys of every configured source: `--steering-api-keys-file`,
 /// `FLARE_STEERING_API_KEYS` and `FLARE_STEERING_API_KEYS_FILE` (`environment` reads a variable).
 /// Duplicates are dropped; an empty result means steering stays open to every client.
 pub fn resolve(
@@ -69,12 +69,6 @@ pub fn resolve(
     environment: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<String>, String> {
     let mut keys = Vec::new();
-    for (index, key) in options.steering_api_key.iter().enumerate() {
-        keys.extend(parse(&key.0, &format!("--steering-api-key #{}", index + 1))?);
-    }
-    if options.steering_api_key.iter().any(|key| key.0.trim().is_empty()) {
-        return Err("--steering-api-key must not be empty".into());
-    }
     if let Some(path) = &options.steering_api_keys_file {
         keys.extend(read_file(path, "--steering-api-keys-file")?);
     }
@@ -96,7 +90,6 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::SteeringKey;
     use std::collections::HashMap;
 
     const SECRET: &str = "s3cret-steering-key";
@@ -129,10 +122,9 @@ mod tests {
 
     #[test]
     fn every_source_contributes_and_duplicates_collapse() {
-        let path = file("keys", &format!("# steering keys\n{SECRET}\n\nfile-two, file-three\n"));
+        let path = file("keys", &format!("# steering keys\n{SECRET}\n\nfile-two, file-three, {SECRET}\n"));
         let env_path = file("env-keys", "env-file-key\n");
         let options = SteeringAccessOptions {
-            steering_api_key: vec![SteeringKey("flag-key".into()), SteeringKey(SECRET.into())],
             steering_api_keys_file: Some(path),
         };
         let keys = resolve(
@@ -145,7 +137,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             keys,
-            ["flag-key", SECRET, "file-two", "file-three", "env-one", "env-two", "env-file-key"]
+            [SECRET, "file-two", "file-three", "env-one", "env-two", "env-file-key"]
         );
     }
 
@@ -170,23 +162,9 @@ mod tests {
         let bad = format!("{SECRET} with-space");
         let path = file("bad", &format!("{SECRET}\nbad key\u{7}\n"));
         let failures = [
-            resolve(
-                &SteeringAccessOptions {
-                    steering_api_key: vec![SteeringKey(bad.clone())],
-                    ..Default::default()
-                },
-                env(&[]),
-            ),
             resolve(&SteeringAccessOptions::default(), env(&[(KEYS_ENV, bad.clone())])),
             resolve(
                 &SteeringAccessOptions { steering_api_keys_file: Some(path), ..Default::default() },
-                env(&[]),
-            ),
-            resolve(
-                &SteeringAccessOptions {
-                    steering_api_key: vec![SteeringKey(" ".into())],
-                    ..Default::default()
-                },
                 env(&[]),
             ),
         ];
@@ -194,10 +172,5 @@ mod tests {
             let message = failure.unwrap_err();
             assert!(!message.contains(SECRET) && !message.contains("with-space"), "{message}");
         }
-        let options = SteeringAccessOptions {
-            steering_api_key: vec![SteeringKey(SECRET.into())],
-            ..Default::default()
-        };
-        assert!(!format!("{options:?}").contains(SECRET));
     }
 }
