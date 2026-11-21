@@ -3,7 +3,7 @@
 
 """TP3: steering (upstream PR #404) inside the BRRR fused tail, on CPU (no kernel, no GPU).
 
-The CUDA layer test checks the kernel itself (analysis/work/steering-sidecar-20261119/optionB/DESIGN.md, GPU plan).
+The CUDA layer test checks the kernel itself (GPU plan).
 This file checks, without a GPU:
 
 * the arithmetic the kernel implements (brrr/kernels/decoder.cu, ``#if BRRR_STEER``), mirrored here operation by

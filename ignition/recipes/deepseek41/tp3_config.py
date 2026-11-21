@@ -52,11 +52,11 @@ RECORDED_WHEN_TRUE = ("mma_pad_once", "vision_arena_host", "markov_embed_host", 
                       "index_row_split_check")
 # Decode small-lever switches (perf/ds41-decode-small-levers, 2026-11-18): on/off, recorded only when on.
 SMALL_LEVERS = ("rotary_once", "pin_small_qproj", "logprob_single_exchange", "no_generation_logprobs")
-# E3c-a exact levers (perf/ds41-e3c-a, 2026-11-19; analysis/work/e3-comms-levers-20261119): on/off, recorded only when
+# E3c-a exact levers (perf/ds41-e3c-a, 2026-11-19): on/off, recorded only when
 # on, so a default export's record is unchanged. F = dcp_gather_pull, d = rotary_once_prefill.
 E3C_A = ("rotary_once_prefill", "dcp_gather_pull")
 RECORDED_WHEN_TRUE = RECORDED_WHEN_TRUE + E3C_A
-# Steering inside BRRR (feat/ds41-steering-brrr, analysis/work/steering-sidecar-20261119/optionB): on/off, recorded
+# Steering inside BRRR (feat/ds41-steering-brrr): on/off, recorded
 # only when on.
 RECORDED_WHEN_TRUE = RECORDED_WHEN_TRUE + ("steering_plain_identity",)
 # b12x's switch of the gather-pull overlay patch (tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch)

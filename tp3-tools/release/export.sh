@@ -1,118 +1,77 @@
 #!/bin/bash
 # Export the package from a checkpoint view (make_checkpoint_view.sh). Run it from the fork checkout with its .venv
 # (uv sync, then re-apply tp3-patches/ to the installed FlashInfer; Hyperflare's torch/Triton fixes are applied in memory
-# by ignition.runtime_patches). The defaults reproduce the release package (16 request slots, FP8 Engram view, round-2
-# switches on, Engram side stream off). Every switch below is recorded in the package's tp3-config.json.
+# by ignition.runtime_patches). The defaults reproduce the release package 202611201530 except the steering sidecar,
+# which you pass with STEERING= (download: README "Building the package"). Every switch is recorded in the package's
+# tp3-config.json. EXPORT.md step 4 has the table of what each one sets.
 #   CKPT     checkpoint view directory (required; the directory name becomes the model name, default view: ds41-1017-engram-fp8)
-#   B12X_OVERLAY  b12x copy with tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch (required while TWOSHOT=1):
-#            VENV=$PWD/.venv B12X_OVERLAY_PATCHES=$PWD/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch \
-#              tp3-tools/make-b12x-overlay.sh $PWD/.b12x-overlay-twoshot
-#   HOT      hot experts per parked layer (default 342; each expert fewer adds ~92K KV tokens, see README)
-#   PARK     parked (host-expert) layers (default 20-33). Prefill runs layers 20-39 on the last 128 rows of a chunk only, so
-#            only those are candidates; e.g. PARK=20-39 HOT=354 keeps the release's host-expert rows (14 x 42 = 588) spread
-#            over 20 layers (20 x 30 = 600; perf/ds41-tp3-park, not measured on the GPU yet)
-#   MAXC     request slots the package captures graphs for (default 16; 8 = fewer graphs, not measured on this build)
+#   B12X_OVERLAY  b12x copy with both overlay patches (required while TWOSHOT=1 or GATHER_PULL=1, the defaults):
+#            VENV=$PWD/.venv B12X_OVERLAY_PATCHES="<folder>/tp3-patches/overlay/flashinfer-pcie-twoshot-pull-world3.patch \
+#              <folder>/tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch" tp3-tools/make-b12x-overlay.sh $PWD/.b12x-overlay-gpull
+#   STEERING  path of the steering sidecar (.safetensors, layers 4-36) = --steering-sidecar; the package then takes a
+#            per-request steering_scale in [0, 1] (0 = unsteered). Unset = no sidecar (nonzero scales get HTTP 400)
+#   STEERING_PLAIN_ID  1 (default) = with STEERING, tune under the checkpoint's plain identity: the same tuning records
+#            and plan selections as the package without the sidecar; 0 = upstream's sidecar-keyed identity
+#   COUNTS   expert route counts that decide the hot experts (default: the blended code and prose order of the release,
+#            expert-order/ next to this script in the release folder)
+#   PARK     layers whose routed experts are split between VRAM and host RAM (default 20-39)
+#   HOT      hot experts per parked layer kept in VRAM, out of 384 (default 355; fewer = more KV, slower decode)
+#   MAXC     request slots the package captures graphs for (default 16)
 #   PREFILL  prefill chunk size (default 4096)
 #   DRAFTS   DSpark drafts (default 5); serve with the same DRAFTS (serve.sh)
-#   PARKED_ROWS  BRRR row gate of the parked layers 20-33 (default 0 = BRRR at every width, as on the resident layers;
-#            12 = the 20261111 gate)
-#   TWOSHOT  1 (default) = race the BF16 two-shot pull all-reduce beside the upstream candidates (B12X_PCIE_TWOSHOT_PULL,
-#            needs B12X_OVERLAY); 0 = upstream candidate set, no overlay
+#   PARKED_ROWS  BRRR row gate of the parked layers (default 0 = BRRR at every width)
+#   TWOSHOT  1 (default) = race the BF16 two-shot pull all-reduce beside the upstream candidates (needs B12X_OVERLAY);
+#            0 = upstream candidate set
+#   GATHER_PULL  1 (default) = world-3 DCP column gathers pull instead of push (needs B12X_OVERLAY with the gather pull
+#            patch; copies only); 0 = push, as before
 #   ATTN     1 (default) = each attention decode's 16-head grid on a side stream beside the 8-head remainder grid
-#            (B12X_MLA_DECODE_REMAINDER_STREAM; ignition hook, no b12x change); 0 = serial
-#   MLA_SPLITS  ROWS:SPLITS,... = DSV41 decode split count per prepared row count (FLARE_DS41_MLA_DECODE_SPLITS;
-#            ignition hook, no b12x change; e.g. 9:10,18:5,28:10,37:5); unset = b12x's tuned split geometry
-#   H24      ROWS:0|1,... = prepared row counts whose DSV41 decode runs all 24 heads in one launch (FLARE_DS41_MLA_H24;
-#            ignition kernel, no b12x change; same values as 16 + 8 at the same split count; e.g. 9:0,80:1);
-#            unset = b12x's 16-head + 8-head grids
-#   MHC_PDL  1 (default) = programmatic dependent launch in b12x's mHC norm kernels (B12X_MHC_PDL); 0 = off
-#   AR_PART_ROWS, ENGRAM_PART_ROWS  prefill all-reduce part caps for the decoder and the Engram projection (default
-#            768 each = 5 x 768 + 256 per 4096-row chunk instead of 4 x 1024; 0 = halving, the 20261111 layout)
-#   INDEX_SIDE   1 (default) = indexer query chain on a side stream (FLARE_DS41_INDEX_SIDE_STREAM)
-#   CONTEXT_SIDE 1 (default) = DSpark context projection on a side stream beside verification (FLARE_DS41_CONTEXT_SIDE_STREAM)
-#   ENGRAM_SIDE  layer list for the Engram side stream (FLARE_DS41_ENGRAM_SIDE_LAYERS; default empty = off; "14" measured
-#            level, not adopted)
-#   WOA_UNEVEN   BRRR wo_a job split for <= 8 rows (FLARE_DS41_BRRR_WOA_UNEVEN; default 1); WOA_SMALL default 0
-#   EMBED_ROWS   1 (default) = vectorised host-row embedding gather (FLARE_DS41_EMBED_ROWS)
-#   RECLAIM  1 (default) = the four VRAM reclaim switches (FLARE_DS41_VRAM_RECLAIM: shared Engram token map, trimmed
-#            vocabulary gather, no draft-vocabulary channel, shared vocabulary columns); 0 = off
-#   LIBRARY_SCRATCH  unset = code default (on): cuBLAS's own 64 MiB pool is kept out of the export's reachability
-#            (FLARE_EXPORT_LIBRARY_SCRATCH); 0 = off, as the code the release package was exported from
-#   PAD_ONCE     1 = one MXFP8 MMA-scale zero fill per decode/verify/draft forward instead of one per layer
-#            (FLARE_DS41_MMA_PAD_ONCE); default 0 (ds41-tp3-next 2026-11-17, not measured on the GPU yet)
-#   VISION_ARENA_HOST  1 = image feature arena (160 MiB/GPU) in device-visible host memory (FLARE_DS41_VISION_ARENA_HOST);
-#            default 0 (VRAM map 2026-11-15 item 3)
-#   MARKOV_HOST  1 = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory (FLARE_DS41_MARKOV_EMBED_HOST);
-#            default 0 (VRAM map item 6)
-#   MARKOV_TILE N = Markov proposal score tiles cover N request rows per program, one head-tile read for all of them
-#            (FLARE_DS41_MARKOV_TILE_ROWS; bit-identical); unset = one program per (tile, row)
-#   MARKOV_STAGE 1 = with MARKOV_HOST=1, copy each request's Markov predecessor row into VRAM once per draft step
-#            (FLARE_DS41_MARKOV_STAGE_ROWS); keeps MARKOV_HOST's ~74K KV without its decode cost (11-18 microbench:
-#            b1 +0.01 ms, b16 -0.00 ms per round vs the table in VRAM); default 0
-#   GLUE2    1 = second decode-glue pass (FLARE_DS41_GLUE_PASS2: no zero fill of the verification staging / draft window
-#            cache, draft state rows once, one-kernel pre-mix, concatenated draft feedback, functional admission check;
-#            same bytes, GPU proof padglue2-proof-1117-2320); default 0
-#   SKIP_SUFFIX  prefill capacities that get an encoder-only twin (FLARE_DS41_PREFILL_SKIP_SUFFIX, e.g. 4096; "1" =
-#            3072,3584,4096): non-final chunks of long cold prompts skip layers 21-39 and the head (Helios decides per
-#            chunk; serve with --scheduler-encoder-prefill false to turn it off); default unset = no twins
-#   IDX_SPLIT  prefill capacities whose index layers 2/8/14 split the indexer rows across the ranks and all-gather the
-#            winners over the vocabulary channel (FLARE_DS41_INDEX_ROW_SPLIT, e.g. 4096; "1" = 3072,3584,4096; +1 vocabulary
-#            channel row); G2 2026-11-19: 512K +15 %, 1M +29 %, 8K -1.7 %, 32K -1.0 %; default unset = replicated indexer
-#   IDX_SPLIT_MIN_CTX  tokens: long-context-only split (FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX; needs IDX_SPLIT): the
-#            IDX_SPLIT graphs stay replicated and each gets a "-split-ctx<tokens>" twin that Helios runs for one-lane
-#            prefill chunks starting at <tokens> or later (needs a binary with catalog::context_variant); default unset
-#   IDX_SPLIT_VARIANTS  which graphs get that twin (FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS; needs IDX_SPLIT_MIN_CTX):
-#            "prefill", "encoder_prefill" or both comma-separated; default unset = both. "encoder_prefill" = the non-final
-#            chunks only (nearly all of the gain, one variant graph's capture memory instead of two)
-#   ORDER    expert order shipped in tp3-tools/release/expert-orders/<ORDER> (sets COUNTS when COUNTS is unset), e.g.
-#            order-mix-provisional-exl3S (blend order of the 11-18 default, fingerprint a70f5e67d564)
-#   SHARE_OPERANDS  1 = upstream a386501f (one computed copy per shared pointwise operand of opaque calls;
-#            FLARE_EXPORT_SHARE_COMPUTED_OPERANDS, part of the compiler cache key); default 0
-#   DRAFT_VOCAB  draft vocabulary JSON (tp3-tools/ds41_draft_vocab.py build; tp3-tools/release/draft-vocab/, held-out
-#            miss rates inside each table): the NVFP4 DSpark draft head keeps only those tokens (FLARE_DS41_DRAFT_VOCAB);
-#            default unset = full head
-#   ROTARY_ONCE  1 = decode/verify/draft forwards compute each RoPE (cos, sin) table once and the query, KV-window and
-#            index-query rotations read it (FLARE_DS41_ROTARY_ONCE; bit-identical); default 0 (perf/ds41-decode-small-levers)
-#   PIN_QPROJ    1 = attention declarations of <= 8 rows take the pinned qkv_a split-K4 / norm / q_b plan triple
-#            (FLARE_DS41_PIN_SMALL_QPROJ; 5-row rounds change rounding as 3/6-row rounds already have); default 0
-#   LOGPROB_ONE_EXCHANGE  1 = the verification commit's generation-logprob reduction exchanges once instead of twice
-#            (FLARE_DS41_LOGPROB_SINGLE_EXCHANGE; logprob values identical); default 0
-#   NO_GEN_LOGPROBS  1 = package without generation logprobs (FLARE_DS41_NO_GENERATION_LOGPROBS; requests that ask for
-#            them get HTTP 400; verify_fix/consistency/engram-eval cannot run on it); default 0, owner decision
-#   DRAFT_HEAD_PLANS  JSON file {"<rows>": {gemm.blockscaled_precision config}} of explicit DSpark head projection
-#            plans (FLARE_DS41_DRAFT_HEAD_PLANS; prepared, not measured); default unset = tuned
-#   E3c-a exact levers (perf/ds41-e3c-a, 2026-11-19; default off; analysis/work/e3-comms-levers-20261119):
-#   GATHER_PULL  1 = world-3 DCP column gathers pull instead of push (B12X_PCIE_DCP_GATHER_PULL=auto; needs B12X_OVERLAY
-#            with tp3-patches/overlay/flashinfer-dcp-gather-pull-world3.patch; copies only, re-keys the head gathers);
-#            default 0 (B12X_PCIE_DCP_GATHER_PULL=0 as before)
-#   ROTARY_PREFILL  1 = prefill graphs read one shared RoPE table per forward (FLARE_DS41_ROTARY_ONCE_PREFILL;
-#            bit-identical)
-#   Steering sidecar (feat/ds41-steering-sidecar, upstream PR #404 port; analysis/work/steering-sidecar-20261119):
-#   STEERING  path of a DS41 steering sidecar (.safetensors, layers 4-36) = --steering-sidecar; the package then takes
-#            a per-request steering_scale in [0, 1] (0 = unsteered). Default unset = no sidecar (6-column requests)
-#            BRRR layers steer inside the fused tail (feat/ds41-steering-brrr: the BRRR_STEER kernel build)
-#   STEERING_PLAIN_ID  1 = with STEERING, tune under the checkpoint's plain identity (FLARE_DS41_STEERING_PLAIN_IDENTITY):
-#            the same tuning records and plan selections as the sidecar-free package, for scale-0 bit comparisons;
-#            default 0 = upstream's sidecar-keyed identity
-#   BRRR_LAYERS  FLARE_DS41_BRRR_LAYERS (default 0-39)
+#   MLA_SPLITS  ROWS:SPLITS,... decode split count per prepared row count (default 18:10,37:5,47:4,62:3,94:2,96:3;
+#            empty = the code's rule)
+#   H24      ROWS:0|1,... row counts whose decode attention runs all 24 heads in one launch (default 9:0,96:1; empty = off)
+#   MHC_PDL  1 (default) = programmatic dependent launch in b12x's mHC norm kernels
+#   AR_PART_ROWS, ENGRAM_PART_ROWS  prefill all-reduce part caps for the decoder and the Engram projection (default 768 each)
+#   INDEX_SIDE   1 (default) = indexer query chain on a side stream
+#   CONTEXT_SIDE 1 (default) = DSpark context projection on a side stream beside verification
+#   ENGRAM_SIDE  layer list for the Engram side stream (default empty = off)
+#   WOA_UNEVEN   BRRR wo_a job split for <= 8 rows (default 1); WOA_SMALL default 0
+#   EMBED_ROWS   1 (default) = vectorised host-row embedding gather
+#   RECLAIM  1 (default) = the four VRAM reclaim switches (shared Engram token map, trimmed vocabulary gather, no
+#            draft-vocabulary channel, shared vocabulary columns)
+#   LIBRARY_SCRATCH  unset = code default (on): cuBLAS's own 64 MiB pool is kept out of the package; 0 = off
+#   PAD_ONCE     1 (default) = one MXFP8 MMA-scale zero fill per forward instead of one per layer
+#   VISION_ARENA_HOST  1 (default) = image feature arena (160 MiB/GPU) in device-visible host memory
+#   MARKOV_HOST  1 (default) = DSpark Markov-head embedding (63 MiB/GPU) in device-visible host memory
+#   MARKOV_STAGE 1 (default) = with MARKOV_HOST=1, copy each request's Markov row into VRAM once per draft step
+#   MARKOV_TILE N = Markov score tiles cover N request rows per program (default unset = one program per row)
+#   GLUE2    1 (default) = second decode-glue pass (fewer zero fills and copies around verification; same bytes)
+#   SKIP_SUFFIX  prefill capacities that get an encoder-only twin (default 4096; empty = none): non-final chunks of long
+#            prompts skip layers 21-39 and the head (serve with --scheduler-encoder-prefill false to turn it off)
+#   IDX_SPLIT  prefill capacities whose index layers split the indexer rows across the GPUs (default 4096; empty = off)
+#   IDX_SPLIT_MIN_CTX  only for prefill chunks from this many tokens on (default 32768; shorter prompts keep the
+#            replicated graphs); IDX_SPLIT_VARIANTS = prefill, encoder_prefill or both (default both)
+#   SHARE_OPERANDS  1 (default) = one computed copy per shared pointwise operand of opaque calls
+#   ROTARY_ONCE  1 (default) = decode/verify/draft forwards compute each RoPE table once (bit-identical)
+#   ROTARY_PREFILL  1 (default) = prefill graphs read one shared RoPE table per forward (bit-identical)
+#   PIN_QPROJ    1 (default) = attention of <= 8 rows takes the pinned q projection plans
+#   LOGPROB_ONE_EXCHANGE  1 (default) = the generation-logprob reduction exchanges once instead of twice (same values)
+#   NO_GEN_LOGPROBS  1 = package without generation logprobs (requests that ask for them get HTTP 400); default 0
+#   DRAFT_VOCAB, DRAFT_HEAD_PLANS  draft-head experiments (default unset; not used by the release)
+#   BRRR_LAYERS  layers with the fused BRRR tail (default 0-39)
 #   CONFIG   Flare config file for the export (--config; default: Flare's default config)
 #   COMPILE_WORKERS  CPU compiler processes (--compile-workers; default automatic). The release export used 3 to stay
 #            inside the test system's power-supply limit
-#   FLARE_EXPORT_FORWARD_WORKERS=N, FLARE_EXPORT_FORWARD_WORKER_GIB=G  (fork, export speed; unset = as before) forward
-#            compiler processes per host for "Compile model forwards" and their host-RAM admission estimate (upstream 32 GiB).
-#            They apply only after kernel tuning (GPUs idle; COMPILE_WORKERS still caps tuning). N=9 G=16: expected
-#            ~13 -> ~5-6 min for 30 forwards. Device/host admission still decides: read "N compiler workers; per rank"
-#   FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB=M  (fork) per-worker GPU-memory admission estimate (upstream 1024; a worker holds
-#            only its CUDA context, ~700 MiB measured 11-17): 768 admits 2 workers per GPU at ~3.2 GiB free (1 GiB margin
-#            kept), 3 at >= 3,328 MiB. Export-time VRAM only. Log line: "Forward compiler admission: ..."
-#            On an out-of-memory retry, unset every FLARE_EXPORT_FORWARD_* variable.
-#   FLARE_EXPORT_TUNE_ONLY=1  (fork) stop after "Prepare and tune kernels" (selections flushed to the kernel cache, exit 0,
-#            no package): the warm-up before a cold-cache HOT 342 export (HOT=300 FLARE_EXPORT_TUNE_ONLY=1, then the export)
+#   FLARE_EXPORT_FORWARD_WORKERS=N, FLARE_EXPORT_FORWARD_WORKER_GIB=G, FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB=M  (optional,
+#            export speed only) forward compiler processes per host and their admission estimates; the release export
+#            used 9 / 16 / 768. On an out-of-memory retry, unset them
+#   FLARE_EXPORT_TUNE_ONLY=1  stop after kernel tuning (no package): a warm-up before a cold-cache export
 #   FLARE_DS41_VISION_STAGE 1 (default) = vision tower in host RAM, weights staged through VRAM slots per block
 #   GPUS     default 0,1,2
 # A cold tuning cache needs more free VRAM than serving. If tuning runs out of memory, export once with HOT=300,
 # then export the target. The second export reuses the shared tuning cache.
 set -euo pipefail
+# Release defaults of the value switches (set one to empty to turn it off).
+SKIP_SUFFIX=${SKIP_SUFFIX-4096} IDX_SPLIT=${IDX_SPLIT-4096} IDX_SPLIT_MIN_CTX=${IDX_SPLIT_MIN_CTX-32768}
+MLA_SPLITS=${MLA_SPLITS-18:10,37:5,47:4,62:3,94:2,96:3} H24=${H24-9:0,96:1}
 : "${CKPT:?set CKPT to the checkpoint view directory}"
 HERE=$(dirname "$(readlink -f "$0")")
 TWOSHOT=${TWOSHOT:-1}
@@ -123,22 +82,23 @@ if [ -n "${B12X_OVERLAY:-}" ]; then
     [ -d "$B12X_OVERLAY/b12x_tree" ] || { echo "B12X_OVERLAY=$B12X_OVERLAY has no b12x_tree" >&2; exit 1; }
     export PYTHONPATH="$B12X_OVERLAY${PYTHONPATH:+:$PYTHONPATH}" B12X_PCIE_DCP_GATHER_PULL=0
 fi
-# E3c-a: refuse an overlay without the gather-pull patch (b12x would ignore the variable silently).
-if [ "${GATHER_PULL:-0}" = 1 ]; then
+# GATHER_PULL=1: refuse an overlay without the gather-pull patch (b12x would ignore the variable silently).
+if [ "${GATHER_PULL:-1}" = 1 ]; then
     grep -qs _gather_pull_enabled "${B12X_OVERLAY:-/nonexistent}/b12x_tree/comm/pcie/_dcp_a2a_cute.py" \
         || { echo "GATHER_PULL=1 needs B12X_OVERLAY with flashinfer-dcp-gather-pull-world3.patch" >&2; exit 1; }
     export B12X_PCIE_DCP_GATHER_PULL=auto
 fi
-if [ -n "${ORDER:-}" ] && [ -z "${COUNTS:-}" ]; then
-    COUNTS=$HERE/expert-orders/$ORDER
-    [ -d "$COUNTS" ] || { echo "ORDER=$ORDER: no $COUNTS" >&2; exit 1; }
-fi
-if [ "${MARKOV_STAGE:-0}" = 1 ] && [ "${MARKOV_HOST:-0}" != 1 ]; then
+# Default expert order: expert-order/ next to this script in the release folder. In the fork checkout the release
+# order is tp3-tools/release/expert-orders/order-mix-provisional-exl3S (tp3-tools/release/expert-order/ there keeps the
+# 20261116 order, which other scripts use); the same file serves both places.
+DEFAULT_COUNTS=$HERE/expert-order
+[ -d "$HERE/expert-orders/order-mix-provisional-exl3S" ] && DEFAULT_COUNTS=$HERE/expert-orders/order-mix-provisional-exl3S
+if [ "${MARKOV_STAGE:-1}" = 1 ] && [ "${MARKOV_HOST:-1}" != 1 ]; then
     echo "MARKOV_STAGE=1 needs MARKOV_HOST=1 (it stages rows of the parked table)" >&2; exit 1
 fi
-export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} FLARE_DS41_HOT_EXPERTS=${HOT:-342} \
+export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-39} FLARE_DS41_HOT_EXPERTS=${HOT:-355} \
        FLARE_DS41_MERGED_BANK=1 FLARE_DS41_TP3_VOCAB_PARALLEL=1 \
-       FLARE_DS41_EXPERT_COUNTS_DIR=${COUNTS:-$HERE/expert-order} HF_HUB_OFFLINE=1 \
+       FLARE_DS41_EXPERT_COUNTS_DIR=${COUNTS:-$DEFAULT_COUNTS} HF_HUB_OFFLINE=1 \
        FLARE_DS41_BRRR_LAYERS=${BRRR_LAYERS:-0-39} FLARE_DS41_BRRR_CKPT="$CKPT" FLARE_DS41_BRRR_PARKED_MAX_ROWS=${PARKED_ROWS:-0} \
        FLARE_DS41_EMBED_HOST=1 FLARE_DS41_VISION_HOST="${FLARE_DS41_VISION_HOST:-1}" FLARE_DS41_VISION_STAGE="${FLARE_DS41_VISION_STAGE:-1}" \
        FLARE_DS41_AR_ROWS=1024 FLARE_DS41_ENGRAM_CHUNK_ROWS=1024 FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1 \
@@ -147,35 +107,35 @@ export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=${PARK:-20-33} F
        FLARE_DS41_VRAM_RECLAIM=${RECLAIM:-1} \
        FLARE_TUNE_SCRATCH_TOLERANCE=0.05 FLARE_TUNE_SCRATCH_MIN_SAVING_MIB=16 \
        B12X_PCIE_TWOSHOT_PULL=$TWOSHOT B12X_MLA_DECODE_REMAINDER_STREAM=${ATTN:-1} B12X_MHC_PDL=${MHC_PDL:-1}
-# On/off switches that TP3Config reads as "1" = on; set only when on, so an off export records the 20261111 values.
+# On/off switches that TP3Config reads as "1" = on; set only when on, so an off export records the earlier values.
 [ "${INDEX_SIDE:-1}" = 1 ] && export FLARE_DS41_INDEX_SIDE_STREAM=1
 [ "${CONTEXT_SIDE:-1}" = 1 ] && export FLARE_DS41_CONTEXT_SIDE_STREAM=1
 [ "${EMBED_ROWS:-1}" = 1 ] && export FLARE_DS41_EMBED_ROWS=1
 [ -n "${ENGRAM_SIDE:-}" ] && export FLARE_DS41_ENGRAM_SIDE_LAYERS=$ENGRAM_SIDE
 [ -n "${LIBRARY_SCRATCH:-}" ] && export FLARE_EXPORT_LIBRARY_SCRATCH=$LIBRARY_SCRATCH
-[ "${PAD_ONCE:-0}" = 1 ] && export FLARE_DS41_MMA_PAD_ONCE=1
-[ "${VISION_ARENA_HOST:-0}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
-[ "${MARKOV_HOST:-0}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
-[ "${MARKOV_STAGE:-0}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
+[ "${PAD_ONCE:-1}" = 1 ] && export FLARE_DS41_MMA_PAD_ONCE=1
+[ "${VISION_ARENA_HOST:-1}" = 1 ] && export FLARE_DS41_VISION_ARENA_HOST=1
+[ "${MARKOV_HOST:-1}" = 1 ] && export FLARE_DS41_MARKOV_EMBED_HOST=1
+[ "${MARKOV_STAGE:-1}" = 1 ] && export FLARE_DS41_MARKOV_STAGE_ROWS=1
 [ -n "${MARKOV_TILE:-}" ] && export FLARE_DS41_MARKOV_TILE_ROWS=$MARKOV_TILE
 [ -n "${MLA_SPLITS:-}" ] && export FLARE_DS41_MLA_DECODE_SPLITS=$MLA_SPLITS
 [ -n "${H24:-}" ] && export FLARE_DS41_MLA_H24=$H24
-[ "${GLUE2:-0}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
+[ "${GLUE2:-1}" = 1 ] && export FLARE_DS41_GLUE_PASS2=1
 [ -n "${SKIP_SUFFIX:-}" ] && export FLARE_DS41_PREFILL_SKIP_SUFFIX=$SKIP_SUFFIX
 [ -n "${IDX_SPLIT:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT=$IDX_SPLIT
 [ -n "${IDX_SPLIT_MIN_CTX:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX=$IDX_SPLIT_MIN_CTX
 [ -n "${IDX_SPLIT_VARIANTS:-}" ] && export FLARE_DS41_INDEX_ROW_SPLIT_VARIANTS=$IDX_SPLIT_VARIANTS
 # the row split's check mode counts in a Python op (debug-serve only): an export must never carry it
 [ -n "${FLARE_DS41_INDEX_ROW_SPLIT_CHECK:-}" ] && { echo "refusing: FLARE_DS41_INDEX_ROW_SPLIT_CHECK is debug-serve only" >&2; exit 2; }
-[ "${SHARE_OPERANDS:-0}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
+[ "${SHARE_OPERANDS:-1}" = 1 ] && export FLARE_EXPORT_SHARE_COMPUTED_OPERANDS=1
 [ -n "${DRAFT_VOCAB:-}" ] && export FLARE_DS41_DRAFT_VOCAB=$DRAFT_VOCAB
-[ "${ROTARY_ONCE:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE=1
-[ "${PIN_QPROJ:-0}" = 1 ] && export FLARE_DS41_PIN_SMALL_QPROJ=1
-[ "${LOGPROB_ONE_EXCHANGE:-0}" = 1 ] && export FLARE_DS41_LOGPROB_SINGLE_EXCHANGE=1
+[ "${ROTARY_ONCE:-1}" = 1 ] && export FLARE_DS41_ROTARY_ONCE=1
+[ "${PIN_QPROJ:-1}" = 1 ] && export FLARE_DS41_PIN_SMALL_QPROJ=1
+[ "${LOGPROB_ONE_EXCHANGE:-1}" = 1 ] && export FLARE_DS41_LOGPROB_SINGLE_EXCHANGE=1
 [ "${NO_GEN_LOGPROBS:-0}" = 1 ] && export FLARE_DS41_NO_GENERATION_LOGPROBS=1
 [ -n "${DRAFT_HEAD_PLANS:-}" ] && export FLARE_DS41_DRAFT_HEAD_PLANS=$DRAFT_HEAD_PLANS
-[ "${ROTARY_PREFILL:-0}" = 1 ] && export FLARE_DS41_ROTARY_ONCE_PREFILL=1
-[ "${STEERING_PLAIN_ID:-0}" = 1 ] && export FLARE_DS41_STEERING_PLAIN_IDENTITY=1
+[ "${ROTARY_PREFILL:-1}" = 1 ] && export FLARE_DS41_ROTARY_ONCE_PREFILL=1
+[ -n "${STEERING:-}" ] && [ "${STEERING_PLAIN_ID:-1}" = 1 ] && export FLARE_DS41_STEERING_PLAIN_IDENTITY=1
 exec .venv/bin/ignition export "$CKPT" --gpus "${GPUS:-0,1,2}" --max-concurrency "${MAXC:-16}" \
   --prefill-chunk-size "${PREFILL:-4096}" --mtp-draft-tokens "${DRAFTS:-5}" --draft-head-quantization nvfp4 \
   --markov-head-quantization fp8 --vocabulary-parallel-sampling --mtp-only --verbose \

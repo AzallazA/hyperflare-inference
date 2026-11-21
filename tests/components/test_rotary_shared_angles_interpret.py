@@ -12,7 +12,7 @@ Runs in Triton's CPU interpreter (a subprocess, TRITON_INTERPRET=1): builds the 
 the table must not serve the ratio-2 compressor positions (-2 at position 0 and on padding rows): the clamped table
 rotates those rows differently. The interpreter evaluates sin/cos with NumPy in both paths, so this proves the
 plumbing (arguments, signs, strides, offsets, clamping, keys); the GPU proof of libdevice identity is the B1 chain's
-microbench (same expression in both kernels, analysis/work/decode-small-levers-20261118/IMPL.md).
+microbench (same expression in both kernels).
 """
 
 import os

@@ -669,7 +669,9 @@ def test_attention_splits_only_index_layers_before_the_candidate_source():
 def test_export_script_knob_reaches_the_switch():
     from tests.recipes.test_deepseek41_tp3_config import export_environment
 
-    assert "FLARE_DS41_INDEX_ROW_SPLIT" not in export_environment()  # default export: replicated indexer
+    assert export_environment()["FLARE_DS41_INDEX_ROW_SPLIT"] == "4096"  # 20261121 default: split from 32K tokens
+    assert export_environment()["FLARE_DS41_INDEX_ROW_SPLIT_MIN_CTX"] == "32768"
+    assert "FLARE_DS41_INDEX_ROW_SPLIT" not in export_environment(IDX_SPLIT="", IDX_SPLIT_MIN_CTX="")  # replicated
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="1")).index_row_split == ROW_SPLIT_DEFAULT
     assert TP3Config.from_environment(export_environment(IDX_SPLIT="4096")).index_row_split == (4096,)
 

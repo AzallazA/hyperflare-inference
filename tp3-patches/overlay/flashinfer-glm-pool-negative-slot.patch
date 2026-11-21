@@ -5,8 +5,8 @@ so a non-owner token's slot -1 became pool location 0 and, on every 4th decode p
 token wrote a pooled indexer key over page 0 slot 0 of their local indexer cache. The fix validates slot >= 0 and
 state slot >= 0 before the conversion. Kernel source only (DS41 never runs this kernel); changes the GLM pool program
 keys, so it takes effect at the next GLM export built with this overlay. Applies with -p4 onto the venv b12x, on its
-own or after flashinfer-dcp-gather-pull-world3.patch. CPU proof (TRITON_INTERPRET=1):
-~/ds41-tp3/analysis/work/upstream-sync-20261120/fi113/test_glm_pool_negative_slot_cpu.py.
+own or after flashinfer-dcp-gather-pull-world3.patch. CPU proof (TRITON_INTERPRET=1): a test kept outside the
+repository (test_glm_pool_negative_slot_cpu.py).
 
 diff --git a/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py b/flashinfer/experimental/b12x/attention/dsa_indexer/_glm_pool_kernels.py
 index 82e86314949..a9f0901b373 100644

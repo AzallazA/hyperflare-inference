@@ -9,12 +9,14 @@ import pytest
 from ignition.recipes.deepseek41.tp3_config import (TP3Config, describe_checkpoint, describe_counts_dir,
                                                     format_layers, parse_layers)
 
-# The release environment as tp3-tools/release/export.sh really exports it with its defaults (HOT=342, COUNTS=
-# $HERE/expert-order, VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1, and since the
+# The release environment as tp3-tools/release/export.sh really exports it with its defaults (since the 20261121
+# release: PARK 20-39, HOT=355, COUNTS = the blended order in expert-orders/order-mix-provisional-exl3S, the round-3
+# switches and GATHER_PULL/ROTARY_PREFILL on; before: HOT=342, COUNTS=$HERE/expert-order), VISION_HOST/VISION_STAGE 1, ENGRAM_CHUNK_ROWS 1024, SHARE_ENGRAM_RESIDUAL 1, and since the
 # 20261116 release PARKED_ROWS 0, 768-row prefill all-reduce parts, index/context side streams, uneven wo_a split,
 # host-row embedding gather, VRAM reclaim, mHC PDL): the script's environment block runs in bash (everything before
 # ``exec``) and its FLARE_DS41_* / HF_HUB_OFFLINE / B12X_* values are read back, so a change to the script's defaults
-# reaches these tests. The default two-shot pull needs B12X_OVERLAY (a directory with ``b12x_tree``): a stub is passed.
+# reaches these tests. The default two-shot pull and gather pull need B12X_OVERLAY (a directory with ``b12x_tree`` and
+# the gather-pull patch's marker): a stub is passed.
 EXPORT_SH = Path(__file__).resolve().parents[2] / "tp3-tools" / "release" / "export.sh"
 RELEASE_CKPT = "/models/ds41-1017-engram-fp8"
 
@@ -25,7 +27,9 @@ def _overlay_stub():
     import tempfile
 
     root = Path(tempfile.mkdtemp(prefix="b12x-overlay-stub-"))
-    (root / "b12x_tree").mkdir()
+    (root / "b12x_tree" / "comm" / "pcie").mkdir(parents=True)
+    # the gather pull default (GATHER_PULL=1) checks the overlay for the gather-pull patch's marker
+    (root / "b12x_tree" / "comm" / "pcie" / "_dcp_a2a_cute.py").write_text("_gather_pull_enabled\n")
     atexit.register(shutil.rmtree, root, True)
     return str(root)
 
@@ -56,14 +60,21 @@ def export_variables(**variables):
 
 RELEASE_ENV = export_environment()
 
+RELEASE_COUNTS = EXPORT_SH.parent / "expert-orders" / "order-mix-provisional-exl3S"
+# switches the 20261121 release export turns on beyond the 20261116 set (recorded when true / when set)
+RELEASE_ON = dict(markov_embed_host=True, markov_stage_rows=True, vision_arena_host=True, glue_pass2=True,
+                  rotary_once=True, pin_small_qproj=True, logprob_single_exchange=True, rotary_once_prefill=True,
+                  mma_pad_once=True, mla_decode_splits="18:10,37:5,47:4,62:3,94:2,96:3", mla_h24="9:0,96:1",
+                  prefill_skip_suffix=(4096,), index_row_split=(4096,), index_row_split_min_context=32768)
+
 RELEASE_CONFIG = TP3Config(
-    host_expert_layers=frozenset(range(20, 34)), hot_experts=342, merged_bank=True,
-    expert_counts_dir=EXPORT_SH.parent / "expert-order", embed_host=True, embed_rows=True, vision_host=True,
+    host_expert_layers=frozenset(range(20, 40)), hot_experts=355, merged_bank=True,
+    expert_counts_dir=RELEASE_COUNTS, embed_host=True, embed_rows=True, vision_host=True,
     vision_stage=True, ar_rows=1024, ar_part_rows=768, engram_part_rows=768, mhc_pdl=True, tp3_graph_gib=1.0,
     tp3_vocab_parallel=True, index_side_stream=True, context_side_stream=True,
     share_engram_token_map=True, trim_vocab_gather=True, skip_draft_vocab_gather=True, share_vocab_columns=True,
     brrr_layers=frozenset(range(40)), brrr_parked_max_rows=0, brrr_ckpt=Path(RELEASE_CKPT),
-    brrr_woa_uneven=1, brrr_woa_small=0, engram_chunk_rows=1024, share_engram_residual=True)
+    brrr_woa_uneven=1, brrr_woa_small=0, engram_chunk_rows=1024, share_engram_residual=True, **RELEASE_ON)
 
 
 def test_export_script_sets_the_b12x_switches_of_the_release():
@@ -71,15 +82,15 @@ def test_export_script_sets_the_b12x_switches_of_the_release():
     assert {key: variables.get(key) for key in ("B12X_PCIE_TWOSHOT_PULL", "B12X_MLA_DECODE_REMAINDER_STREAM",
                                                  "B12X_MHC_PDL", "B12X_PCIE_DCP_GATHER_PULL")} == \
         {"B12X_PCIE_TWOSHOT_PULL": "1", "B12X_MLA_DECODE_REMAINDER_STREAM": "1", "B12X_MHC_PDL": "1",
-         "B12X_PCIE_DCP_GATHER_PULL": "0"}
-    off = export_variables(TWOSHOT="0", ATTN="0", MHC_PDL="0", B12X_OVERLAY="")
+         "B12X_PCIE_DCP_GATHER_PULL": "auto"}
+    off = export_variables(TWOSHOT="0", ATTN="0", MHC_PDL="0", GATHER_PULL="0", B12X_OVERLAY="")
     assert (off["B12X_PCIE_TWOSHOT_PULL"], off["B12X_MLA_DECODE_REMAINDER_STREAM"], off["B12X_MHC_PDL"]) == ("0",) * 3
     assert "B12X_PCIE_DCP_GATHER_PULL" not in off
 
 
 def test_export_script_environment_is_parsed_not_copied():
-    assert RELEASE_ENV["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "1024" and RELEASE_ENV["FLARE_DS41_HOT_EXPERTS"] == "342"
-    assert RELEASE_ENV["FLARE_DS41_EXPERT_COUNTS_DIR"] == str(EXPORT_SH.parent / "expert-order")
+    assert RELEASE_ENV["FLARE_DS41_ENGRAM_CHUNK_ROWS"] == "1024" and RELEASE_ENV["FLARE_DS41_HOT_EXPERTS"] == "355"
+    assert RELEASE_ENV["FLARE_DS41_EXPERT_COUNTS_DIR"] == str(RELEASE_COUNTS)
     # The script's overrides reach the parsed environment (it is the script, not a copy).
     overridden = export_environment(HOT="300", PARKED_ROWS="12")
     assert overridden["FLARE_DS41_HOT_EXPERTS"] == "300" and overridden["FLARE_DS41_BRRR_PARKED_MAX_ROWS"] == "12"
@@ -284,11 +295,11 @@ def test_metadata_record_is_json_ready_and_complete():
 
     # the release export sets the two wo_a switches (recorded when set), the other tuning switches stay unset
     assert set(record) == ({item.name for item in fields(TP3Config)} - set(RECORDED_WHEN_SET) - set(RECORDED_WHEN_TRUE)
-                           | {"brrr_woa_small", "brrr_woa_uneven"})
+                           | {"brrr_woa_small", "brrr_woa_uneven"} | set(RELEASE_ON))
     assert (record["brrr_woa_small"], record["brrr_woa_uneven"]) == (0, 1)
-    assert record["host_expert_layers"] == "20-33" and record["brrr_layers"] == "0-39"
+    assert record["host_expert_layers"] == "20-39" and record["brrr_layers"] == "0-39"
     counts, counts_digest = record["expert_counts_dir"].split("#")
-    assert counts == "expert-order" and (counts_digest == "missing" or len(counts_digest) == 12)
+    assert counts == "order-mix-provisional-exl3S" and (counts_digest == "missing" or len(counts_digest) == 12)
     assert record["tp3_graph_gib"] == 1.0
     # The release view may exist on the build host, so only the shape is fixed: basename#12-hex-or-missing.
     name, digest = record["brrr_ckpt"].split("#")
@@ -298,7 +309,7 @@ def test_metadata_record_is_json_ready_and_complete():
     json.dumps(record)  # every value serializes
     assert TP3Config().to_metadata()["host_expert_layers"] == ""
     described = TP3Config.from_environment(RELEASE_ENV).describe()
-    assert described.startswith("TP3 config: ") and "hot_experts=342" in described and "brrr_log" not in described
+    assert described.startswith("TP3 config: ") and "hot_experts=355" in described and "brrr_log" not in described
 
 
 def test_config_is_frozen_and_hashable():
@@ -397,7 +408,7 @@ def test_planner_helpers_read_the_environment_through_the_config(monkeypatch, tm
     assert _graph_bytes(3, RELEASE_CONFIG) == 1 << 30 and _graph_bytes(4, RELEASE_CONFIG) == 8 << 30
     local = -(-2304 // 3)
     per_expert = 2 * local * 5120 // 2 + 5120 * local // 2
-    assert _parked_bytes(3, RELEASE_CONFIG) == 14 * (384 - 342) * per_expert
+    assert _parked_bytes(3, RELEASE_CONFIG) == 20 * (384 - 355) * per_expert
     for key, value in RELEASE_ENV.items():
         monkeypatch.setenv(key, value)
     assert _graph_bytes(3) == 1 << 30 and _parked_bytes(3) == _parked_bytes(3, RELEASE_CONFIG)

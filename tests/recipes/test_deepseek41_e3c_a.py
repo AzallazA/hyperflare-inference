@@ -94,7 +94,11 @@ def test_export_sh_resolves_the_e3c_a_knobs(tmp_path):
     assert rc == 0, err
     assert "B12X_PCIE_DCP_GATHER_PULL=auto" in lines and "FLARE_DS41_ROTARY_ONCE_PREFILL=1" in lines
     (tmp_path / "base").mkdir()
-    rc, lines, err = _resolve(tmp_path / "base", True)
+    rc, lines, err = _resolve(tmp_path / "base", True)   # since 20261121 both are export.sh defaults
+    assert rc == 0, err
+    assert "B12X_PCIE_DCP_GATHER_PULL=auto" in lines and "FLARE_DS41_ROTARY_ONCE_PREFILL=1" in lines
+    (tmp_path / "off").mkdir()
+    rc, lines, err = _resolve(tmp_path / "off", True, GATHER_PULL="0", ROTARY_PREFILL="0")
     assert rc == 0, err
     assert "B12X_PCIE_DCP_GATHER_PULL=0" in lines
     assert not any(line.startswith("FLARE_DS41_ROTARY_ONCE_PREFILL=") for line in lines)

@@ -85,10 +85,14 @@ if [ -x "$VENV/bin/python" ]; then
       else fail "$b neither applied nor applicable to the installed FlashInfer (wrong version? re-run uv sync --locked, then re-apply)"; fi
     done
     # The b12x two-shot overlay patch is not applied to the venv: export.sh needs a separate overlay built from it
-    # (tp3-tools/make-b12x-overlay.sh, B12X_OVERLAY) while TWOSHOT=1, the export default.
+    # (tp3-tools/make-b12x-overlay.sh, B12X_OVERLAY) while TWOSHOT=1 or GATHER_PULL=1, the export defaults.
     OV=$PATCHES/overlay/flashinfer-pcie-twoshot-pull-world3.patch
     if [ -f "$OV" ]; then pass "overlay patch present: $(basename "$OV") (build B12X_OVERLAY with tp3-tools/make-b12x-overlay.sh)"
     else warn "overlay patch $OV missing: export.sh then needs TWOSHOT=0 (upstream all-reduce candidates)"; fi
+    # The DCP gather pull patch (from 20261121) goes into the same overlay; export.sh refuses GATHER_PULL=1 without it.
+    GP=$PATCHES/overlay/flashinfer-dcp-gather-pull-world3.patch
+    if [ -f "$GP" ]; then pass "overlay patch present: $(basename "$GP") (build the overlay with both patches)"
+    else warn "overlay patch $GP missing: export.sh then needs GATHER_PULL=0"; fi
   fi
   # Upstream replaced `python -m ignition.patches` (on-disk edits of torch/Triton, re-run after every uv sync) with
   # ignition.runtime_patches: version-checked in-memory fixes that ignition export applies itself. Nothing to run;

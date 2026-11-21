@@ -122,8 +122,8 @@ static_assert((OTOK > SPAN ? OTOK : SPAN) * KW_INTER * 4 <= BS && OTOK * (KS_WOB
 constexpr int SPIN_TRAP = BRRR_SPIN_TRAP;
 static_assert(SPIN_TRAP == 0 || SPIN_TRAP == 1, "BRRR switch values");
 
-// Activation steering (upstream PR #404 semantics inside the fused tail; feat/ds41-steering-brrr, analysis/work/
-// steering-sidecar-20261119/optionB/DESIGN.md). Compile-time: brrr.kernel_defines(tp3, steering=True) adds
+// Activation steering (upstream PR #404 semantics inside the fused tail; branch feat/ds41-steering-brrr).
+// Compile-time: brrr.kernel_defines(tp3, steering=True) adds
 // BRRR_STEER=1 for packages exported with a steering sidecar (its own extension build). Every steering line below is
 // inside #if BRRR_STEER, so the default build (no define) preprocesses to the previous source and compiles to the same
 // layer kernel. At run time a launch steers only when the layer has steering constants (set_steering), the op passes
