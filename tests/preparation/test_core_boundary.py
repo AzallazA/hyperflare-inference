@@ -38,12 +38,23 @@ def _imported_modules(path: Path) -> set[str]:
 
 
 def test_ignition_never_imports_recipes_or_hyperflare_recipes():
+    assert not (ROOT / "hyperflare_recipes").exists()
+    assert not (ROOT / "ignition" / "recipes").exists()
     violations = []
     for py in sorted((ROOT / "ignition").rglob("*.py")):
         for mod in sorted(_imported_modules(py)):
-            if mod == "hyperflare_recipes" or mod.startswith("hyperflare_recipes."):
+            if mod in ("ignition.recipes", "hyperflare_recipes") or mod.startswith(("ignition.recipes.", "hyperflare_recipes.")):
                 violations.append(f"{py.relative_to(ROOT)} imports {mod}")
-            if mod == "hyperflare_recipes.recipes" or mod.startswith("hyperflare_recipes.recipes."):
+    assert not violations, "\n".join(violations)
+
+
+def test_core_tests_do_not_import_extracted_recipes_or_qualify():
+    violations = []
+    for py in sorted((ROOT / "tests").rglob("*.py")):
+        if py.name in ("test_core_boundary.py", "test_source_identity.py"):
+            continue
+        for mod in sorted(_imported_modules(py)):
+            if mod in ("hyperflare_recipes", "qualify") or mod.startswith(("hyperflare_recipes.", "qualify.")):
                 violations.append(f"{py.relative_to(ROOT)} imports {mod}")
     assert not violations, "\n".join(violations)
 
