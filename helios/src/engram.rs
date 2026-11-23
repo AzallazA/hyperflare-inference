@@ -444,6 +444,7 @@ impl Shared {
         workers: usize,
         gather_threads: usize,
         resident_scales: bool,
+        pin_cpu_base: usize,
     ) -> Result<Arc<Self>> {
         if storage.len() != index.tables.len() {
             return Err("embedding table storage list does not match the table count".into());
@@ -493,7 +494,16 @@ impl Shared {
                 .map(|reader| reader.with_gather_threads(gather_threads))
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
+        Self::with_readers(
+            index,
+            readers,
+            ranks,
+            max_tokens,
+            context,
+            device,
+            stats,
+            pin_cpu_base,
+        )
     }
 
     fn with_readers(
@@ -504,6 +514,7 @@ impl Shared {
         context: usize,
         device: i32,
         stats: Arc<Stats>,
+        pin_cpu_base: usize,
     ) -> Result<Arc<Self>> {
         if ranks == 0 || ranks > 16 || max_tokens == 0 || readers.len() != index.tables.len() {
             return Err("invalid embedding delivery geometry".into());
@@ -539,10 +550,11 @@ impl Shared {
             let advisory = read_ahead::advisory_for(&reader, table.hash.as_ref());
             let worker_advisory = advisory.clone();
             let hash = advisory.as_ref().and(table.hash.clone());
+            let pin_cpu = pin_cpu_base + table_index;
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
-                    crate::os::pin_current_thread(3 + table_index);
+                    crate::os::pin_current_thread(pin_cpu);
                     let (Some(advisory), Some(hash)) = (worker_advisory, hash) else {
                         while let Ok(job) = receiver.recv() {
                             serve(&mut reader, &planes, &buffers, row_bytes, &stop, job);
