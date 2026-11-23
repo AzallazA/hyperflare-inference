@@ -118,6 +118,17 @@ message RebuildManifest {
   string online_mxfp8_scope = 30;
   // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
   uint32 context_parallel_size = 31;
+  // Preparation-only prompt-logprob prefill graph capture.
+  bool prompt_logprobs = 32;
+  // Preparation-only kernel search effort: off, default, or audit.
+  string autotune_effort = 33;
+  // Preparation-only quantized dense activations (A8/A4) instead of auto precision.
+  bool native_dense_activations = 34;
+  // Preparation-only GPU clock locking during autotuning.
+  bool lock_gpu_clocks = 35;
+  // Canonical `ignition export` arguments reproducing this deployment's preparation inputs,
+  // without host-local paths or secrets.
+  repeated string reproduction_args = 36;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

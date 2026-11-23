@@ -39,6 +39,9 @@ pub fn validate_sampling_defaults(value: &wire::DefaultSamplingParameters) -> cr
 pub const WIRE_DESCRIPTOR: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/runtime_core_descriptor.bin"));
 mod publishers;
+pub fn embedded_publishers() -> Result<Vec<Publisher>> {
+    publishers::embedded()
+}
 #[cfg(any(test, feature = "test-tools"))]
 pub mod test_support;
 pub use protection::{

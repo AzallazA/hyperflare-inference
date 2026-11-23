@@ -921,7 +921,7 @@ Both commands accept these download options:
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
 | `--offline` | Resolve prepared cores only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local core path | Off |
-| `--tensor-parallel N[,N...]` | Tensor-parallel deployments of the repository's core to install | The selected GPU count |
+| `--tensor-parallel N[,N...]` | Tensor-parallel deployments of the repository's core to install | The selected GPU count, or the core's sole deployment when neither `--tensor-parallel` nor `--gpus` is given |
 | `--core-cache PATH` | Flare prepared-model cache directory | `paths.core_cache`, otherwise `~/.cache/flare/cores` |
 
 Online acquisition uses the shared Hugging Face transport tree described under

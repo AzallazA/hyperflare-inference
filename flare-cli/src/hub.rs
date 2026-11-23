@@ -10,7 +10,9 @@ pub fn token(options: &HubOptions) -> Result<Option<String>> {
     flare::hub::token(&options.into())
 }
 pub fn run_download(args: crate::cli::Download) -> Result<()> {
-    crate::environment::configure(&args.gpus)?;
+    if !args.gpus.is_empty() {
+        crate::environment::configure(&args.gpus)?;
+    }
     let entry = download(
         &args.repository,
         &args.hub,
@@ -33,7 +35,7 @@ pub fn download(
 ) -> Result<flare_helios::core::cache::Entry> {
     let mut resolved = flare::options::HubOptions::from(options);
     if resolved.revision.is_none() && repository(source)?.1.is_none() {
-        resolved.revision = Some(crate::hardware::detect_isolated(gpu_count)?);
+        resolved.revision = Some(crate::hardware::detect_isolated(gpu_count.max(1))?);
     }
     let progress = flare_helios::core::progress::AcquisitionProgress::new();
     let startup = flare_helios::startup::StartupProgress::stderr_rows();
@@ -115,7 +117,7 @@ pub fn refresh_model(
         entry,
         pinned,
         &(&args.hub).into(),
-        args.gpus.len().max(1),
+        args.gpus.len(),
         &args.publisher_keys,
         args.trust_store.as_deref(),
     )

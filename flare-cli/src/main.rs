@@ -378,7 +378,7 @@ fn load_core(
         let entry = hub::download(
             text,
             &hub_options,
-            args.gpus.len().max(1),
+            args.gpus.len(),
             &args.publisher_keys,
             args.trust_store.as_deref(),
             &[],

@@ -277,7 +277,7 @@ fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
 
 #[test]
 fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns() {
-    let source = include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja");
+    let source = include_str!("fixtures/templates/kimi3/chat_template.jinja");
     let annotated = frontend(source, TemplateEncoding::TokenSegments);
     let upgraded = frontend(
         &source.replace("{%- mark ns.segments | length -%}", ""),
@@ -306,7 +306,7 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
 #[test]
 fn segmented_xtml_preserves_block_hints_through_json_escaping() {
     let frontend = frontend(
-        include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+        include_str!("fixtures/templates/kimi3/chat_template.jinja"),
         TemplateEncoding::TokenSegments,
     );
     let history = "Repeated \"history\"\\\n café 世界 😀 <|close|>";
@@ -344,7 +344,7 @@ fn segmented_xtml_preserves_block_hints_through_json_escaping() {
 #[test]
 fn segmented_tool_results_keep_images_and_checkpoints_in_rendered_order() {
     let frontend = frontend(
-        include_str!("../../ignition/recipes/kimi31/assets/chat_template.jinja"),
+        include_str!("fixtures/templates/kimi31/chat_template.jinja"),
         TemplateEncoding::TokenSegments,
     );
     let messages = json!([

@@ -46,7 +46,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
                 // The NVIDIA checkpoint's bundled template is annotated in place. The calibrated
                 // checkpoint's template is replaced by the canonical source, and the reference
                 // fixtures generated from the same snapshot fail if the choice is wrong.
-                let patch: serde_json::Value=serde_json::from_str(include_str!("../../ignition/recipes/glm53/assets/chat_template.patch.json")).unwrap();
+                let patch: serde_json::Value=serde_json::from_str(include_str!("fixtures/templates/glm53/chat_template.patch.json")).unwrap();
                 let digest=format!("{:x}",Sha256::digest(fs::read(snapshot.join("chat_template.jinja")).unwrap()));
                 let name=if digest==patch["source_sha256"].as_str().unwrap() {"chat_template"} else {"chat_template.zai"};
                 let path=template_fixtures::path("glm53", name);

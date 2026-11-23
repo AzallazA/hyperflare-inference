@@ -19,7 +19,6 @@ def _rank(rank, directory):
     # Compiled forwards are pickled to compile workers, so their classes must live in an importable module.
     from tests.components.gather_core_forwards import GatherForward, RecordForward
     from ignition.components.collectives import PreparedAllGather, PreparedVarlenGather
-    from ignition.recipes.glm53.dcp import ContextShards
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.collectives import (
         CollectivePreparation, create_all_gather_runtime, create_varlen_gather_runtime)
@@ -71,7 +70,8 @@ def _rank(rank, directory):
                 counts = torch.zeros(4, dtype=torch.int64, device=device)
                 windows = tuple((first, PreparedVarlenGather(records, counts, runtime=runtimes[-1],
                     session=session, coordinator=coordinator, name=f"records{first}")) for first in range(0, 64, window))
-                record_call = RecordForward(windows, ContextShards.on(rank, 4, device), cache, table, output, window)
+                rank_tensor = torch.tensor([rank], dtype=torch.int64, device=device)
+                record_call = RecordForward(windows, rank_tensor, 4, cache, table, output, window)
                 session.tune(show_progress=False)
                 # BF16 and FP32 views share a producer; an independent channel has its own.
                 assert len(session._startup_collectives.groups) == 4

@@ -344,12 +344,15 @@ canonical forms, packing, publication, locations, and conversion.
 
 ### Preparation rebuild metadata
 
-Exports through `ignition export` record an optional `RebuildManifest`. Export
+Exports through `ignition export` record `RebuildManifest`. Export
 staging carries it as `ModelIndex.rebuild`, and the published payload core
 signs it as `DeploymentBody.rebuild`.
 It identifies the recipe, preparation source identity, qualified checkpoint
 repository and revision, tensor-parallel size, concurrency, chunk size,
-speculation, and selected preparation settings. A local checkpoint override
+speculation, selected preparation settings (including prompt logprobs,
+autotune effort, native dense activations, and GPU clock locking), and
+canonical `ignition export` reproduction arguments in `reproduction_args`
+without host-local paths or secrets. A local checkpoint override
 is marked explicitly and carries no asserted upstream revision. Runtime
 collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the

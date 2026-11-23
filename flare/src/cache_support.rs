@@ -8,7 +8,7 @@
 //! Unix-specific rank transport and locking remain in `core_cache`.
 
 use crate::configuration::{Configuration, expand};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -132,11 +132,16 @@ pub fn local_model(
 }
 
 /// Normalize requested tensor-parallel sizes: deduplicated, ascending, non-zero.
+///
+/// Returns an empty list when neither explicit sizes nor a GPU count was given,
+/// letting deployment selection default to the core's sole prepared deployment.
 pub fn requested_tensor_parallel(requested: &[u32], gpu_count: usize) -> Result<Vec<u32>, Failure> {
-    let mut sizes: Vec<u32> = if requested.is_empty() {
-        vec![u32::try_from(gpu_count.max(1)).map_err(|_| "GPU count is too large")?]
-    } else {
+    let mut sizes: Vec<u32> = if !requested.is_empty() {
         requested.to_vec()
+    } else if gpu_count > 0 {
+        vec![u32::try_from(gpu_count).map_err(|_| "GPU count is too large")?]
+    } else {
+        return Ok(Vec::new());
     };
     if sizes.contains(&0) {
         return Err("tensor-parallel sizes must be positive".into());
@@ -151,6 +156,8 @@ pub fn requested_tensor_parallel(requested: &[u32], gpu_count: usize) -> Result<
 /// Topology comes from each authenticated deployment body, never from
 /// availability hints: a size that was never exported, appears twice, or has an
 /// incomplete payload closure is an error rather than a silently dropped request.
+/// When `sizes` is empty, selects the core's sole deployment or rejects
+/// multi-deployment cores with the available sizes.
 pub fn select_deployments(
     metadata: &flare_helios::core::reader::Metadata,
     publishers: &[flare_helios::runtime_core::Publisher],
@@ -164,7 +171,8 @@ pub fn select_deployments(
         protection::Selection::Catalog,
     )?;
     let count = catalog.deployment_count();
-    let mut found: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut found: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut available = Vec::with_capacity(count);
     for index in 0..count {
         let selection = protection::Selection::Deployment {
             deployment: index,
@@ -174,30 +182,49 @@ pub fn select_deployments(
         let deployment = verified
             .deployment()
             .ok_or_else(|| format!("deployment {index} has no authenticated body"))?;
+        available.push(deployment.tensor_parallel);
         found
             .entry(deployment.tensor_parallel)
             .or_default()
             .push(index);
     }
-    let mut selected = Vec::with_capacity(sizes.len());
-    for size in sizes {
-        let indices = found.get(size).ok_or_else(|| {
-            format!("core exports no deployment with tensor-parallel size {size}")
-        })?;
-        match indices.as_slice() {
-            [index] => selected.push(protection::Selection::Deployment {
-                deployment: *index,
+    let selected = if sizes.is_empty() {
+        match count {
+            0 => return Err("core holds no prepared deployment".into()),
+            1 => vec![protection::Selection::Deployment {
+                deployment: 0,
                 rank: None,
-            }),
+            }],
             _ => {
+                available.sort_unstable();
                 return Err(format!(
-                    "core exports {} deployments with tensor-parallel size {size}",
-                    indices.len()
+                    "core holds {count} deployments; select a tensor-parallel size with --tensor-parallel or --gpus (available: {available:?})"
                 )
                 .into());
             }
         }
-    }
+    } else {
+        let mut selected = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            let indices = found.get(size).ok_or_else(|| {
+                format!("core exports no deployment with tensor-parallel size {size}")
+            })?;
+            match indices.as_slice() {
+                [index] => selected.push(protection::Selection::Deployment {
+                    deployment: *index,
+                    rank: None,
+                }),
+                _ => {
+                    return Err(format!(
+                        "core exports {} deployments with tensor-parallel size {size}",
+                        indices.len()
+                    )
+                    .into());
+                }
+            }
+        }
+        selected
+    };
     let mut verified = Vec::with_capacity(selected.len());
     for selection in &selected {
         verified.push(protection::verify(

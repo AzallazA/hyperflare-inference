@@ -267,7 +267,7 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
         ),
         (
             "kimi",
-            include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+            include_str!("../../../tests/fixtures/templates/kimi3/chat_template.jinja"),
         ),
         (
             "gemma",

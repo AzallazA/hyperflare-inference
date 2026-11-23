@@ -1084,7 +1084,7 @@ mod native_prompt_tests {
         let source = r#"{"z":1e2,"a":[1,  2],"z":-0,"s":"café\n"}"#;
         let (frontend, compiler, mut config) = renderer(
             PromptEncoder::Jinja,
-            Some(include_str!("../../../../ignition/recipes/kimi31/assets/chat_template.jinja")),
+            Some(include_str!("../../../tests/fixtures/templates/kimi31/chat_template.jinja")),
             TemplateEncoding::TokenSegments,
         );
         config.contract.frontend.rejected_tokens.clear();
@@ -1148,7 +1148,7 @@ mod native_prompt_tests {
                 "<|image_pad|>",
             ),
             (
-                include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+                include_str!("../../../tests/fixtures/templates/kimi3/chat_template.jinja"),
                 TemplateEncoding::TokenSegments,
                 ImageLayoutKind::Moonvit,
                 "<|media_pad|>",

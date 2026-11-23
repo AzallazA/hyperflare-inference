@@ -126,12 +126,17 @@ class ReplicaPreparation:
 
 
 def _resolve_recipe(prepare, recipe_name):
-    from ignition.recipes import recipes
+    from ignition.declaration import Recipe
+    from ignition.registry import current_recipes
 
-    for recipe in recipes():
+    for recipe in current_recipes():
         if recipe.name == recipe_name:
             return recipe
-    return importlib.import_module(prepare.__module__).RECIPE
+    module = importlib.import_module(prepare.__module__)
+    for value in vars(module).values():
+        if isinstance(value, Recipe) and value.name == recipe_name:
+            return value
+    return module.RECIPE
 
 
 def _replica(parent, prepare, recipe_name, snapshot, values, gpu_uuids, options):

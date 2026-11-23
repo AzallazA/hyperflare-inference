@@ -241,7 +241,7 @@ fn download_for_model_at(
     let (id, given_revision) = repository(source)?;
     let revision = match options.revision.as_deref().or(given_revision) {
         Some(revision) => revision.to_owned(),
-        None => crate::hardware::detect(gpu_count)?.to_owned(),
+        None => crate::hardware::detect(gpu_count.max(1))?.to_owned(),
     };
     validate_relative(&revision)?;
     if let Some(filename) = &options.filename {
@@ -472,17 +472,17 @@ fn download_for_model_at(
         if expected_model.is_some_and(|model| model != entry.model()) {
             return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
         }
-        let expected_envelope =
-            authenticated_source_envelope(&primary, options, gpu_count, &publishers)?;
+        let (expected_envelope, resolved_sizes) =
+            authenticated_source(&primary, options, gpu_count, &publishers)?;
         check_cancel(Some(&report.progress))?;
-        remember_download(
+        remember_download_sizes(
             &model_root,
             id,
             &revision,
             pinned.revision(),
             &filename,
             options,
-            gpu_count,
+            &resolved_sizes,
             &entry,
             expected_envelope,
         )?;
@@ -1644,19 +1644,24 @@ fn refresh_model_at(
     )
 }
 
-fn authenticated_source_envelope(
+fn authenticated_source(
     primary: &Path,
     options: &HubOptions,
     gpu_count: usize,
     publishers: &[flare_helios::runtime_core::Publisher],
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], Vec<u32>)> {
     use flare_helios::core::{conversion, reader};
     use flare_helios::runtime_core::VerifiedCore;
     if conversion::form(primary)
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        return Ok(VerifiedCore::open(primary, publishers, None)?.envelope_digest());
+        let verified = VerifiedCore::open(primary, publishers, None)?;
+        let ranks = verified
+            .identity()
+            .map_err(|error| error.to_string())?
+            .tensor_parallel;
+        return Ok((verified.envelope_digest(), vec![ranks]));
     }
     let metadata = reader::Metadata::open(primary)?;
     let sizes =
@@ -1664,16 +1669,34 @@ fn authenticated_source_envelope(
             .map_err(|error| error.to_string())?;
     let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
         .map_err(|error| error.to_string())?;
-    let selection = *selections
-        .first()
-        .ok_or("authenticated source has no selected deployment")?;
-    // The signed envelope and selected deployment are sufficient to establish the
-    // identity. Opening payload companions here would require materializing the
-    // Hub snapshot and duplicate the acquisition's closure work.
-    Ok(
-        flare_helios::core::protection::verify(&metadata.envelope, publishers, selection)?
-            .envelope_digest(),
-    )
+    let mut envelope = None;
+    let mut resolved = std::collections::BTreeSet::new();
+    for selection in selections {
+        // The signed envelope and selected deployment are sufficient to establish the
+        // identity. Opening payload companions here would require materializing the
+        // Hub snapshot and duplicate the acquisition's closure work.
+        let verified =
+            flare_helios::core::protection::verify(&metadata.envelope, publishers, selection)?;
+        if envelope.is_none() {
+            envelope = Some(verified.envelope_digest());
+        }
+        let deployment = verified
+            .deployment()
+            .ok_or("authenticated source deployment has no body")?;
+        resolved.insert(deployment.tensor_parallel);
+    }
+    let envelope = envelope.ok_or("authenticated source has no selected deployment")?;
+    Ok((envelope, resolved.into_iter().collect()))
+}
+
+#[cfg(test)]
+fn authenticated_source_envelope(
+    primary: &Path,
+    options: &HubOptions,
+    gpu_count: usize,
+    publishers: &[flare_helios::runtime_core::Publisher],
+) -> Result<[u8; 32]> {
+    Ok(authenticated_source(primary, options, gpu_count, publishers)?.0)
 }
 
 pub fn remember_download(
@@ -1687,10 +1710,35 @@ pub fn remember_download(
     entry: &flare_helios::core::cache::Entry,
     expected_envelope: [u8; 32],
 ) -> Result<()> {
-    let store = flare_helios::core::cache::Root::open(root)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
+    remember_download_sizes(
+        root,
+        repository,
+        revision,
+        commit,
+        filename,
+        options,
+        &sizes,
+        entry,
+        expected_envelope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remember_download_sizes(
+    root: &Path,
+    repository: &str,
+    revision: &str,
+    commit: &str,
+    filename: &str,
+    options: &HubOptions,
+    sizes: &[u32],
+    entry: &flare_helios::core::cache::Entry,
+    expected_envelope: [u8; 32],
+) -> Result<()> {
+    let store = flare_helios::core::cache::Root::open(root)?;
     let mut filenames = vec![Some(filename)];
     if options.filename.is_none() {
         filenames.push(None);
@@ -1699,7 +1747,7 @@ pub fn remember_download(
         for filename in &filenames {
             // The exact selection retains earlier TP entries; the unqualified
             // selector also permits subsets of the most recently acquired union.
-            for selection in [sizes.as_slice(), &[]] {
+            for selection in [sizes, &[]] {
                 store.publish_source_ref(
                     &source_selector(repository, revision, *filename, selection),
                     commit,
@@ -1710,7 +1758,7 @@ pub fn remember_download(
         }
     }
     store.publish_entry_source(
-        &source_selector(repository, revision, Some(filename), &sizes),
+        &source_selector(repository, revision, Some(filename), sizes),
         commit,
         entry,
         expected_envelope,
@@ -1812,8 +1860,13 @@ fn missing_source(
     sizes: &[u32],
     root: &Path,
 ) -> String {
+    let tp = if sizes.is_empty() {
+        "automatic".to_owned()
+    } else {
+        format!("{sizes:?}")
+    };
     format!(
-        "core {repository}@{revision} (filename: {}, TP: {sizes:?}) is not available in the Flare cache {}; download it online first",
+        "core {repository}@{revision} (filename: {}, TP: {tp}) is not available in the Flare cache {}; download it online first",
         options.filename.as_deref().unwrap_or("automatic"),
         root.display(),
     )
@@ -2095,13 +2148,19 @@ fn plan_payload_acquisition<'a>(
             .union(publishers, &selections)?;
         let model_key = acquisition_model_key(&source, repository)?;
         let store = cache::Root::open(model_root)?;
+        let (platform, signed_sizes) = signed_hardware(&source)?;
+        let lookup_sizes = if sizes.is_empty() {
+            signed_sizes.as_slice()
+        } else {
+            sizes.as_slice()
+        };
 
         // Warm reuse is keyed by the private source selector, then checked
         // against the signed primary and selected deployments before the hit.
         let mut selectors = Vec::new();
         for source_revision in [revision, commit] {
             for source_filename in [Some(filename), None] {
-                for selection in [sizes.as_slice(), &[]] {
+                for selection in [lookup_sizes, &[]] {
                     selectors.push(source_selector(
                         repository,
                         source_revision,
@@ -2122,7 +2181,6 @@ fn plan_payload_acquisition<'a>(
             }
         }
 
-        let (platform, signed_sizes) = signed_hardware(&source)?;
         let candidate = acquisition_candidate(platform.as_deref(), &signed_sizes)?;
         let staging = store.stage_named(&model_key, &candidate)?;
         let plan = store.plan_acquisition_with(source, &derivation::Limits::default(), progress)?;
@@ -7542,6 +7600,287 @@ pub(crate) mod tests {
         assert!(
             !files.iter().any(|file| file.contains("tokenizer")),
             "{files:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_tp_and_gpu_count_defaults_to_sole_deployment_and_rejects_ambiguous_cores() {
+        use flare_helios::core::{PayloadId, container, export, schema::wire};
+        use flare_helios::runtime_core::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        // Multi-deployment core: omitting both --tensor-parallel and --gpus rejects with available sizes.
+        {
+            let (_scratch, primary, publishers) = selected_tp_core();
+            let source_root = primary.parent().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let model_root = temp.path().join("models");
+            let options = HubOptions {
+                revision: Some("gb202".into()),
+                core_cache: Some(model_root.clone()),
+                ..Default::default()
+            };
+            let routes = core_routes(source_root, "sel/multi", "gb202");
+            let (endpoint, worker, _log) = mock_hub_counted(routes);
+            let error = match download_with_token_at(
+                &endpoint,
+                "sel/multi",
+                &options,
+                0,
+                None,
+                &[],
+                None,
+                &publishers,
+                None,
+            ) {
+                Ok(_) => panic!("multi-deployment core without TP or GPU count should error"),
+                Err(error) => error.to_string(),
+            };
+            worker.join().unwrap();
+            assert!(
+                error.contains("core holds 2 deployments") && error.contains("[1, 2]"),
+                "{error}"
+            );
+        }
+
+        // Single-deployment TP2 core: omitting both --tensor-parallel and --gpus selects TP2.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-tp2");
+        std::fs::create_dir_all(&source).unwrap();
+        let weights = b"sole tp2 deployment weights".repeat(4);
+        let id = PayloadId::of(&weights);
+        let raw = temp.path().join("weights.bin");
+        std::fs::write(&raw, &weights).unwrap();
+        let graph = temp.path().join("graph.bin");
+        std::fs::write(&graph, b"graph-bytes").unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "TP2".into(),
+            namespace: "tp2".into(),
+            public_key,
+            development: false,
+        };
+        let contract = flare_helios::runtime_core::wire::ServingContract {
+            model_id: "tp2-only".into(),
+            identity: "tp2-only-gb202".into(),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_core::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rank0 = wire::RankBody {
+            rank: 0,
+            deployment_id: "gb202-tp2".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-0".into(),
+                nbytes: weights.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            initializers: vec![wire::Initializer {
+                allocation: "device-0".into(),
+                destination_offset: 0,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: id.as_bytes().to_vec(),
+                        offset: 0,
+                        nbytes: weights.len() as u64,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rank1 = wire::RankBody {
+            rank: 1,
+            deployment_id: "gb202-tp2".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-1".into(),
+                nbytes: weights.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = export::PublishRequest {
+            core: wire::CoreBody {
+                model_identity: "tp2/only".into(),
+                hardware_identity: "gb202".into(),
+                frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "tp2".into(),
+                    official_source: "https://huggingface.co/tp2/only".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![export::PublishDeployment {
+                payloads: vec![],
+                body: wire::DeploymentBody {
+                    deployment_id: "gb202-tp2".into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 2,
+                    contract: Some(contract),
+                    ..Default::default()
+                },
+                ranks: vec![
+                    export::PublishRank {
+                        body: rank0,
+                        payloads: vec![export::PublishPayload {
+                            role: wire::PayloadRole::Weights,
+                            relative: "weights/tp2/rank-0/layer-000.safetensors".into(),
+                            tensor: Some(container::COMPANION_TENSOR.into()),
+                            source: container::Slice::new(
+                                std::sync::Arc::new(std::fs::File::open(&raw).unwrap()),
+                                0,
+                                weights.len() as u64,
+                            )
+                            .unwrap(),
+                            id,
+                        }],
+                        resources: vec![export::PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph.clone(),
+                            nbytes: 11,
+                        }],
+                    },
+                    export::PublishRank {
+                        body: rank1,
+                        payloads: vec![],
+                        resources: vec![export::PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph,
+                            nbytes: 11,
+                        }],
+                    },
+                ],
+            }],
+            core_id: [44u8; 32],
+            public_key,
+            accepted: "tp2".into(),
+            no_weights: false,
+        };
+        export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+
+        let model_root = temp.path().join("models");
+        let options = HubOptions {
+            revision: Some("gb202".into()),
+            core_cache: Some(model_root.clone()),
+            ..Default::default()
+        };
+        let routes = core_routes(&source, "tp2/only", "gb202");
+        let (endpoint, worker, _log) = mock_hub_counted(routes);
+        let entry = download_with_token_at(
+            &endpoint,
+            "tp2/only",
+            &options,
+            0,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        let installed_id = entry.id().to_owned();
+        assert!(installed_id.contains("-tp2-"), "{installed_id}");
+        drop(entry);
+
+        // Warm online reuse with omitted TP/GPU count transfers only the primary.
+        let routes = core_routes(&source, "tp2/only", "gb202");
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let warm = download_with_token_at(
+            &endpoint,
+            "tp2/only",
+            &options,
+            0,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(warm.id(), installed_id);
+        let transfers = log.lock().unwrap();
+        assert!(
+            transfers.files.keys().all(|file| file.ends_with("/model.safetensors")),
+            "warm reuse fetched dependencies: {transfers:?}"
+        );
+        drop(transfers);
+        drop(warm);
+
+        // Offline resolution works both with omitted TP/GPU count and with explicit TP2.
+        let offline = HubOptions {
+            offline: true,
+            ..options.clone()
+        };
+        for gpu_count in [0usize, 2usize] {
+            let resolved = download_with_token_at(
+                "http://unused",
+                "tp2/only",
+                &offline,
+                gpu_count,
+                None,
+                &[],
+                None,
+                std::slice::from_ref(&publisher),
+                None,
+            )
+            .unwrap();
+            assert_eq!(resolved.id(), installed_id);
+        }
+
+        // Explicit mismatched GPU count (1) is still rejected.
+        let mismatch = download_with_token_at(
+            "http://unused",
+            "tp2/only",
+            &offline,
+            1,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            mismatch.contains("core exports no deployment with tensor-parallel size 1"),
+            "{mismatch}"
         );
     }
 

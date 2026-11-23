@@ -238,7 +238,8 @@ def _export_hosts(args):
             with phase(progress, "Export native cores", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
-                options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
+                options['rebuild_manifest'] = from_plan(
+                    model, plan, compiled_forwards=not args.no_compile, multi_host=True)
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
                                 staging=configuration.directory("export_staging"),

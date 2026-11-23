@@ -73,7 +73,7 @@ mod tests {
     fn kimi3_fixture() -> String {
         std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../ignition/recipes/kimi3/assets/chat_template.jinja"
+            "/tests/fixtures/templates/kimi3/chat_template.jinja"
         ))
         .expect("Kimi K3 template fixture")
     }

@@ -8,9 +8,9 @@ import os
 from dataclasses import dataclass, replace
 
 from ignition import planning
+from ignition.declaration import Speculation
 from ignition.errors import FetchError, UsageError
-from ignition.recipes import ResolvedModel, resolve
-from ignition.recipes.declaration import Speculation
+from ignition.registry import ResolvedModel, resolve
 
 from .config import AUTOTUNE_EFFORTS, Configuration, Setting
 
@@ -33,11 +33,11 @@ class Host:
         return cls(gpus, restriction)
 
 
-def resolve_model(configuration: Configuration, name: str | None) -> ResolvedModel:
+def resolve_model(configuration: Configuration, name: str | None, *, recipes=None) -> ResolvedModel:
     name = configuration.model if name is None else name
     if name is None:
         raise UsageError("no MODEL given and defaults.model is not set in the configuration file")
-    model = resolve(name, configuration.directory("hub_cache"))
+    model = resolve(name, configuration.directory("hub_cache"), recipes=recipes)
     model.verify(configuration.directory("hub_cache"))
     return model
 

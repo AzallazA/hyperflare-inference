@@ -276,6 +276,9 @@ fn render_payload(value: &Value, mut canvas: Canvas) -> String {
         if !deployment["vision"].is_null() {
             canvas.row("Vision", &text(&deployment["vision"]));
         }
+        if let Some(command) = reproduction_command(&deployment["rebuild"]) {
+            canvas.row("Reproduction", &command);
+        }
     }
     for rank in value["ranks"].as_array().into_iter().flatten() {
         if let Some(graphs) = rank["graphs"].as_array() {
@@ -443,6 +446,27 @@ fn list(value: &Value) -> String {
         .as_array()
         .map(|items| items.iter().map(text).collect::<Vec<_>>().join(", "))
         .unwrap_or_default()
+}
+
+fn reproduction_command(rebuild: &Value) -> Option<String> {
+    let args = rebuild.get("reproduction_args")?.as_array()?;
+    if args.is_empty() {
+        return None;
+    }
+    let formatted: Vec<String> = args
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|arg| {
+            if arg.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b"-_./@:=,+".contains(&b)
+            }) {
+                arg.to_owned()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect();
+    (!formatted.is_empty()).then(|| formatted.join(" "))
 }
 
 pub(crate) struct Canvas {
@@ -806,6 +830,9 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
         },
     );
     sampling(&mut canvas, &value["sampling_defaults"]);
+    if let Some(command) = reproduction_command(&value["rebuild"]) {
+        canvas.row("reproduction", &command);
+    }
     canvas.open("Rank resources");
     canvas.table(
         &["Rank", "Device", "Mapped host", "Peer views", "Graphs"],
@@ -1722,5 +1749,33 @@ mod tests {
         assert_eq!(duration(0), "–");
         assert_eq!(Canvas::wrap("abc def ghi", 7), vec!["abc def", "ghi"]);
         assert_eq!(Canvas::wrap("abcdefghijkl", 8), vec!["abcdefgh", "ijkl"]);
+    }
+
+    #[test]
+    fn reproduction_command_renders_when_present_and_omits_when_empty() {
+        assert_eq!(reproduction_command(&Value::Null), None);
+        assert_eq!(
+            reproduction_command(&json!({"reproduction_args": []})),
+            None
+        );
+        assert_eq!(
+            reproduction_command(&json!({
+                "reproduction_args": [
+                    "ignition", "export", "org/model@abc123", "--gpus", "0-15", "a b"
+                ]
+            }))
+            .as_deref(),
+            Some("ignition export org/model@abc123 --gpus 0-15 'a b'")
+        );
+        let mut value = document();
+        value["rebuild"] = json!({
+            "reproduction_args": ["ignition", "export", "org/model@abc123", "--gpus", "0"]
+        });
+        let rendered = render(&value, 100, false);
+        assert!(
+            rendered.contains("reproduction")
+                && rendered.contains("ignition export org/model@abc123 --gpus 0"),
+            "{rendered}"
+        );
     }
 }

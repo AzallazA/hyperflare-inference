@@ -163,22 +163,6 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes, ipc=ipc)
 
 
-def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):
-    """Allocate b12x staging for all-gathering head shards and LSE-combining partial attention.
-
-    Queries may be wider than the combined values: latent attention gathers absorbed queries of
-    `query_head_dim` and combines `head_dim` outputs.
-    """
-    from b12x.comm.pcie import DcpAllToAll
-
-    world_size = dist.get_world_size(group)
-    query_head_dim = head_dim if query_head_dim is None else query_head_dim
-    if world_size < 2 or max_rows <= 0 or heads % world_size or head_dim % 8 or query_head_dim % 8:
-        raise ValueError("head exchanges require multiple equal head shards and positive capacity")
-    return DcpAllToAll.from_exchange_group(exchange_group=group, device=device, max_batch_size=max_rows,
-        total_heads=heads, head_dim=head_dim, query_head_dim=query_head_dim, stream_affine=False, ipc=ipc)
-
-
 def _tuning_results(contributions):
     """Forward finalist shards in rank order and select ordinary race winners."""
     races = {}

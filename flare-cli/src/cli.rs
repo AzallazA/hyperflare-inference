@@ -192,7 +192,8 @@ pub struct HubOptions {
     #[arg(long, help_heading = "Download options")]
     pub offline: bool,
 
-    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count.
+    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count,
+    /// or the core's sole deployment when neither is given.
     #[arg(
         long,
         value_name = "N[,N...]",
@@ -292,9 +293,10 @@ pub struct Download {
     #[arg(value_name = "REPOSITORY")]
     pub repository: String,
 
-    /// GPUs used to detect the hardware revision; unnecessary with --revision.
+    /// GPUs used to detect the hardware revision (first visible GPU when omitted) and default
+    /// tensor-parallel size; unnecessary with --revision.
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
-        default_value = "0", value_parser = clap::value_parser!(i32).range(0..))]
+        value_parser = clap::value_parser!(i32).range(0..))]
     pub gpus: Vec<i32>,
 
     /// Additional publisher verification profiles (JSON); repeatable.
@@ -1437,6 +1439,21 @@ mod tests {
             "4,7"
         );
         assert!(crate::environment::visibility(&args.gpus, Some("4")).is_err());
+
+        let Command::Download(download) =
+            Cli::try_parse_from(["flare", "download", "org/model"]).unwrap().command
+        else {
+            panic!("expected download")
+        };
+        assert!(download.gpus.is_empty());
+        let Command::Download(download) =
+            Cli::try_parse_from(["flare", "download", "org/model", "--gpus", "0,1"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected download")
+        };
+        assert_eq!(download.gpus, vec![0, 1]);
     }
 
     #[test]

@@ -10,24 +10,27 @@ from pathlib import Path
 from ignition.errors import FlareError
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(*, recipes=(), prog="ignition") -> argparse.ArgumentParser:
+    from functools import partial
     from . import serve
     from . import publishing
     from . import bench
     from .help import RecipeHelp, recipe_help
 
+    recipes = tuple(recipes)
     parser = argparse.ArgumentParser(
-        prog="ignition", allow_abbrev=False,
+        prog=prog, allow_abbrev=False,
         description="Prepare native runtime cores for NVIDIA SM103, SM120, and SM121 GPUs.",
-        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=recipe_help())
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=recipe_help(recipes=recipes, prog=prog))
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     def command(name, handler, summary):
         subparser = subparsers.add_parser(
             name, help=summary, description=summary, allow_abbrev=False, add_help=False,
             formatter_class=argparse.RawDescriptionHelpFormatter)
+        help_action = partial(RecipeHelp, recipes=recipes, prog=prog) if name in ("export", "debug-serve") else "help"
         subparser.add_argument("-h", "--help",
-                               action=RecipeHelp if name in ("export", "debug-serve") else "help",
+                               action=help_action,
                                help="show this help message and exit")
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
@@ -44,17 +47,17 @@ def _parser() -> argparse.ArgumentParser:
                            help="public publisher profile authenticating the cached weight source")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
-    _preparation_arguments(exporting)
+    _preparation_arguments(exporting, recipes=recipes, prog=prog)
     benchmarking = command("bench", bench.run,
         "measure complete prepared GPU graph latency without export or HTTP; not serving throughput")
-    _preparation_arguments(benchmarking, model_default="defaults.model, else qwen3.8-27b")
+    _preparation_arguments(benchmarking, recipes=recipes, prog=prog)
     bench.arguments(benchmarking)
     serving = command("debug-serve", serve.debug_serve,
                       "prepare and run diagnostic HTTP requests; not for actual serving or performance"
                       " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
-    _preparation_arguments(serving)
+    _preparation_arguments(serving, recipes=recipes, prog=prog)
     for spanning in (serving, exporting):
         hosts = spanning.add_argument_group("multi-host tensor parallelism")
         hosts.add_argument("--roce-ring", action="store_true",
@@ -130,11 +133,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _preparation_arguments(running, *, model_default="defaults.model"):
+def _preparation_arguments(running, *, model_default="defaults.model", recipes=(), prog="ignition"):
     from .help import recipe_help
 
     running.usage = "%(prog)s [MODEL] [options]"
-    running.epilog = recipe_help()
+    running.epilog = recipe_help(recipes=recipes, prog=prog)
     running.set_defaults(roce_ring=False, roce_chain=False)
     running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
     running.add_argument("model", nargs="?", metavar="MODEL",
@@ -267,10 +270,15 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " pages (recipes with a separable encoder; default: the recipe's image support)")
 
 
-def main(argv=None) -> int:
-    args = _parser().parse_args(argv)
+def main(argv=None, *, recipes=(), prog="ignition", source_roots=()) -> int:
+    from ignition.preparation.source_identity import source_roots as bind_source_roots
+    from ignition.registry import active_recipes
+
+    recipes = tuple(recipes)
+    args = _parser(recipes=recipes, prog=prog).parse_args(argv)
     try:
-        return args.handler(args) or 0
+        with active_recipes(recipes), bind_source_roots(source_roots):
+            return args.handler(args) or 0
     except FlareError as error:
         from . import display
 

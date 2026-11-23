@@ -17,7 +17,7 @@ from pathlib import Path
 from ignition.errors import CapacityError, UsageError
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.selection import BenchmarkSelection
-from ignition.recipes.declaration import Checkpoint, Recipe, Speculation
+from ignition.declaration import Checkpoint, Recipe, Speculation
 
 # Free memory kept after the final KV allocation during preparation. Headroom
 # covers the transient working memory of compiled warm-up and graph capture,
