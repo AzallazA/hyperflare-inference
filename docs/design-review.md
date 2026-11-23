@@ -30,8 +30,11 @@ before committing; a design acknowledgment cannot authorize them.
    and capacities explicitly.
 3. **Preserve canonical model semantics and shared mechanisms.** Reuse Transformers
    forwards where their dataflow fits; replace the smallest coherent module needed.
-   Recipes own model composition and checkpoint mapping. Reusable projections,
-   experts, collectives, and state transfers belong in `ignition/components/`.
+   Recipes (in `local-inference-lab/hyperflare-recipes` or external recipe
+   repositories) own model composition and checkpoint mapping. Reusable
+   projections, experts, collectives, and model execution blocks belong in
+   `hyperflare_recipes/components/`; Helios-ABI runtime interface components
+   belong in `ignition/components/`.
    Native transport, scheduling, cache ownership, input packing, frontend processing,
    and request handling stay shared; use prepared metadata and frontend assets
    to express model-dependent behavior. Admission, page reservation and growth,
