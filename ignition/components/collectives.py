@@ -268,7 +268,7 @@ class PreparedAllReduce:
                     self.fused_addend = True
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
-            zero_addend = torch.zeros_like(source) if self.fused_addend else None
+            fused_addend = self.fused_addend
 
             def prepare(state):
                 if state.query.surface == "PCIeTwoShotBF16.all_reduce":
@@ -276,6 +276,7 @@ class PreparedAllReduce:
 
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
+                zero_addend = torch.zeros_like(source) if fused_addend else None
                 return PreparedCall(
                     run=((lambda: state.run_plain(source, output, addend=zero_addend))
                          if zero_addend is not None else (lambda: state.run_plain(source, output))),
@@ -1042,11 +1043,16 @@ class PreparedAllGather:
                 startup = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
-        one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if self.gated else None
-        prepare_call_kwargs = call if one_gate is None else {**call, "gate": one_gate}
+        gated = self.gated
+
+        def prepare_gather(state):
+            one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if gated else None
+            kwargs = call if one_gate is None else {**call, "gate": one_gate}
+            return PreparedCall(run=lambda: state.run(**kwargs), output=output,
+                                owners=(runtime,) if one_gate is None else (runtime, one_gate))
+
         declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: PreparedCall(run=lambda: state.run(**prepare_call_kwargs), output=output,
-                                                    owners=(runtime,) if one_gate is None else (runtime, one_gate)),
+            prepare_call=prepare_gather,
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         if startup:
             from ignition.preparation.startup_tuning import register_collective
