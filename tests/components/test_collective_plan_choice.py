@@ -192,3 +192,42 @@ def test_single_host_varlen_gather_plans_the_pcie_counted_byte_surface(monkeypat
         ("DcpAllToAll.all_gather_varlen", VARLEN_BANK_BYTES)]
     assert queries[0][1]["out"] is output and queries[0][1]["counts"] is counts
     assert [request["name"] for request in requests] == ["records"]
+
+
+def test_static_gated_all_gather_enables_selected_barrier(monkeypatch):
+    from dataclasses import dataclass
+    from b12x.comm import pcie
+    from b12x.preparation import FrozenMapping
+    from ignition.components import collectives
+
+    @dataclass(frozen=True)
+    class FakeQuery:
+        call: FrozenMapping
+
+    planned = []
+    plan = SimpleNamespace(request=lambda **kwargs: object())
+    source = torch.zeros((4, 512), dtype=torch.bfloat16)
+    output = torch.zeros((4, 1536), dtype=torch.bfloat16)
+    runtime = SimpleNamespace(
+        world_size=3, device=source.device, max_batch_size=16,
+        heads_per_rank=1, total_heads=3, query_head_dim=512, exchange_group=object(),
+    )
+    base_query = FakeQuery(call=FrozenMapping({
+        "shape": (4, 1, 512), "dtype": "torch.bfloat16",
+        "disjoint_output": True, "pack_aligned": True,
+    }))
+    monkeypatch.setattr(pcie, "query_from_runtime", lambda *_a, **_kw: base_query)
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: planned.append(query) or plan)
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *_a, **_kw: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2])
+    op = collectives.PreparedAllGather(
+        source, output, runtime=runtime,
+        session=SimpleNamespace(collective_tuning="static"),
+        coordinator=None, name="logprobs.exchange", has_gate=True,
+    )
+    assert op.gated is True
+    assert planned[0].call["gather_transport"] == "selected_barrier"
+    assert planned[0].call["has_gate"] is True
+    assert planned[0].call["submode"] == "barrier"
+    assert (planned[0].call["threads"], planned[0].call["block_limit"], planned[0].call["active_blocks"]) == (128, 8, 8)
