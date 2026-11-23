@@ -1090,7 +1090,7 @@ impl<'a> Worker<'a> {
     }
 
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
-        crate::os::pin_current_thread(0);
+        crate::os::pin_current_thread(1);
         // Input construction stays inside the worker's unwind and drain boundary.
         self.inputs = Some(crate::model::Inputs::new(self.config, executor.manifest())?);
         self.read_ahead = executor

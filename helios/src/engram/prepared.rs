@@ -294,6 +294,7 @@ impl PreparedTables {
                 manifest.context,
                 manifest.device,
                 stats,
+                2,
             )?,
             rank: 0,
             events: handles,

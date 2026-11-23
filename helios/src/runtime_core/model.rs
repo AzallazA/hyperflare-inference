@@ -975,10 +975,15 @@ impl NativeModel {
                     }
                 }
                 let mut bindings = Vec::new();
+                // Rank 0 runs on CPU 1 and ranks 1..N-1 on CPUs 2..N, leaving CPU 0 free for OS IRQs.
+                // Each Engram reader group (including per-rank sharded groups) receives disjoint CPUs.
+                let mut next_engram_cpu = 1 + devices.len();
                 for (position, ((index, ranks), tokens)) in
                     engram.into_iter().zip(engram_tokens).enumerate()
                 {
                     let first = ranks[0];
+                    let pin_cpu_base = next_engram_cpu;
+                    next_engram_cpu += table_storage[position].len();
                     let shared = crate::engram::Shared::new(
                         index,
                         &direct_files,
@@ -995,6 +1000,7 @@ impl NativeModel {
                         options.embedding_workers(),
                         gather_threads,
                         embedding_table_resident_scales,
+                        pin_cpu_base,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
