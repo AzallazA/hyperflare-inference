@@ -232,7 +232,7 @@ impl Layout {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
         for (snapshot, range) in aliases.iter_mut().enumerate() {
-            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+            if *range == (u32::MAX..0) {
                 *range = 0..0;
             } else if range.start >= range.end && padding[snapshot] {
                 // Backed only by padding past the last page: no KV page conflicts.
@@ -1085,6 +1085,27 @@ mod tests {
             }
         }
         assert!(padded > 0, "sweep never produced a padding-only row");
+    }
+
+    #[test]
+    fn plane_granule_padding_backs_snapshots_without_kv_conflicts() {
+        let alignment = 2 << 20;
+        let geometry = geometry(256 << 10, &[64 << 10, 4 << 10], 1000, 8 + 16);
+        let layout = Layout::new(&geometry, 8, &[alignment; 2], alignment).unwrap();
+        assert_eq!(layout.aliases.len(), 16);
+        let mut unconflicted = 0usize;
+        for (snapshot, range) in layout.aliases.iter().enumerate() {
+            let pages = conflicts(&layout, &geometry, 8 + snapshot as u64);
+            if pages.is_empty() {
+                assert_eq!(range, &(0..0));
+                unconflicted += 1;
+            } else {
+                assert!(range.start <= range.end && range.end <= 1000);
+                assert!((range.start as u64) <= *pages.first().unwrap());
+                assert!((range.end as u64) > *pages.last().unwrap());
+            }
+        }
+        assert!(unconflicted > 0);
     }
 
     #[test]
