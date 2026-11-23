@@ -14,6 +14,7 @@ mod cli;
 mod cluster;
 mod config;
 use flare::download_cache;
+mod dry_run;
 #[cfg(unix)]
 mod core_cache;
 #[cfg(unix)]
@@ -30,6 +31,7 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+mod steering_keys;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -50,6 +52,32 @@ static STOP: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+/// `FLARE_FAST_EXIT=1`: once a signalled shutdown has confirmed the drain (HTTP joined, every
+/// request failed or finished, replay streams synchronized, host prefix store closed), end the
+/// process with `_exit(0)` instead of releasing the model object by object. The kernel and the
+/// GPU driver reclaim host mappings, pinned/registered memory, VMM allocations and contexts at
+/// process exit. Nothing on disk depends on the skipped destructors: the prefix store is closed
+/// (durable records flushed) before the drain is reported. Unconfirmed drains, errors and
+/// unexpected stops keep the normal path. Default off (orderly release).
+#[cfg(unix)]
+fn fast_exit_requested() -> bool {
+    env_switch(std::env::var("FLARE_FAST_EXIT").ok().as_deref())
+}
+
+fn env_switch(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+#[cfg(unix)]
+fn fast_exit() -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: Terminates the process without running destructors or atexit handlers; the caller
+    // has confirmed that no GPU work, host transfer or durable write is outstanding.
+    unsafe { libc::_exit(0) }
 }
 
 #[cfg(all(feature = "roce", not(target_os = "linux")))]
@@ -134,6 +162,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return trust::revoke(&fingerprint, trust_store.as_deref());
         }
     };
+    if args
+        .scheduler
+        .apply_environment(std::env::var(cli::PREFILL_MERGE_ENV).ok().as_deref())?
+    {
+        eprintln!(
+            "scheduler: prefill merge below {} rows (from {})",
+            args.scheduler.scheduler_prefill_merge_min_rows.unwrap_or_default(),
+            cli::PREFILL_MERGE_ENV
+        );
+    }
     #[cfg(windows)]
     if args.rank.is_some()
         || args.rendezvous.is_some()
@@ -159,6 +197,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = configuration
         .api_key(args.api_key_file.as_deref())
         .map_err(|error| error.to_string())?;
+    // Rank zero serves HTTP; other ranks never see steering keys.
+    let steering_keys = if args.rank.is_some_and(|rank| rank != 0) {
+        Vec::new()
+    } else {
+        steering_keys::resolve(&args.steering_access, |name| std::env::var(name).ok())?
+    };
     let mut progress = StartupProgress::stderr();
     #[cfg(unix)]
     let mut launched = None;
@@ -182,7 +226,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| error.to_string())?;
         configure_core_devices(&mut args, &authorized, &mut progress)?;
         _lease = lease;
-        if flare_helios::runtime_core::core_cluster(&authorized).is_some() && !args.stage_only {
+        if flare_helios::runtime_core::core_cluster(&authorized).is_some()
+            && !args.stage_only
+            && !args.dry_run
+        {
             cluster::require_transport()?;
         }
         if !args.hosts.is_empty() {
@@ -238,6 +285,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.dry_run {
+        progress.finish_animation();
+        return dry_run::run(&args, authorized);
+    }
     if membership.is_some() {
         cluster::require_transport()?;
     }
@@ -273,8 +324,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let phase = progress.phase("Read model configuration", None);
     let mut config = owner.server_config().clone();
     config["bind"] = bind.to_string().into();
-    if let Some(alpha) = args.serving.mtp_adaptive_verification_alpha {
-        config["mtp_adaptive_verification_alpha"] = alpha.into();
+    if let Some(alpha) = &args.serving.mtp_adaptive_verification_alpha {
+        config["mtp_adaptive_verification_alpha"] = alpha.to_json_value();
     }
     config["scheduler_policy"] = args.scheduler_policy.into();
     if let Some(value) = args.scheduler_terminal_value {
@@ -286,10 +337,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(fraction) = args.scheduler_checkpoint_extra_work_fraction {
         config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
     }
+    args.scheduler.configure(&mut config);
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }
     config["api_key"] = key.into();
+    if !steering_keys.is_empty() {
+        config["steering_api_keys"] = serde_json::json!(steering_keys);
+    }
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, routing)?;
@@ -653,7 +708,9 @@ fn serve_local(
     server.stop_dashboard();
     std::thread::sleep(Duration::from_millis(50));
     let phase = progress.phase("Shut down server", None);
+    let begin = std::time::Instant::now();
     let shutdown = session.close();
+    let drained_in = begin.elapsed().as_secs_f64();
     if !shutdown.drained {
         return Err(shutdown
             .error
@@ -666,8 +723,18 @@ fn serve_local(
     if !STOP.load(Ordering::Relaxed) {
         return Err("native server stopped unexpectedly".into());
     }
+    #[cfg(unix)]
+    if fast_exit_requested() {
+        phase.finish(format!("drain {drained_in:.1}s · fast exit"));
+        drop(progress);
+        fast_exit();
+    }
+    let release = std::time::Instant::now();
     drop(session);
-    phase.finish("");
+    phase.finish(format!(
+        "drain {drained_in:.1}s · release {:.1}s",
+        release.elapsed().as_secs_f64()
+    ));
     Ok(())
 }
 

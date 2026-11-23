@@ -9,7 +9,9 @@
 mod cache;
 #[cfg(unix)]
 mod prepared;
+mod read_ahead;
 mod reader;
+mod row_ids;
 use crate::{
     Error, Result,
     cuda::{Event, PinnedHost, Stream},
@@ -18,6 +20,9 @@ use crate::{
 #[cfg(unix)]
 pub use prepared::{PlaneSource, PreparedTables, SourceSegment, TableSource};
 pub(crate) use reader::Plane;
+pub(crate) use read_ahead::read_ahead_requested;
+pub(crate) use row_ids::RowHash;
+use read_ahead::Advisory;
 #[cfg(feature = "server")]
 use std::fmt::Write;
 use std::{
@@ -26,7 +31,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, Thread},
 };
 
 #[derive(Default)]
@@ -46,6 +51,14 @@ pub(crate) struct Stats {
     disk_submit_ns: AtomicU64,
     disk_wait_ns: AtomicU64,
     disk_complete_ns: AtomicU64,
+    /// TP3 fork (perf/engram-readahead): set when any table of this set reads ahead; the
+    /// counters below are rendered only then, so /metrics is unchanged with read-ahead off.
+    read_ahead: AtomicBool,
+    read_ahead_queued: AtomicU64,
+    read_ahead_loaded: AtomicU64,
+    read_ahead_dropped: AtomicU64,
+    read_ahead_errors: AtomicU64,
+    read_ahead_skipped: AtomicU64,
 }
 
 impl Stats {
@@ -149,8 +162,26 @@ impl Stats {
                 counter.load(Ordering::Relaxed)
             );
         }
+        if !self.read_ahead.load(Ordering::Relaxed) {
+            return;
+        }
+        for (name, help, counter) in [
+            ("read_ahead_rows_total", "Predicted prefill rows handed to disk-table readers ahead of their graph.", &self.read_ahead_queued),
+            ("read_ahead_rows_loaded_total", "Rows read ahead from disk into the row cache (resident rows are pinned, not counted).", &self.read_ahead_loaded),
+            ("read_ahead_rows_dropped_total", "Predicted rows not read ahead because the advisory queue or a batch was full.", &self.read_ahead_dropped),
+            ("read_ahead_windows_skipped_total", "Read-ahead windows dropped unread because their gather was already served or their request left.", &self.read_ahead_skipped),
+            ("read_ahead_errors_total", "Read-ahead batches that failed; a failure fails the table as a failed gather does.", &self.read_ahead_errors),
+        ] {
+            let _ = writeln!(
+                text,
+                "# HELP flare_engram_{name} {help}\n# TYPE flare_engram_{name} counter\nflare_engram_{name} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
     }
 }
+
+pub use reader::default_gather_threads;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Storage {
@@ -168,6 +199,9 @@ pub(crate) struct Table {
     pub(crate) hashes: String,
     pub(crate) event: String,
     pub(crate) request: Option<String>,
+    /// TP3 fork (perf/engram-readahead): the declared row hash when the host can predict this
+    /// table's rows (unpartitioned `XOR_MODULO`); None never reads ahead.
+    pub(crate) hash: Option<Arc<RowHash>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +248,15 @@ enum Requests {
     },
 }
 impl Requests {
+    /// Whether `read` would return without waiting for the graph to publish its ids.
+    fn ready(&self) -> bool {
+        match self {
+            Self::Host(_) => true,
+            Self::Device { flag, sequence, .. } => {
+                unsafe { &*(*flag as *const AtomicU64) }.load(Ordering::Acquire) == *sequence
+            }
+        }
+    }
     fn rows(&self) -> usize {
         match self {
             Self::Host(ids) => ids.len(),
@@ -246,6 +289,9 @@ const STAGING_FRAMES: usize = 2;
 struct Job {
     frame: usize,
     generation: u32,
+    /// Submission sequence (TP3 fork, perf/engram-readahead: read-ahead drops windows whose
+    /// gather was served).
+    sequence: u64,
     requests: Requests,
 }
 #[derive(Clone, Copy, Default)]
@@ -304,15 +350,63 @@ struct Layer {
     worker: Option<JoinHandle<()>>,
     state: Mutex<[State; STAGING_FRAMES]>,
     cancelled: Arc<AtomicBool>,
+    /// TP3 fork (perf/engram-readahead): Some only for a table that reads ahead; its reader
+    /// thread then parks instead of blocking on `sender`, so producers unpark `thread`.
+    advisory: Option<(Arc<Advisory>, Thread)>,
+}
+impl Layer {
+    fn wake(&self) {
+        if let Some((_, thread)) = &self.advisory {
+            thread.unpark();
+        }
+    }
 }
 impl Drop for Layer {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
         self.sender.take();
+        // A read-ahead thread parks rather than blocking on the closed channel.
+        self.wake();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
+}
+
+/// Serve one real gather into its staging frame and release the frame (the reader loop body of
+/// tp3-main, shared unchanged by both loops below).
+fn serve(
+    reader: &mut reader::Reader,
+    planes: &[Plane; 2],
+    buffers: &[Staging; STAGING_FRAMES],
+    row_bytes: usize,
+    stop: &AtomicBool,
+    job: Job,
+) {
+    // Each frame stays owned until every rank retires its consuming graph.
+    // The reader alone writes its data before publishing the ready flag.
+    let buffers = &buffers[job.frame];
+    let output = unsafe {
+        std::slice::from_raw_parts_mut(
+            buffers.data.address() as *mut u8,
+            job.requests.rows() * row_bytes,
+        )
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if stop.load(Ordering::Acquire) {
+            return Err("n-gram request cancelled".into());
+        }
+        let ids = job.requests.read(stop)?;
+        reader.gather(planes, &ids, output)
+    }))
+    .unwrap_or_else(|_| Err("Engram reader panicked".into()));
+    if let Err(error) = result {
+        output.fill(0);
+        *buffers.error.lock().unwrap() = Some(error);
+        stop.store(true, Ordering::Release);
+    }
+    // Release failed reads too, so graph shutdown can drain before reporting the error.
+    buffers.signal(job.generation);
 }
 
 pub(crate) struct Shared {
@@ -321,6 +415,9 @@ pub(crate) struct Shared {
     ranks: usize,
     max_tokens: usize,
     stats: Arc<Stats>,
+    /// TP3 fork (perf/engram-readahead): any layer reads ahead.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    read_ahead: bool,
 }
 impl Shared {
     #[cfg(test)]
@@ -331,6 +428,7 @@ impl Shared {
             ranks,
             max_tokens: 4096,
             stats: Arc::new(Stats::default()),
+            read_ahead: false,
         })
     }
 
@@ -341,42 +439,58 @@ impl Shared {
         max_tokens: usize,
         context: usize,
         device: i32,
-        storage: Storage,
+        storage: &[Storage],
         cache_bytes: u64,
         workers: usize,
+        gather_threads: usize,
         resident_scales: bool,
     ) -> Result<Arc<Self>> {
-        if storage == Storage::Ram && cache_bytes != 0 {
+        if storage.len() != index.tables.len() {
+            return Err("embedding table storage list does not match the table count".into());
+        }
+        if cache_bytes != 0 && storage.iter().all(|s| *s == Storage::Ram) {
             return Err("embedding row cache requires disk table storage".into());
         }
         let index = Arc::new(index);
         let stats = Arc::new(Stats::default());
-        let table_bytes: u128 = index
+        // Disk tables of this set share the row-cache budget in proportion to their bytes;
+        // RAM-resident tables take none of it.
+        let disk_bytes: u128 = index
             .tables
             .iter()
-            .flat_map(|table| &table.planes)
+            .zip(storage)
+            .filter(|(_, storage)| **storage == Storage::Disk)
+            .flat_map(|(table, _)| &table.planes)
             .map(|plane| plane.nbytes as u128)
-            .sum();
+            .sum::<u128>()
+            .max(1);
         let readers = index
             .tables
             .iter()
-            .map(|table| {
+            .zip(storage)
+            .map(|(table, storage)| {
+                let ram = *storage == Storage::Ram;
                 let bytes: u128 = table.planes.iter().map(|plane| plane.nbytes as u128).sum();
-                let budget = usize::try_from(cache_bytes as u128 * bytes / table_bytes)
-                    .map_err(|_| "embedding row cache exceeds host address range")?;
+                let budget = if ram {
+                    0
+                } else {
+                    usize::try_from(cache_bytes as u128 * bytes / disk_bytes)
+                        .map_err(|_| "embedding row cache exceeds host address range")?
+                };
                 let rows = max_tokens
                     .checked_mul(table.heads)
                     .ok_or("embedding row capacity exceeds host range")?;
                 reader::Reader::from_files(
                     files,
                     &table.planes,
-                    storage == Storage::Ram,
+                    ram,
                     budget,
                     rows,
                     stats.clone(),
                     workers,
-                    resident_scales,
+                    resident_scales && !ram,
                 )
+                .map(|reader| reader.with_gather_threads(gather_threads))
             })
             .collect::<Result<Vec<_>>>()?;
         Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
@@ -396,7 +510,9 @@ impl Shared {
         }
         let stream = Stream::open(context, device)?;
         let mut layers = Vec::new();
-        for (table, mut reader) in index.tables.iter().zip(readers) {
+        let mut read_ahead = false;
+        for (table_index, (table, mut reader)) in index.tables.iter().zip(readers).enumerate() {
+            let reader_stats = stats.clone();
             let staging_bytes = table.staging_payload_bytes(max_tokens)?;
             let mut staging = Vec::with_capacity(STAGING_FRAMES);
             for _ in 0..STAGING_FRAMES {
@@ -417,51 +533,47 @@ impl Shared {
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
+            // TP3 fork (perf/engram-readahead): only a disk table with a row cache and a
+            // predictable hash, with FLARE_ENGRAM_READ_AHEAD=1, gets advisory state. Every other
+            // table (all RAM-resident ones) runs the tp3-main loop below and allocates nothing.
+            let advisory = read_ahead::advisory_for(&reader, table.hash.as_ref());
+            let worker_advisory = advisory.clone();
+            let hash = advisory.as_ref().and(table.hash.clone());
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
-                    while let Ok(job) = receiver.recv() {
-                        // Each frame stays owned until every rank retires its consuming graph.
-                        // The reader alone writes its data before publishing the ready flag.
-                        let buffers = &buffers[job.frame];
-                        let output = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                buffers.data.address() as *mut u8,
-                                job.requests.rows() * row_bytes,
-                            )
-                        };
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if stop.load(Ordering::Acquire) {
-                                return Err("n-gram request cancelled".into());
-                            }
-                            let ids = job.requests.read(&stop)?;
-                            reader.gather(&planes, &ids, output)
-                        }))
-                        .unwrap_or_else(|_| Err("Engram reader panicked".into()));
-                        if let Err(error) = result {
-                            output.fill(0);
-                            *buffers.error.lock().unwrap() = Some(error);
-                            stop.store(true, Ordering::Release);
+                    crate::os::pin_current_thread(3 + table_index);
+                    let (Some(advisory), Some(hash)) = (worker_advisory, hash) else {
+                        while let Ok(job) = receiver.recv() {
+                            serve(&mut reader, &planes, &buffers, row_bytes, &stop, job);
                         }
-                        // Release failed reads too, so graph shutdown can drain before reporting the error.
-                        buffers.signal(job.generation);
-                    }
+                        return;
+                    };
+                    read_ahead::run_reader(
+                        receiver, &advisory, &hash, &mut reader, &planes, &buffers, row_bytes, &stop,
+                        &reader_stats,
+                    );
                 })
                 .map_err(|e| format!("start Engram reader: {e}"))?;
+            let advisory = advisory.map(|advisory| (advisory, worker.thread().clone()));
+            read_ahead |= advisory.is_some();
             layers.push(Layer {
                 staging,
                 cancelled,
                 sender: Some(sender),
                 worker: Some(worker),
                 state: Mutex::new(std::array::from_fn(|_| State::default())),
+                advisory,
             });
         }
+        stats.read_ahead.store(read_ahead, Ordering::Relaxed);
         Ok(Arc::new(Self {
             index,
             layers,
             ranks,
             max_tokens,
             stats,
+            read_ahead,
         }))
     }
 
@@ -473,6 +585,7 @@ impl Shared {
     pub(crate) fn cache_bytes(&self) -> u64 {
         self.stats.cache_bytes.load(Ordering::Relaxed)
     }
+
     fn validate_start(&self, table: usize, rank: usize, sequence: u64, rows: usize) -> Result<()> {
         if rows > self.max_tokens * self.index.tables[table].heads {
             return Err("Engram input exceeds staged capacity".into());
@@ -518,9 +631,12 @@ impl Shared {
                 .send(Job {
                     frame,
                     generation: state.generation,
+                    sequence,
                     requests,
                 })
                 .map_err(|_| "Engram reader disconnected")?;
+            // No-op unless this table reads ahead (its thread parks instead of blocking in recv).
+            layer.wake();
         }
         states[frame] = state;
         Ok((rows, state.generation))
@@ -725,6 +841,7 @@ pub(crate) fn consumes(kind: GraphKind) -> bool {
         kind,
         GraphKind::Prefill
             | GraphKind::ScoredPrefill
+            | GraphKind::EncoderPrefill
             | GraphKind::Decode
             | GraphKind::Speculative
             | GraphKind::Mixed
@@ -741,7 +858,7 @@ mod tests {
             planes: [Plane { file: 0, offset: 0, nbytes: 1024, row_bytes: 64 },
                 Plane { file: 0, offset: 1024, nbytes: 128, row_bytes: 8 }],
             heads: 4, weights: "weights".into(), scales: "scales".into(),
-            hashes: "hashes".into(), event: "ready".into(), request: None,
+            hashes: "hashes".into(), event: "ready".into(), request: None, hash: None,
         };
         let index = Index { tables: vec![table.clone(), table] };
         assert_eq!(staging_bytes(&index, 128).unwrap(), 2 * 2 * (128 * 4 * (64 + 8) + 4));
@@ -806,4 +923,18 @@ mod tests {
         cancelled.store(true, Ordering::Release);
         assert!(request().read(&cancelled).is_err());
     }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn metrics_are_unchanged_without_read_ahead() {
+        let stats = Stats::default();
+        let mut off = String::new();
+        stats.render(&mut off);
+        assert!(!off.contains("read_ahead"));
+        stats.read_ahead.store(true, Ordering::Relaxed);
+        let mut on = String::new();
+        stats.render(&mut on);
+        assert!(on.starts_with(&off) && on.contains("flare_engram_read_ahead_rows_total 0"));
+    }
+
 }

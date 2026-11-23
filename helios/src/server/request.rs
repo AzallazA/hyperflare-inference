@@ -64,6 +64,28 @@ fn prepare_inner(
     })
 }
 
+/// Lowers a conversation for the frontend's prompt encoder: chat templates (GLM-5.3 and the
+/// other Jinja models) merge instructions behind a developer message, DeepSeek V4.1 keeps them in
+/// place, and DeepSeek V4 keeps the merge.
+pub(super) fn conversation_messages(
+    frontend: &Frontend,
+    messages: &[super::inference::Message],
+    tool_choice: super::inference::ToolChoice,
+    hints: &[(usize, usize)],
+) -> Result<Vec<Value>> {
+    use crate::frontend::PromptEncoder;
+    let failure_text = !frontend.prompt_encoder().renders_tool_errors();
+    match frontend.prompt_encoder() {
+        PromptEncoder::DeepseekV4 => {
+            super::inference::native_messages(messages, hints, failure_text, false)
+        }
+        PromptEncoder::DeepseekV41 => {
+            super::inference::native_messages(messages, hints, failure_text, true)
+        }
+        _ => super::inference::template_messages(messages, tool_choice, hints, failure_text),
+    }
+}
+
 pub(super) struct PreparedInference {
     pub prompt: Prompt,
     pub output: Option<crate::output::OutputConfig>,
@@ -138,6 +160,14 @@ pub(super) fn prepare_validated_inference(
 ) -> Result<PreparedInference> {
     use super::inference::{Constraint, RawPrompt};
     let opts = &request.options;
+    if opts.sampling.steering_scale.unwrap_or(0.) != 0.
+        && config.steering_sidecar_sha256.is_none()
+    {
+        return Err(crate::Error::admission(
+            AdmissionError::Feature,
+            "steering_scale is not available in this model core",
+        ));
+    }
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
             return Err("prompt logprobs are not available in this model core; export with --prompt-logprobs".into());
@@ -173,6 +203,10 @@ pub(super) fn prepare_validated_inference(
     let object = &object;
     let structured = opts.constraint.is_some();
     let (normalized, raw, options) = template_inputs(frontend, request, index)?;
+    // Tool definitions reach the template through `options` (request tools, or template
+    // kwargs); an empty list renders no tool prompt.
+    let tools = raw.is_none()
+        && options.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty());
     let (rendered, echo) = if let Some(raw) = raw {
         let (mut token_ids, echo) = match raw {
             RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone()),
@@ -297,7 +331,7 @@ pub(super) fn prepare_validated_inference(
         tokens,
         token_expansions,
         data,
-        conditioning,
+        mut conditioning,
         conditioned_inputs,
     } = crate::model::prepare_image_inputs(config, frontend, processor, &rendered, images)?;
     let mut expansions = token_expansions.iter().peekable();
@@ -325,6 +359,15 @@ pub(super) fn prepare_validated_inference(
     }
     let mut sampling = sampling_parameters(object, &config.sampling_defaults, &config.sampling_ranges)?;
     sampling.seed = sampling.seed.wrapping_add(index as u64);
+    if let Some(event) = config
+        .steering_sidecar_sha256
+        .and_then(|digest| crate::cache::steering_conditioning_event(
+            digest,
+            sampling.steering_scale,
+        ))
+    {
+        conditioning.insert(0, event);
+    }
     let stop_sequences = opts.token_stops.clone();
     super::stops::TokenStops::new(stop_sequences.clone(), config.contract.vocabulary)?;
     let stop_strings = opts.stops.clone();
@@ -394,6 +437,10 @@ pub(super) fn prepare_validated_inference(
         prompt: Prompt {
             tokens,
             message_boundaries,
+            tools,
+            reasoning_prompt: output.as_ref().is_some_and(|output| {
+                output.content.start == crate::output::tagged::OutputStart::Reasoning
+            }),
             data,
             conditioned_inputs,
             conditioning,
@@ -431,7 +478,8 @@ pub(super) fn template_inputs<'a>(
     let shared_lowering = !frontend.prompt_encoder().renders_tool_choice();
     let (mut normalized, raw) = match &request.input {
         Input::Conversation(messages) => (
-            super::inference::template_messages(
+            conversation_messages(
+                frontend,
                 messages,
                 if shared_lowering {
                     request.tool_choice.clone()
@@ -439,7 +487,6 @@ pub(super) fn template_inputs<'a>(
                     ToolChoice::Auto
                 },
                 &request.checkpoint_hints,
-                !frontend.prompt_encoder().renders_tool_errors(),
             )?,
             None,
         ),
@@ -467,10 +514,18 @@ pub(super) fn template_inputs<'a>(
     if !shared_lowering && matches!(opts.constraint, Some(Constraint::JsonObject)) {
         options.insert("response_format".into(), "json_object".into());
     }
+    let is_deepseek = matches!(
+        frontend.prompt_encoder(),
+        crate::frontend::PromptEncoder::DeepseekV4 | crate::frontend::PromptEncoder::DeepseekV41
+    );
     let tool_choice = match request.tool_choice {
         ToolChoice::Auto => None,
         ToolChoice::None => Some("none"),
         ToolChoice::Required => Some("required"),
+        // The DeepSeek reference makes a named choice a required call of the one kept tool
+        // (deepseek-recipe protocol/client_tools.rs convert_client_tools). The encoder then
+        // forces the call in chat mode; in thinking mode the encoder rejects it, as "required".
+        ToolChoice::Named(_) if is_deepseek => Some("required"),
         ToolChoice::Named(_) => Some("auto"),
     };
     if let Some(choice) = tool_choice {
@@ -621,6 +676,12 @@ pub(super) fn sampling_parameters(
             "frequency_penalty",
             defaults.frequency_penalty,
             ranges.frequency_penalty,
+        )?,
+        steering_scale: sampling_number(
+            object,
+            "steering_scale",
+            defaults.steering_scale,
+            ranges.steering_scale,
         )?,
         top_k: object
             .get("top_k")
@@ -1019,21 +1080,22 @@ mod tests {
             presence_penalty: Some(SamplingRange { min: -2., max: 2. }),
             frequency_penalty: Some(SamplingRange { min: -1., max: 1. }),
             top_k: Some(SamplingRange { min: 1, max: 100 }),
+            steering_scale: Some(SamplingRange { min: 0., max: 1. }),
         };
         for (value, top_k, expected, expected_k) in [
             (
                 -1e100,
                 serde_json::json!(i64::MIN),
-                [0.5, 0.5, 0., 0.5, -2., -1.],
+                [0.5, 0.5, 0., 0.5, -2., -1., 0.],
                 1,
             ),
             (
                 1e100,
                 serde_json::json!(u64::MAX),
-                [1.5, 1., 0.5, 2., 2., 1.],
+                [1.5, 1., 0.5, 2., 2., 1., 0.],
                 100,
             ),
-            (0.5, serde_json::json!(50), [0.5; 6], 50),
+            (0.5, serde_json::json!(50), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.], 50),
         ] {
             let body = serde_json::json!({"seed":u64::MAX,"temperature":value,"top_p":value,
                 "min_p":value,"repetition_penalty":value,"presence_penalty":value,"frequency_penalty":value,"top_k":top_k});

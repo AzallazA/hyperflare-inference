@@ -139,6 +139,7 @@ impl Fixture {
                 eos_token_ids: vec![eos],
                 sampling_ranges: Default::default(),
                 sampling_defaults: SamplingParameters::default(),
+                steering_sidecar_sha256: None,
                 max_new_tokens: 16,
                 speculative_widths: vec![],
                 speculative_fixed_width: None,
@@ -208,6 +209,8 @@ impl Fixture {
         Prompt {
             tokens,
             message_boundaries: vec![],
+            tools: false,
+            reasoning_prompt: false,
             data,
             conditioned_inputs: vec![],
             conditioning: vec![],
@@ -3791,6 +3794,8 @@ fn exercise_text_preemption(
                 grammar_constrained: false,
                 host_stops: false,
                 prompt_logprobs: false,
+                tools: false,
+                reasoning_prompt: false,
             })
             .unwrap();
         worker.scheduler.cancel(pressure).unwrap();
@@ -4073,6 +4078,7 @@ fn http_state_for(
         run: crate::server::run_id(),
         ids: Default::default(),
         api_key,
+        steering_access: crate::server::steering_access::SteeringAccess::new::<&str>(&[]),
         thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
@@ -5318,6 +5324,8 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: true,
+                    tools: false,
+                    reasoning_prompt: false,
                 })
                 .unwrap();
             worker.scheduler.set_vision_images(occupied, &[64]).unwrap();
@@ -5864,6 +5872,8 @@ fn unpinned_checkpoint(
         host_stops: false,
         prompt_logprobs: false,
         growable_output: true,
+        tools: false,
+        reasoning_prompt: false,
     };
     let plan = worker.scheduler.plan_admission(&spec).unwrap();
     let key = plan.history().key_at(end as u64).unwrap();
@@ -6026,6 +6036,8 @@ fn publication_copy_pins_survive_ancestor_compaction() {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: true,
+        tools: false,
+        reasoning_prompt: false,
     };
     let plan = worker.scheduler.plan_admission(&spec).unwrap();
     let key = plan.history().key_at(64).unwrap();
@@ -6200,6 +6212,8 @@ fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: true,
+            tools: false,
+            reasoning_prompt: false,
         };
         worker.scheduler.admit(spec).unwrap();
         worker.service_store().unwrap();

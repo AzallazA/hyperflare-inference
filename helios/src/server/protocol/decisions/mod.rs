@@ -7,7 +7,7 @@
 
 mod adapter;
 
-use crate::server::{GenerationEvent, HttpState, Prompt, http, inference, protocol, request};
+use crate::server::{GenerationEvent, HttpState, Prompt, http, protocol, request};
 use crate::{AdmissionError, Error, ExecutionError, Result};
 use axum::{
     Extension, Json,
@@ -755,11 +755,11 @@ fn prepare_questions(
             else {
                 unreachable!();
             };
-            let mut normalized = inference::template_messages(
+            let mut normalized = request::conversation_messages(
+                &state.frontend,
                 conversation,
                 decoded.request.tool_choice.clone(),
                 &decoded.request.checkpoint_hints,
-                !state.frontend.prompt_encoder().renders_tool_errors(),
             )?;
             state
                 .frontend

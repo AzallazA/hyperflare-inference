@@ -195,6 +195,8 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--steering-sidecar", type=Path, metavar="PATH",
+                          help="prepare DeepSeek V4.1 with per-request activation steering constants")
     advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
                           help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
                                " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")
@@ -241,6 +243,9 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")
+    advanced.add_argument("--compile-headroom", metavar="SIZE",
+                          help="system memory compiler and tuning pools leave free on each host, such as 6G;"
+                               " a larger preparation headroom still applies (default: 8G)")
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")

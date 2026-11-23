@@ -67,7 +67,7 @@ contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xt
 contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5, ContentHeaders = 6 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9, PaddedGrid = 10 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9, ClassToken = 10 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12, EncoderPrefill = 14 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -79,6 +79,7 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Snapshot => Self::Snapshot,
             GraphKind::Prefill => Self::Prefill,
             GraphKind::ScoredPrefill => Self::ScoredPrefill,
+            GraphKind::EncoderPrefill => Self::EncoderPrefill,
             GraphKind::Decode => Self::Decode,
             GraphKind::Resume => Self::Resume,
             GraphKind::Vision => Self::Vision,
@@ -583,6 +584,41 @@ impl PreparedContract {
             }) && graph.pending_token.is_none()
             {
                 return Err("decode graph must declare its pending token source".into());
+            }
+        }
+        // TP3 fork: the runtime packs an encoder-only step with its prefill twin's binding plan.
+        for descriptor in manifest
+            .graphs
+            .iter()
+            .filter(|graph| graph.kind == GraphKind::EncoderPrefill)
+        {
+            let uploads = |name: &str| -> Result<Vec<_>> {
+                Ok(self
+                    .graph(name)?
+                    .inputs
+                    .iter()
+                    .map(|b| {
+                        (
+                            b.buffer.clone(),
+                            b.source as i32,
+                            b.indexing as i32,
+                            b.value_offset,
+                            b.padding,
+                            b.tensor.clone(),
+                        )
+                    })
+                    .collect())
+            };
+            let own = uploads(&descriptor.name)?;
+            if !manifest.graphs.iter().any(|graph| {
+                graph.kind == GraphKind::Prefill
+                    && graph.batch_capacity == descriptor.batch_capacity
+                    && graph.token_capacity == descriptor.token_capacity
+                    && uploads(&graph.name).is_ok_and(|inputs| inputs == own)
+            }) {
+                return Err(
+                    "encoder-only prefill must bind exactly its prefill twin's uploads".into(),
+                );
             }
         }
         Ok(())

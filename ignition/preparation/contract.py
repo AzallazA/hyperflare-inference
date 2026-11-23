@@ -18,6 +18,8 @@ def state_view(buffer, stride, *, offset=0, nbytes=None):
 
 def text_inputs(kind):
     """Uploads for the shared admission, paged-text, and state-transfer components."""
+    if kind == "encoder_prefill":
+        kind = "prefill"  # TP3 fork: an encoder-only twin binds exactly its prefill graph's uploads
     b = binding
     values = [b("request_state_rows", p.LIVE_STATE_ROWS, p.REQUEST_ROW)]
     if kind not in ("init", "restore"):
@@ -84,7 +86,7 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,
             embedding_tables=list(embedding_tables) if kind in (
-                "prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
+                "prefill", "scored_prefill", "decode", "speculative", "mixed", "encoder_prefill") else [],
             pending_token=pending if kind not in ("init", "restore", "snapshot", "vision") else None))
     return result
 

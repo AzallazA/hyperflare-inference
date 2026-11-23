@@ -172,7 +172,8 @@ pub fn rank_needs(core: &AuthorizedCore) -> Vec<RankNeeds> {
                 .filter(|a| {
                     protobuf::wire::Memory::try_from(a.memory) == Ok(protobuf::wire::Memory::Device)
                 })
-                .map(|a| a.nbytes)
+                // TP3 merged expert banks are device-resident only up to their declared device bytes.
+                .map(|a| super::mixed_device_bytes_named(&a.name, a.nbytes).unwrap_or(a.nbytes))
                 .sum(),
         })
         .collect()
@@ -276,18 +277,101 @@ impl NativeModel {
             },
         }
     }
+}
 
-    /// Load as [`NativeModel::load`] does, sizing caches through `agree`.
-    ///
-    /// # Safety
-    /// All rank bundles must be trusted and obey the CUDA execution contract.
-    pub unsafe fn load_agreeing(
+/// A core resolved for one load, before any CUDA call: rank bundles decoded and validated,
+/// graphs selected for the serving options, embedding tables indexed, and the serving
+/// configuration assembled. Loading continues from here on the GPUs; the memory dry run
+/// ([`super::plan`]) sizes caches from the same state without them.
+pub(super) struct Staged {
+    pub cores: Vec<Core>,
+    pub files: FilesRef,
+    pub cluster: Option<ClusterRank>,
+    pub roce: Vec<Option<RoceSpec>>,
+    /// Owner rank -> peer allocation address -> ranks that actually import it (upstream #286).
+    pub peer_readers: Vec<std::collections::HashMap<u64, Vec<usize>>>,
+    pub server_config: serde_json::Value,
+    /// Selected concurrency.
+    pub active: usize,
+    /// Embedding table groups and the local ranks sharing each one.
+    pub engram: Vec<(crate::engram::Index, Vec<usize>)>,
+    /// Packed tokens of the largest graph consuming each embedding table group.
+    pub engram_tokens: Vec<usize>,
+    pub table_storage: super::selection::EmbeddingTableStorage,
+    pub has_disk_tables: bool,
+    /// Pinned host bytes of the embedding gather staging frames.
+    pub staging_bytes: u64,
+    /// The load options after the legacy embedding-storage environment shim.
+    pub options: LoadOptions,
+    /// The CUDA stack limit the first core recorded, before any override replaced it.
+    pub recorded_stack_limit: Option<usize>,
+}
+
+/// Host bytes of embedding table planes kept resident: every plane of a RAM table, and the scale
+/// plane of a disk table when scales stay resident.
+pub(super) fn engram_resident_bytes(
+    engram: &[(crate::engram::Index, Vec<usize>)],
+    table_storage: &super::selection::EmbeddingTableStorage,
+    resident_scales: bool,
+) -> Result<u64> {
+    engram
+        .iter()
+        .enumerate()
+        .flat_map(|(position, (index, _))| {
+            index
+                .tables
+                .iter()
+                .enumerate()
+                .map(move |(table_index, table)| (position, table_index, table))
+        })
+        .flat_map(|(position, table_index, table)| {
+            table
+                .planes
+                .iter()
+                .enumerate()
+                .map(move |p| (position, table_index, p))
+        })
+        .filter(|(position, table_index, (ordinal, _))| {
+            table_storage[*position][*table_index] == crate::engram::Storage::Ram
+                || (resident_scales && *ordinal == 1)
+        })
+        .map(|(_, _, plane)| plane)
+        .try_fold(0u64, |bytes, (_, plane)| {
+            bytes
+                .checked_add(plane.resident_bytes()? as u64)
+                .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
+        })
+}
+
+impl Staged {
+    /// Resolve `authorized` for `devices` under `options`, reporting the "Prepare model" phase.
+    pub(super) fn prepare(
         authorized: AuthorizedCore,
         devices: &[i32],
         options: &LoadOptions,
         progress: &StartupProgress,
-        agree: &mut dyn CacheAgreement,
     ) -> Result<Self> {
+        // Compatibility shim, kept at the entry of the load path: until the CLI populates
+        // `embedding_table_storage_per_table`, the legacy FLARE_ENGRAM_RAM_TABLES/_LAYERS pair is
+        // read here exactly once and then only the resolved options are consulted below. A parse
+        // failure is held until the core's table geometry is known (tables: error; none: ignored).
+        let legacy_env = match &options.embedding_table_storage_per_table {
+            Some(_) => Ok(None),
+            None => super::selection::EmbeddingTableStorageSpec::from_legacy_env(),
+        };
+        let mut options = match &legacy_env {
+            Ok(Some(spec)) => LoadOptions {
+                embedding_table_storage_per_table: Some(spec.clone()),
+                ..options.clone()
+            },
+            _ => options.clone(),
+        };
+        // The stack-limit override is resolved here once, like the shim above: the option, else
+        // FLARE_CUDA_STACK_LIMIT; later stages read only `options.cuda_stack_limit`.
+        options.cuda_stack_limit = super::stack_limit::resolve_stack_limit(
+            options.cuda_stack_limit,
+            std::env::var(super::STACK_LIMIT_ENV).ok().as_deref(),
+        )?;
         let device_labels = options.device_labels.as_deref().unwrap_or(devices);
         if device_labels.len() != devices.len() {
             return Err(invalid("GPU label count must match selected devices"));
@@ -304,7 +388,6 @@ impl NativeModel {
                 (descriptor, None, Some(cores), FilesRef::Payload(source))
             }
         };
-        let root = files.path();
         // A multi-host core holds every rank; each host keeps only the bundle it serves, so
         // it never maps another rank's storage.
         let cluster = match (descriptor.cluster.take(), options.cluster_rank) {
@@ -368,9 +451,16 @@ impl NativeModel {
         if cores.is_empty() || cores.len() != devices.len() {
             return Err(invalid("model rank count differs from its cores"));
         }
-        for core in &cores {
+        let recorded_stack_limit = cores
+            .first()
+            .and_then(|core| super::stack_limit::recorded_stack_limit(&core.context.limits));
+        for core in &mut cores {
             core.validate()?;
             Files::validate(&files, core)?;
+            if let Some(bytes) = options.cuda_stack_limit {
+                core.context.limits =
+                    super::stack_limit::with_stack_limit(&core.context.limits, bytes);
+            }
         }
         validate_persistent_worker_topology(&cores, cluster.as_ref())?;
         let roce = transports
@@ -467,7 +557,21 @@ impl NativeModel {
                 "resident embedding scales require an embedding table catalog",
             ));
         }
-        let ram = options.embedding_table_storage == Some(crate::engram::Storage::Ram);
+        // The one resolution of per-table storage: explicit per-table spec, then the global
+        // setting, then disk. Host accounting, the row-cache split and the table readers all use it.
+        let table_storage = super::selection::resolve_embedding_table_storage(
+            &options,
+            &engram
+                .iter()
+                .map(|(index, _)| index.tables.len())
+                .collect::<Vec<_>>(),
+            &legacy_env,
+        )?;
+        let has_disk_tables = super::selection::any_disk_table(&table_storage);
+        if !engram.is_empty() {
+            // Disk-only options are judged by the resolved layout, whatever the global flag says.
+            options.validate_embedding_storage(has_disk_tables)?;
+        }
         let engram_tokens = engram.iter().map(|(_, ranks)| {
             ranks.iter().flat_map(|rank| cores[*rank].execution.as_ref().unwrap().graphs.iter())
                 .filter(|graph| crate::execution::GraphKind::try_from(graph.kind.as_str())
@@ -611,6 +715,56 @@ impl NativeModel {
             devices.len(),
             if devices.len() == 1 { "" } else { "s" }
         ));
+        Ok(Self {
+            cores,
+            files,
+            cluster,
+            roce,
+            peer_readers,
+            server_config,
+            active,
+            engram,
+            engram_tokens,
+            table_storage,
+            has_disk_tables,
+            staging_bytes,
+            options,
+            recorded_stack_limit,
+        })
+    }
+}
+
+impl NativeModel {
+    /// Load as [`NativeModel::load`] does, sizing caches through `agree`.
+    ///
+    /// # Safety
+    /// All rank bundles must be trusted and obey the CUDA execution contract.
+    pub unsafe fn load_agreeing(
+        authorized: AuthorizedCore,
+        devices: &[i32],
+        options: &LoadOptions,
+        progress: &StartupProgress,
+        agree: &mut dyn CacheAgreement,
+    ) -> Result<Self> {
+        let Staged {
+            mut cores,
+            files,
+            cluster,
+            roce,
+            peer_readers,
+            server_config,
+            active,
+            engram,
+            engram_tokens,
+            table_storage,
+            has_disk_tables,
+            staging_bytes,
+            options,
+            recorded_stack_limit,
+        } = Staged::prepare(authorized, devices, options, progress)?;
+        let options = &options;
+        let device_labels = options.device_labels.as_deref().unwrap_or(devices);
+        let root = files.path();
         // Windows direct reads can stall while any buffered handle remains open.
         // Keep every shard's write/delete exclusion through unbuffered guards;
         // the buffered startup readers close when loading returns.
@@ -678,23 +832,13 @@ impl NativeModel {
                     .join(" / "),
             );
             let embedding_table_resident_scales = options.embedding_resident_scales(
-                !engram.is_empty(),
+                has_disk_tables,
                 model.ranks.iter().any(|rank| rank.integrated),
             );
-            let resident_bytes = engram
-                .iter()
-                .flat_map(|(index, _)| &index.tables)
-                .flat_map(|table| table.planes.iter().enumerate())
-                .filter(|(ordinal, _)| {
-                    ram || (embedding_table_resident_scales && *ordinal == 1)
-                })
-                .try_fold(0u64, |bytes, (_, plane)| {
-                    bytes
-                        .checked_add(plane.resident_bytes()? as u64)
-                        .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
-                })?;
+            let resident_bytes =
+                engram_resident_bytes(&engram, &table_storage, embedding_table_resident_scales)?;
             let embedding_table_cache_bytes = options.embedding_cache_bytes(
-                !engram.is_empty(),
+                has_disk_tables,
                 model.ranks.iter().any(|rank| rank.integrated),
             );
             let embedding_host_bytes = resident_bytes
@@ -715,7 +859,12 @@ impl NativeModel {
             let (mut gpu_bytes, mut host_bytes, mut payload_bytes) = (0u64, 0u64, 0u64);
             for allocation in cores.iter().flat_map(|core| &core.allocations) {
                 match allocation.memory {
-                    Memory::Device => gpu_bytes += allocation.nbytes as u64,
+                    Memory::Device => {
+                        let device =
+                            super::mixed_device_bytes(allocation).unwrap_or(allocation.nbytes);
+                        gpu_bytes += device as u64;
+                        host_bytes += (allocation.nbytes - device) as u64;
+                    }
                     Memory::MappedHost => host_bytes += allocation.nbytes as u64,
                     Memory::Peer => {}
                 }
@@ -755,7 +904,20 @@ impl NativeModel {
             model.parallel(&cores, &files, |rank, core, path| {
                 rank.prepare_kernels(path, core, &phase)
             })?;
-            phase.finish(format!("{kernels} kernels"));
+            match options.cuda_stack_limit {
+                None => phase.finish(format!("{kernels} kernels")),
+                Some(limit) => {
+                    let mut largest = 0;
+                    for rank in &model.ranks {
+                        largest = largest.max(rank.check_stack_limit(limit)?);
+                    }
+                    let recorded = recorded_stack_limit
+                        .map_or("none".to_owned(), |bytes| format!("{bytes} B"));
+                    phase.finish(format!(
+                        "{kernels} kernels · CUDA stack limit {limit} B per thread (recorded {recorded}, largest kernel stack {largest} B)"
+                    ));
+                }
+            }
             let nodes = cores
                 .iter()
                 .flat_map(|p| &p.graphs)
@@ -768,11 +930,22 @@ impl NativeModel {
             phase.finish(format!("concurrency {active}"));
             if !engram.is_empty() {
                 let phase = progress.phase("Prepare embedding tables", None);
-                let storage = options.embedding_table_storage.unwrap_or_default();
-                let group_budget = embedding_table_cache_bytes / engram.len() as u64;
+                // The row-cache budget is shared by the groups that still have a disk-backed table;
+                // all-RAM groups need none of it. Within a group, `Shared::new` splits by disk bytes.
+                let group_has_disk = |position: usize| {
+                    table_storage[position].contains(&crate::engram::Storage::Disk)
+                };
+                let cached_groups = (0..engram.len())
+                    .filter(|position| group_has_disk(*position))
+                    .count()
+                    .max(1) as u64;
+                let group_budget = embedding_table_cache_bytes / cached_groups;
+                let gather_threads = options.embedding_gather_threads();
                 let files = files.direct_files().collect::<Result<Vec<_>>>()?;
                 let mut bindings = Vec::new();
-                for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
+                for (position, ((index, ranks), tokens)) in
+                    engram.into_iter().zip(engram_tokens).enumerate()
+                {
                     let first = ranks[0];
                     let shared = crate::engram::Shared::new(
                         index,
@@ -781,9 +954,14 @@ impl NativeModel {
                         tokens,
                         model.ranks[first].context as usize,
                         devices[first],
-                        storage,
-                        group_budget,
+                        &table_storage[position],
+                        if group_has_disk(position) {
+                            group_budget
+                        } else {
+                            0
+                        },
                         options.embedding_workers(),
+                        gather_threads,
                         embedding_table_resident_scales,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
@@ -795,12 +973,39 @@ impl NativeModel {
                     .into_iter()
                     .map(|(_, shared, rank)| (shared, rank))
                     .collect();
-                let label = match storage {
+                let describe = |storage: crate::engram::Storage| match storage {
                     crate::engram::Storage::Disk if embedding_table_resident_scales => {
                         "disk weights, RAM scales"
                     }
                     crate::engram::Storage::Disk => "disk",
                     crate::engram::Storage::Ram => "RAM",
+                };
+                // Uniform layouts keep the single label; mixed layouts list each group (or table).
+                let uniform = table_storage
+                    .iter()
+                    .flatten()
+                    .all(|s| *s == table_storage[0][0]);
+                let label = if uniform {
+                    describe(table_storage[0][0]).to_owned()
+                } else {
+                    table_storage
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(group, tables)| {
+                            if tables.iter().all(|s| *s == tables[0]) {
+                                vec![format!("group {group} {}", describe(tables[0]))]
+                            } else {
+                                tables
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(table, storage)| {
+                                        format!("{group}.{table} {}", describe(*storage))
+                                    })
+                                    .collect()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 };
                 let cache_bytes: u64 = model
                     .engram
@@ -809,7 +1014,7 @@ impl NativeModel {
                     .map(|(shared, _)| shared.cache_bytes())
                     .sum();
                 phase.finish(if cache_bytes == 0 {
-                    label.to_owned()
+                    label
                 } else {
                     format!(
                         "{label} · {:.0} MiB row cache",
@@ -975,23 +1180,44 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
+        // `FLARE_SHUTDOWN_TIMING=1` reports how long each part of the release takes (stderr).
+        let timing = matches!(
+            std::env::var("FLARE_SHUTDOWN_TIMING")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "true" | "on" | "yes")
+        );
+        let mut parts = Vec::new();
+        let mut begin = std::time::Instant::now();
+        let mut lap = |label: String, parts: &mut Vec<String>| {
+            parts.push(format!("{label} {:.2}s", begin.elapsed().as_secs_f64()));
+            begin = std::time::Instant::now();
+        };
         self.offload.reset();
+        lap("host prefix store".into(), &mut parts);
         self.engram.clear();
+        lap("embedding tables".into(), &mut parts);
         // Phase 1: destroy graphs, modules, and peer-accessible mappings across every rank
         // before any rank releases shared VA reservations or destroys its CUDA context.
         let mut all_drained = true;
         for rank in self.ranks.iter_mut().rev() {
             all_drained &= rank.release_execution_resources();
         }
+        lap("execution resources".into(), &mut parts);
         // Phase 2: release shared VA reservations and destroy CUDA contexts (rank zero last).
         // If any rank failed context drain, retain remaining contexts until process exit.
         if all_drained {
             while let Some(mut rank) = self.ranks.pop() {
                 rank.release_reservations_and_context();
+                lap(format!("rank {}", self.ranks.len()), &mut parts);
             }
         } else {
             let retained = std::mem::take(&mut self.ranks);
             std::mem::forget(retained);
+        }
+        if timing {
+            eprintln!("Model release: {}", parts.join(" · "));
         }
     }
 }

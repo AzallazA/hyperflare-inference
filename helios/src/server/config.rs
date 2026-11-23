@@ -116,6 +116,35 @@ impl Bootstrap {
                     ))
                 })?;
         }
+        let steering_sidecar_sha256 = match object.get("steering_sidecar_sha256") {
+            None => None,
+            Some(Value::String(value))
+                if value.len() == 64
+                    && value.bytes().all(|byte| byte.is_ascii_digit()
+                        || (b'a'..=b'f').contains(&byte)) =>
+            {
+                let mut digest = [0u8; 32];
+                for (index, byte) in digest.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                        .map_err(|error| {
+                            crate::ExecutionError::Manifest(crate::Failure::caused_by(
+                                error.to_string(),
+                                error,
+                            ))
+                        })?;
+                }
+                Some(digest)
+            }
+            _ => return Err("steering sidecar SHA-256 must be 64 lowercase hexadecimal characters".into()),
+        };
+        let steering_range = sampling_ranges.steering_scale;
+        if sampling_defaults.steering_scale != 0.
+            || steering_sidecar_sha256.is_some()
+                != (steering_range
+                    == Some(crate::model::SamplingRange { min: 0., max: 1. }))
+        {
+            return Err("steering metadata requires a zero default, a 0..1 range, and a sidecar SHA-256".into());
+        }
         let contract = serde_json::from_value(
             object
                 .get("model_contract")
@@ -169,6 +198,7 @@ impl Bootstrap {
             eos_token_ids: frontend_settings.eos_token_ids.clone(),
             sampling_defaults,
             sampling_ranges,
+            steering_sidecar_sha256,
             speculative_token_capacity: usize::try_from(integer("speculative_token_capacity", Some(0))?).map_err(|_| "speculative token capacity exceeds usize")?,
             decode_weight_bytes: integer("decode_weight_bytes", Some(0))?,
             speculative_fixed_width: object
@@ -314,20 +344,42 @@ impl Bootstrap {
                 .ok_or("served_names must contain strings")?,
             Some(_) => return Err("served_names must be an array".into()),
         };
+        // Error messages name the field only, never a key.
+        let steering_api_keys = match object.get("steering_api_keys") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(keys)) => keys
+                .iter()
+                .map(|key| {
+                    key.as_str()
+                        .filter(|key| !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()))
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or("steering_api_keys must contain nonempty printable ASCII strings without spaces")?,
+            Some(_) => return Err("steering_api_keys must be an array".into()),
+        };
         let mut scheduling_policy = match object.get("scheduler_policy") {
             None => crate::scheduler::PolicyConfig::default(),
             Some(Value::String(value)) if value == "balanced" => crate::scheduler::PolicyConfig::default(),
             Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
-            Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
+            Some(Value::String(value)) if value == "interactive" => crate::scheduler::PolicyConfig::interactive(),
+            Some(_) => return Err("scheduler_policy must be balanced, throughput or interactive".into()),
         };
-        for (name, coefficient) in [
-            ("scheduler_terminal_value", &mut scheduling_policy.terminal_value),
-            ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price),
+        for (name, coefficient, positive) in [
+            ("scheduler_terminal_value", &mut scheduling_policy.terminal_value, false),
+            ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price, false),
+            ("scheduler_output_token_value", &mut scheduling_policy.output_token_value, true),
+            ("scheduler_token_fairness", &mut scheduling_policy.token_fairness, false),
+            ("scheduler_delivery_fairness", &mut scheduling_policy.delivery_fairness, false),
+            ("scheduler_decode_age_price", &mut scheduling_policy.decode_age_price, false),
+            ("scheduler_adaptation_ms", &mut scheduling_policy.adaptation_ms, true),
+            ("scheduler_ttft_target_ms", &mut scheduling_policy.ttft_target_ms, false),
         ] {
             if let Some(value) = object.get(name) {
                 *coefficient = value.as_f64()
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-                    .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
+                    .filter(|value| value.is_finite() && *value >= 0.0 && (!positive || *value > 0.0))
+                    .ok_or_else(|| if positive { format!("{name} must be finite and positive") }
+                        else { format!("{name} must be finite and nonnegative") })?;
             }
         }
         if let Some(value) = object.get("scheduler_checkpoint_extra_work_fraction") {
@@ -335,10 +387,65 @@ impl Bootstrap {
                 .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                 .ok_or("scheduler_checkpoint_extra_work_fraction must be finite and between zero and one")?;
         }
+        if let Some(value) = object.get("scheduler_ttft_max_chunk") {
+            scheduling_policy.ttft_max_chunk = value.as_u64().and_then(|v| usize::try_from(v).ok())
+                .ok_or("scheduler_ttft_max_chunk must be a nonnegative integer")?;
+        }
+        if let Some(value) = object.get("scheduler_ttft_decode_interleave") {
+            scheduling_policy.ttft_decode_interleave = value.as_u64().and_then(|v| u32::try_from(v).ok())
+                .ok_or("scheduler_ttft_decode_interleave must be a nonnegative 32-bit integer")?;
+        }
+        if let Some(value) = object.get("scheduler_ttft_order") {
+            use crate::scheduler::TtftOrder;
+            scheduling_policy.ttft_order = match value.as_str() {
+                Some("oldest") => TtftOrder::Oldest,
+                Some("shortest") => TtftOrder::Shortest,
+                _ => return Err("scheduler_ttft_order must be \"oldest\" or \"shortest\"".into()),
+            };
+        }
+        if let Some(value) = object.get("scheduler_prefill_tail_merge") {
+            use crate::scheduler::PrefillTailMerge;
+            scheduling_policy.prefill_tail_merge = match value {
+                serde_json::Value::Bool(false) => PrefillTailMerge::Off,
+                serde_json::Value::Bool(true) => PrefillTailMerge::On,
+                serde_json::Value::String(mode) if mode == "tools-only" => PrefillTailMerge::ToolsOnly,
+                _ => return Err("scheduler_prefill_tail_merge must be true, false or \"tools-only\"".into()),
+            };
+        }
+        if let Some(value) = object.get("scheduler_eager_message_offers") {
+            scheduling_policy.eager_message_offers = value.as_bool()
+                .ok_or("scheduler_eager_message_offers must be a boolean")?;
+        }
+        if let Some(value) = object.get("scheduler_prefill_merge_min_rows") {
+            scheduling_policy.prefill_merge_min_rows = value.as_u64().and_then(|v| usize::try_from(v).ok())
+                .ok_or("scheduler_prefill_merge_min_rows must be a nonnegative integer")?;
+        }
+        if let Some(value) = object.get("scheduler_encoder_prefill") {
+            scheduling_policy.encoder_prefill = value.as_bool()
+                .ok_or("scheduler_encoder_prefill must be a boolean")?;
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
-            scheduling_policy.adaptive_verification_alpha = value.as_f64()
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .ok_or("adaptive verification alpha must be finite and greater than zero")?;
+            match value {
+                serde_json::Value::Number(_) => {
+                    scheduling_policy.adaptive_verification_alpha = value
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .ok_or("adaptive verification alpha must be finite and greater than zero")?;
+                    scheduling_policy.adaptive_verification_alpha_by_batch.clear();
+                }
+                serde_json::Value::String(spec) => {
+                    let (alpha, schedule) =
+                        crate::scheduler::PolicyConfig::parse_adaptive_verification_alpha(spec)?;
+                    scheduling_policy.adaptive_verification_alpha = alpha;
+                    scheduling_policy.adaptive_verification_alpha_by_batch = schedule;
+                }
+                _ => {
+                    return Err(
+                        "adaptive verification alpha must be a finite positive number or max_batch:alpha schedule"
+                            .into(),
+                    );
+                }
+            }
         }
         let server = ServerConfig {
             log_to_stderr: true,
@@ -351,6 +458,7 @@ impl Bootstrap {
                     .ok_or("server configuration thinking_token_budget must be a positive 32-bit integer"))
                 .transpose()?,
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
+            steering_api_keys,
             served_names,
             context_hint: optional_text("context_hint")?,
             capacity_hint: optional_text("capacity_hint")?,

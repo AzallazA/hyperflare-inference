@@ -10,9 +10,9 @@ use super::{
 };
 use crate::{
     Result,
-    engram::{Index, Plane, Table},
+    engram::{Index, Plane, RowHash, Table},
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 /// Payload ownership follows the table layout; absent partitions retain shared storage.
 pub(super) fn spans(
@@ -110,6 +110,13 @@ pub(super) fn decode<F: super::payload::Files>(
     let mut buffers = HashSet::new();
     let mut events = HashSet::new();
     let mut tables = Vec::new();
+    // TP3 fork (perf/engram-readahead): one copy of the token map for every table's row hash,
+    // made only when read-ahead is requested.
+    let token_map: Arc<[u32]> = if crate::engram::read_ahead_requested() {
+        value.token_map.clone().into()
+    } else {
+        Arc::from([])
+    };
     for table in value.tables {
         validate_shards(&table, world)?;
         let gpu = !table.request_buffer.is_empty();
@@ -117,6 +124,10 @@ pub(super) fn decode<F: super::payload::Files>(
             .map_err(|_| invalid("unknown n-gram encoding"))?;
         let (width, block, row_bytes, scale_bytes) = match encoding {
             wire::engram_table::Encoding::Fp8E4m3E8m0 => (256, 32, 256, 8),
+            // TP3: DeepSeek Engram tables as packed MXFP4 (E2M1 pairs) with E8M0 scales per 32 columns.
+            wire::engram_table::Encoding::Mxfp4E2m1E8m0 => (256, 32, 128, 8),
+            // exp/ds41-exl3: diffbot int4 rows (nibble pairs, q + 8) with eight FP16 scales per row (16 bytes).
+            wire::engram_table::Encoding::Int4Fp16Block32 => (256, 32, 128, 16),
             wire::engram_table::Encoding::Nvfp4E4m3Global
                 if table.global_scale.is_finite() && table.global_scale > 0.0 =>
             {
@@ -173,6 +184,23 @@ pub(super) fn decode<F: super::payload::Files>(
         {
             return Err(invalid("invalid Engram hash geometry"));
         }
+        // TP3 fork (perf/engram-readahead): unpartitioned XOR_MODULO tables (the DS41 TP3/TP2
+        // shared tables) can have their prefill rows predicted on the host; others never read ahead.
+        let hash = (crate::engram::read_ahead_requested()
+            && table.shards.is_empty()
+            && order == 4
+            && !token_map.is_empty())
+        .then(|| {
+            Arc::new(RowHash {
+                orders: geometry.orders.clone(),
+                multipliers: geometry.multipliers.clone(),
+                primes: geometry.primes.clone(),
+                offsets: geometry.offsets.clone(),
+                rows: table.rows,
+                token_map: token_map.clone(),
+                pad_token_id: value.pad_token_id,
+            })
+        });
         let (stored_rows, weights, scales) = if table.shards.is_empty() {
             (table.rows, table.weights.clone(), table.scales.clone())
         } else {
@@ -291,6 +319,7 @@ pub(super) fn decode<F: super::payload::Files>(
             hashes: table.hash_buffer,
             event: table.ready_event,
             request: gpu.then_some(table.request_buffer),
+            hash,
         });
     }
     Ok(Index { tables })
@@ -322,6 +351,16 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn int4_encoding_is_wire_value_16() {
+        // exp/ds41-exl3: Python publishes the encoding by name; the number is part of the package format.
+        assert_eq!(wire::engram_table::Encoding::Int4Fp16Block32 as i32, 16);
+        assert_eq!(
+            wire::engram_table::Encoding::from_str_name("INT4_FP16_BLOCK32"),
+            Some(wire::engram_table::Encoding::Int4Fp16Block32)
+        );
     }
 
     #[test]

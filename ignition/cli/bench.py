@@ -163,13 +163,14 @@ def run(args):
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
         stream_overlap=stream_overlap(args, model),
-        compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
+        compile_workers=args.compile_workers, compile_headroom=args.compile_headroom, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
-        prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
+        prompt_logprobs=args.prompt_logprobs, steering_sidecar=args.steering_sidecar,
+        expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
         language_model_only=args.language_model_only or model.recipe.benchmark_language_model_only,
         mla_compute_mode=args.mla_compute_mode)
@@ -241,8 +242,9 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
+            "compile_headroom_bytes",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
+            "online_mxfp8", "online_mxfp8_scope", "language_model_only", "steering_sidecar")}}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(

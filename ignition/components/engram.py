@@ -8,14 +8,87 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
+import triton
+import triton.language as tl
 from b12x.preparation import PreparedCall
 from b12x.sequence import engram
 from b12x.sequence.engram._kernels import hash_op, lookup_op
 
 from ignition.components.ngram_delivery import publish_requests
 from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings, wait_for_readiness
+from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.tuning import declare, register_finalizer
 
-from ignition.preparation.tuning import declare
+
+@triton.jit(do_not_specialize=["prepared_tokens"])
+def _lookup_local_kernel(
+    weight,
+    scales,
+    hashes,
+    num_tokens,
+    rank_ptr,
+    out,
+    prepared_tokens,
+    T: tl.constexpr,
+    ROWS: tl.constexpr,
+    WORLD: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    PACKED_FP4: tl.constexpr = False,
+):
+    """Gather and dequantize only this rank's interleaved Engram heads from compact 24-head staged rows."""
+    t = tl.program_id(0)
+    local_head = tl.program_id(1)
+    rank = tl.load(rank_ptr)
+    head = rank + local_head * WORLD
+    col = tl.arange(0, 256)
+    nt = tl.load(num_tokens)
+    live = (t < nt) & (t < prepared_tokens) & (nt >= 0) & (nt <= T)
+    row = tl.load(hashes + t.to(tl.int64) * 24 + head, live, -1).to(tl.int64)
+    local = live & (row >= 0) & (row < ROWS)
+    local_row = t.to(tl.int64) * 24 + head
+    if PACKED_FP4:
+        byte = tl.load(weight + local_row * 128 + (col // 2).to(tl.int64), local, 0).to(tl.int32)
+        nib = tl.where(col % 2 == 0, byte & 0xF, (byte >> 4) & 0xF)
+        e = (nib & 0x7) >> 1
+        m = (nib & 0x1).to(tl.float32)
+        pow2 = ((e - 2 + 127) << 23).to(tl.float32, bitcast=True)
+        mag = tl.where(e == 0, m * 0.5, (2.0 + m) * pow2)
+        quant = tl.where((nib & 0x8) != 0, -mag, mag)
+    else:
+        quant = tl.load(weight + local_row * 256 + col.to(tl.int64), local, 0.0).to(tl.float32)
+    exponent = tl.load(scales + local_row * 8 + (col // 32).to(tl.int64), local, 127).to(tl.uint32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(exponent == 0, 2.0**-127, scale)
+    scale = tl.where(exponent == 255, float("nan"), scale)
+    result = (quant * scale).to(tl.bfloat16)
+    tl.store(
+        out + t.to(tl.int64) * (LOCAL_HEADS * 256) + local_head * 256 + col,
+        tl.where(local, result, 0),
+    )
+
+
+@torch.library.custom_op("flare::staged_engram_local", mutates_args=("out", "timings", "barrier_output"))
+def _lookup_local(source: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
+                  hashes: torch.Tensor, count: torch.Tensor, rank_tensor: torch.Tensor,
+                  out: torch.Tensor, timings: torch.Tensor, frame: torch.Tensor,
+                  barrier_input: torch.Tensor, barrier_output: torch.Tensor,
+                  interval: int, barrier: int, event: int, world: int, table_rows: int) -> None:
+    wait_for_readiness(source, event, timings, frame, interval, barrier_input, barrier_output, barrier)
+    tokens = hashes.shape[0]
+    packed_fp4 = weight.shape[-1] == 128
+    weight_view = weight if packed_fp4 else weight.view(torch.float8_e4m3fn)
+    local_heads = 24 // world
+    _lookup_local_kernel[(tokens, local_heads, 1)](
+        weight_view, scales, hashes, count, rank_tensor, out, tokens,
+        T=tokens, ROWS=table_rows, WORLD=world, LOCAL_HEADS=local_heads,
+        PACKED_FP4=packed_fp4, num_warps=4,
+    )
+
+
+@_lookup_local.register_fake
+def _lookup_local_fake(source, weight, scales, hashes, count, rank_tensor, out, timings, frame,
+                       barrier_input, barrier_output, interval, barrier, event, world, table_rows):
+    pass
 
 
 @torch.library.custom_op("flare::staged_engram", mutates_args=("out", "timings", "barrier_output"))
@@ -24,7 +97,8 @@ def _lookup(source: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
             timings: torch.Tensor, frame: torch.Tensor, barrier_input: torch.Tensor,
             barrier_output: torch.Tensor, interval: int, barrier: int, plan: int, event: int) -> None:
     wait_for_readiness(source, event, timings, frame, interval, barrier_input, barrier_output, barrier)
-    lookup_op(plan, weight.view(torch.float8_e4m3fn), scales, hashes, count, out, hashes.shape[0], True)
+    lookup_op(plan, weight if weight.shape[-1] == 128 else weight.view(torch.float8_e4m3fn),
+              scales, hashes, count, out, hashes.shape[0], True)
 
 
 @_lookup.register_fake
@@ -43,15 +117,51 @@ class EngramInputs:
     interval: int
 
     @classmethod
-    def allocate(cls, tokens, device, *, timings, interval=0):
+    def allocate(cls, tokens, device, *, timings, interval=0, packed_fp4=False, scale_bytes=8):
         ready = torch.cuda.Event(external=True)
         ready.record(torch.cuda.current_stream(device))
-        return cls(torch.zeros((tokens * 24, 256), dtype=torch.uint8, device=device),
-                   torch.zeros((tokens * 24, 8), dtype=torch.uint8, device=device),
+        # Staged rows: 256 FP8 bytes, or 128 bytes of packed MXFP4 / int4 pairs; scales: 8 E8M0 bytes, or 16 bytes of
+        # eight FP16 scales (exp/ds41-exl3 int4 rows).
+        return cls(torch.zeros((tokens * 24, 128 if packed_fp4 else 256), dtype=torch.uint8, device=device),
+                   torch.zeros((tokens * 24, scale_bytes), dtype=torch.uint8, device=device),
                    torch.full((tokens, 24), -1, dtype=torch.int64, device=device), ready, timings, interval)
 
     def buffers(self, layer):
         return {f"engram_{layer}_{name}": getattr(self, name) for name in ("weights", "scales", "hashes")}
+
+
+def share_hash_token_map(plan, token_map):
+    """Make a b12x Engram hash plan's materialized state read ``token_map`` instead of its own copy.
+
+    TP3 fork (DS41 ``tp3.share_engram_token_map``). b12x's hash ``materialize`` builds a private int64 device copy of
+    the token map per plan (1 MiB; two Engram layers per graph). The map is a read-only constant: the compress kernel
+    only loads from it and the binding's mutation-alias contract lists it read-only. Every plan of a rank receives
+    the same values, so they can all read one persistent tensor (``Tables.device_token_map``, which the graphs'
+    history lookups already read and the package already restores). The plan's own copy is released as soon as
+    ``materialize`` returns; the caching allocator hands its block to the next plan's (equally transient) copy.
+    No b12x source file changes (kernel fingerprints and compile/discovery keys stay put)."""
+    from dataclasses import replace
+
+    if plan.query.operation != "hash":
+        raise ValueError("only Engram hash plans own a token map")
+    if (token_map.dtype != torch.int64 or token_map.ndim != 1 or not token_map.is_contiguous()
+            or token_map.numel() != plan.query.vocab_size or token_map.device != plan._device):
+        raise ValueError("a shared Engram token map must be a contiguous int64 vector of the plan's vocabulary "
+                         "on the plan's device")
+    original = plan._materialize
+
+    def materialize(selection, device):
+        state = original(selection, device)
+        own = state.token_map
+        # Bit-identity at export: the plan's own copy (b12x's construction) must equal the shared tensor.
+        if own.shape != token_map.shape or own.dtype != token_map.dtype or not torch.equal(own, token_map):
+            raise ValueError("a shared Engram token map differs from the plan's own token map")
+        return replace(state, token_map=token_map)
+
+    # Plans are frozen; replacing the callback before declaration keeps the plan's identity (its handle and
+    # persistent-memory key) and its query, so selection and compile caches see the same declaration.
+    object.__setattr__(plan, "_materialize", materialize)
+    return plan
 
 
 class PreparedEngramLookup:
@@ -68,8 +178,9 @@ class PreparedEngramLookup:
         self.plan = engram.plan(engram.Caps(device=output.device, max_tokens=tokens,
             max_seqs=tokens, max_requests=tokens, vocab_size=len(token_map), layer_id=layer,
             tp_size=1, tp_rank=0), token_map=token_map, geometry=geometry,
-            invocation={"operation": "lookup", "compact_rows": True})
-        binding = SimpleNamespace(weight=self.weights.view(torch.float8_e4m3fn),
+            invocation={"operation": "lookup", "compact_rows": True,
+                        **({"packed_fp4": True} if self.weights.shape[-1] == 128 else {})})
+        binding = SimpleNamespace(weight=self.weights if self.weights.shape[-1] == 128 else self.weights.view(torch.float8_e4m3fn),
             scale_bytes=self.scales, hash_ids=self.hashes, num_tokens=count, out=output)
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run_lookup(binding, tokens, clear_tail=True), owners=(inputs, binding))),))
@@ -93,11 +204,66 @@ class PreparedEngramLookup:
         return output
 
 
+class PreparedEngramLookupLocal:
+    """Rank-local Engram lookup reading only this rank's strided heads from compact 24-head staged rows."""
+
+    def __init__(self, inputs, tokens, count, *, layer, geometry, shard, session, name,
+                 runtime=None, coordinator=None):
+        if 24 % shard.world_size != 0:
+            raise ValueError(f"rank-local Engram lookup requires world size dividing 24, got {shard.world_size}")
+        self.weights = inputs.weights[:tokens * 24]
+        self.scales = inputs.scales[:tokens * 24]
+        self.hashes = inputs.hashes[:tokens]
+        self.count = count
+        self.handle = inputs.ready.cuda_event
+        self.world = int(shard.world_size)
+        self.local_heads = 24 // self.world
+        self.table_rows = int(geometry.num_embeddings[geometry.layer_ids.index(layer)])
+        self.tokens = int(tokens)
+        device = self.weights.device
+        # Persistent 1-element device tensor keeps the traced FX graph and Triton kernel identical across ranks.
+        self.rank_tensor = persistent_copy(torch.tensor([shard.rank], dtype=torch.int32, device=device))
+        self.wait = PreparedReadinessWait(inputs.timings, inputs.interval, runtime=runtime, session=session,
+                                          coordinator=coordinator, name=name + ".readiness")
+        self.output_layout = ((self.tokens, self.local_heads * 256), torch.bfloat16)
+        packed_fp4 = self.weights.shape[-1] == 128
+
+        def warm():
+            if device.type != "cuda":
+                return
+            w = self.weights if packed_fp4 else self.weights.view(torch.float8_e4m3fn)
+            dummy_out = torch.empty(self.output_layout[0], dtype=self.output_layout[1], device=device)
+            with torch.cuda.device(device):
+                compiled = _lookup_local_kernel.warmup(
+                    w, self.scales, self.hashes, count, self.rank_tensor, dummy_out, self.tokens,
+                    T=self.tokens, ROWS=self.table_rows, WORLD=self.world, LOCAL_HEADS=self.local_heads,
+                    PACKED_FP4=packed_fp4, grid=(self.tokens, self.local_heads, 1), num_warps=4,
+                )
+                compiled._init_handles()
+
+        register_finalizer(session, warm)
+
+    def functional(self, *, session):
+        self.count = None
+        self.wait.functional(session=session)
+        return self
+
+    def __call__(self, source, count=None):
+        shape, dtype = self.output_layout
+        output = torch.empty(shape, dtype=dtype, device=source.device)
+        barrier_input, barrier_output = self.wait.operands(source)
+        _lookup_local(source, self.weights, self.scales, self.hashes, self.count if count is None else count,
+                      self.rank_tensor, output, self.wait.timings.timestamps, self.wait.timings.frame,
+                      barrier_input, barrier_output, self.wait.interval, self.wait.handle, self.handle,
+                      self.world, self.table_rows)
+        return output
+
+
 class PreparedEngramRequests:
     """Hash packed token rows on the GPU and release their mapped delivery mailbox."""
 
     def __init__(self, inputs, token_ids, starts, history, counts, mailbox, sequence, *,
-                 layer, token_map, geometry, session, name, row_mapping=None):
+                 layer, token_map, geometry, session, name, row_mapping=None, shared_token_map=None):
         tokens, rows = token_ids.numel(), history.shape[0]
         device = token_ids.device
         self.mask = torch.ones(tokens, dtype=torch.bool, device=device)
@@ -115,6 +281,8 @@ class PreparedEngramRequests:
         self.plan = engram.plan(engram.Caps(device=device, max_tokens=tokens, max_seqs=rows,
             max_requests=rows, vocab_size=len(token_map), layer_id=layer, tp_size=1, tp_rank=0),
             token_map=token_map, geometry=geometry, invocation={"operation": "hash"})
+        if shared_token_map is not None:
+            share_hash_token_map(self.plan, shared_token_map)
         binding = SimpleNamespace(**dict(zip(("token_ids", "token_mask", "query_start_loc", "request_slots",
             "committed_history", "num_seqs", "num_tokens", "hash_ids", "compressed", "request_ids"), self.args[:-1])))
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(

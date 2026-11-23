@@ -88,6 +88,8 @@ fn spec(system: Option<usize>, prompt: usize, output: u32) -> RequestSpec {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
+        reasoning_prompt: false,
     }
 }
 fn run_step(s: &mut RequestScheduler) -> ScheduledPlan {

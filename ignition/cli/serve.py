@@ -5,6 +5,7 @@
 """Prepare one checkpoint for native serving or runtime-core export."""
 
 import ipaddress
+import os
 import json
 import socket
 import sys
@@ -17,7 +18,7 @@ from ignition.preparation.collective_ladder import resolve as resolve_collective
 
 from . import display, environment
 
-from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+from .preparation import (Host, collective_tuning_mode, compiler_headroom, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -122,11 +123,51 @@ def _check_host_shape(args) -> None:
         raise UsageError(error)
 
 
+def _refuse_tune_only(command) -> None:
+    """TP3 fork: FLARE_EXPORT_TUNE_ONLY=1 belongs to a single-host `ignition export` only."""
+    from ignition.preparation.export_speed import TUNE_ONLY_ENV, tune_only
+
+    try:
+        requested = tune_only()
+    except ValueError as error:
+        raise UsageError(str(error)) from error
+    if requested:
+        raise UsageError(f"{TUNE_ONLY_ENV}=1 applies to a single-host export, not {command}; unset it")
+
+
+def _check_export_speed(args) -> None:
+    """TP3 fork: validate the FLARE_EXPORT_* export-speed switches before any model or GPU work."""
+    from ignition.preparation import export_speed
+
+    try:
+        export_speed.forward_workers()
+        export_speed.forward_worker_bytes()
+        export_speed.forward_worker_device_bytes()
+        requested = export_speed.tune_only()
+    except ValueError as error:
+        raise UsageError(str(error)) from error
+    if requested and args.tuning_gpus is not None:
+        raise UsageError(f"{export_speed.TUNE_ONLY_ENV}=1 does not combine with --tuning-gpus")
+
+
+# Debug switches whose counters live in Python ops: a debug-serve reads them; an exported core must never carry them.
+DEBUG_SERVE_ONLY_ENV = ("FLARE_DS41_INDEX_ROW_SPLIT_CHECK",)  # TP3 tp3.index_row_split_check (index_row_split.py)
+
+
+def _refuse_debug_serve_only(environ=None) -> None:
+    environ = os.environ if environ is None else environ
+    found = [name for name in DEBUG_SERVE_ONLY_ENV if environ.get(name, "") not in ("", "0")]
+    if found:
+        raise UsageError(f"{', '.join(found)} is debug-serve only; unset it to export")
+
+
 def export(args) -> int:
     from ignition.preparation.core_snapshot import export_options
     from .publishing import validate_repository
+    _refuse_debug_serve_only()
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
+    _check_export_speed(args)
     model = resolve_model(configuration, args.model)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
@@ -154,6 +195,10 @@ def export(args) -> int:
             code, result = _export_hosts(args)
         else:
             code, result = _prepare(args)
+    if result is None:
+        # TP3 fork: FLARE_EXPORT_TUNE_ONLY=1 (ignition/preparation/export_speed.py).
+        print('Tune-only export: kernel tuning selections are in the kernel cache; no package was written')
+        return code
     print(f'Exported cache entry: {result.entry_path}')
     if repository:
         print(f'Hugging Face target: {repository}')
@@ -168,6 +213,7 @@ def _export_hosts(args):
     from ignition.preparation.host_ranks import HostRendezvous, local_topology, source_identity, topology_gpu
 
     _check_host_shape(args)
+    _refuse_tune_only("a multi-host export")
     if args.rendezvous is None:
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
@@ -199,12 +245,14 @@ def _export_hosts(args):
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         steering_sidecar=args.steering_sidecar,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
@@ -274,7 +322,7 @@ def _prepare(args):
                                                     args.max_concurrency)
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
-                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      compile_workers=args.compile_workers, compile_headroom=args.compile_headroom, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
@@ -282,9 +330,10 @@ def _prepare(args):
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
-                         stream_overlap=stream_overlap(args, model),
+                      stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                      steering_sidecar=args.steering_sidecar,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                       language_model_only=args.language_model_only,
@@ -306,10 +355,12 @@ def _prepare(args):
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
+                     f"{(' · steering ' + plan.steering_sidecar.name) if plan.steering_sidecar is not None else ''}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
+                     f" · compile headroom {plan.compile_headroom_bytes / (1 << 30):g} GiB"
                      f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
                      f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
@@ -333,8 +384,9 @@ def _prepare(args):
     signals.__enter__()
     try:
         try:
+            from ignition.preparation.export_speed import tune_only
             from ignition.preparation.module_images import ModuleImages
-            from ignition.preparation.tuning_replicas import prepare_recipe
+            from ignition.preparation.tuning_replicas import TuningComplete, prepare_recipe
 
             recorder = ModuleImages()
             preparation_options = {"retain_graphs": True}
@@ -346,10 +398,19 @@ def _prepare(args):
                 storage = CoreStorage(world=plan.world_size)
                 preparation_options["core_storage"] = storage
                 with storage:
-                    prepared = prepare_recipe(model.recipe.prepare,
-                        model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
-                        kernel_cache=configuration.directory("kernel_cache"), progress=progress,
-                        **preparation_options)
+                    try:
+                        prepared = prepare_recipe(model.recipe.prepare,
+                            model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
+                            kernel_cache=configuration.directory("kernel_cache"), progress=progress,
+                            **preparation_options)
+                    except TuningComplete:
+                        # TP3 fork: every rank flushed its tuning selections and closed its session.
+                        if not tune_only():
+                            raise
+                        prepared = None
+            if prepared is None:
+                progress("Tune-only export (FLARE_EXPORT_TUNE_ONLY=1): stopped after kernel tuning")
+                return 0, None
         except FlareError:
             raise
         except MemoryError as error:
@@ -407,6 +468,7 @@ def debug_serve(args) -> int:
     from ignition.progress import phase
 
     _check_host_shape(args)
+    _refuse_tune_only("debug-serve")
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
@@ -416,6 +478,8 @@ def debug_serve(args) -> int:
         raise UsageError("--graph-times applies only to --direct execution")
     if args.eager and args.graph_times is not None and not args.graph_times.is_file():
         raise UsageError(f"--graph-times {args.graph_times} does not exist; graph replay with --graph-times saves it")
+    if args.direct and args.steering_sidecar is not None:
+        raise UsageError("--steering-sidecar requires native serving; direct execution cannot apply steering")
     if args.direct and args.history_drafts:
         raise UsageError("--history-drafts requires native serving; it does not apply to --direct")
     if not args.direct:
@@ -467,12 +531,14 @@ def debug_serve(args) -> int:
                          context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
-                         cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill,
+                         prompt_logprobs=args.prompt_logprobs, steering_sidecar=args.steering_sidecar,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
@@ -558,6 +624,10 @@ def _serve_prepared(prepared, bind, options):
                  for rank in prepared.memory_report.get("ranks", (prepared.memory_report,))]
         print(json.dumps({"memory": ranks}, default=str), file=sys.stderr, flush=True)
         limited = _diagnostic_options(prepared, options)
+        extra = os.environ.get("FLARE_DEBUG_SERVE_SERVER_JSON", "").strip()
+        if extra:   # exp/ds41-exl3-s1 debug-serve: native server settings `flare run` sets from its flags
+            limited = {**limited, **json.loads(extra)}
+            print(json.dumps({"server_overrides": json.loads(extra)}), file=sys.stderr, flush=True)
         print(json.dumps({"diagnostic_capacity": {key: limited[key] for key in ("pages", "snapshots")}}),
               file=sys.stderr, flush=True)
         server = prepared.start_server(bind=bind, options=limited)

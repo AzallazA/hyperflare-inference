@@ -17,7 +17,7 @@ mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
-pub use policy::{PolicyConfig, RequestAccounting};
+pub use policy::{PolicyConfig, PrefillTailMerge, RequestAccounting, TtftOrder};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
@@ -92,6 +92,44 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
+/// Rows the DeepSeek V4.1 decoder suffix replays per prefill chunk (its SWA window and draft ring).
+pub(crate) const SUFFIX_WINDOW: usize = 128;
+
+/// TP3 fork: may the prefill chunk `[start, start + tokens)` run its encoder-only twin?
+///
+/// Layers after the global-KV boundary keep only SWA windows, the draft ring and `last_hidden`;
+/// a following chunk longer than the window replays its own (fresh replay boundary, all 128 ring
+/// slots, `last_hidden`). So the suffix of a chunk is dead when the chunk is longer than the
+/// window, is not the prompt's last, ends at no checkpoint, and the next cut (message boundary or
+/// prompt end) is more than a window away. Images, scored prompts and spans keep the ordinary
+/// graph. The policy then never schedules a window-sized successor (`prefill_work`), and no
+/// snapshot is taken at the stale endpoint.
+#[cfg(test)]
+pub(crate) fn encoder_only_chunk(request: &LiveRequest, start: u64, tokens: usize) -> bool {
+    encoder_chunk(request, start, tokens, true)
+}
+
+/// `encoder_only_chunk`; `window_guard = false` drops the "next cut more than a window ahead"
+/// rule (test-only negative control, `RequestScheduler::unguarded_encoder_prefill`).
+fn encoder_chunk(request: &LiveRequest, start: u64, tokens: usize, window_guard: bool) -> bool {
+    let end = start as usize + tokens;
+    let next_cut = request
+        .message_boundaries
+        .get(request.message_boundaries.partition_point(|&n| n <= end))
+        .copied()
+        .unwrap_or(request.prompt_tokens)
+        .min(request.prompt_tokens);
+    tokens > SUFFIX_WINDOW
+        && end < request.prompt_tokens
+        && !request.prompt_logprobs
+        && request.vision_patches.is_empty()
+        && request.image_slot.is_none()
+        && request.conditioned_windows.is_empty()
+        && request.prefill_spans.is_empty()
+        && request.message_boundaries.binary_search(&end).is_err()
+        && (!window_guard || next_cut > end + SUFFIX_WINDOW)
+}
+
 #[derive(Clone, Debug)]
 pub struct SchedulerCapabilities {
     pub completion_token_capacity: usize,
@@ -142,6 +180,13 @@ pub struct SchedulerStats {
     pub checkpoint_skip_storage: u64,
     pub checkpoint_extra_work_ns: u64,
     pub checkpoint_anchor_guards: usize,
+    /// TP3 fork: prefill chunks submitted to an encoder-only graph, and their prompt tokens.
+    pub encoder_prefill_chunks: u64,
+    pub encoder_prefill_tokens: u64,
+    /// TP3 fork: prefill chunks the runtime ran on a long-context variant graph
+    /// (`<base>-split-ctx<N>`), and their prompt tokens.
+    pub context_variant_chunks: u64,
+    pub context_variant_tokens: u64,
 }
 
 #[derive(Clone)]
@@ -157,6 +202,13 @@ pub struct RequestSpec {
     /// request decodes. When pages run out the scheduler may preempt such a request:
     /// it finishes through its terminal checkpoint and the runtime readmits its history.
     pub growable_output: bool,
+    /// The rendered prompt includes tool definitions (`PrefillTailMerge::ToolsOnly`).
+    pub tools: bool,
+    /// Fork (TP3): the generation prompt opens a reasoning block (thinking mode). A template
+    /// that drops reasoning from history (DeepSeek V4.1 without tools) renders this turn
+    /// differently in the next one, so only the last message's checkpoint prefixes it
+    /// (`PrefillTailMerge::applies`).
+    pub reasoning_prompt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,12 +311,23 @@ pub struct LiveRequest {
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     growable_output: bool,
+    tools: bool,
+    reasoning_prompt: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
+    /// TP3 fork: end of the last chunk submitted to an encoder-only graph while no later chunk
+    /// has been submitted; the decoder-suffix state (layer >= 20 windows, draft ring,
+    /// `last_hidden`) at that endpoint is stale until a chunk longer than the window replays it.
+    pub(crate) encoder_only_through: Option<u64>,
 }
 
 impl LiveRequest {
+    /// TP3 fork: the state at the consumed endpoint left a decoder suffix unrun.
+    pub(crate) fn suffix_stale(&self) -> bool {
+        self.encoder_only_through == Some(self.consumed_tokens)
+    }
+
     pub fn checkpoint_accounting(&self) -> CheckpointAccounting {
         self.checkpoints.clone()
     }
@@ -546,12 +609,15 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    cleared_pages: Vec<PageId>,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
     expected_tokens: [f64; REQUEST_LANES],
     origin: PlanOrigin,
     timing: SubmittedTiming,
+    /// TP3 fork: the step runs its prefill graph's encoder-only twin (decided once, in `commit`).
+    encoder: bool,
 }
 impl std::ops::Deref for Submission {
     type Target = ScheduledStep;
@@ -648,6 +714,8 @@ pub struct RequestScheduler {
     free_snapshots: BTreeSet<SnapshotId>,
     snapshot_pages: Vec<std::ops::Range<u32>>,
     page_snapshot_refs: Vec<u32>,
+    /// Released alias pages whose bytes are snapshot rows, not KV, until cleared.
+    page_holds_row_bytes: Vec<bool>,
     retired: Vec<RetiredRequest>,
     submissions: BTreeMap<Fence, Submission>,
     completed: Fence,
@@ -662,6 +730,10 @@ pub struct RequestScheduler {
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
+    /// TP3 fork: prefill capacities with an encoder-only twin graph.
+    encoder_prefill_catalog: Vec<usize>,
+    /// TP3 fork, test only: the window guards are off (negative control of the GPU proof).
+    encoder_window_guard: bool,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     decoded_history: Option<decoded_history::DecodedHistory>,
@@ -677,6 +749,10 @@ pub struct RequestScheduler {
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
     admissions: u64,
+    /// Rounds left before the TTFT guard forces the overdue request again.
+    ttft_interleave: u32,
+    /// `TtftOrder::Shortest`: the next guarded round belongs to the oldest overdue request.
+    ttft_owe_oldest: bool,
 }
 
 fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
@@ -740,6 +816,7 @@ impl RequestScheduler {
             free_snapshots: (0..limits.snapshots).map(SnapshotId).collect(),
             snapshot_pages: Vec::new(),
             page_snapshot_refs: vec![0; limits.pages as usize],
+            page_holds_row_bytes: vec![false; limits.pages as usize],
             retired: Vec::new(),
             submissions: BTreeMap::new(),
             completed: Fence(0),
@@ -754,6 +831,8 @@ impl RequestScheduler {
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
             scored_prefill_catalog: Vec::new(),
+            encoder_prefill_catalog: Vec::new(),
+            encoder_window_guard: true,
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
             decoded_history: None,
@@ -769,6 +848,8 @@ impl RequestScheduler {
             evictions: Vec::new(),
             evictions_lost: false,
             admissions: 0,
+            ttft_interleave: 0,
+            ttft_owe_oldest: false,
         })
     }
 
@@ -807,6 +888,48 @@ impl RequestScheduler {
         Ok(())
     }
 
+    /// The shape catalogs of a prepared model, in start-up order: mixed, scored prefill, prefill,
+    /// encoder-only prefill and speculative shapes. TP3 fork: context variants
+    /// (`<base>-split-ctx<N>`) are left out; they share their base's shape and the runtime swaps
+    /// them in at submit.
+    pub fn shape_catalogs(&mut self, graphs: &[crate::execution::GraphDescriptor]) -> Result<()> {
+        let graphs = crate::model::catalog::scheduling_graphs(graphs);
+        let of = |kind: GraphKind| graphs.iter().filter(move |g| g.kind == kind);
+        self.mixed_graphs(
+            &of(GraphKind::Mixed)
+                .map(|g| (g.batch_capacity, g.token_capacity, g.prefill_capacity))
+                .collect::<Vec<_>>(),
+        )?;
+        self.scored_prefill_graphs(
+            &of(GraphKind::ScoredPrefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.prefill_graphs(
+            &of(GraphKind::Prefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.encoder_prefill_graphs(
+            &of(GraphKind::EncoderPrefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.speculative_graphs(
+            &of(GraphKind::Speculative)
+                .map(|g| (g.batch_capacity, g.token_capacity))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// TP3 fork: the runtime ran a prefill chunk of `tokens` prompt tokens on a context variant.
+    pub fn record_context_variant(&mut self, tokens: usize) {
+        self.stats.context_variant_chunks += 1;
+        self.stats.context_variant_tokens += tokens as u64;
+    }
+
     pub fn scored_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("scored prefill graphs must be selected before admission".into());
@@ -820,6 +943,92 @@ impl RequestScheduler {
         }
         self.scored_prefill_catalog = catalog;
         Ok(())
+    }
+
+    /// TP3 fork: prefill capacities whose package carries an encoder-only twin; select after
+    /// `prefill_graphs`.
+    pub fn encoder_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
+        if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
+            return Err("encoder-only prefill graphs must be selected before admission".into());
+        }
+        let mut catalog = capacities.to_vec();
+        catalog.sort_unstable();
+        if catalog
+            .iter()
+            .any(|n| *n <= SUFFIX_WINDOW || !self.prefill_catalog.contains(n))
+            || catalog.windows(2).any(|p| p[0] == p[1])
+        {
+            return Err(
+                "encoder-only prefill graphs must twin distinct prefill capacities above the window"
+                    .into(),
+            );
+        }
+        self.encoder_prefill_catalog = catalog;
+        Ok(())
+    }
+
+    /// TP3 fork, NEGATIVE CONTROL ONLY (unit tests): drop the window rule and its guards (a
+    /// window-sized chunk may then follow an encoder-only chunk and read its stale suffix state).
+    /// Not reachable from a server: the GPU proof's env hook was removed before merging.
+    #[cfg(test)]
+    pub(crate) fn unguarded_encoder_prefill(&mut self) {
+        self.encoder_window_guard = false;
+    }
+
+    pub(crate) fn encoder_window_guard(&self) -> bool {
+        self.encoder_window_guard
+    }
+
+    /// TP3 fork: whether `step` runs the encoder-only twin of its prefill graph: a one-lane
+    /// prefill step whose chunk `encoder_only_chunk` admits, with a twin of its capacity, unless
+    /// `--scheduler-encoder-prefill false`. `commit` records the same decision.
+    pub fn encoder_prefill_step(&self, step: &ScheduledStep) -> Result<bool> {
+        if step.kind != GraphKind::Prefill || step.mixed.is_some() || step.lanes.len() != 1 {
+            return Ok(false);
+        }
+        let lane = &step.lanes[0];
+        Ok(self.encoder_lane(
+            self.request(lane.request)?,
+            lane.start_position,
+            lane.tokens,
+            step.token_capacity,
+        ))
+    }
+
+    /// TP3 fork: a one-lane prefill chunk `[start, start + tokens)` on capacity `capacity` runs the
+    /// encoder-only twin: the switch is on, the package has the twin, the chunk qualifies
+    /// (`encoder_chunk`), and the full graph of that capacity has a measured cost. The last rule
+    /// makes cost discovery time a full chunk first, so the planner always holds a full-graph
+    /// bound for the twin's price (`policy::add_candidate`); the planner and `commit` share it.
+    pub(crate) fn encoder_lane(
+        &self,
+        request: &LiveRequest,
+        start: u64,
+        tokens: usize,
+        capacity: usize,
+    ) -> bool {
+        self.policy.encoder_prefill
+            && self.encoder_prefill_catalog.contains(&capacity)
+            && self
+                .costs
+                .duration(GraphKind::Prefill, 1, capacity)
+                .is_some_and(|nanos| nanos != 0)
+            && encoder_chunk(request, start, tokens, self.encoder_window_guard)
+    }
+
+    /// TP3 fork: the cost key a committed step is timed under: the twin's own `EncoderPrefill`
+    /// entry for an encoder-only chunk (when the package lists the twin), else the step's graph.
+    fn step_cost_key(&self, step: &ScheduledStep, encoder: bool) -> cost::Key {
+        let key = cost::Key::from_step(step);
+        let twin = cost::Key {
+            kind: GraphKind::EncoderPrefill,
+            ..key
+        };
+        if encoder && self.costs.duration_key(twin).is_some() {
+            twin
+        } else {
+            key
+        }
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {
@@ -1089,6 +1298,21 @@ impl RequestScheduler {
             .get(&fence)
             .map(|submission| &submission.step)
             .ok_or_else(|| "unknown scheduled submission".into())
+    }
+    /// Pages whose snapshot-row bytes every rank clears before the submission's graph.
+    pub fn cleared_pages(&self, fence: Fence) -> Result<&[PageId]> {
+        self.submissions
+            .get(&fence)
+            .map(|submission| submission.cleared_pages.as_slice())
+            .ok_or_else(|| "unknown scheduled submission".into())
+    }
+    /// TP3 fork: whether the step committed at `fence` runs the encoder-only twin. The runtime
+    /// selects the graph from this record, so the graph and the stale-state marker never disagree.
+    pub fn submitted_encoder(&self, fence: Fence) -> Result<bool> {
+        self.submissions
+            .get(&fence)
+            .map(|submission| submission.encoder)
+            .ok_or_else(|| "unknown submission fence".into())
     }
     pub fn cache(&self) -> &PrefixCheckpointCache {
         &self.cache
@@ -1361,7 +1585,11 @@ impl RequestScheduler {
         let request = self.request_mut(handle)?;
         request.preempted = preempted;
         request.phase = RequestPhase::Finishing;
-        if request.consumed_tokens <= request.prefix_tokens || request.error_code.is_some() {
+        // TP3 fork: never retain a terminal snapshot of a stale encoder-only endpoint.
+        if request.consumed_tokens <= request.prefix_tokens
+            || request.error_code.is_some()
+            || request.suffix_stale()
+        {
             return Ok(());
         }
         let unused = std::mem::take(&mut request.reserved_pages);
@@ -1678,8 +1906,11 @@ impl RequestScheduler {
             vision_patches: VecDeque::new(),
             prefill_spans: Vec::new(),
             growable_output: spec.growable_output,
+            tools: spec.tools,
+            reasoning_prompt: spec.reasoning_prompt,
             preempted: false,
             admission_order: self.admissions,
+            encoder_only_through: None,
         });
         self.admissions += 1;
         if let Some(inbound) = &inbound {
@@ -2204,7 +2435,9 @@ impl RequestScheduler {
         if fence <= self.submitted || fence.0 > i64::MAX as u64 {
             return Err("submission fences must increase within int64 range".into());
         }
-        let key = cost::Key::from_step(step);
+        // TP3 fork: the step is timed under the encoder-only decision below (an unknown request
+        // is refused later, after the window checks, so it is not an error here).
+        let key = self.step_cost_key(step, matches!(self.encoder_prefill_step(step), Ok(true)));
         let observed_at_ns = self.costs.observation(key).and_then(|(_, observed, _)| observed);
         let origin = match plan.origin {
             PlanOrigin::Ordinary if observed_at_ns.is_none() => PlanOrigin::Discovery,
@@ -2266,10 +2499,15 @@ impl RequestScheduler {
         let expected_tokens = std::array::from_fn(|slot| step.lanes.iter().enumerate()
             .find(|(_, lane)| lane.request.slot as usize == slot).map_or(0.0, |(row, lane)| {
                 if step.lane_kind(row) == GraphKind::Speculative {
-                    self.expected_speculative_tokens(self.request(lane.request).unwrap(), expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]))
+                    self.expected_speculative_tokens(
+                        self.request(lane.request).unwrap(),
+                        step.batch_capacity,
+                        expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]),
+                    )
                 } else if matches!(step.lane_kind(row), GraphKind::Decode | GraphKind::Resume) { 1.0 }
                 else if step.lane_kind(row).is_prefill() { lane.tokens as f64 } else { 0.0 }
             }));
+        let encoder = self.encoder_prefill_step(step)?;
         let participants = self.service_participants();
         let submitted_timing = SubmittedTiming {
             retained_ns: plan.selected_cost.retained_ns,
@@ -2288,22 +2526,50 @@ impl RequestScheduler {
                 _ => None,
             },
         };
+        for (row, lane) in step.lanes.iter().enumerate() {
+            // TP3 fork: a stale suffix (layer >= 20 windows, draft ring, last hidden) is rebuilt only
+            // by a prefill chunk longer than the window; refuse anything else at the point of use.
+            if self.encoder_window_guard
+                && self.request(lane.request)?.suffix_stale()
+                && !(step.lane_kind(row).is_prefill() && lane.tokens > SUFFIX_WINDOW)
+            {
+                return Err("a request after an encoder-only chunk needs a prefill chunk longer than the decoder window".into());
+            }
+        }
+        for (row, lane) in step.lanes.iter().enumerate() {
+            if step.lane_kind(row).is_prefill() {
+                // TP3 fork: the stale endpoint of an encoder-only chunk, cleared by any later chunk.
+                self.request_mut(lane.request)?.encoder_only_through =
+                    encoder.then(|| lane.start_position + lane.tokens as u64);
+            }
+        }
+        if encoder {
+            self.stats.encoder_prefill_chunks += 1;
+            self.stats.encoder_prefill_tokens += step.lanes[0].tokens as u64;
+        }
         for lane in &step.lanes { self.promote_request_anchor(lane.request)?; }
         self.commit_checkpoint_plans(&plan.checkpoint_plans)?;
         self.commit_checkpoint_copies(step)?;
+        let mut cleared_pages = Vec::new();
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
                 .collect();
-            request.private_pages.extend(allocated);
+            request.private_pages.extend_from_slice(&allocated);
             request.scheduled_consumed = next_consumed_ceiling;
             request.last_use = fence;
             request.pending += 1;
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
             }
+            for page in allocated {
+                if std::mem::take(&mut self.page_holds_row_bytes[page.0 as usize]) {
+                    cleared_pages.push(page);
+                }
+            }
         }
+        self.note_ttft_round(step);
         self.submitted = fence;
         self.refresh.commit(origin, fence, step);
         self.costs.record_attempt(key);
@@ -2318,12 +2584,14 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                cleared_pages,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,
                 expected_tokens,
                 origin,
                 timing: submitted_timing,
+                encoder,
             },
         );
         Ok(())
@@ -2536,7 +2804,13 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        self.observe_execution(&submission.step, timing);
+        // TP3 fork: an encoder-only chunk is timed under its twin's own estimate, which prices
+        // eligible chunks (`policy::add_candidate`); the full Prefill estimate learns only from
+        // full chunks. Without a twin entry (test graph sets) the sample is dropped.
+        let key = self.step_cost_key(&submission.step, submission.encoder);
+        if !submission.encoder || key.kind == GraphKind::EncoderPrefill {
+            self.costs.observe_key(key, timing);
+        }
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
@@ -2643,7 +2917,10 @@ impl RequestScheduler {
                 }
             }
             request.phase = if finished {
-                if request.consumed_tokens > request.prefix_tokens && request.error_code.is_none() {
+                if request.consumed_tokens > request.prefix_tokens
+                    && request.error_code.is_none()
+                    && !request.suffix_stale()
+                {
                     RequestPhase::Snapshot
                 } else {
                     RequestPhase::Finishing
@@ -2676,7 +2953,11 @@ impl RequestScheduler {
                 if !finished && request.consumed_tokens < request.prompt_tokens as u64 {
                     request.phase = request.prompt_phase();
                 }
-                if let Some(capture) = request.checkpoint_capture {
+                // TP3 fork: an encoder-only endpoint is never captured (encoder_only_chunk excludes
+                // checkpoint ends; this keeps a stale state out of the cache regardless).
+                if !request.suffix_stale()
+                    && let Some(capture) = request.checkpoint_capture
+                {
                     if capture.endpoint == endpoint {
                         let kind = if endpoint == request.prompt_tokens as u64 { BoundaryKind::Prompt } else { BoundaryKind::Message };
                         captures.push((lane.request, Some(kind), endpoint, request.phase));

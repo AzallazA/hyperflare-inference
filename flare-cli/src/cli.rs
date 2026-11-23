@@ -18,7 +18,7 @@ use flare_helios::{
         PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
-    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
+    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit, parse_stack_limit},
 };
 
 /// The serving option that routes every peer over subnets every rank holds.
@@ -480,11 +480,15 @@ impl OrbitPush {
             controller_key: None,
             transfer_streams: self.transfer_streams,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: None,
+            steering_access: SteeringAccessOptions::default(),
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
+            scheduler: SchedulerOptions::default(),
             serving: self.serving.clone(),
         }
     }
@@ -573,9 +577,9 @@ pub struct OrbitRun {
     #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
     pub served_model_name: Option<String>,
 
-    /// Favor throughput or output cadence [default: saved group or balanced].
+    /// Favor throughput or output cadence, or bound first-token waits [default: saved group or balanced].
     #[arg(long, value_name = "MODE",
-        value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
+        value_parser = ["balanced", "throughput", "interactive"], help_heading = "Serving options")]
     pub scheduler_policy: Option<String>,
 
     /// Value per terminal retirement in prompt-token units [default: 256].
@@ -594,6 +598,12 @@ pub struct OrbitRun {
     /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub steering_access: SteeringAccessOptions,
+
+    #[command(flatten)]
+    pub scheduler: SchedulerOptions,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -639,8 +649,12 @@ impl OrbitRun {
         if let Some(fraction) = self.scheduler_checkpoint_extra_work_fraction {
             options.extend(["--scheduler-checkpoint-extra-work-fraction".into(), fraction.to_string()]);
         }
+        options.extend(self.scheduler.options());
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
+        }
+        if let Some(path) = &self.steering_access.steering_api_keys_file {
+            options.extend(["--steering-api-keys-file".into(), path.display().to_string()]);
         }
         options
     }
@@ -661,7 +675,10 @@ impl OrbitRun {
             controller_key: None,
             transfer_streams: self.transfer_streams,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: self.api_key_file.clone(),
+            steering_access: self.steering_access.clone(),
             scheduler_policy: self
                 .scheduler_policy
                 .clone()
@@ -669,6 +686,7 @@ impl OrbitRun {
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
+            scheduler: self.scheduler.clone(),
             serving: self.serving.clone(),
         }
     }
@@ -773,13 +791,38 @@ pub struct Run {
     #[arg(long, help_heading = "Multi-host options")]
     pub stage_only: bool,
 
+    /// Print the memory plan and KV capacity this configuration would get on the selected GPUs,
+    /// then exit without creating a CUDA context, allocating GPU memory, or reading weights.
+    #[arg(
+        long,
+        conflicts_with_all = ["hosts", "rank", "rendezvous", "stage_only"],
+        help_heading = "Planning options"
+    )]
+    pub dry_run: bool,
+
+    /// Free GPU memory the dry run assumes before loading: one size for every GPU or one per
+    /// selected GPU [default: each GPU's CUDA driver total minus 606 MiB].
+    #[arg(
+        long,
+        value_name = "SIZE[,SIZE...]",
+        value_delimiter = ',',
+        value_parser = parse_size,
+        requires = "dry_run",
+        help_heading = "Planning options"
+    )]
+    pub dry_run_free_memory: Vec<u64>,
+
     /// File containing the serving API key; overrides [server].api_key, including with an empty file.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
-    /// Favor token throughput or balance it with output cadence; both retain token-service fairness.
+    #[command(flatten)]
+    pub steering_access: SteeringAccessOptions,
+
+    /// Favor token throughput or balance it with output cadence; all retain token-service fairness.
+    /// Interactive is balanced with a 50 ms first-token target.
     #[arg(long, value_name = "MODE", default_value = "balanced",
-        value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
+        value_parser = ["balanced", "throughput", "interactive"], help_heading = "Serving options")]
     pub scheduler_policy: String,
 
     /// Value per terminal retirement in prompt-token units [default: 256].
@@ -796,7 +839,155 @@ pub struct Run {
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 
     #[command(flatten)]
+    pub scheduler: SchedulerOptions,
+
+    #[command(flatten)]
     pub serving: ServingOptions,
+}
+
+/// Scheduler utility coefficients and the first-token guard; omitted values keep the policy's.
+#[derive(Debug, Args, Clone, Default, PartialEq)]
+pub struct SchedulerOptions {
+    /// Value of one output token in prompt-token units [default: 64].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_positive, help_heading = "Scheduler options")]
+    pub scheduler_output_token_value: Option<f64>,
+
+    /// Price of unserved token throughput relative to other requests [default: 16].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_token_fairness: Option<f64>,
+
+    /// Price of unserved output deliveries [default: 4; throughput: 0].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_delivery_fairness: Option<f64>,
+
+    /// Waiting cost of a decoding request per ms of output age [default: 0.1; throughput: 0].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_decode_age_price: Option<f64>,
+
+    /// Time constant of the served-rate estimates in ms [default: 100].
+    #[arg(long, value_name = "MS", value_parser = scheduler_positive, help_heading = "Scheduler options")]
+    pub scheduler_adaptation_ms: Option<f64>,
+
+    /// Force the next round for a prompt still without output this long after arrival; 0 disables
+    /// [default: 0; interactive: 50].
+    #[arg(long, value_name = "MS", value_parser = scheduler_coefficient, help_heading = "Scheduler options")]
+    pub scheduler_ttft_target_ms: Option<f64>,
+
+    /// Largest prefill chunk a forced round may use; 0 allows the largest prepared [default: 0].
+    #[arg(long, value_name = "TOKENS", help_heading = "Scheduler options")]
+    pub scheduler_ttft_max_chunk: Option<usize>,
+
+    /// Other rounds allowed between two forced rounds of one prompt [default: 1].
+    #[arg(long, value_name = "N", help_heading = "Scheduler options")]
+    pub scheduler_ttft_decode_interleave: Option<u32>,
+
+    /// Which overdue prompt forced rounds serve: oldest (arrival order), or shortest (fewest
+    /// remaining prefill chunks first; after each forced chunk of another prompt the next forced
+    /// round goes to the oldest, so long prompts keep at least every second one) [default: oldest].
+    #[arg(long, value_name = "ORDER", value_parser = ["oldest", "shortest"], help_heading = "Scheduler options")]
+    pub scheduler_ttft_order: Option<String>,
+
+    /// Absorb a final message segment of at most chunk/16 tokens (64-512) into the preceding
+    /// prefill chunk instead of running it as its own prefill graph (the prompt-end checkpoint is
+    /// still captured). true: every request except one without tools whose generation prompt
+    /// opens reasoning (a thinking chat's next turn resumes from its last message's checkpoint);
+    /// false; or tools-only: requests with tools [default: tools-only].
+    #[arg(long, value_name = "MODE", value_parser = ["true", "false", "tools-only"],
+        help_heading = "Scheduler options")]
+    pub scheduler_prefill_tail_merge: Option<String>,
+
+    /// Offer message checkpoints to the host prefix cache at capture, even when the prompt
+    /// checkpoint follows within one KV page (upstream PR #227); false defers them until
+    /// exact reuse [default: true].
+    #[arg(long, value_name = "BOOL", help_heading = "Scheduler options")]
+    pub scheduler_eager_message_offers: Option<bool>,
+
+    /// Run a prefill piece shorter than ROWS tokens together with the pieces after it instead of
+    /// as its own prefill graph, when the chunk starts at the request's own checkpoint (an agent
+    /// turn's one-token answer end joins its next message). Skipped message checkpoints are never
+    /// a linear next turn's resume point; the last message stays whenever the tail merge does not
+    /// apply. 0 = off [default: FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS, then 0].
+    #[arg(long, value_name = "ROWS", help_heading = "Scheduler options")]
+    pub scheduler_prefill_merge_min_rows: Option<usize>,
+
+    /// Run a package's encoder-only prefill graphs (TP3 DS41 exports with
+    /// FLARE_DS41_PREFILL_SKIP_SUFFIX) for non-final prompt chunks whose decoder-suffix state the
+    /// next chunk replaces; false always runs the ordinary prefill graph. A package without such
+    /// graphs is unaffected [default: true].
+    #[arg(long, value_name = "BOOL", help_heading = "Scheduler options")]
+    pub scheduler_encoder_prefill: Option<bool>,
+}
+
+/// Who may set `steering_scale`. Without any key every client may; with keys (from this file,
+/// FLARE_STEERING_API_KEYS and FLARE_STEERING_API_KEYS_FILE together), a request with a nonzero
+/// `steering_scale` must carry one in `X-Steering-Key` or `Authorization: Bearer`, or is refused
+/// with 403.
+#[derive(Debug, Args, Clone, Default, PartialEq)]
+pub struct SteeringAccessOptions {
+    /// File of steering keys, one per line or comma-separated ('#' starts a comment line); must
+    /// hold at least one key. Keys are never taken on the command line (they would show in the
+    /// process list) [default: FLARE_STEERING_API_KEYS_FILE; none = any client may steer].
+    #[arg(long, value_name = "PATH", help_heading = "Serving options")]
+    pub steering_api_keys_file: Option<PathBuf>,
+}
+
+/// Read by rank zero's `flare run` when `--scheduler-prefill-merge-min-rows` is absent.
+pub const PREFILL_MERGE_ENV: &str = "FLARE_SCHEDULER_PREFILL_MERGE_MIN_ROWS";
+
+impl SchedulerOptions {
+    fn values(&self) -> [(&'static str, Option<serde_json::Value>); 13] {
+        [
+            ("output_token_value", self.scheduler_output_token_value.map(Into::into)),
+            ("token_fairness", self.scheduler_token_fairness.map(Into::into)),
+            ("delivery_fairness", self.scheduler_delivery_fairness.map(Into::into)),
+            ("decode_age_price", self.scheduler_decode_age_price.map(Into::into)),
+            ("adaptation_ms", self.scheduler_adaptation_ms.map(Into::into)),
+            ("ttft_target_ms", self.scheduler_ttft_target_ms.map(Into::into)),
+            ("ttft_max_chunk", self.scheduler_ttft_max_chunk.map(Into::into)),
+            ("ttft_decode_interleave", self.scheduler_ttft_decode_interleave.map(Into::into)),
+            ("ttft_order", self.scheduler_ttft_order.as_deref().map(Into::into)),
+            ("prefill_tail_merge", self.scheduler_prefill_tail_merge.as_deref().map(|mode| match mode {
+                "true" => true.into(),
+                "false" => false.into(),
+                mode => mode.into(),
+            })),
+            ("eager_message_offers", self.scheduler_eager_message_offers.map(Into::into)),
+            ("prefill_merge_min_rows", self.scheduler_prefill_merge_min_rows.map(Into::into)),
+            ("encoder_prefill", self.scheduler_encoder_prefill.map(Into::into)),
+        ]
+    }
+
+    /// Takes `--scheduler-prefill-merge-min-rows` from `value` (the `PREFILL_MERGE_ENV`
+    /// environment variable) when the flag is absent; true when the environment set it.
+    pub fn apply_environment(&mut self, value: Option<&str>) -> Result<bool, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(false);
+        };
+        if self.scheduler_prefill_merge_min_rows.is_some() {
+            return Ok(false);
+        }
+        let rows = value.parse().map_err(|_| format!("{PREFILL_MERGE_ENV} must be a nonnegative integer, got {value:?}"))?;
+        self.scheduler_prefill_merge_min_rows = Some(rows);
+        Ok(true)
+    }
+
+    /// The equivalent command-line flags, for forwarding to rank zero.
+    pub fn options(&self) -> Vec<String> {
+        self.values().into_iter()
+            .filter_map(|(name, value)| value.map(|value| [format!("--scheduler-{}", name.replace('_', "-")),
+                value.as_str().map_or_else(|| value.to_string(), str::to_owned)]))
+            .flatten()
+            .collect()
+    }
+
+    /// Writes the given values as `scheduler_*` server configuration keys.
+    pub fn configure(&self, config: &mut serde_json::Value) {
+        for (name, value) in self.values() {
+            if let Some(value) = value {
+                config[format!("scheduler_{name}")] = value;
+            }
+        }
+    }
 }
 
 /// Options that select a core's trust, loading, speculation and caching; every rank of a
@@ -858,6 +1049,14 @@ pub struct ServingOptions {
         help_heading = "Serving options"
     )]
     pub memory_limit: Option<MemoryLimit>,
+
+    /// Advanced: CUDA per-thread stack limit in bytes, replacing the limit the core recorded
+    /// (1024 on exported cores). The driver reserves this much local memory for every thread the
+    /// GPU can hold resident, so a smaller limit leaves more memory for the KV cache. The load
+    /// refuses a value below the largest stack of any kernel the core registers
+    /// [default: FLARE_CUDA_STACK_LIMIT, then the recorded limit].
+    #[arg(long, value_name = "BYTES", value_parser = parse_stack_limit, help_heading = "Serving options")]
+    pub cuda_stack_limit: Option<usize>,
 
     /// Route RoCE rails and fabric transfers only over subnets every rank holds, as on a switch
     /// alone, leaving direct cables between ranks unused.
@@ -921,6 +1120,10 @@ pub struct ServingOptions {
     )]
     pub no_history_drafts: bool,
 
+    /// Serve prompts and decoding in separate rounds even when the package captured mixed graphs.
+    #[arg(long, help_heading = "Speculation options")]
+    pub no_mixed_prefill: bool,
+
     /// Advanced: fix the total verification-row budget, including pending inputs, using
     /// one exact captured packed graph per batch [default: adaptive within captured capacities].
     /// Requires adaptive prefix selection at the captured draft depth.
@@ -954,10 +1157,12 @@ pub struct ServingOptions {
     )]
     pub no_mtp_adaptive_verification: bool,
 
-    /// Exponent on completed prefix-survival scores; below 1 favors longer prefixes [default: 1.0].
+    /// Exponent on completed prefix-survival scores, or a comma-separated `max_batch:alpha`
+    /// schedule with ascending batch limits (e.g. `8:0.8,16:0.55`); below 1 favors longer
+    /// prefixes [default: 1.0].
     #[arg(long, value_name = "ALPHA", value_parser = verification_alpha,
         help_heading = "Advanced speculation options")]
-    pub mtp_adaptive_verification_alpha: Option<f64>,
+    pub mtp_adaptive_verification_alpha: Option<AdaptiveVerificationAlpha>,
 
     /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
     /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
@@ -1020,12 +1225,52 @@ fn checkpoint_extra_work_fraction(value: &str) -> Result<f64, String> {
         .ok_or_else(|| "checkpoint extra work fraction must be finite and between zero and one".into())
 }
 
-fn verification_alpha(value: &str) -> Result<f64, String> {
-    value
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| "adaptive verification alpha must be finite and greater than zero".into())
+fn scheduler_positive(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "scheduler coefficient must be finite and positive".into())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdaptiveVerificationAlpha {
+    Scalar(f64),
+    Schedule(Vec<(usize, f64)>),
+}
+
+impl AdaptiveVerificationAlpha {
+    pub fn to_json_value(&self) -> serde_json::Value {
+        match self {
+            Self::Scalar(alpha) => serde_json::Value::from(*alpha),
+            Self::Schedule(_) => serde_json::Value::String(self.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for AdaptiveVerificationAlpha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scalar(alpha) => write!(f, "{alpha}"),
+            Self::Schedule(entries) => {
+                for (index, (max_batch, alpha)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{max_batch}:{alpha}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn verification_alpha(value: &str) -> Result<AdaptiveVerificationAlpha, String> {
+    let (alpha, schedule) =
+        flare_helios::scheduler::PolicyConfig::parse_adaptive_verification_alpha(value)?;
+    if schedule.is_empty() {
+        Ok(AdaptiveVerificationAlpha::Scalar(alpha))
+    } else {
+        Ok(AdaptiveVerificationAlpha::Schedule(schedule))
+    }
 }
 
 impl std::ops::Deref for Run {
@@ -1070,6 +1315,9 @@ impl ServingOptions {
         if let Some(limit) = self.memory_limit {
             options.push(format!("--memory-limit={limit}"));
         }
+        if let Some(bytes) = self.cuda_stack_limit {
+            options.extend(["--cuda-stack-limit".into(), bytes.to_string()]);
+        }
         match shape {
             Shape::Mesh => {}
             Shape::Ring => options.push("--roce-ring".into()),
@@ -1093,6 +1341,9 @@ impl ServingOptions {
         if self.no_history_drafts {
             options.push("--no-history-drafts".into());
         }
+        if self.no_mixed_prefill {
+            options.push("--no-mixed-prefill".into());
+        }
         if let Some(n) = self.mtp_verification_token_budget {
             options.extend(["--mtp-verification-token-budget".into(), n.to_string()]);
         }
@@ -1105,7 +1356,7 @@ impl ServingOptions {
         if self.no_mtp_adaptive_verification {
             options.push("--no-mtp-adaptive-verification".into());
         }
-        if let Some(alpha) = self.mtp_adaptive_verification_alpha {
+        if let Some(alpha) = &self.mtp_adaptive_verification_alpha {
             options.extend([
                 "--mtp-adaptive-verification-alpha".into(),
                 alpha.to_string(),
@@ -1177,6 +1428,8 @@ impl ServingOptions {
             kv_cache_limit: self.kv_cache_limit,
             memory_limit: self.memory_limit,
             embedding_table_storage: self.embedding_table_storage,
+            // Per-table storage has no CLI flag yet; Helios applies the legacy env shim at load.
+            embedding_table_storage_per_table: None,
             embedding_table_cache_bytes: self.embedding_table_cache_size,
             embedding_table_resident_scales: if self.embedding_table_resident_scales {
                 Some(true)
@@ -1188,6 +1441,8 @@ impl ServingOptions {
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
+            no_mixed_prefill: self.no_mixed_prefill,
+            cuda_stack_limit: self.cuda_stack_limit,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {
@@ -1360,7 +1615,7 @@ mod tests {
             );
             assert_eq!(
                 effective.mtp_adaptive_verification_alpha,
-                Some(if explicit { 1.0 } else { 0.5 })
+                Some(AdaptiveVerificationAlpha::Scalar(if explicit { 1.0 } else { 0.5 }))
             );
             assert_eq!(
                 effective.host.to_string(),
@@ -1893,7 +2148,7 @@ mod tests {
             ]);
             assert_eq!(
                 args.mtp_adaptive_verification_alpha,
-                Some(value.parse().unwrap())
+                Some(AdaptiveVerificationAlpha::Scalar(value.parse().unwrap()))
             );
             let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
             forwarded.extend(args.rank_options());

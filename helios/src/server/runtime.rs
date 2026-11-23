@@ -30,6 +30,10 @@ pub struct Prompt {
     pub tokens: Vec<u32>,
     /// Sorted token counts of exact rendered message prefixes.
     pub message_boundaries: Vec<usize>,
+    /// The rendered chat prompt includes tool definitions (prefill tail merge tools-only rule).
+    pub tools: bool,
+    /// The generation prompt opens a reasoning block (`RequestSpec::reasoning_prompt`).
+    pub reasoning_prompt: bool,
     pub data: crate::model::PromptData,
     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
     pub conditioning: Vec<ConditioningEvent>,
@@ -253,6 +257,8 @@ impl Incoming {
             host_stops: self.prompt.has_host_stops(),
             prompt_logprobs: self.prompt_scored < self.prompt_score_end,
             growable_output: true,
+            tools: self.prompt.tools,
+            reasoning_prompt: self.prompt.reasoning_prompt,
         }
     }
 
@@ -601,7 +607,8 @@ impl ModelRuntime {
                     }
                 };
                 if let Err(error) = scheduler
-                    .graph_durations(&executor.manifest().graphs)
+                    // TP3 fork: context variants share their base's shape (cost key): base graphs only.
+                    .graph_durations(&crate::model::catalog::scheduling_graphs(&executor.manifest().graphs))
                     .and_then(|()| scheduler.configure_policy(policy))
                     .and_then(|()| match &executor.manifest().cache {
                         Some(cache) if !cache.snapshot_pages.is_empty() => {
@@ -625,47 +632,7 @@ impl ModelRuntime {
                     .and_then(|()| {
                         scheduler.fixed_speculative_width(worker_config.speculative_fixed_width)
                     })
-                    .and_then(|()| {
-                        scheduler.mixed_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|g| g.kind == GraphKind::Mixed)
-                                .map(|g| (g.batch_capacity, g.token_capacity, g.prefill_capacity))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .and_then(|()| {
-                        scheduler.scored_prefill_graphs(&executor.manifest().graphs.iter()
-                            .filter(|g| g.kind == GraphKind::ScoredPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
-                        scheduler.prefill_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|graph| graph.kind == crate::execution::GraphKind::Prefill)
-                                .map(|graph| graph.token_capacity)
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .and_then(|()| {
-                        scheduler.speculative_graphs(
-                            &executor
-                                .manifest()
-                                .graphs
-                                .iter()
-                                .filter(|graph| {
-                                    matches!(
-                                        graph.kind,
-                                        GraphKind::Speculative
-                                    )
-                                })
-                                .map(|graph| (graph.batch_capacity, graph.token_capacity))
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .into_iter().collect::<Vec<_>>(),
-                        )
-                    })
+                    .and_then(|()| scheduler.shape_catalogs(&executor.manifest().graphs))
                 {
                     let _ = ready_tx.send(Err(error.clone()));
                     let mut shutdown = executor.close();
@@ -1038,6 +1005,10 @@ impl Drop for ImagePreparation {
     }
 }
 
+/// TP3 fork (perf/engram-readahead).
+mod read_ahead;
+use read_ahead::ReadAhead;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CopyoutResources {
     completed: crate::cache::Fence,
@@ -1075,6 +1046,9 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    /// TP3 fork (perf/engram-readahead): Some only when a disk-backed Engram table reads ahead
+    /// (FLARE_ENGRAM_READ_AHEAD=1); None with every table in RAM, so `submit` does nothing more.
+    read_ahead: Option<ReadAhead>,
 }
 
 impl<'a> Worker<'a> {
@@ -1108,6 +1082,7 @@ impl<'a> Worker<'a> {
             inputs: None,
             prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
+            read_ahead: None,
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
@@ -1115,14 +1090,22 @@ impl<'a> Worker<'a> {
     }
 
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
+        crate::os::pin_current_thread(0);
         // Input construction stays inside the worker's unwind and drain boundary.
         self.inputs = Some(crate::model::Inputs::new(self.config, executor.manifest())?);
+        self.read_ahead = executor
+            .manifest()
+            .engram
+            .as_ref()
+            .and_then(|binding| ReadAhead::new(&binding.shared, self.config.limits.max_active));
+        let mut idle_polls = 0u32;
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
             };
             if let Some(completion) = executor.poll()? {
                 let kind = executor.manifest().graphs[completion.graph_index].kind;
+                // TP3 fork: an encoder-only twin completes its Prefill step (checked in `complete`).
                 self.complete(kind, completion)?;
                 progress = true;
             }
@@ -1161,14 +1144,21 @@ impl<'a> Worker<'a> {
                     }),
                 }
             });
-            if !progress {
+            if progress {
+                idle_polls = 0;
+            } else {
                 if executor.outstanding() > 0 {
-                    // A park is bounded; the yield keeps the old loop's cooperative handoff.
+                    // A park is bounded; spin briefly before cooperative yield to cut kernel sched_yield overhead.
                     if !executor.park() {
                         std::hint::spin_loop();
                     }
-                    thread::yield_now();
+                    idle_polls += 1;
+                    if idle_polls >= 64 {
+                        idle_polls = 0;
+                        thread::yield_now();
+                    }
                 } else {
+                    idle_polls = 0;
                     self.scheduler.idle()?;
                     let wait = self.idle_wait();
                     match self.receiver.recv_timeout(wait) {
@@ -1613,6 +1603,12 @@ impl<'a> Worker<'a> {
         let completed_at_ns = super::observation::monotonic_ns();
         self.scheduler.advance_to(completed_at_ns)?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
+        // TP3 fork: the encoder-only twin of a prefill graph completes the Prefill step it was
+        // submitted for, and only a step committed as encoder-only may run it.
+        if (kind == GraphKind::EncoderPrefill) != self.scheduler.submitted_encoder(completion.fence)? {
+            return Err("completion graph and the step's encoder-only decision differ".into());
+        }
+        let kind = if kind == GraphKind::EncoderPrefill { GraphKind::Prefill } else { kind };
         let selection = self.scheduler.submitted_timing(completion.fence)?;
         if measured_step.kind != kind {
             return Err("completion graph kind differs from submitted step".into());
@@ -2218,10 +2214,15 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         validate_sampling_admissions(step, &self.admissions)?;
+        let fence = executor.next_fence()?;
+        self.reserve_and_pack(step, fence)?;
+        // TP3 fork: an eligible non-final chunk runs its prefill graph's encoder-only twin. The
+        // scheduler decides once, in `commit`; the graph follows that record.
+        let kind = if self.scheduler.submitted_encoder(fence)? { GraphKind::EncoderPrefill } else { step.kind };
         let graph = crate::model::catalog::select_shape_with_drafts(
             self.config,
             executor.manifest(),
-            step.kind,
+            kind,
             step.batch_capacity,
             step.token_capacity,
             step.prefill_capacity(),
@@ -2229,9 +2230,24 @@ impl<'a> Worker<'a> {
             step.draft_tokens,
             SamplingMode::General,
         )?;
-        let fence = executor.next_fence()?;
-        self.reserve_and_pack(step, fence)?;
+        // TP3 fork (DS41 tp3.index_row_split_min_context): a one-lane prefill chunk that starts at
+        // or past a context variant's minimum runs that variant (same shape and uploads).
+        let graph = match (kind, step.lanes.as_slice()) {
+            (GraphKind::Prefill | GraphKind::EncoderPrefill, [lane]) if step.mixed.is_none() => {
+                let variant = crate::model::catalog::select_context_variant(executor.manifest(), graph, lane.start_position);
+                if variant != graph {
+                    self.scheduler.record_context_variant(lane.tokens);
+                }
+                variant
+            }
+            _ => graph,
+        };
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
+        // TP3 fork (perf/engram-readahead): before the launch, so the readers start while the
+        // previous step still replays. A no-op unless a disk-backed table reads ahead.
+        if let Some(read_ahead) = &mut self.read_ahead {
+            read_ahead.submit(step, fence.0, &self.scheduler, &self.admissions);
+        }
         if step
             .lanes
             .iter()
@@ -2305,6 +2321,7 @@ impl<'a> Worker<'a> {
         if executor.submit(
             graph,
             &uploads,
+            self.scheduler.cleared_pages(fence)?,
             feedback,
         )? != Some(fence)
         {
@@ -3115,6 +3132,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         };
         let constrained = scheduler.admit(spec(7, true)).unwrap();
         assert_eq!(
@@ -3181,6 +3200,8 @@ mod tests {
             prompt: Prompt {
                 tokens: vec![7],
                 message_boundaries: vec![],
+                tools: false,
+                reasoning_prompt: false,
                 data: PromptData {
                     positions: vec![[0; 3]],
                     vision_token_indices: vec![-1],
@@ -3379,6 +3400,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         }
     }
 
@@ -3894,6 +3917,8 @@ mod tests {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         };
         let active = scheduler.admit(spec()).unwrap();
         let rejected = scheduler.admit(spec()).unwrap_err();

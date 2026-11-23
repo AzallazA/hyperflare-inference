@@ -187,7 +187,7 @@ impl RequestScheduler {
                 );
             }
         } else {
-            let mut curve = None;
+            let mut curve: Option<(u64, Vec<f64>)> = None;
             for batch in crate::execution::BATCH_CAPACITIES {
                 if batch > self.limits.max_active.next_power_of_two() {
                     break;
@@ -198,15 +198,18 @@ impl RequestScheduler {
                     if self.speculative_widths.is_empty() {
                         consider(GraphKind::Decode, batch, 1, 1.0, true);
                     } else {
+                        let alpha_bits = self.policy.alpha_for_batch(batch).to_bits();
                         for &width in &self.speculative_catalog[batch.ilog2() as usize] {
                             let tokens = self.speculative_tokens(request, width);
                             if tokens > 0 {
-                                let curve = curve.get_or_insert_with(|| self.powered_curve(request, false));
+                                if curve.as_ref().is_none_or(|(bits, _)| *bits != alpha_bits) {
+                                    curve = Some((alpha_bits, self.powered_curve(request, batch, false)));
+                                }
                                 consider(
                                     GraphKind::Speculative,
                                     batch,
                                     width,
-                                    super::rounds::forecast_tokens(curve, tokens),
+                                    super::rounds::forecast_tokens(&curve.as_ref().unwrap().1, tokens),
                                     true,
                                 );
                             }

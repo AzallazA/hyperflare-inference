@@ -32,8 +32,12 @@ class GraphSignature:
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
-                             "vision", "speculative", "mixed"):
+                             "vision", "speculative", "mixed", "encoder_prefill"):
             raise ValueError("unknown prepared graph operation")
+        if self.kind == "encoder_prefill" and (self.batch_capacity != 1 or self.token_capacity <= 128
+                                               or self.token_capacity % 64):
+            # TP3 fork: the encoder-only twin of a prefill graph (no decoder suffix, head or sampling).
+            raise ValueError("encoder-only prefill requires one aligned prompt chunk above the decoder window")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1
                 or self.token_capacity < 64 or self.token_capacity % 64
                 or "prompt_target_tokens" not in self.inputs):

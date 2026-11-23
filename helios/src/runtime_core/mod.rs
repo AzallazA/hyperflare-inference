@@ -22,6 +22,8 @@ mod format;
 #[cfg(any(windows, test))]
 mod host;
 mod limits;
+mod stack_limit;
+pub use stack_limit::{STACK_LIMIT_ENV, parse_stack_limit};
 mod metadata;
 #[cfg(test)]
 mod programmatic_edge_tests;
@@ -29,6 +31,7 @@ pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
+pub mod plan;
 mod peer_access;
 mod persistent_worker;
 pub use persistent_worker::WorkerState;
@@ -64,7 +67,7 @@ pub use model::{
     CacheAgreement, ClusterRank, NativeModel, RankNeeds, RoceSpec, core_cluster, rank_needs,
     rank_ranges, reserve_bytes,
 };
-pub use selection::LoadOptions;
+pub use selection::{EmbeddingTableStorage, EmbeddingTableStorageSpec, LoadOptions, TableSelector};
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -112,6 +115,9 @@ pub struct NativeResources {
     integrated: bool,
     events: HashMap<String, Handle>,
     cache: Option<flare_selene::CacheGeometry>,
+    /// Largest per-thread stack requirement (bytes, kernel) among the registered kernels, read
+    /// from the module images by `prepare_kernels`; consulted only under a stack-limit override.
+    kernel_stack: std::result::Result<(u64, String), String>,
     #[cfg(windows)]
     host_mappings: Vec<(u64, usize)>,
     green_partition: Option<persistent_worker::GreenContextPartition>,
@@ -408,6 +414,7 @@ impl NativeResources {
                 integrated: integrated != 0,
                 events: HashMap::new(),
                 cache: None,
+                kernel_stack: Err("kernels are not prepared".into()),
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
                 green_partition: None,
@@ -527,7 +534,7 @@ impl NativeResources {
                             .is_some_and(|a| a.nbytes > 0)
                 })
                 .try_fold(0usize, |total, allocation| {
-                    total.checked_add(allocation.nbytes)
+                    total.checked_add(mixed_device_bytes(allocation).unwrap_or(allocation.nbytes))
                 })
                 .ok_or_else(|| invalid("core device footprint overflows address space"))?;
             let free = self.available_memory()?;
@@ -563,29 +570,45 @@ impl NativeResources {
                 let address = if let Some(address) = allocation.address {
                     match allocation.memory {
                         Memory::Device => {
-                            let properties = AllocationProperties {
-                                kind: 1,
-                                handles: 0,
-                                location: Location {
-                                    kind: 1,
-                                    device: self.device,
-                                },
-                                windows: null_mut(),
-                                flags: [0; 8],
-                            };
-                            let mut physical = 0;
-                            driver.check(
-                                "cuMemCreate",
-                                (driver.physical_create)(
-                                    &mut physical,
-                                    allocation.nbytes,
-                                    &properties,
-                                    0,
+                            // TP3 merged expert banks (`mixed-<index>-<device bytes>`): the prefix is
+                            // device memory and the rest pinned host-NUMA memory, mapped contiguously.
+                            let device_bytes =
+                                mixed_device_bytes(allocation).unwrap_or(allocation.nbytes);
+                            let mut numa = 0;
+                            if device_bytes < allocation.nbytes {
+                                driver.check(
+                                    "cuDeviceGetAttribute",
+                                    (driver.device_attribute)(&mut numa, 134, self.device),
+                                )?;
+                            }
+                            for (offset, nbytes, location) in [
+                                (0, device_bytes, Location { kind: 1, device: self.device }),
+                                (
+                                    device_bytes,
+                                    allocation.nbytes - device_bytes,
+                                    Location { kind: 3, device: numa.max(0) },
                                 ),
-                            )?;
-                            let mapped = (driver.map)(address, allocation.nbytes, 0, physical, 0);
-                            (driver.physical_release)(physical);
-                            driver.check("cuMemMap", mapped)?;
+                            ] {
+                                if nbytes == 0 {
+                                    continue;
+                                }
+                                let properties = AllocationProperties {
+                                    kind: 1,
+                                    handles: 0,
+                                    location,
+                                    windows: null_mut(),
+                                    flags: [0; 8],
+                                };
+                                let mut physical = 0;
+                                driver.check(
+                                    "cuMemCreate",
+                                    (driver.physical_create)(&mut physical, nbytes, &properties, 0),
+                                )?;
+                                let mapped =
+                                    (driver.map)(address + offset as u64, nbytes, 0, physical, 0);
+                                (driver.physical_release)(physical);
+                                driver.check("cuMemMap", mapped)?;
+                            }
                         }
                         Memory::MappedHost => {
                             #[cfg(unix)]
@@ -642,7 +665,18 @@ impl NativeResources {
                         mappings: if allocation.address.is_some()
                             && matches!(allocation.memory, Memory::Device)
                         {
-                            vec![(address, allocation.nbytes)]
+                            // Each half of a mixed bank is its own VMM mapping, and #286 grants
+                            // access per mapping (a zero-byte VRAM prefix maps nothing).
+                            match mixed_device_bytes(allocation) {
+                                Some(device) if device < allocation.nbytes => [
+                                    (address, device),
+                                    (address + device as u64, allocation.nbytes - device),
+                                ]
+                                .into_iter()
+                                .filter(|&(_, bytes)| bytes > 0)
+                                .collect(),
+                                _ => vec![(address, allocation.nbytes)],
+                            }
                         } else {
                             Vec::new()
                         },
@@ -728,6 +762,7 @@ impl NativeResources {
         phase: &Phase,
     ) -> Result<()> {
         let driver = self.driver.clone();
+        let mut stack_needs = HashMap::new();
         unsafe {
             // Configure recorded limits and Green Context partitions after VA
             // reservations and mappings so cuCtxSetLimit cannot claim core VA.
@@ -757,6 +792,7 @@ impl NativeResources {
                 if !image.starts_with(b"\x7fELF") {
                     return Err(invalid("module image is not a compiled cubin"));
                 }
+                stack_needs.insert(&module.name, stack_limit::kernel_stack_needs(&image));
                 let mut handle = null_mut();
                 driver.check(
                     "cuModuleLoadData",
@@ -826,7 +862,22 @@ impl NativeResources {
                 phase.advance(1);
             }
         }
+        self.kernel_stack = stack_limit::registered_stack_need(core.functions.iter().map(
+            |function| {
+                (
+                    function.symbol.as_str(),
+                    stack_needs[&function.module].as_ref(),
+                )
+            },
+        ));
         Ok(())
+    }
+
+    /// Refuse a CUDA stack-limit override below the largest stack of this rank's kernels;
+    /// returns that largest stack in bytes.
+    pub(super) fn check_stack_limit(&self, limit: usize) -> Result<u64> {
+        stack_limit::check_stack_limit(limit, self.rank, &self.kernel_stack)?;
+        Ok(self.kernel_stack.as_ref().map(|(bytes, _)| *bytes).unwrap_or(0))
     }
 
     unsafe fn prepare_graphs<F: payload::Files>(
@@ -1490,4 +1541,18 @@ unsafe fn apply_context_settings(
         }
         configured
     }
+}
+
+/// TP3 merged expert bank (`mixed-<index>-<device bytes>`): device bytes of a VRAM/host-NUMA allocation.
+fn mixed_device_bytes(allocation: &format::Allocation) -> Option<usize> {
+    mixed_device_bytes_named(&allocation.name, allocation.nbytes as u64).map(|bytes| bytes as usize)
+}
+
+/// Same, from an allocation name and size (wire bundle indexes carry names, not `format::Allocation`s).
+/// A declared device prefix larger than the allocation is rejected (treated as a plain device allocation)
+/// instead of underflowing the host tail size.
+pub(super) fn mixed_device_bytes_named(name: &str, nbytes: u64) -> Option<u64> {
+    let rest = name.strip_prefix("mixed-")?;
+    let bytes: u64 = rest.rsplit_once('-')?.1.parse().ok()?;
+    (bytes <= nbytes).then_some(bytes)
 }
