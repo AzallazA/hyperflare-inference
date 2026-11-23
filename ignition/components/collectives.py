@@ -69,6 +69,19 @@ def _fake_all_reduce(source, output, handle):
     pass
 
 
+@torch.library.custom_op("flare::pcie_all_reduce_addend", mutates_args=("output",))
+def _all_reduce_addend(source: torch.Tensor, addend: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
+    owner.runtime.all_reduce(source, out=output, addend=addend, plan=owner.plan)
+
+
+@_all_reduce_addend.register_fake
+def _fake_all_reduce_addend(source, addend, output, handle):
+    pass
+
+
 @torch.library.custom_op("flare::pcie_all_reduce_dep", mutates_args=("output",))
 def _all_reduce_dep(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor], handle: int) -> None:
     owner = _OWNERS[handle]
@@ -174,11 +187,12 @@ class PreparedAllReduce:
     runtime until every rank has drained native replay.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, has_addend=False):
         import torch.distributed as dist
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        self.fused_addend = False
         startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
@@ -249,8 +263,12 @@ class PreparedAllReduce:
                     submode=mode, active_blocks=initial_active))
                 if cluster_size > 1:
                     plan_options["joint_cluster_size"] = cluster_size
+                if has_addend:
+                    plan_options["joint_has_addend"] = True
+                    self.fused_addend = True
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
+            zero_addend = torch.zeros_like(source) if self.fused_addend else None
 
             def prepare(state):
                 if state.query.surface == "PCIeTwoShotBF16.all_reduce":
@@ -258,8 +276,12 @@ class PreparedAllReduce:
 
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
-                return PreparedCall(run=lambda: state.run_plain(source, output),
-                                    output=output, owners=(runtime,))
+                return PreparedCall(
+                    run=((lambda: state.run_plain(source, output, addend=zero_addend))
+                         if zero_addend is not None else (lambda: state.run_plain(source, output))),
+                    output=output,
+                    owners=(runtime,) if zero_addend is None else (runtime, zero_addend),
+                )
 
         ranks = tuple(dist.get_process_group_ranks(group))
         request = self.plan.request(name=name, prepare_call=prepare,
@@ -278,18 +300,26 @@ class PreparedAllReduce:
             self.output = None
         return self
 
-    def __call__(self, source, output=None, *, dependencies=()):
+    def __call__(self, source, output=None, *, dependencies=(), addend=None):
         if output is None:
             output = self.output
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
-            output.copy_(source)
-        elif dependencies:
-            _all_reduce_dep(source, output, list(dependencies), self.handle)
+            if addend is not None:
+                torch.add(source, addend, out=output)
+            else:
+                output.copy_(source)
+        elif addend is not None and self.fused_addend and not dependencies:
+            _all_reduce_addend(source, addend, output, self.handle)
         else:
-            _all_reduce(source, output, self.handle)
+            if addend is not None:
+                source = source + addend
+            if dependencies:
+                _all_reduce_dep(source, output, list(dependencies), self.handle)
+            else:
+                _all_reduce(source, output, self.handle)
         return output
 
 
@@ -356,12 +386,18 @@ class PreparedChunkedAllReduce:
         elif runtime is not None:
             from b12x.comm import pcie
 
-            # One-shot pools answer through their stream channel; hierarchical runtimes directly.
-            accepts = (runtime.for_stream().should_allreduce
-                       if not isinstance(runtime, pcie.DmaAllReduce) and runtime.algorithm == "oneshot"
-                       else runtime.should_allreduce)
-            while step > 1 and not accepts(source[:step]):
-                step = (step + 1) // 2
+            if isinstance(runtime, pcie.DmaAllReduce):
+                row_bytes = source[0].numel() * source.element_size()
+                step = min(rows, runtime.max_bytes // row_bytes)
+                while step > 1 and not runtime.should_allreduce(source[:step]):
+                    step -= 1
+            else:
+                # One-shot pools answer through their stream channel; hierarchical runtimes directly.
+                accepts = (runtime.for_stream().should_allreduce
+                           if runtime.algorithm == "oneshot"
+                           else runtime.should_allreduce)
+                while step > 1 and not accepts(source[:step]):
+                    step = (step + 1) // 2
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]
         self.parts = [PreparedAllReduce(source[begin:end], output[begin:end], runtime=runtime, session=session,
                                         coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}")
@@ -557,19 +593,23 @@ def _gather_transport_view(tensor):
     return tensor.view(torch.bfloat16) if tensor.dtype == torch.float32 else tensor
 
 
-def _gather_columns(source, output, handle):
-    source, output = _gather_transport_view(source), _gather_transport_view(output)
+def _gather_columns(source, output, handle, gate=None):
     owner = _OWNERS[handle]
     from ignition.preparation.startup_tuning import record_consumer
     record_consumer(owner)
     runtime = owner.runtime
+    if owner.dma:
+        runtime.all_gather(source, out=output, plan=owner.plan)
+        return
+    source, output = _gather_transport_view(source), _gather_transport_view(output)
     if owner.roce:
         runtime.all_gather(source, dim=-1, out=output, plan=owner.plan)
         return
+    kwargs = {} if gate is None else {"gate": gate}
     runtime.all_gather_heads(
         source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
         out=output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim),
-        plan=owner.plan)
+        plan=owner.plan, **kwargs)
 
 
 @torch.library.custom_op("flare::pcie_all_gather", mutates_args=("output",))
@@ -579,6 +619,17 @@ def _all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[t
 
 @_all_gather.register_fake
 def _fake_all_gather(source, output, dependencies, handle):
+    pass
+
+
+@torch.library.custom_op("flare::pcie_all_gather_gated", mutates_args=("output",))
+def _all_gather_gated(source: torch.Tensor, gate: torch.Tensor, output: torch.Tensor,
+                      dependencies: list[torch.Tensor], handle: int) -> None:
+    _gather_columns(source, output, handle, gate=gate)
+
+
+@_all_gather_gated.register_fake
+def _fake_all_gather_gated(source, gate, output, dependencies, handle):
     pass
 
 
@@ -830,18 +881,42 @@ class PreparedAllGather:
     Dependencies order storage writes before the collective publishes them to peers.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name, dependencies=()):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, dependencies=(), has_gate=False):
         import torch.distributed as dist
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
         self.dependencies = list(dependencies)
+        self.gated = False
+        self.roce = False
+        self.dma = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
         if runtime is None:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank gather copies its source into a matching output")
+            return
+        self.dma = isinstance(runtime, pcie.DmaAllReduce)
+        if self.dma:
+            if (not runtime.should_all_gather(source)
+                    or tuple(output.shape) != (runtime.world_size, *source.shape)
+                    or output.dtype != source.dtype or output.device != source.device
+                    or not output.is_contiguous()):
+                raise ValueError("DMA all-gather requires contiguous aligned input within shard capacity "
+                                 "and matching [world, *source] output")
+            from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+            self.plan = pcie.plan(query_from_metadata(runtime, shape=tuple(output.shape), dtype=output.dtype),
+                                  runtime=runtime)
+            ranks = tuple(dist.get_process_group_ranks(runtime.group))
+            declare(session, (self.plan.request(name=name,
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run_all_gather(source, out=output),
+                    output=output, owners=(runtime,)),
+                collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+            self.handle = next(_HANDLES)
+            _OWNERS[self.handle] = self
             return
         if (source.ndim != 2 or source.dtype not in (torch.bfloat16, torch.float32, torch.float8_e4m3fn)
                 or output.dtype != source.dtype or not source.is_contiguous() or not output.is_contiguous()):
@@ -893,16 +968,22 @@ class PreparedAllGather:
                     world_size=runtime.world_size, capability=torch.cuda.get_device_capability(source.device))
                 self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
                 self.runtime_cache_policy = ladder["cache_policy"]
+                transport = row["implementation"].removeprefix("gather_")
+                use_gate = bool(has_gate and transport in ("joint", "selected_barrier", "selected_word_exchange"))
+                extra = {"has_gate": True} if use_gate else {}
                 query = replace(query, call=FrozenMapping(dict(query.call,
-                    gather_transport=row["implementation"].removeprefix("gather_"),
+                    gather_transport=transport,
                     threads=row["threads"], block_limit=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1)))
+                    submode=self.runtime_profiles[0][0], active_blocks=1, **extra)))
+                self.gated = use_gate
                 startup = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
+        one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if self.gated else None
+        prepare_call_kwargs = call if one_gate is None else {**call, "gate": one_gate}
         declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: PreparedCall(run=lambda: state.run(**call), output=output,
-                                                    owners=(runtime,)),
+            prepare_call=lambda state: PreparedCall(run=lambda: state.run(**prepare_call_kwargs), output=output,
+                                                    owners=(runtime,) if one_gate is None else (runtime, one_gate)),
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         if startup:
             from ignition.preparation.startup_tuning import register_collective
@@ -918,7 +999,7 @@ class PreparedAllGather:
         self.dependencies = []
         return self
 
-    def __call__(self, source, output=None, *, dependencies=()):
+    def __call__(self, source, output=None, *, dependencies=(), gate=None):
         if output is None:
             output = self.output
         if output is None:
@@ -926,6 +1007,8 @@ class PreparedAllGather:
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
             output.copy_(source)
+        elif self.gated and gate is not None:
+            _all_gather_gated(source, gate, output, [*self.dependencies, *dependencies], self.handle)
         else:
             _all_gather(source, output, [*self.dependencies, *dependencies], self.handle)
         return output
