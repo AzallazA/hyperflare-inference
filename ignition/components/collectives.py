@@ -276,12 +276,11 @@ class PreparedAllReduce:
 
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
-                zero_addend = torch.zeros_like(source) if fused_addend else None
                 return PreparedCall(
-                    run=((lambda: state.run_plain(source, output, addend=zero_addend))
-                         if zero_addend is not None else (lambda: state.run_plain(source, output))),
+                    run=((lambda: state.run_plain(source, output, addend=source))
+                         if fused_addend else (lambda: state.run_plain(source, output))),
                     output=output,
-                    owners=(runtime,) if zero_addend is None else (runtime, zero_addend),
+                    owners=(runtime,),
                 )
 
         ranks = tuple(dist.get_process_group_ranks(group))
