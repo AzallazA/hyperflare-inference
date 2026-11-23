@@ -209,9 +209,10 @@ and gives the tail page count since the nearest offered ancestor. `MemoryStore`,
 implement the trait for serving, `PooledStore` wraps them when a pool is
 attached (section 2.15), and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn HostStore>>`. The trait's remaining methods have
-default bodies: `reused` refreshes a retained record when a request reuses its
-GPU checkpoint, and the export, eviction-notice, and pool-lookup hooks of
-section 2.15 do nothing unless a pooled store overrides them.
+default bodies that do nothing. Local stores implement `reused` to refresh an
+indexed record when its GPU checkpoint is reused at admission or refreshed on
+request completion. Pooled stores implement the export, eviction-notice, and
+pool-lookup hooks of section 2.15.
 
 Three components are shared by the implementations:
 
@@ -522,8 +523,10 @@ usual stop time plus DRAM bytes ÷ measured disk write rate.
 Host record expiry is off by default. Enable it with
 `--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
 positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
-Publication, reuse, restore and child publication refresh the record and its
-required ancestors in memory only. Recovery uses file mtime, from the last write
+With expiry enabled, publication, GPU reuse at admission, request completion,
+restore, and child publication refresh last-use timestamps for the indexed
+record and its required ancestors in memory only. A reuse notice changes the
+LRU position of its named key only. Recovery uses file mtime, from the last write
 when a record was spilled cold or drained. After a restart, a record reused from
 disk but never rewritten may expire up to one max age early. The cost is a
 recompute, never wrong output. With expiry off, hits do not refresh last use;
@@ -678,13 +681,13 @@ disk-only store whose ranks each keep their own records; see
 
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
-outbound results, delivers eviction notices, reports publications through
-`store`, and retries capacity refusals after host progress. The worker then
+outbound results, delivers eviction notices, refreshes checkpoint recency through
+`reused`, reports publications through `store`, and retries capacity refusals
+after host progress. The worker then
 plans and submits model work. Copy-out pins are taken before the next admission, so a
-checkpoint cannot be evicted between submission and its pin. A pooled store
-receives logical eviction notices, including compaction; the scheduler queues
-no notices for a store without a pool. Every store
-call from the worker returns without waiting.
+checkpoint cannot be evicted between submission and its pin. Only pooled stores
+receive logical eviction notices, including compaction. Any attached store can
+receive completion refreshes. Every store call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
@@ -735,8 +738,16 @@ Policy:
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
   admission uses ordinary cache eviction and the cache's pin and retirement fences.
-  A GPU-resident hit refreshes the matching host record's recency. This does not
-  recreate an evicted host copy or protect an endpoint from tree compaction.
+  A GPU hit at admission refreshes the matching host record. On successful
+  terminal publication, the worker reports the terminal's direct parent first,
+  then the terminal itself. Without a terminal publication, completion or a
+  client stop after inference progress reports only the retained prefix.
+  Preemption, execution errors, and cancellation before progress send no
+  completion notice. Each notice changes only the named record's LRU position.
+  Usually the prompt or message boundary is already on the host and the terminal
+  is deferred on the GPU until reuse. An indexed copy-out accepts the notice
+  before its transfer completes; an absent key is ignored. A notice neither
+  recreates a host copy nor protects an endpoint from tree compaction.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
