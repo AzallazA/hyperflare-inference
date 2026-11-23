@@ -194,7 +194,7 @@ def test_single_host_varlen_gather_plans_the_pcie_counted_byte_surface(monkeypat
     assert [request["name"] for request in requests] == ["records"]
 
 
-def test_static_gated_all_gather_enables_selected_barrier(monkeypatch):
+def test_static_gated_all_gather_enables_native_gate(monkeypatch):
     from dataclasses import dataclass
     from b12x.comm import pcie
     from b12x.preparation import FrozenMapping
@@ -204,6 +204,7 @@ def test_static_gated_all_gather_enables_selected_barrier(monkeypatch):
     class FakeQuery:
         call: FrozenMapping
 
+    seen_calls = []
     planned = []
     plan = SimpleNamespace(request=lambda **kwargs: object())
     source = torch.zeros((4, 512), dtype=torch.bfloat16)
@@ -216,7 +217,8 @@ def test_static_gated_all_gather_enables_selected_barrier(monkeypatch):
         "shape": (4, 1, 512), "dtype": "torch.bfloat16",
         "disjoint_output": True, "pack_aligned": True,
     }))
-    monkeypatch.setattr(pcie, "query_from_runtime", lambda *_a, **_kw: base_query)
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda _rt, *, surface, call: seen_calls.append((surface, dict(call))) or base_query)
     monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: planned.append(query) or plan)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
     monkeypatch.setattr(collectives, "declare", lambda *_a, **_kw: None)
@@ -227,7 +229,6 @@ def test_static_gated_all_gather_enables_selected_barrier(monkeypatch):
         coordinator=None, name="logprobs.exchange", has_gate=True,
     )
     assert op.gated is True
-    assert planned[0].call["gather_transport"] == "selected_barrier"
-    assert planned[0].call["has_gate"] is True
-    assert planned[0].call["submode"] == "barrier"
-    assert (planned[0].call["threads"], planned[0].call["block_limit"], planned[0].call["active_blocks"]) == (128, 8, 8)
+    assert seen_calls[0][0] == "DcpAllToAll.all_gather_heads"
+    assert seen_calls[0][1]["has_gate"] is True
+    assert planned == [base_query]
