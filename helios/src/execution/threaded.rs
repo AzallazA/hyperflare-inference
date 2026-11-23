@@ -177,7 +177,6 @@ impl ThreadedExecutor {
             let thread = thread::Builder::new()
                 .name(format!("flare-rank-{}", index + 1))
                 .spawn(move || {
-                    crate::os::pin_current_thread(1 + index);
                     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
                         Ok(executor) => executor,
                         Err(error) => {
@@ -189,6 +188,8 @@ impl ThreadedExecutor {
                         }
                     };
                     executor.copy_logprobs = false;
+                    // Pin after GraphExecutor creation so lazily spawned CUDA driver threads do not inherit affinity.
+                    crate::os::pin_current_thread(2 + index);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         rank_loop(&mut executor, commands, &replies)
                     }))
