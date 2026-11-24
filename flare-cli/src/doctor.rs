@@ -22,7 +22,7 @@ const NVIDIA_PARAMS_PATH: &str = "/proc/driver/nvidia/params";
 const CMDLINE_PATH: &str = "/proc/cmdline";
 const SYSFS_ROOT: &str = "/sys";
 
-const EXPECTED_REGISTRY_DWORDS: [(&str, &str, u64, &str); 5] = [
+const EXPECTED_REGISTRY_DWORDS: [(&str, &str, u64, &str); 4] = [
     ("nvidia.registry_dwords.force_p2p", "ForceP2P", 0x11, "0x11"),
     (
         "nvidia.registry_dwords.rm_force_p2p_type",
@@ -42,17 +42,11 @@ const EXPECTED_REGISTRY_DWORDS: [(&str, &str, u64, &str); 5] = [
         1,
         "1",
     ),
-    (
-        "nvidia.registry_dwords.enable_resizable_bar",
-        "EnableResizableBar",
-        1,
-        "1",
-    ),
 ];
 
 const NVIDIA_MODPROBE_REMEDIATION: &str = "Configure /etc/modprobe.d/nvidia.conf with: \
 options nvidia NVreg_EnablePCIERelaxedOrderingMode=1 NVreg_EnableResizableBar=1 \
-NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\" \
+NVreg_RegistryDwords=\"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1\" \
 and reload the driver or reboot.";
 
 const IOMMU_REMEDIATION: &str =
@@ -1502,19 +1496,20 @@ mod tests {
 ResmanDebugLevel: 4294967295
 EnablePCIERelaxedOrderingMode: 1
 EnableResizableBar: 1
-RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1"
+RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1"
 "#;
 
     #[test]
     fn nvidia_params_parser_and_checks_validate_all_required_fields() {
         let checks = check_nvidia_params(Ok(HEALTHY_NVIDIA_PARAMS));
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 6);
         assert!(
             checks.iter().all(|c| c.status == CheckStatus::Pass),
             "{checks:#?}"
         );
 
-        // Decimal ForceP2P=17 equals 0x11; extra whitespace and extra keys are accepted.
+        // Decimal ForceP2P=17 equals 0x11; extra whitespace and extra keys (including
+        // redundant EnableResizableBar=1 in RegistryDwords) are accepted.
         let variant = r#"
 EnablePCIERelaxedOrderingMode: 1
 EnableResizableBar: 1
@@ -1529,7 +1524,7 @@ RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=
         // Missing or wrong values fail individually with expected/actual details.
         let broken = r#"
 EnablePCIERelaxedOrderingMode: 0
-EnableResizableBar: 1
+EnableResizableBar: 0
 RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
 "#;
         let checks = check_nvidia_params(Ok(broken));
@@ -1538,7 +1533,10 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             by_id["nvidia.enable_pcie_relaxed_ordering_mode"].status,
             CheckStatus::Fail
         );
-        assert_eq!(by_id["nvidia.enable_resizable_bar"].status, CheckStatus::Pass);
+        assert_eq!(
+            by_id["nvidia.enable_resizable_bar"].status,
+            CheckStatus::Fail
+        );
         assert_eq!(
             by_id["nvidia.registry_dwords.force_p2p"].status,
             CheckStatus::Fail
@@ -1555,9 +1553,9 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             by_id["nvidia.registry_dwords.grdma_pci_topo_check_override"].status,
             CheckStatus::Fail
         );
-        assert_eq!(
-            by_id["nvidia.registry_dwords.enable_resizable_bar"].status,
-            CheckStatus::Fail
+        assert!(
+            !by_id.contains_key("nvidia.registry_dwords.enable_resizable_bar"),
+            "EnableResizableBar is verified via the top-level driver param, not duplicated in RegistryDwords"
         );
         assert!(
             by_id["nvidia.registry_dwords.force_p2p"]
@@ -1879,7 +1877,7 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
         // Healthy params + IOMMU pass `evaluate_run_basic_checks` even when ACS config is absent/enabled.
         fs::write(
             &params,
-            "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1;EnableResizableBar=1\"\n",
+            "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1\"\n",
         )
         .unwrap();
         let healthy = evaluate_run_basic_checks(&bdfs, dir.path(), &params, &cmdline);
