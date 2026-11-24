@@ -445,6 +445,24 @@ impl NativeResources {
         }
     }
 
+    pub(super) fn pci_bus_id(&self) -> Result<String> {
+        let mut buf = [0 as std::ffi::c_char; 32];
+        // SAFETY: `self.driver` initialized CUDA and `self.device` is a valid device handle.
+        unsafe {
+            self.driver.check(
+                "cuDeviceGetPCIBusId",
+                (self.driver.device_pci_bus_id)(
+                    buf.as_mut_ptr(),
+                    buf.len() as std::ffi::c_int,
+                    self.device,
+                ),
+            )?;
+            Ok(std::ffi::CStr::from_ptr(buf.as_ptr())
+                .to_string_lossy()
+                .into_owned())
+        }
+    }
+
     fn address(&self, reference: &Reference) -> u64 {
         self.allocations[&reference.allocation].address + reference.offset as u64
     }

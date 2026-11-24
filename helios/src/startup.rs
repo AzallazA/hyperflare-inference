@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Animated startup banner and loading rows with measured progress and elapsed time.
+//! Static startup banner and loading rows with measured progress and elapsed time.
 
 mod banner;
 
@@ -20,7 +20,6 @@ pub struct StartupProgress {
     enabled: bool,
     terminal: bool,
     output: Arc<Mutex<Output>>,
-    animation: Option<(mpsc::Sender<AnimationStop>, JoinHandle<()>)>,
     observation: Option<StartupObservation>,
 }
 
@@ -146,15 +145,10 @@ impl StartupObservation {
     }
 }
 
-enum AnimationStop {
-    Finish,
-    Pause,
-}
-
 impl StartupProgress {
     pub fn stderr() -> Self {
-        let mut progress = Self::stderr_rows();
-        progress.animate_banner();
+        let progress = Self::stderr_rows();
+        progress.show_banner();
         progress
     }
 
@@ -163,8 +157,7 @@ impl StartupProgress {
         Self {
             enabled: true,
             terminal: std::io::stderr().is_terminal(),
-            output: Arc::new(Mutex::new(Output::default())),
-            animation: None,
+            output: Arc::new(Mutex::new(Output)),
             observation: None,
         }
     }
@@ -173,8 +166,7 @@ impl StartupProgress {
         Self {
             enabled: false,
             terminal: false,
-            output: Arc::new(Mutex::new(Output::default())),
-            animation: None,
+            output: Arc::new(Mutex::new(Output)),
             observation: None,
         }
     }
@@ -197,77 +189,25 @@ impl StartupProgress {
         self.terminal
     }
 
-    fn animate_banner(&mut self) {
-        if !self.terminal {
+    fn show_banner(&self) {
+        if !self.terminal || std::env::var("TERM").is_ok_and(|term| term == "dumb") {
             return;
         }
-        let (width, height) = terminal_size();
-        if cfg!(windows) || banner::frame(0.0, width).lines().count() + 2 >= height {
-            let mut out = std::io::stderr().lock();
-            let _ = out.write_all(banner::frame(1.0, width).as_bytes());
-            let _ = out.flush();
-            return;
-        }
-        let started = Instant::now();
-        let mut output = self.output.lock().unwrap();
-        output.started = Some(started);
-        output.redraw(0.0);
-        drop(output);
-        self.spawn_animation(started);
+        let (width, _) = terminal_size();
+        let mut out = std::io::stderr().lock();
+        let _ = out.write_all(banner::render(width).as_bytes());
+        let _ = out.flush();
     }
 
-    fn spawn_animation(&mut self, started: Instant) {
-        let output = self.output.clone();
-        let (stop, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            loop {
-                let stopped = match receiver.recv_timeout(
-                    banner::DURATION
-                        .saturating_sub(started.elapsed())
-                        .min(Duration::from_micros(62_500)),
-                ) {
-                    Ok(AnimationStop::Pause) => return,
-                    Ok(AnimationStop::Finish) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
-                    Err(mpsc::RecvTimeoutError::Timeout) => false,
-                };
-                let mut output = output.lock().unwrap();
-                let progress = output.progress();
-                if stopped || progress >= 1.0 {
-                    output.redraw(1.0);
-                    output.started = None;
-                    output.completed.clear();
-                    output.active = None;
-                    output.drawn_lines = 0;
-                    break;
-                }
-                output.redraw(progress);
-            }
-        });
-        self.animation = Some((stop, worker));
-    }
-
-    /// Joins the banner worker for an operation, then resumes its original timeline.
-    /// Callers must finish any loading phases first to stop their progress workers.
+    /// Runs an operation between startup phases.
     pub fn with_animation_paused<T>(&mut self, operation: impl FnOnce() -> T) -> T {
-        if let Some((stop, worker)) = self.animation.take() {
-            let _ = stop.send(AnimationStop::Pause);
-            let _ = worker.join();
-        }
-        let result = operation();
-        let started = self.output.lock().unwrap().started;
-        if let Some(started) = started {
-            self.spawn_animation(started);
-        }
-        result
+        operation()
     }
 
-    /// Settles the header before another terminal UI takes ownership of stderr.
-    pub fn finish_animation(&mut self) {
-        if let Some((stop, worker)) = self.animation.take() {
-            let _ = stop.send(AnimationStop::Finish);
-            let _ = worker.join();
-        }
-    }
+    /// Hook called before another terminal UI takes ownership of stderr.
+    ///
+    /// The startup banner is static, so no background worker needs to settle.
+    pub fn finish_animation(&mut self) {}
 
     pub fn phase(&self, label: &str, total: Option<u64>) -> Phase {
         self.phase_named(StartupStage::from_label(label), label, total)
@@ -368,6 +308,16 @@ impl Phase {
             Some(total) => format!("{completed:.1} / {:.1} GiB", total as f64 / (1u64 << 30) as f64),
             None => format!("{completed:.1} GiB"),
         };
+        drop(state);
+        self.publish(StartupStatus::Running);
+    }
+
+    pub fn set_total(&self, total: Option<u64>) {
+        let mut state = self.state.lock().unwrap();
+        if state.total == total {
+            return;
+        }
+        state.total = total;
         drop(state);
         self.publish(StartupStatus::Running);
     }
@@ -517,67 +467,16 @@ impl State {
 }
 
 #[derive(Default)]
-struct Output {
-    started: Option<Instant>,
-    completed: Vec<(State, Status)>,
-    active: Option<State>,
-    drawn_lines: usize,
-}
+struct Output;
 
 impl Output {
-    fn progress(&self) -> f64 {
-        self.started.map_or(1.0, |started| {
-            (started.elapsed().as_secs_f64() / banner::DURATION.as_secs_f64()).min(1.0)
-        })
-    }
-
     fn write(&mut self, state: &State, terminal: bool, status: Status) {
-        if self.started.is_some() {
-            if matches!(status, Status::Running) {
-                self.active = Some(state.clone());
-            } else {
-                let mut state = state.clone();
-                state.elapsed = Some(state.started.elapsed());
-                self.completed.push((state, status));
-                self.active = None;
-            }
-            self.redraw(self.progress());
-        } else {
-            let mut out = std::io::stderr().lock();
-            let _ = out.write_all(state.render(terminal, status).as_bytes());
-            if !terminal || !matches!(status, Status::Running) {
-                let _ = writeln!(out);
-            }
-            let _ = out.flush();
-        }
-    }
-
-    fn redraw(&mut self, progress: f64) {
-        if self.started.is_none() {
-            return;
-        }
-        let (width, height) = terminal_size();
-        let mut content = banner::frame(progress, width);
-        for (state, status) in &self.completed {
-            content.push_str(&state.render(true, *status));
-            content.push('\n');
-        }
-        if let Some(state) = &self.active {
-            content.push_str(&state.render(true, Status::Running));
-        }
-        let lines: Vec<_> = content.split('\n').collect();
-        let visible = &lines[lines.len().saturating_sub(height.saturating_sub(1).max(1))..];
         let mut out = std::io::stderr().lock();
-        if self.drawn_lines > 1 {
-            let _ = write!(
-                out,
-                "\x1b[{}A",
-                (self.drawn_lines - 1).min(height.saturating_sub(1))
-            );
+        let _ = out.write_all(state.render(terminal, status).as_bytes());
+        if !terminal || !matches!(status, Status::Running) {
+            let _ = writeln!(out);
         }
-        let _ = write!(out, "\r\x1b[J{}", visible.join("\n"));
         let _ = out.flush();
-        self.drawn_lines = visible.len();
     }
 }
 
@@ -644,38 +543,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pausing_banner_preserves_playback_and_loading_rows() {
-        let mut progress = StartupProgress::silent();
-        progress.enabled = true;
-        progress.terminal = true;
-        progress.animate_banner();
-        let started = progress.output.lock().unwrap().started.unwrap();
-        progress.phase("Verify core", None).finish("signatures");
-        let output = progress.output.clone();
-        let result = progress.with_animation_paused(|| {
-            let output = output.lock().unwrap();
-            assert_eq!(output.started, Some(started));
-            assert!(output.progress() < 1.0);
-            assert_eq!(output.completed.len(), 1);
-            Err::<(), _>("configuration failed")
-        });
-        assert_eq!(result, Err("configuration failed"));
-        assert_eq!(progress.output.lock().unwrap().started, Some(started));
-
-        let (stop, worker) = progress.animation.take().unwrap();
-        worker.join().unwrap();
-        drop(stop);
-        assert!(started.elapsed() >= banner::DURATION);
-        assert!(progress.output.lock().unwrap().started.is_none());
-        progress.with_animation_paused(|| ());
-        assert!(progress.animation.is_none());
-    }
-
-    #[test]
-    fn pausing_without_a_banner_does_not_start_animation() {
+    fn static_banner_hooks_forward_results_without_background_animation() {
         let mut progress = StartupProgress::silent();
         assert_eq!(progress.with_animation_paused(|| 42), 42);
-        assert!(progress.animation.is_none());
-        assert!(progress.output.lock().unwrap().started.is_none());
+        let err: Result<(), &str> = progress.with_animation_paused(|| Err("configuration failed"));
+        assert_eq!(err, Err("configuration failed"));
+        progress.finish_animation();
     }
 }

@@ -47,6 +47,8 @@ pub enum Command {
     Download(Download),
     /// Summarize a core's metadata, with optional memory, graph, and frontend details.
     Inspect(Inspect),
+    /// Check Linux host PCIe, NVIDIA driver, IOMMU, and ACS settings for TP>1 serving.
+    Doctor(Doctor),
     #[command(hide = true)]
     HardwareRevision {
         #[arg(value_parser = clap::value_parser!(i32).range(1..))]
@@ -287,6 +289,22 @@ pub struct Inspect {
 }
 
 #[derive(Debug, Args)]
+pub struct Doctor {
+    /// GPUs to check, relative to CUDA_VISIBLE_DEVICES when set [default: all visible GPUs].
+    #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
+        value_parser = clap::value_parser!(i32).range(0..))]
+    pub gpus: Vec<i32>,
+
+    /// Print the diagnostic report as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Disable terminal styling.
+    #[arg(long, conflicts_with = "json")]
+    pub plain: bool,
+}
+
+#[derive(Debug, Args)]
 #[command(args_override_self = true)]
 pub struct Download {
     /// Hugging Face repository containing prepared Flare cores, optionally ORG/NAME@REVISION.
@@ -485,6 +503,7 @@ impl OrbitPush {
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
+            bypass_performance_check: false,
             serving: self.serving.clone(),
         }
     }
@@ -669,6 +688,7 @@ impl OrbitRun {
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
+            bypass_performance_check: false,
             serving: self.serving.clone(),
         }
     }
@@ -794,6 +814,10 @@ pub struct Run {
     /// Terminal checkpoints also earn allowance from completed decode work.
     #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+
+    /// Skip Linux PCIe TP>1 host performance checks (NVIDIA driver params and IOMMU) after GPU init.
+    #[arg(long, help_heading = "Serving options")]
+    pub bypass_performance_check: bool,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -1229,6 +1253,33 @@ impl ServingOptions {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn doctor_parses_gpus_json_and_plain_conflicts() {
+        let cli = Cli::try_parse_from(["flare", "doctor"]).unwrap();
+        let Command::Doctor(doctor) = cli.command else {
+            panic!("expected doctor");
+        };
+        assert!(doctor.gpus.is_empty());
+        assert!(!doctor.json);
+        assert!(!doctor.plain);
+
+        let cli = Cli::try_parse_from(["flare", "doctor", "--gpus", "0,2,3", "--json"]).unwrap();
+        let Command::Doctor(doctor) = cli.command else {
+            panic!("expected doctor");
+        };
+        assert_eq!(doctor.gpus, vec![0, 2, 3]);
+        assert!(doctor.json);
+        assert!(!doctor.plain);
+
+        assert!(Cli::try_parse_from(["flare", "doctor", "--json", "--plain"]).is_err());
+        assert!(Cli::try_parse_from(["flare", "doctor", "--gpus", "-1"]).is_err());
+
+        let default_run = run(&["flare", "run", "model.safetensors"]);
+        assert!(!default_run.bypass_performance_check);
+        let bypassed = run(&["flare", "run", "model.safetensors", "--bypass-performance-check"]);
+        assert!(bypassed.bypass_performance_check);
+    }
 
     #[test]
     fn canonical_core_cache_flag_accepts_hidden_legacy_aliases() {

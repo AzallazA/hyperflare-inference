@@ -228,6 +228,12 @@ pub trait CacheAgreement {
     fn pool_approved(&mut self, approved: bool, _world: usize) -> Result<bool> {
         Ok(approved)
     }
+
+    /// Called immediately after local GPUs finish CUDA initialization and before
+    /// model memory allocation or weight loading, with each rank's PCI bus ID.
+    fn after_gpu_init(&mut self, _pci_bus_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<F: FnMut((u64, u64)) -> Result<(u64, u64)>> CacheAgreement for F {
@@ -677,6 +683,12 @@ impl NativeModel {
                     .collect::<Vec<_>>()
                     .join(" / "),
             );
+            let pci_bus_ids = model
+                .ranks
+                .iter()
+                .map(NativeResources::pci_bus_id)
+                .collect::<Result<Vec<_>>>()?;
+            agree.after_gpu_init(&pci_bus_ids)?;
             let embedding_table_resident_scales = options.embedding_resident_scales(
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),

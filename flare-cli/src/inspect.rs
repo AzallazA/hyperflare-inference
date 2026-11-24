@@ -491,6 +491,20 @@ impl Canvas {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn sized(width: usize, color: bool) -> Self {
+        Self {
+            out: String::new(),
+            width,
+            color,
+            panel: None,
+        }
+    }
+
+    pub(crate) fn is_color(&self) -> bool {
+        self.color
+    }
+
     pub(crate) fn finish(mut self) -> String {
         self.close();
         self.out
@@ -571,7 +585,7 @@ impl Canvas {
         self.width - if self.panel.is_some() { 4 } else { 0 }
     }
 
-    fn open(&mut self, title: &str) {
+    pub(crate) fn open(&mut self, title: &str) {
         self.close();
         if !self.out.is_empty() && !self.out.ends_with("\n\n") {
             self.out.push('\n');
@@ -672,7 +686,7 @@ impl Canvas {
         }
     }
 
-    fn table(&mut self, head: &[&str], rows: &[Vec<String>]) {
+    pub(crate) fn table(&mut self, head: &[&str], rows: &[Vec<String>]) {
         if rows.is_empty() {
             return;
         }

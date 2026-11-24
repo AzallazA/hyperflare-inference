@@ -115,6 +115,7 @@ flare-cli/target/release/flare run CORE --gpus 0
 flare run [CORE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared core
 flare inspect CORE|MODEL[@VERSION] [--tensor-parallel N] [--rank N] [--unverified] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
+flare doctor [--gpus N[,N...]] [--json | --plain]  check Linux PCIe TP>1 driver, IOMMU, and ACS settings
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -726,6 +727,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--dangerously-accept-publisher NAMESPACE` | Accept this exact publisher namespace; requires the matching key flag | Interactive first use or remembered trust |
 | `--trust-store PATH` | Persistent key/namespace acceptance file | `~/.config/flare/trust.toml` |
 | `--verify-weights` | Verify the stored allocation and table ranges of the ranks served before loading model GPU resources | off |
+| `--bypass-performance-check` | Skip Linux PCIe `TP > 1` host checks (`/proc/driver/nvidia/params` and IOMMU) after GPU initialization | off |
 | `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | First N visible GPUs for the core's N local ranks; one GPU per host for multi-host cores |
 | `--host ADDR` | Listener IP address, IPv4 or IPv6 | `[server] host`, otherwise `127.0.0.1` |
 | `--port N` | Listener port | `[server] port`, otherwise `8000` |
@@ -1216,7 +1218,7 @@ There is no unsigned runtime mode and no blanket approval for development keys.
 
 Publisher identity, key, source, license, and verification disclosures appear
 only on first acceptance of a signing-key fingerprint and publisher namespace.
-On a terminal, the banner animation finishes before those disclosures and the
+On a terminal, the static startup banner prints before those disclosures and the
 acceptance prompt. Remembered acceptance suppresses the disclosures, while
 every load verifies signatures and executable resources.
 
@@ -1481,9 +1483,17 @@ SIGINT and SIGTERM end preparation immediately. Preparation exit codes are
 
 ### 5.2 `flare run`
 
-Animate the Flare banner during loading on a terminal. Validate the core,
+Display the static Hyperflare banner once on a terminal. Validate the core,
 initialize GPUs, allocate model memory, load weights and compiled kernels,
 instantiate graphs, allocate caches, load frontend assets, and start HTTP.
+On Linux, when starting a single-process tensor-parallel core with more than one
+local GPU, `flare run` runs the basic PCIe `TP > 1` checks
+(`/proc/driver/nvidia/params` and Linux IOMMU mode; PCIe ACS is not checked
+during `flare run`) immediately after GPU initialization and before model memory
+allocation or weight loading. When all basic checks pass, no extra NVML
+initialization runs. When a check fails and the initialized GPUs are not all
+pairwise linked by NVLink, `flare run` aborts with an error directing the
+operator to `flare doctor`, unless `--bypass-performance-check` is passed.
 Loading performs no kernel compilation or graph capture. Helios reports each stage with a ten-column bracketed
 progress bar, a result, and elapsed time.
 Terminal bars use cyan completed segments, dark gray remaining segments, and
@@ -1572,6 +1582,43 @@ to the selected deployment and reports `selected_tensor_parallel` and the filter
 `--trust-store` cannot be combined with it. Inspection accepts payload format version 2, including compressed executable
 resources, and logical-resource containers whose signed `ProtectedIndex`
 envelope has format 4 or 6.
+
+### 5.4 `flare doctor`
+
+Inspect Linux host configuration for multi-GPU tensor-parallel serving over
+PCIe:
+
+```sh
+flare doctor [--gpus N[,N...]] [--json | --plain]
+```
+
+`--gpus` selects GPU indices relative to `CUDA_VISIBLE_DEVICES` when set,
+otherwise NVML indices; omitting `--gpus` inspects all visible GPUs. NVML
+queries each selected GPU's PCI bus identifier and checks pairwise NVLink P2P
+status without creating a CUDA context. When all selected pairs have NVLink
+P2P, PCIe checks are reported as not applicable.
+
+On Linux PCIe hosts, `flare doctor` verifies:
+
+- `/proc/driver/nvidia/params` sets `EnablePCIERelaxedOrderingMode: 1`,
+  `EnableResizableBar: 1`, and `RegistryDwords` entries `ForceP2P=0x11`,
+  `RMForceP2PType=1`, `RMPcieP2PType=2`, `GrdmaPciTopoCheckOverride=1`, and
+  `EnableResizableBar=1`.
+- IOMMU is `off` (no active IOMMU groups for the selected GPUs) or in
+  passthrough mode (`identity` in `/sys/bus/pci/devices/<bdf>/iommu_group/type`,
+  falling back to kernel command-line flags when `type` is absent).
+- PCIe Access Control Services (ACS, extended capability `0x000d`) P2P
+  redirection bits (`ReqRedir`, `CmpltRedir`, `UpstreamFwd`, `EgressCtrl`) are
+  disabled on the root ports and switch bridges along the PCIe P2P paths
+  connecting the selected GPUs (from their lowest common ancestor downward).
+  Reading PCIe extended configuration space from
+  `/sys/bus/pci/devices/<bdf>/config` requires root (`CAP_SYS_ADMIN`); without
+  it, ACS is reported as `unverified` with a hint to run `sudo flare doctor`.
+
+`--json` prints the structured report; `--plain` disables terminal styling and
+conflicts with `--json`. The command exits zero when no check fails and
+non-zero when one or more checks fail. On non-Linux hosts, the command reports
+the checks as not applicable and exits zero.
 
 ## 6. Capacity errors
 

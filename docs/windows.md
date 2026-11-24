@@ -18,7 +18,7 @@ Install the NVIDIA driver. CLI builds also require the Microsoft Visual C++
 Redistributable for the host architecture. The desktop distribution includes
 its runtime dependencies.
 
-On Windows terminals, startup displays the banner's final frame once.
+On Windows and Unix terminals, startup displays the static banner once.
 Loading progress continues below the static banner.
 
 ## Build from Linux

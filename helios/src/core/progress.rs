@@ -417,8 +417,10 @@ impl<'a> AcquisitionDisplay<'a> {
     /// `total` is how many units this stage expects to add to the counter, not
     /// the counter's absolute value: a stage that begins with the counter at
     /// 3 GiB and expects to transfer 4 GiB passes 4 GiB, not 7 GiB. A total
-    /// enables a filled bar and an ETA; without one the row shows an
-    /// indeterminate bar, the transferred bytes, and the rate.
+    /// enables a filled bar and an ETA; a `Counter::Network` stage opened with
+    /// `None` adopts `AcquisitionProgress::record_network_total` when it
+    /// becomes known and otherwise shows an indeterminate bar, transferred
+    /// bytes, and rate.
     pub fn stage(&self, label: &str, counter: Counter, total: Option<u64>) {
         let baseline = self.counters.snapshot().counter(counter);
         let mut slot = self.stage.lock().unwrap_or_else(|error| error.into_inner());
@@ -482,19 +484,46 @@ impl Drop for AcquisitionDisplay<'_> {
 
 impl Stage {
     fn refresh(&mut self, counters: &AcquisitionProgress) {
-        let done = counters.snapshot().counter(self.counter);
-        let advanced = done
-            .saturating_sub(self.baseline)
-            .saturating_sub(self.advanced);
+        let snapshot = counters.snapshot();
+        let done = snapshot.counter(self.counter);
+        let done_in_stage = done.saturating_sub(self.baseline);
+        let total = self.total.or_else(|| {
+            (self.counter == Counter::Network)
+                .then(|| snapshot.network_total?.checked_sub(self.baseline))
+                .flatten()
+        });
+        let bar_total = total.filter(|&total| total > 0 && total >= done_in_stage);
+        self.phase.set_total(bar_total);
+        let advanced = done_in_stage.saturating_sub(self.advanced);
         if advanced > 0 {
             self.phase.advance_bytes(advanced);
             self.advanced = self.advanced.saturating_add(advanced);
         }
-        self.detail = format_progress(
-            done.saturating_sub(self.baseline),
-            self.total,
-            Some(self.rate.bytes_per_second(done)),
-        );
+        self.detail = if self.total.is_none()
+            && self.counter == Counter::Network
+            && snapshot.phase == AcquisitionPhase::PreparingDownload
+            && let Some(files) = snapshot.planning_total.filter(|&files| files > 0)
+        {
+            format!(
+                "planning {}/{} files",
+                snapshot.planning_completed.min(files),
+                files
+            )
+        } else if self.total.is_none()
+            && self.counter == Counter::Network
+            && snapshot.phase == AcquisitionPhase::Installing
+        {
+            if done_in_stage > 0 {
+                format!(
+                    "{}  installing",
+                    format_progress(done_in_stage, total, None)
+                )
+            } else {
+                "installing".to_owned()
+            }
+        } else {
+            format_progress(done_in_stage, total, Some(self.rate.bytes_per_second(done)))
+        };
         self.phase.detail(self.detail.clone());
     }
 
@@ -704,6 +733,62 @@ mod tests {
             assert!(stage.detail.starts_with("512.0 KiB  "), "{}", stage.detail);
         }
         display.finish();
+    }
+
+    #[test]
+    fn network_stage_without_initial_total_adopts_declared_network_total_and_phases() {
+        let (startup, observation) = StartupProgress::observed();
+        let counters = AcquisitionProgress::new();
+        let display = AcquisitionDisplay::new(&startup, &counters);
+        counters.record_network_bytes(1 << 20);
+        display.stage("Acquire core", Counter::Network, None);
+
+        counters.begin_download_planning(4);
+        counters.record_planned_file();
+        counters.record_planned_file();
+        {
+            let mut slot = display.stage.lock().unwrap();
+            slot.as_mut().unwrap().refresh(&counters);
+        }
+        let planning = observation.snapshot().expect("planning snapshot");
+        assert_eq!(planning.total, None);
+        assert_eq!(planning.detail, "planning 2/4 files");
+
+        counters.record_network_total(Some(9 << 20));
+        counters.set_phase(AcquisitionPhase::Downloading);
+        counters.record_network_bytes(2 << 20);
+        {
+            let mut slot = display.stage.lock().unwrap();
+            slot.as_mut().unwrap().refresh(&counters);
+        }
+        let downloading = observation.snapshot().expect("downloading snapshot");
+        assert_eq!(downloading.total, Some(8 << 20));
+        assert_eq!(downloading.completed, 2 << 20);
+        assert!(
+            downloading.detail.starts_with("2.0 / 8.0 MiB"),
+            "{}",
+            downloading.detail
+        );
+
+        counters.record_network_bytes(6 << 20);
+        counters.set_phase(AcquisitionPhase::Installing);
+        {
+            let mut slot = display.stage.lock().unwrap();
+            slot.as_mut().unwrap().refresh(&counters);
+        }
+        let installing = observation.snapshot().expect("installing snapshot");
+        assert_eq!(installing.total, Some(8 << 20));
+        assert_eq!(installing.detail, "8.0 / 8.0 MiB  installing");
+
+        counters.set_phase(AcquisitionPhase::Complete);
+        display.finish();
+        let finished = observation.snapshot().expect("finished snapshot");
+        assert!(
+            finished.detail.starts_with("8.0 / 8.0 MiB"),
+            "{}",
+            finished.detail
+        );
+        assert!(!finished.detail.contains("installing"), "{}", finished.detail);
     }
 
     impl<'a> AcquisitionDisplay<'a> {
