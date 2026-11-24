@@ -22,24 +22,29 @@ const NVIDIA_PARAMS_PATH: &str = "/proc/driver/nvidia/params";
 const CMDLINE_PATH: &str = "/proc/cmdline";
 const SYSFS_ROOT: &str = "/sys";
 
-const EXPECTED_REGISTRY_DWORDS: [(&str, &str, u64, &str); 4] = [
-    ("nvidia.registry_dwords.force_p2p", "ForceP2P", 0x11, "0x11"),
+const EXPECTED_REGISTRY_DWORDS: [(&str, &str, &[u64], &str); 4] = [
+    (
+        "nvidia.registry_dwords.force_p2p",
+        "ForceP2P",
+        &[0x11],
+        "0x11",
+    ),
     (
         "nvidia.registry_dwords.rm_force_p2p_type",
         "RMForceP2PType",
-        1,
+        &[1],
         "1",
     ),
     (
         "nvidia.registry_dwords.rm_pcie_p2p_type",
         "RMPcieP2PType",
-        2,
-        "2",
+        &[1, 2],
+        "1 or 2",
     ),
     (
         "nvidia.registry_dwords.grdma_pci_topo_check_override",
         "GrdmaPciTopoCheckOverride",
-        1,
+        &[1],
         "1",
     ),
 ];
@@ -672,12 +677,12 @@ pub(crate) fn check_nvidia_params(params_text: std::result::Result<&str, String>
 
     let dwords_raw = params.get("RegistryDwords").map(String::as_str).unwrap_or("");
     let dwords = parse_registry_dwords(dwords_raw);
-    for (id, key, expected_val, expected_display) in EXPECTED_REGISTRY_DWORDS {
+    for (id, key, expected_vals, expected_display) in EXPECTED_REGISTRY_DWORDS {
         let actual = dwords.get(key).cloned();
         let matches = actual
             .as_deref()
             .and_then(parse_u64_param)
-            .is_some_and(|v| v == expected_val);
+            .is_some_and(|v| expected_vals.contains(&v));
         checks.push(Check {
             id: id.into(),
             name: format!("RegistryDwords {key}"),
@@ -1508,18 +1513,39 @@ RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoChec
             "{checks:#?}"
         );
 
-        // Decimal ForceP2P=17 equals 0x11; extra whitespace and extra keys (including
-        // redundant EnableResizableBar=1 in RegistryDwords) are accepted.
+        // Decimal ForceP2P=17 equals 0x11; RMPcieP2PType=1 (forced BAR1) and 2 (auto) are both
+        // accepted; extra whitespace and extra keys (including redundant EnableResizableBar=1 in
+        // RegistryDwords) are accepted.
         let variant = r#"
 EnablePCIERelaxedOrderingMode: 1
 EnableResizableBar: 1
-RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=2; GrdmaPciTopoCheckOverride=1; EnableResizableBar=1;"
+RegistryDwords: "OtherKey=42; ForceP2P = 17 ; RMForceP2PType=0x1; RMPcieP2PType=1; GrdmaPciTopoCheckOverride=1; EnableResizableBar=1;"
 "#;
         let checks = check_nvidia_params(Ok(variant));
         assert!(
             checks.iter().all(|c| c.status == CheckStatus::Pass),
             "{checks:#?}"
         );
+
+        // Out-of-range RMPcieP2PType=3 or omitted RMPcieP2PType fails.
+        for bad_val in [Some("3"), None] {
+            let dwords = match bad_val {
+                Some(v) => format!(
+                    "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType={v};GrdmaPciTopoCheckOverride=1"
+                ),
+                None => "ForceP2P=0x11;RMForceP2PType=1;GrdmaPciTopoCheckOverride=1".to_owned(),
+            };
+            let text = format!(
+                "EnablePCIERelaxedOrderingMode: 1\nEnableResizableBar: 1\nRegistryDwords: \"{dwords}\"\n"
+            );
+            let checks = check_nvidia_params(Ok(&text));
+            let by_id: BTreeMap<&str, &Check> =
+                checks.iter().map(|c| (c.id.as_str(), c)).collect();
+            assert_eq!(
+                by_id["nvidia.registry_dwords.rm_pcie_p2p_type"].status,
+                CheckStatus::Fail
+            );
+        }
 
         // Missing or wrong values fail individually with expected/actual details.
         let broken = r#"

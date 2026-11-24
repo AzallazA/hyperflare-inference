@@ -1629,7 +1629,7 @@ On Linux PCIe hosts, `flare doctor` verifies:
 
 - `/proc/driver/nvidia/params` sets `EnablePCIERelaxedOrderingMode: 1`,
   `EnableResizableBar: 1`, and `RegistryDwords` entries `ForceP2P=0x11`,
-  `RMForceP2PType=1`, `RMPcieP2PType=2`, and `GrdmaPciTopoCheckOverride=1`.
+  `RMForceP2PType=1`, `RMPcieP2PType=1` or `2`, and `GrdmaPciTopoCheckOverride=1`.
 - IOMMU is `off` (no active IOMMU groups for the selected GPUs) or in
   passthrough mode (`identity` in `/sys/bus/pci/devices/<bdf>/iommu_group/type`,
   falling back to kernel command-line flags when `type` is absent).
