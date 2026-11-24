@@ -54,7 +54,15 @@ fn load_with(
             tensor_parallel,
         },
     )?;
-    phase.finish("signatures");
+    let signatures = review.core().signature_count();
+    phase.finish(format!(
+        "{signatures} {}",
+        if signatures == 1 {
+            "signature"
+        } else {
+            "signatures"
+        }
+    ));
     let disclosure = &review.disclosure;
     if let Some(origin) = origin {
         let downloaded = format!("https://huggingface.co/{origin}");

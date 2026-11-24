@@ -151,18 +151,19 @@ pub fn requested_tensor_parallel(requested: &[u32], gpu_count: usize) -> Result<
     Ok(sizes)
 }
 
-/// Resolve signed deployments for the requested tensor-parallel sizes.
-///
-/// Topology comes from each authenticated deployment body, never from
-/// availability hints: a size that was never exported, appears twice, or has an
-/// incomplete payload closure is an error rather than a silently dropped request.
-/// When `sizes` is empty, selects the core's sole deployment or rejects
-/// multi-deployment cores with the available sizes.
-pub fn select_deployments(
+/// Authenticate and select signed deployments for the requested tensor-parallel sizes.
+fn select_verified_deployments(
     metadata: &flare_helios::core::reader::Metadata,
     publishers: &[flare_helios::runtime_core::Publisher],
     sizes: &[u32],
-) -> Result<Vec<flare_helios::core::protection::Selection>, Failure> {
+    bound_envelope: Option<[u8; 32]>,
+) -> Result<
+    (
+        Vec<flare_helios::core::protection::Selection>,
+        Vec<flare_helios::core::protection::VerifiedCore>,
+    ),
+    Failure,
+> {
     use flare_helios::core::protection;
 
     let catalog = protection::verify(
@@ -170,18 +171,16 @@ pub fn select_deployments(
         publishers,
         protection::Selection::Catalog,
     )?;
+    if let Some(expected) = bound_envelope
+        && catalog.envelope_digest() != expected
+    {
+        return Err("core envelope differs from its expected digest".into());
+    }
     let count = catalog.deployment_count();
     let mut found: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     let mut available = Vec::with_capacity(count);
     for index in 0..count {
-        let selection = protection::Selection::Deployment {
-            deployment: index,
-            rank: None,
-        };
-        let verified = protection::verify(&metadata.envelope, publishers, selection)?;
-        let deployment = verified
-            .deployment()
-            .ok_or_else(|| format!("deployment {index} has no authenticated body"))?;
+        let deployment = catalog.deployment_body(index)?;
         available.push(deployment.tensor_parallel);
         found
             .entry(deployment.tensor_parallel)
@@ -225,21 +224,76 @@ pub fn select_deployments(
         }
         selected
     };
-    let mut verified = Vec::with_capacity(selected.len());
-    for selection in &selected {
-        verified.push(protection::verify(
-            &metadata.envelope,
-            publishers,
-            *selection,
-        )?);
-    }
+    let verified = match selected.as_slice() {
+        [protection::Selection::Deployment { deployment, rank }] => {
+            let verified = match bound_envelope {
+                Some(expected) => catalog.into_bound_deployment(*deployment, *rank, expected)?,
+                None => catalog.into_deployment(*deployment, *rank)?,
+            };
+            vec![verified]
+        }
+        _ => {
+            let mut verified = Vec::with_capacity(selected.len());
+            for selection in &selected {
+                let protection::Selection::Deployment { deployment, rank } = *selection else {
+                    return Err("selected deployment is missing".into());
+                };
+                let core = match bound_envelope {
+                    Some(expected) => catalog.verify_bound_deployment(deployment, rank, expected)?,
+                    None => catalog.verify_deployment(deployment, rank)?,
+                };
+                verified.push(core);
+            }
+            verified
+        }
+    };
     flare_helios::core::cache::Root::validate_ready_closure(
         metadata,
         &verified,
         &flare_helios::core::derivation::Limits::default(),
     )
     .map_err(|error| error.to_string())?;
-    Ok(selected)
+    Ok((selected, verified))
+}
+
+/// Resolve signed deployments for the requested tensor-parallel sizes.
+///
+/// Topology comes from each authenticated deployment body, never from
+/// availability hints: a size that was never exported, appears twice, or has an
+/// incomplete payload closure is an error rather than a silently dropped request.
+/// When `sizes` is empty, selects the core's sole deployment or rejects
+/// multi-deployment cores with the available sizes.
+pub fn select_deployments(
+    metadata: &flare_helios::core::reader::Metadata,
+    publishers: &[flare_helios::runtime_core::Publisher],
+    sizes: &[u32],
+) -> Result<Vec<flare_helios::core::protection::Selection>, Failure> {
+    Ok(select_verified_deployments(metadata, publishers, sizes, None)?.0)
+}
+
+/// Authenticate the requested deployments once and pair them with their opened primary.
+pub fn select_core_source(
+    metadata: flare_helios::core::reader::Metadata,
+    publishers: &[flare_helios::runtime_core::Publisher],
+    sizes: &[u32],
+) -> Result<flare_helios::core::cache::CoreSource<'static>, Failure> {
+    let (_, verified) = select_verified_deployments(&metadata, publishers, sizes, None)?;
+    flare_helios::core::cache::CoreSource::from_verified(metadata, verified)
+        .map_err(|error| error.to_string().into())
+}
+
+/// Authenticate an installed primary whose exact root envelope hash matches
+/// `expected_envelope` without re-inflating compressed prepared-weight catalogs.
+pub fn select_bound_core_source(
+    metadata: flare_helios::core::reader::Metadata,
+    expected_envelope: [u8; 32],
+    publishers: &[flare_helios::runtime_core::Publisher],
+    sizes: &[u32],
+) -> Result<flare_helios::core::cache::CoreSource<'static>, Failure> {
+    let (_, verified) =
+        select_verified_deployments(&metadata, publishers, sizes, Some(expected_envelope))?;
+    flare_helios::core::cache::CoreSource::from_verified(metadata, verified)
+        .map_err(|error| error.to_string().into())
 }
 
 #[cfg(test)]

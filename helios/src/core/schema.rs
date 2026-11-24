@@ -744,7 +744,7 @@ fn validate_prepared_weights(
     if catalog.version == 0 {
         return Err(invalid("prepared weight catalog has no version"));
     }
-    let mut names = BTreeSet::new();
+    let mut names = std::collections::HashSet::with_capacity(catalog.views.len());
     for view in &catalog.views {
         bounded_name(&view.name, 256, "weight view name")?;
         if !names.insert(view.name.as_str()) {

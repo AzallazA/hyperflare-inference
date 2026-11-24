@@ -460,21 +460,64 @@ impl Root {
     }
 }
 
+/// Process-owned staging directory pinning cached blobs across an acquisition plan.
+///
+/// One exclusive staging lock keeps every hardlinked blob reachable to [`Root::collect`]
+/// without holding per-blob lock or data file descriptors open during network transfer.
+struct PlanPins {
+    directory: PathBuf,
+    _transaction: Transaction,
+}
+
+impl PlanPins {
+    fn new(root: &Root) -> Result<Self> {
+        let transaction = Transaction::begin(root)?;
+        let directory = transaction.staging_file("trees")?;
+        fs::create_dir_all(&directory).map_err(failure)?;
+        Ok(Self {
+            directory,
+            _transaction: transaction,
+        })
+    }
+
+    fn pin(&self, id: PayloadId, blob: &Path) -> Result<PathBuf> {
+        let destination = self.directory.join(id.file_name());
+        match fs::hard_link(blob, &destination) {
+            Ok(()) => Ok(destination),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(destination),
+            Err(error) => Err(failure(error)),
+        }
+    }
+}
+
+impl Drop for PlanPins {
+    fn drop(&mut self) {
+        if let Ok(items) = read_dir(&self.directory) {
+            for item in items {
+                let _ = remove_file(&item);
+            }
+        }
+        let _ = remove_tree(&self.directory);
+    }
+}
+
 /// Resolved acquisition work for one authenticated core selection.
 ///
-/// The plan owns the verified source, retained cache-object leases, the selected
-/// catalog, ordered derivations, and the minimal remote payload locations. Fields
-/// are private so callers cannot present a plan built from different metadata.
+/// The plan owns the verified source, one staging pin lease over reused cached
+/// objects, the selected catalog, ordered derivations, and the minimal remote
+/// payload locations. Fields are private so callers cannot present a plan built
+/// from different metadata.
 pub struct AcquisitionPlan<'a> {
     source: CoreSource<'a>,
     required: BTreeMap<Vec<u8>, (PayloadId, u64)>,
     catalog: schema::Catalog,
-    available: BTreeMap<PayloadId, PayloadObject>,
+    available: BTreeMap<PayloadId, PathBuf>,
     derivations: Vec<derivation::Derivation>,
     remote: BTreeMap<Vec<u8>, (String, String)>,
     local: BTreeSet<Vec<u8>>,
     retained_available: BTreeSet<PayloadId>,
     progress: Option<progress::AcquisitionProgress>,
+    pins: Option<PlanPins>,
 }
 
 impl AcquisitionPlan<'_> {
@@ -817,7 +860,8 @@ impl Root {
                 }
             }
         }
-        let mut available: BTreeMap<PayloadId, PayloadObject> = BTreeMap::new();
+        let publication = Lock::shared(self.publication_lock())?;
+        let mut available_blobs: BTreeMap<PayloadId, PathBuf> = BTreeMap::new();
         for id in &candidates {
             let identity = PayloadId::from_bytes(
                 id.as_slice()
@@ -827,17 +871,14 @@ impl Root {
             let Ok(length) = catalog.length(id) else {
                 continue;
             };
-            if let Ok(Some(object)) = self.payload(identity) {
-                if object.length() != length {
-                    continue;
-                }
+            if let Some(path) = self.cached_blob_path(identity, length)? {
                 if let Some(progress) = &progress {
                     progress.record_local_source_bytes(length);
                 }
-                available.insert(identity, object);
+                available_blobs.insert(identity, path);
             }
         }
-        let available_ids: BTreeSet<PayloadId> = available.keys().copied().collect();
+        let available_ids: BTreeSet<PayloadId> = available_blobs.keys().copied().collect();
         let missing_required: BTreeSet<PayloadId> = required
             .values()
             .map(|(id, _)| *id)
@@ -971,7 +1012,7 @@ impl Root {
                     .try_into()
                     .map_err(|_| "payload identity is not 32 bytes".to_string())?,
             );
-            if available.contains_key(&identity) {
+            if available_blobs.contains_key(&identity) {
                 retained_available.insert(identity);
             } else if !resolved.contains(&identity) && placed.contains_key(id.as_slice()) {
                 local.insert(id.clone());
@@ -991,6 +1032,43 @@ impl Root {
                 return Err(format!("ready closure lacks payload {identity}").into());
             }
         }
+        // Pin only cached blobs this plan will link or read as derivation sources
+        // while `publication` is still shared, then release `publication` so
+        // concurrent `collect` passes are never blocked during remote transfer.
+        let mut needed_available: BTreeSet<PayloadId> = required
+            .values()
+            .map(|(identity, _)| *identity)
+            .filter(|identity| available_blobs.contains_key(identity))
+            .collect();
+        for identity in &retained_available {
+            if available_blobs.contains_key(identity) {
+                needed_available.insert(*identity);
+            }
+        }
+        for derivation in &ordered {
+            if available_blobs.contains_key(&derivation.target) {
+                needed_available.insert(derivation.target);
+            }
+            for operation in &derivation.operations {
+                if let derivation::Operation::Copy(copy) = operation
+                    && available_blobs.contains_key(&copy.source)
+                {
+                    needed_available.insert(copy.source);
+                }
+            }
+        }
+        let mut available = BTreeMap::new();
+        let pins = if needed_available.is_empty() {
+            None
+        } else {
+            let pins = PlanPins::new(self)?;
+            for identity in needed_available {
+                let pinned = pins.pin(identity, &available_blobs[&identity])?;
+                available.insert(identity, pinned);
+            }
+            Some(pins)
+        };
+        drop(publication);
         Ok(AcquisitionPlan {
             source,
             required,
@@ -1001,6 +1079,7 @@ impl Root {
             local,
             retained_available,
             progress,
+            pins,
         })
     }
 
@@ -1036,6 +1115,11 @@ impl Root {
         plan: AcquisitionPlan<'_>,
         mut staging: Staging,
     ) -> Result<Entry> {
+        enum SourceBacking {
+            Companion(PathBuf),
+            Primary(String),
+        }
+
         let AcquisitionPlan {
             source,
             required,
@@ -1046,6 +1130,7 @@ impl Root {
             local,
             retained_available,
             progress,
+            pins: _pins,
         } = plan;
         let placed: BTreeMap<Vec<u8>, (String, String)> = source
             .metadata
@@ -1059,8 +1144,16 @@ impl Root {
                 )
             })
             .collect();
-        let mut sources: BTreeMap<PayloadId, Slice> = BTreeMap::new();
-        let mut present: BTreeMap<Vec<u8>, Slice> = BTreeMap::new();
+        let mut derivation_sources: BTreeSet<PayloadId> = BTreeSet::new();
+        for derivation in &derivations {
+            for operation in &derivation.operations {
+                if let derivation::Operation::Copy(copy) = operation {
+                    derivation_sources.insert(copy.source);
+                }
+            }
+        }
+        let mut source_files: BTreeMap<PayloadId, SourceBacking> = BTreeMap::new();
+        let mut present: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut locations = Vec::new();
         let mut used = BTreeSet::from(["model.safetensors".to_owned()]);
         let mut needed: BTreeSet<PayloadId> = required
@@ -1089,12 +1182,13 @@ impl Root {
             .map(|(identity, _)| *identity)
             .chain(retained_available.iter().copied())
             .collect();
-        for (identity, object) in available {
+        for (identity, pinned_path) in available {
             if !needed.contains(&identity) {
                 continue;
             }
-            let slice = object.slice().clone();
-            sources.insert(identity, slice.clone());
+            if derivation_sources.contains(&identity) {
+                source_files.insert(identity, SourceBacking::Companion(pinned_path.clone()));
+            }
             // Alternative deployment targets may supply derivation bytes without
             // being retained in this entry. Only the selected closure and the
             // reviewed optional source closure become entry locations.
@@ -1109,7 +1203,7 @@ impl Root {
                 )
             });
             if file.is_empty() && source.asset_payloads.contains(&id) {
-                present.insert(id.clone(), slice.clone());
+                present.insert(id.clone());
                 locations.push(wire::PayloadLocation {
                     payload_id: id,
                     file,
@@ -1118,8 +1212,8 @@ impl Root {
                 continue;
             }
             let companion = companion_name(&file, &tensor, identity, &mut used)?;
-            staging.link(&object, &companion)?;
-            present.insert(id.clone(), slice.clone());
+            staging.link_path(&pinned_path, identity, &companion)?;
+            present.insert(id.clone());
             locations.push(wire::PayloadLocation {
                 payload_id: id,
                 file: companion,
@@ -1128,63 +1222,73 @@ impl Root {
         }
         let remote_ids: BTreeSet<Vec<u8>> = remote.keys().cloned().collect();
         if !remote_ids.is_empty() {
-            let payloads =
-                source.metadata.payloads(&catalog, remote_ids.iter().map(|id| id.as_slice()))?;
+            // Group by companion file so installation opens one transport file at a time.
+            let mut by_file: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
             for id in remote_ids {
-                if present.contains_key(&id) {
+                if present.contains(&id) {
                     continue;
                 }
-                let identity = PayloadId::from_bytes(
-                    id.as_slice()
-                        .try_into()
-                        .map_err(|_| "payload identity is not 32 bytes".to_string())?,
-                );
-                let slice = payloads.get(&id)?.clone();
-                let (file, tensor) = placed.get(&id).cloned().unwrap_or_else(|| {
-                    (
-                        format!("companions/{}", identity.file_name()),
-                        COMPANION_TENSOR.to_string(),
-                    )
-                });
-                let object = if remote.contains_key(&id) {
-                    self.insert_payload(
+                let file = placed
+                    .get(&id)
+                    .map(|(file, _)| file.clone())
+                    .unwrap_or_default();
+                by_file.entry(file).or_default().push(id);
+            }
+            for (_, group) in by_file {
+                let payloads = source
+                    .metadata
+                    .payloads(&catalog, group.iter().map(|id| id.as_slice()))?;
+                for id in group {
+                    if present.contains(&id) {
+                        continue;
+                    }
+                    let identity = PayloadId::from_bytes(
+                        id.as_slice()
+                            .try_into()
+                            .map_err(|_| "payload identity is not 32 bytes".to_string())?,
+                    );
+                    let slice = payloads.get(&id)?.clone();
+                    let (file, tensor) = placed.get(&id).cloned().unwrap_or_else(|| {
+                        (
+                            format!("companions/{}", identity.file_name()),
+                            COMPANION_TENSOR.to_string(),
+                        )
+                    });
+                    let object = self.insert_payload(
                         identity,
                         slice.len(),
                         ProgressReader {
                             inner: SliceReader { slice: slice.clone(), offset: 0 },
                             progress: progress.clone(),
                         },
-                    )?
-                } else {
-                    match self.insert_optional_payload(
-                        identity,
-                        slice.len(),
-                        SliceReader { slice: slice.clone(), offset: 0 },
-                        progress.as_ref(),
-                    )? {
-                        Some((object, _)) => object,
-                        None => continue,
+                    )?;
+                    if file.is_empty() && source.asset_payloads.contains(&id) {
+                        present.insert(id.clone());
+                        if derivation_sources.contains(&identity) {
+                            source_files.insert(identity, SourceBacking::Primary(tensor.clone()));
+                        }
+                        locations.push(wire::PayloadLocation { payload_id: id, file, tensor });
+                        continue;
                     }
-                };
-                if file.is_empty() && source.asset_payloads.contains(&id) {
-                    present.insert(id.clone(), slice.clone());
-                    sources.insert(identity, slice.clone());
-                    locations.push(wire::PayloadLocation { payload_id: id, file, tensor });
-                    continue;
+                    let companion = companion_name(&file, &tensor, identity, &mut used)?;
+                    staging.link(&object, &companion)?;
+                    present.insert(id.clone());
+                    if derivation_sources.contains(&identity) {
+                        source_files.insert(
+                            identity,
+                            SourceBacking::Companion(staging.directory().join(&companion)),
+                        );
+                    }
+                    locations.push(wire::PayloadLocation {
+                        payload_id: id,
+                        file: companion,
+                        tensor: COMPANION_TENSOR.to_string(),
+                    });
                 }
-                let companion = companion_name(&file, &tensor, identity, &mut used)?;
-                staging.link(&object, &companion)?;
-                present.insert(id.clone(), slice.clone());
-                sources.insert(identity, slice.clone());
-                locations.push(wire::PayloadLocation {
-                    payload_id: id,
-                    file: companion,
-                    tensor: COMPANION_TENSOR.to_string(),
-                });
             }
         }
         for id in local {
-            if present.contains_key(&id) {
+            if present.contains(&id) {
                 continue;
             }
             let identity = PayloadId::from_bytes(
@@ -1215,8 +1319,10 @@ impl Root {
                 )
             });
             if file.is_empty() && source.asset_payloads.contains(&id) {
-                present.insert(id.clone(), slice.clone());
-                sources.insert(identity, slice.clone());
+                present.insert(id.clone());
+                if derivation_sources.contains(&identity) {
+                    source_files.insert(identity, SourceBacking::Primary(tensor.clone()));
+                }
                 locations.push(wire::PayloadLocation { payload_id: id, file, tensor });
                 continue;
             }
@@ -1224,8 +1330,13 @@ impl Root {
                 continue;
             };
             staging.link(&object, &companion)?;
-            present.insert(id.clone(), slice.clone());
-            sources.insert(identity, slice.clone());
+            present.insert(id.clone());
+            if derivation_sources.contains(&identity) {
+                source_files.insert(
+                    identity,
+                    SourceBacking::Companion(staging.directory().join(&companion)),
+                );
+            }
             locations.push(wire::PayloadLocation {
                 payload_id: id,
                 file: companion,
@@ -1241,20 +1352,41 @@ impl Root {
         let mut ordinal = 0usize;
         for derivation in derivations {
             let identity = derivation.target;
-            if present.contains_key(identity.as_bytes().as_slice()) {
+            if present.contains(identity.as_bytes().as_slice()) {
                 continue;
             }
             let directory = staging.directory().join(format!("weights/tuned/{deployment}"));
             fs::create_dir_all(&directory).map_err(failure)?;
             let target = directory.join(format!("derived-{ordinal:03}.safetensors"));
             ordinal += 1;
-            derivation::materialize_with(
-                &target,
-                &derivation,
-                &sources,
-                &derivation::Limits::default(),
-                progress.as_ref(),
-            )?;
+            {
+                let mut step_sources: BTreeMap<PayloadId, Slice> = BTreeMap::new();
+                for operation in &derivation.operations {
+                    let derivation::Operation::Copy(copy) = operation else {
+                        continue;
+                    };
+                    if step_sources.contains_key(&copy.source) {
+                        continue;
+                    }
+                    let backing = source_files.get(&copy.source).ok_or_else(|| {
+                        format!("missing derivation source payload {}", copy.source)
+                    })?;
+                    let slice = match backing {
+                        SourceBacking::Companion(path) => {
+                            Container::open(path)?.tensor(COMPANION_TENSOR)?
+                        }
+                        SourceBacking::Primary(tensor) => source.metadata.primary().tensor(tensor)?,
+                    };
+                    step_sources.insert(copy.source, slice);
+                }
+                derivation::materialize_with(
+                    &target,
+                    &derivation,
+                    &step_sources,
+                    &derivation::Limits::default(),
+                    progress.as_ref(),
+                )?;
+            }
             if fs::metadata(&target).map_err(failure)?.len() != derivation.length {
                 return Err("materialized target has the wrong length".into());
             }
@@ -1270,8 +1402,13 @@ impl Root {
             let companion = format!("weights/tuned/{deployment}/derived-{:03}.safetensors", ordinal - 1);
             remove_file(&target).map_err(failure)?;
             staging.link(&object, &companion)?;
-            present.insert(identity.as_bytes().to_vec(), object.slice().clone());
-            sources.insert(identity, object.slice().clone());
+            present.insert(identity.as_bytes().to_vec());
+            if derivation_sources.contains(&identity) {
+                source_files.insert(
+                    identity,
+                    SourceBacking::Companion(staging.directory().join(&companion)),
+                );
+            }
             locations.push(wire::PayloadLocation {
                 payload_id: identity.as_bytes().to_vec(),
                 file: companion,
@@ -1279,7 +1416,7 @@ impl Root {
             });
         }
         for id in required.keys() {
-            if !present.contains_key(id) {
+            if !present.contains(id) {
                 return Err(format!("ready closure lacks payload {}", required.get(id).unwrap().0).into());
             }
         }
@@ -1312,6 +1449,37 @@ impl Root {
 
     pub fn path(&self) -> &Path {
         &self.root
+    }
+
+    /// Inspect a cached blob's container framing and payload length without holding
+    /// its data descriptor or per-blob lock open. Callers must hold `publication`
+    /// shared so collection cannot remove the blob before it is pinned.
+    fn cached_blob_path(&self, id: PayloadId, expected_length: u64) -> Result<Option<PathBuf>> {
+        #[cfg(test)]
+        PAYLOAD_OPENS.with(|count| count.set(count.get() + 1));
+        let path = self.root.join("blobs").join(id.file_name());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(failure(error)),
+        }
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if is_fd_exhaustion(&error) => return Err(failure(error)),
+            Err(_) => return Ok(None),
+        };
+        let Ok(container) = Container::open_pinned(Arc::new(file)) else {
+            return Ok(None);
+        };
+        let Ok(slice) = container.tensor(COMPANION_TENSOR) else {
+            return Ok(None);
+        };
+        if slice.len() != expected_length {
+            return Ok(None);
+        }
+        Ok(Some(path))
     }
 
     /// Published object for one payload identity, retained by its handle lock.
@@ -1782,34 +1950,48 @@ impl Root {
         source: &CoreSource<'_>,
         progress: Option<&progress::AcquisitionProgress>,
     ) -> Result<()> {
-        let files = self.ready_payloads(entry, source)?;
-        for (id, slice) in files.iter() {
-            let identity = PayloadId::from_bytes(
-                id.try_into()
-                    .map_err(|_| "payload identity is not 32 bytes".to_string())?,
-            );
-            verify_slice(slice, identity, progress)?;
-        }
-        Ok(())
+        self.visit_ready_payloads(entry, source, false, true, progress)
     }
 
     /// Check a published entry's signed envelope, payload locations, and lengths.
     /// Immutable cached payload bytes are reused without hashing them again.
     pub fn check_ready(&self, entry: &Entry, source: &CoreSource<'_>) -> Result<()> {
-        self.ready_payloads(entry, source).map(|_| ())
+        self.visit_ready_payloads(entry, source, false, false, None)
     }
 
-    fn ready_payloads(
+    /// Check a published entry whose primary was already opened into `source`,
+    /// reusing its opened metadata without reading the primary manifest again.
+    pub fn check_ready_installed(&self, entry: &Entry, source: &CoreSource<'_>) -> Result<()> {
+        let expected = entry.directory().join("model.safetensors");
+        if source.metadata.path != expected {
+            return self.visit_ready_payloads(entry, source, false, false, None);
+        }
+        self.visit_ready_payloads(entry, source, true, false, None)
+    }
+
+    /// Validate (and optionally hash) every required payload in `entry` across a
+    /// bounded worker set so ready checks scale independently of the process
+    /// open-file limit.
+    fn visit_ready_payloads(
         &self,
         entry: &Entry,
         source: &CoreSource<'_>,
-    ) -> Result<reader::PayloadFiles> {
-        // The entry must be the same signed core. Its physical locations may
-        // be normalized, but its signed envelope may not change.
-        let installed = reader::Metadata::open(entry.directory())?;
-        if installed.envelope != source.metadata.envelope {
-            return Err("cached entry signed envelope differs from its source".into());
-        }
+        reuse_source_metadata: bool,
+        verify: bool,
+        progress: Option<&progress::AcquisitionProgress>,
+    ) -> Result<()> {
+        let opened;
+        let installed = if reuse_source_metadata {
+            &source.metadata
+        } else {
+            // The entry must be the same signed core. Its physical locations may
+            // be normalized, but its signed envelope may not change.
+            opened = reader::Metadata::open(entry.directory())?;
+            if opened.envelope != source.metadata.envelope {
+                return Err("cached entry signed envelope differs from its source".into());
+            }
+            &opened
+        };
         let mut required: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         for verified in &source.verified {
             for id in reader::required_payloads(verified)? {
@@ -1827,36 +2009,118 @@ impl Root {
                 }
             }
         }
-        // Resolve the installed locations and their exact tensor names. Cache
-        // entries may normalize paths, but the entry's location tensor is the
-        // binding the loader will follow.
-        let mut catalog = schema::Catalog::new();
+        let locations: BTreeMap<&[u8], &wire::PayloadLocation> = installed
+            .locations
+            .locations
+            .iter()
+            .map(|location| (location.payload_id.as_slice(), location))
+            .collect();
+        // Resolve installed locations and group by file so each worker opens one
+        // companion at a time and closes it before moving to the next.
+        let mut by_file: BTreeMap<&str, Vec<(PayloadId, &str, u64)>> = BTreeMap::new();
         for (id, length) in &required {
-            catalog.insert(&wire::PayloadDescriptor {
-                id: id.clone(),
-                nbytes: *length,
-            })?;
-        }
-        let files = installed.payloads(
-            &catalog,
-            required.keys().map(|id| id.as_slice()),
-        )?;
-        for (id, length) in required {
             let identity = PayloadId::from_bytes(
                 id.as_slice()
                     .try_into()
                     .map_err(|_| "payload identity is not 32 bytes".to_string())?,
             );
-            let slice = files.get(id.as_slice())?;
-            if slice.len() != length {
-                return Err(format!(
-                    "cached entry payload {identity} has {} bytes, expected {length}",
-                    slice.len()
-                )
-                .into());
+            let location = locations
+                .get(id.as_slice())
+                .ok_or_else(|| invalid("selected deployment is missing a payload location"))?;
+            by_file
+                .entry(location.file.as_str())
+                .or_default()
+                .push((identity, location.tensor.as_str(), *length));
+        }
+        if let Some(primary_payloads) = by_file.remove("") {
+            for (identity, tensor, length) in primary_payloads {
+                let slice = installed.primary().tensor(tensor)?;
+                if slice.len() != length {
+                    return Err(format!(
+                        "cached entry payload {identity} has {} bytes, expected {length}",
+                        slice.len()
+                    )
+                    .into());
+                }
+                if verify {
+                    verify_slice(&slice, identity, progress)?;
+                }
             }
         }
-        Ok(files)
+        let external: Vec<(&str, Vec<(PayloadId, &str, u64)>)> = by_file.into_iter().collect();
+        if external.is_empty() {
+            return Ok(());
+        }
+        let root = installed
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let check_companion = |file: &str, payloads: &[(PayloadId, &str, u64)]| -> Result<()> {
+            let (_, pinned) = open_relative(root, file)?;
+            let container = Container::open_pinned(pinned)?;
+            if container.format() != PAYLOAD_FORMAT {
+                return Err(invalid("invalid payload companion format"));
+            }
+            for &(identity, tensor, length) in payloads {
+                let slice = container.tensor(tensor)?;
+                if slice.len() != length {
+                    return Err(format!(
+                        "cached entry payload {identity} has {} bytes, expected {length}",
+                        slice.len()
+                    )
+                    .into());
+                }
+                if verify {
+                    verify_slice(&slice, identity, progress)?;
+                }
+            }
+            Ok(())
+        };
+        const MAX_READY_WORKERS: usize = 8;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |count| count.get())
+            .min(MAX_READY_WORKERS)
+            .min(external.len());
+        if workers <= 1 {
+            for (file, payloads) in &external {
+                check_companion(file, payloads)?;
+            }
+            return Ok(());
+        }
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let first_error: std::sync::Mutex<Option<(usize, crate::Error)>> =
+            std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let cursor = &cursor;
+                let failed = &failed;
+                let first_error = &first_error;
+                let external = &external;
+                scope.spawn(move || loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((file, payloads)) = external.get(index) else {
+                        break;
+                    };
+                    if let Err(error) = check_companion(file, payloads) {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = first_error.lock().expect("ready check error mutex");
+                        if slot.as_ref().is_none_or(|(prev, _)| index < *prev) {
+                            *slot = Some((index, error));
+                        }
+                        break;
+                    }
+                });
+            }
+        });
+        if let Some((_, error)) = first_error.into_inner().expect("ready check error mutex") {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Select an already leased entry; callers retain the lease through loading.
@@ -1970,17 +2234,20 @@ impl Root {
         let directory = destination
             .parent()
             .ok_or("source reference has no parent")?;
+        let bytes = serde_json::to_vec(&SourceRefRecord::Versioned {
+            version: 2,
+            selector: selector.to_owned(),
+            revision: revision.to_owned(),
+            model: entry.model().to_owned(),
+            entry: entry.id().to_owned(),
+            envelope_sha256: PayloadId::from_bytes(expected_envelope).to_hex(),
+        })
+        .map_err(|error| error.to_string())?;
+        if fs::read(destination).ok().as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
         let temporary = directory.join(format!(".ref-{}", token()));
         let result = (|| {
-            let bytes = serde_json::to_vec(&SourceRefRecord::Versioned {
-                version: 2,
-                selector: selector.to_owned(),
-                revision: revision.to_owned(),
-                model: entry.model().to_owned(),
-                entry: entry.id().to_owned(),
-                envelope_sha256: PayloadId::from_bytes(expected_envelope).to_hex(),
-            })
-            .map_err(|error| error.to_string())?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -2705,16 +2972,21 @@ impl Root {
 
     fn write_ref(&self, model: &str, entry: &str) -> Result<()> {
         let directory = self.root.join("refs");
+        let expected = format!("{entry}\n");
+        let target = directory.join(model);
+        if fs::read_to_string(&target).ok().as_deref() == Some(expected.as_str()) {
+            return Ok(());
+        }
         let temporary = directory.join(format!(".ref-{}", token()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
             .map_err(failure)?;
-        io::Write::write_all(&mut file, format!("{entry}\n").as_bytes()).map_err(failure)?;
+        io::Write::write_all(&mut file, expected.as_bytes()).map_err(failure)?;
         file.sync_all().map_err(failure)?;
         drop(file);
-        fs::rename(&temporary, directory.join(model)).map_err(failure)?;
+        fs::rename(&temporary, target).map_err(failure)?;
         syncdir(&directory)
     }
 
@@ -2899,6 +3171,52 @@ impl<'a> CoreSource<'a> {
         })
     }
 
+    /// Pair already-verified deployments with the primary they were read from.
+    pub fn from_verified(
+        metadata: reader::Metadata,
+        verified: Vec<protection::VerifiedCore>,
+    ) -> Result<Self> {
+        if verified.is_empty() {
+            return Err("installation requires at least one selected deployment".into());
+        }
+        let envelope_digest = protection::sha256(&metadata.envelope);
+        let mut deployments = Vec::with_capacity(verified.len());
+        let mut asset_payloads = BTreeSet::new();
+        let mut union_ids = Vec::new();
+        let mut seen_union = BTreeSet::new();
+        let track_union = verified.len() > 1;
+        for core in &verified {
+            if core.envelope_digest() != envelope_digest {
+                return Err("verified core does not match this primary".into());
+            }
+            if !core.is_executable() {
+                return Err("installation requires a selected prepared deployment".into());
+            }
+            let deployment = core
+                .deployment()
+                .ok_or_else(|| "selection has no authenticated deployment".to_string())?;
+            if !deployments.contains(&deployment.deployment_id) {
+                deployments.push(deployment.deployment_id.clone());
+            }
+            asset_payloads.extend(core_asset_payloads(core));
+            if track_union {
+                for id in reader::required_payloads(core)? {
+                    if seen_union.insert(id.clone()) {
+                        union_ids.push(id);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            verified,
+            metadata,
+            deployments,
+            union_ids,
+            asset_payloads,
+            _source: std::marker::PhantomData,
+        })
+    }
+
     /// Verify every requested deployment from this primary and union their closures.
     pub fn union(
         mut self,
@@ -2908,12 +3226,28 @@ impl<'a> CoreSource<'a> {
         if selections.is_empty() {
             return Err("installation requires at least one selected deployment".into());
         }
+        let mut previous = std::mem::take(&mut self.verified);
         self.verified = Vec::with_capacity(selections.len());
         self.deployments.clear();
         self.asset_payloads.clear();
         self.union_ids.clear();
+        let mut seen_union = BTreeSet::new();
         for selection in selections {
-            let verified = protection::verify(&self.metadata.envelope, publishers, *selection)?;
+            let reused = match previous
+                .iter()
+                .position(|core| core.selection() == *selection)
+            {
+                Some(index)
+                    if protection::publisher_authorized(publishers, previous[index].publisher())? =>
+                {
+                    Some(previous.swap_remove(index))
+                }
+                _ => None,
+            };
+            let verified = match reused {
+                Some(verified) => verified,
+                None => protection::verify(&self.metadata.envelope, publishers, *selection)?,
+            };
             let deployment = verified
                 .deployment()
                 .ok_or_else(|| "selection has no authenticated deployment".to_string())?;
@@ -2922,7 +3256,7 @@ impl<'a> CoreSource<'a> {
             }
             self.asset_payloads.extend(core_asset_payloads(&verified));
             for id in reader::required_payloads(&verified)? {
-                if !self.union_ids.contains(&id) {
+                if seen_union.insert(id.clone()) {
                     self.union_ids.push(id);
                 }
             }
@@ -3075,17 +3409,20 @@ impl Staging {
 
     /// Link one published object into the staged tree.
     pub fn link(&mut self, object: &PayloadObject, relative: &str) -> Result<()> {
+        self.link_path(object.path(), object.id(), relative)
+    }
+
+    fn link_path(&mut self, source: &Path, id: PayloadId, relative: &str) -> Result<()> {
         validate_relative_path(relative)?;
         let _publication = Lock::shared(self.root.publication_lock())?;
         let destination = self.directory.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(failure)?;
         }
-        match fs::hard_link(object.path(), &destination) {
+        match fs::hard_link(source, &destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => Err(format!(
-                "object {} cannot be hardlinked from another filesystem",
-                object.id()
+                "object {id} cannot be hardlinked from another filesystem"
             )
             .into()),
             Err(error) => Err(failure(error)),
@@ -3900,6 +4237,18 @@ pub(crate) fn syncdir(path: &Path) -> Result<()> {
 pub(crate) fn syncdir(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
+}
+
+fn is_fd_exhaustion(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn failure(error: io::Error) -> crate::Error {
@@ -7093,6 +7442,88 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_plan_pins_blobs_without_per_blob_locks_and_survives_collect() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let directory = temporary.0.join("pin-lease");
+        let data: Vec<(String, Vec<u8>)> = (0..4u8)
+            .map(|index| (format!("layer-{index:02}"), vec![index ^ 0x5a; 8]))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = data
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let initializers: Vec<(PayloadId, u64)> = data
+            .iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (PayloadId::of(bytes), (index * 8) as u64))
+            .collect();
+        let publisher = publish_fixture(&directory, &refs, &initializers);
+        for (id, _) in &initializers {
+            let (_, bytes) = data
+                .iter()
+                .find(|(_, bytes)| PayloadId::of(bytes) == *id)
+                .unwrap();
+            root.insert_payload(*id, bytes.len() as u64, bytes.as_slice())
+                .unwrap();
+        }
+        let plan = root
+            .plan_acquisition(
+                core_source(&directory, &publisher),
+                &derivation::Limits::default(),
+            )
+            .unwrap();
+        assert!(
+            plan.remote_files()
+                .iter()
+                .all(|file| !file.starts_with("weights/")),
+            "{:?}",
+            plan.remote_files()
+        );
+        // Cached payloads stay pinned through a single staging transaction without
+        // holding per-blob lock descriptors open during remote transfer.
+        for (id, _) in &initializers {
+            let lock = Lock::try_exclusive(root.lock_path("blobs", &id.to_hex())).unwrap();
+            assert!(
+                lock.is_some(),
+                "plan must not hold per-blob lock descriptor for {id}"
+            );
+        }
+        // Collection runs concurrently without blocking and preserves every pinned blob.
+        let collected = root.collect().unwrap();
+        assert_eq!(collected.objects, 0);
+        for (id, _) in &initializers {
+            assert!(root.path().join("blobs").join(id.file_name()).is_file());
+        }
+
+        let entry = root.install_planned(plan, "pin-lease", "v1").unwrap();
+        let source = core_source(&directory, &publisher);
+        root.check_ready(&entry, &source).unwrap();
+        root.verify_ready(&entry, &source).unwrap();
+        for (name, bytes) in &data {
+            let slice = entry
+                .payload(&format!("weights/{name}.safetensors"))
+                .unwrap();
+            let mut stored = vec![0; slice.len() as usize];
+            slice.read_at(0, &mut stored).unwrap();
+            assert_eq!(&stored, bytes);
+        }
+
+        // Dropping an uninstalled plan removes its pin tree so unreferenced blobs reclaim.
+        let abandoned = root
+            .plan_acquisition(
+                core_source(&directory, &publisher),
+                &derivation::Limits::default(),
+            )
+            .unwrap();
+        drop(abandoned);
+        drop(entry);
+        root.remove("pin-lease", "v1", true).unwrap();
+        let reclaimed = root.collect().unwrap();
+        assert!(reclaimed.objects >= initializers.len());
+    }
+
+    #[test]
     fn arbitrary_packed_tensors_install_with_friendly_companions() {
         let temporary = Temporary::new();
         let root = temporary.root();
@@ -8155,6 +8586,4 @@ mod selection_tests {
         assert!(root.primary(&entry).is_err(), "ambiguous primaries must be rejected");
         let _ = fs::remove_dir_all(path);
     }
-
-
 }

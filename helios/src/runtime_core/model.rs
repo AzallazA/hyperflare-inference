@@ -782,13 +782,33 @@ impl NativeModel {
                 let phase = progress.phase("Prepare embedding tables", None);
                 let storage = options.embedding_table_storage.unwrap_or_default();
                 let group_budget = embedding_table_cache_bytes / engram.len() as u64;
-                let files = files.direct_files().collect::<Result<Vec<_>>>()?;
+                // Open direct-I/O handles only for containers that actually carry embedding
+                // planes rather than every weight companion in the deployment.
+                let mut mapped_files = std::collections::BTreeMap::new();
+                let mut direct_files = Vec::new();
+                for (index, _) in &mut engram {
+                    for table in &mut index.tables {
+                        for plane in &mut table.planes {
+                            let target = match mapped_files.entry(plane.file) {
+                                std::collections::btree_map::Entry::Occupied(entry) => {
+                                    *entry.get()
+                                }
+                                std::collections::btree_map::Entry::Vacant(slot) => {
+                                    let next = direct_files.len();
+                                    direct_files.push(files.direct_file(plane.file)?);
+                                    *slot.insert(next)
+                                }
+                            };
+                            plane.file = target;
+                        }
+                    }
+                }
                 let mut bindings = Vec::new();
                 for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
                     let first = ranks[0];
                     let shared = crate::engram::Shared::new(
                         index,
-                        &files,
+                        &direct_files,
                         ranks.len(),
                         tokens,
                         model.ranks[first].context as usize,

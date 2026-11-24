@@ -303,6 +303,7 @@ fn open_descriptors() -> Option<u64> {
 
 fn preflight_open_files(
     metadata: &payload_reader::Metadata,
+    verified: &payload_auth::VerifiedCore,
     ids: &std::collections::BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     let mut files = std::collections::BTreeSet::new();
@@ -312,17 +313,48 @@ fn preflight_open_files(
             files.insert(location.file.clone());
         }
     }
-    // Each selected companion needs one opened container and one direct-I/O handle, and every
-    // payload inside it shares that handle.
-    let required = (files.len() as u64).saturating_mul(2);
+    let mut engram_ids = std::collections::BTreeSet::new();
+    if let Some(engram) = verified.deployment().and_then(|deployment| deployment.engram.as_ref()) {
+        for table in &engram.tables {
+            for plane in [&table.weights, &table.scales] {
+                if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+                    engram_ids.insert(slice.payload_id.as_slice());
+                }
+            }
+            for shard in &table.shards {
+                if verified.rank(shard.rank).is_some() {
+                    for plane in [&shard.weights, &shard.scales] {
+                        if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+                            engram_ids.insert(slice.payload_id.as_slice());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let engram_files: std::collections::BTreeSet<&str> = metadata
+        .locations
+        .locations
+        .iter()
+        .filter(|location| engram_ids.contains(location.payload_id.as_slice()))
+        .map(|location| location.file.as_str())
+        .collect();
+    // Each selected companion needs one pinned descriptor; weight loading holds at most
+    // `READERS` temporary direct-I/O handles per rank, and Engram opens one direct handle per
+    // distinct table-plane file.
+    let loader_direct =
+        (verified.ranks().len().max(1) as u64).saturating_mul(super::payload::READERS as u64);
+    let required = (files.len() as u64)
+        .saturating_add(loader_direct)
+        .saturating_add(engram_files.len() as u64);
     #[cfg(unix)]
     {
-        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-        // SAFETY: getrlimit writes into the provided struct.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-            // Count what the process already holds rather than assuming fixed headroom.
-            let current = open_descriptors().unwrap_or(0);
-            return open_file_budget(current, required, limit.rlim_cur as u64);
+        // Count what the process already holds rather than assuming fixed headroom, and raise the
+        // soft limit toward the hard limit when the deployment requires more descriptors.
+        let current = open_descriptors().unwrap_or(0);
+        let desired = current.saturating_add(required).saturating_add(256);
+        if let Some(limit) = crate::os::raise_open_file_limit(desired) {
+            return open_file_budget(current, required, limit);
         }
         Ok(())
     }
@@ -479,6 +511,12 @@ impl super::payload::Files for FilesRef {
         match self {
             FilesRef::Legacy(archive) => super::payload::Files::direct_files(archive),
             FilesRef::Payload(source) => super::payload::Files::direct_files(source),
+        }
+    }
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
+        match self {
+            FilesRef::Legacy(archive) => super::payload::Files::direct_file(archive, index),
+            FilesRef::Payload(source) => super::payload::Files::direct_file(source, index),
         }
     }
     fn retained_files(&self) -> Result<Vec<Arc<File>>> {
@@ -714,6 +752,13 @@ impl VerifiedCore {
         match self {
             Self::Legacy(core) => core.index.ranks.len(),
             Self::Payload(core) => core.verified.ranks().len(),
+        }
+    }
+    /// Number of Ed25519 signatures verified for this core selection.
+    pub fn signature_count(&self) -> usize {
+        match self {
+            Self::Legacy(core) => 3 + core.index.ranks.len(),
+            Self::Payload(core) => core.verified.signature_count(),
         }
     }
     pub fn open_selected(
@@ -1816,24 +1861,47 @@ impl super::payload::Files for PayloadSource {
     fn direct_files(&self) -> Box<dyn Iterator<Item = Result<Arc<File>>> + '_> {
         Box::new(self.files.values().map(|file| file.direct()))
     }
-    fn retained_files(&self) -> Result<Vec<Arc<File>>> {
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
         self.files
             .values()
-            .map(|payload| {
-                #[cfg(windows)]
-                {
-                    return Ok(Arc::new(
+            .nth(index)
+            .ok_or_else(|| invalid("payload container index out of range"))?
+            .direct()
+    }
+    fn retained_files(&self) -> Result<Vec<Arc<File>>> {
+        #[cfg(windows)]
+        {
+            return self
+                .files
+                .values()
+                .map(|payload| {
+                    Ok(Arc::new(
                         crate::os::direct_read_guard(&payload.file).map_err(|error| {
                             invalid(format!("retain read-only core: {error}"))
                         })?,
-                    ));
+                    ))
+                })
+                .collect();
+        }
+        #[cfg(unix)]
+        {
+            // On Unix, weights, kernels, and graphs finish uploading before serving begins, and
+            // the cache entry lease protects published entries. Keep only the files backing
+            // frontend assets so `/proc/self/fd/<fd>` paths in `server_config["assets"]` stay open.
+            let mut retained = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for asset in &self.authorized.verified().core().assets {
+                let Some(slice) = asset.payload.as_ref().and_then(|use_| use_.slice.as_ref())
+                else {
+                    continue;
+                };
+                let (file, _) = self.payload_file(&slice.payload_id)?;
+                if seen.insert(Arc::as_ptr(&file.file) as usize) {
+                    retained.push(file.file.clone());
                 }
-                #[cfg(unix)]
-                {
-                    Ok(payload.file.clone())
-                }
-            })
-            .collect()
+            }
+            Ok(retained)
+        }
     }
     fn resource_reader<'a>(
         &'a self,
@@ -2126,7 +2194,7 @@ impl PayloadVerifiedCore {
             .deployment()
             .ok_or_else(|| invalid("catalog verification selects no deployment"))?;
         let ids = payload_reader::required_payloads(&verified)?;
-        preflight_open_files(&metadata, &ids)?;
+        preflight_open_files(&metadata, &verified, &ids)?;
         let payloads = metadata.payloads(verified.catalog(), ids.iter().map(|id| id.as_slice()))?;
         let mut files = BTreeMap::new();
         let mut placements = BTreeMap::new();
@@ -2470,7 +2538,7 @@ impl PayloadVerifiedCore {
                 }
             })?;
             if let Some(phase) = phase {
-                phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
+                phase.finish(crate::core::progress::format_bytes(total));
             }
         }
         Ok(PayloadAuthorizedCore { source, cores })
@@ -4270,6 +4338,42 @@ mod payload_core_tests {
                 .contains("payload content verification failed"),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_retained_files_keeps_only_asset_containers() {
+        use super::super::payload::Files;
+        use std::os::fd::AsRawFd;
+
+        let (root, publishers) = two_initializer_core();
+        let verified = VerifiedCore::open_tensor_parallel(&root, &publishers, 1, None).unwrap();
+        let authorized = verified.authorize(&publishers[0].namespace, false).unwrap();
+        let AuthorizedKind::Payload(payload) = &authorized.kind else {
+            panic!("expected the payload backend");
+        };
+        let retained = payload.source.retained_files().unwrap();
+        assert!(
+            retained.len() < payload.source.files.len(),
+            "Unix retained_files should not pin non-asset companions: {} vs {}",
+            retained.len(),
+            payload.source.files.len()
+        );
+        let retained_fds: std::collections::BTreeSet<i32> =
+            retained.iter().map(|file| file.as_raw_fd()).collect();
+        for asset in &payload.source.authorized.verified().core().assets {
+            let slice = asset
+                .payload
+                .as_ref()
+                .and_then(|use_| use_.slice.as_ref())
+                .unwrap();
+            let (file, _) = payload.source.payload_file(&slice.payload_id).unwrap();
+            assert!(
+                retained_fds.contains(&file.file.as_raw_fd()),
+                "asset descriptor must stay retained for /proc/self/fd reads"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

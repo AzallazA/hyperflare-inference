@@ -325,6 +325,43 @@ fn download_for_model_at(
         let (entry, expected_envelope) =
             offline_entry_with_expected(&model_root, id, &revision, options, gpu_count)?;
         let primary = entry_primary(&entry)?;
+        if flare_helios::core::conversion::form(&primary)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            let metadata = flare_helios::core::reader::Metadata::open(&primary)?;
+            let claim = payload_core_claim(&metadata.envelope)?;
+            let resolved = crate::trust::resolve_identity_for_claim(
+                claim,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            )?;
+            let actual = *flare_helios::core::PayloadId::of(&metadata.envelope).as_bytes();
+            if actual != expected_envelope {
+                return Err(format!(
+                    "cached core for {id}@{revision} does not match the signed envelope recorded for its source; refresh source online or load cached entry by explicit path"
+                )
+                .into());
+            }
+            let sizes =
+                crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
+                    .map_err(|error| error.to_string())?;
+            let source = crate::cache_support::select_bound_core_source(
+                metadata,
+                expected_envelope,
+                &resolved.profiles,
+                &sizes,
+            )
+            .map_err(|error| error.to_string())?;
+            let store = flare_helios::core::cache::Root::open(&model_root)?;
+            store.check_ready_installed(&entry, &source)?;
+            if select_default {
+                store.publish_entry(&entry)?;
+            }
+            return Ok(entry);
+        }
         let resolved = crate::trust::resolve_identity_with(
             &primary,
             publisher_keys,
@@ -354,7 +391,7 @@ fn download_for_model_at(
     let cache = Cache::new(transport.root().to_owned());
     let repo = Repo::with_revision(id.to_owned(), RepoType::Model, revision.clone());
     log::info!("Core source: {id}@{revision}");
-    let (path, installed_folder, installed_commit) = {
+    let (path, installed_folder, installed_commit, fetched_transport) = {
         let api = ApiBuilder::from_cache(cache)
             .with_token(access_token.clone())
             .with_endpoint(endpoint.into())
@@ -364,214 +401,254 @@ fn download_for_model_at(
         let token = access_token.as_deref();
         check_cancel(Some(&report.progress))?;
 
-        report.progress.set_phase(AcquisitionPhase::Downloading);
-        let (primary, pinned) = fetch_primary_with_progress(
+        report.progress.set_phase(AcquisitionPhase::Checking);
+        let (pinned, filename) = resolve_primary_target(
             &api,
-            &transport,
             &repo,
             options.filename.as_deref(),
-            token,
             Some(&report.progress),
         )?;
-        let filename = primary
-            .strip_prefix(transport.snapshot_dir(&pinned.folder_name(), pinned.revision()))?
-            .to_str()
-            .ok_or("core filename is not UTF-8")?
-            .to_owned();
-        report.progress.set_phase(AcquisitionPhase::Checking);
-        // The shared resolver supplies remembered and explicit profiles plus the
-        // established identity; download never accepts terms or decodes executables.
-        let resolved = crate::trust::resolve_identity_with(
-            &primary,
-            publisher_keys,
-            supplied_profiles,
-            options,
-            trust_store,
-        )
-        .map_err(|error| transport_hint(transport.root(), error))?;
-        let publishers = resolved.profiles;
-        if !publishers.iter().any(|publisher| {
-            publisher.fingerprint() == resolved.claim.signer
-                && publisher.namespace == resolved.claim.namespace
-        }) {
-            return Err(Box::new(PublisherKeyRequired {
-                primary,
-                profile_url: api.repo(pinned.clone()).url("publisher.json"),
-            }));
-        }
-        let legacy = flare_helios::core::conversion::form(&primary)
-            .map_err(|error| error.to_string())?
-            .is_none();
-        if let Some(expected) = expected_model.filter(|_| !legacy) {
-            use flare_helios::core::{cache, protection, reader};
-            let metadata = reader::Metadata::open(&primary)?;
-            let catalog = protection::verify(
-                &metadata.envelope,
-                &publishers,
-                protection::Selection::Catalog,
-            )?;
-            let identity = catalog.core().model_identity.as_str();
-            let model = cache::model_key(if identity.is_empty() { id } else { identity })
-                .map_err(|error| error.to_string())?;
-            if model != expected {
-                return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
-            }
-        }
-        let entry = if legacy {
-            match legacy_warm_entry(
-                &primary,
-                options,
-                &id,
-                &revision,
-                pinned.revision(),
-                &filename,
-                gpu_count,
-                &publishers,
-                &model_root,
-            )? {
-                Some(entry) => entry,
-                None => {
-                    let names = dependency_files(&primary, options, gpu_count, &publishers)?;
-                    let planned = plan_dependency_download(
-                        &api, &transport, &pinned, &primary, &names, token,
-                        Some(&report.progress),
-                    )?;
-                    let pending = planned.pending.as_ref();
-                    let remaining = pending.and_then(|pending| pending.total);
-                    report
-                        .progress
-                        .record_network_total(remaining.map(|remaining| {
-                            report
-                                .progress
-                                .snapshot()
-                                .network_bytes
-                                .saturating_add(remaining)
-                        }));
-                    announce_space(
-                        &transport,
-                        &model_root,
-                        pending.map(|pending| pending.bound),
-                    );
-                    if !names.is_empty() {
-                        check_cancel(Some(&report.progress))?;
-                    }
-                    report.progress.set_phase(AcquisitionPhase::Downloading);
-                    for (index, name) in names.iter().enumerate() {
-                        fetch_dependency_with_identity(
-                            &api,
-                            &transport,
-                            &pinned,
-                            &primary,
-                            name,
-                            token,
-                            Some(&report.progress),
-                            planned.identities[index].as_ref(),
-                        )?;
-                    }
-                    // A completed transfer ends at exactly the bytes it pulled,
-                    // even when adoption saved more or less than predicted.
-                    report
-                        .progress
-                        .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    check_cancel(Some(&report.progress))?;
-
-                    report.progress.set_phase(AcquisitionPhase::Installing);
-                    install_ready(&id, &primary, options, &model_root, gpu_count, &publishers)
-                        .map_err(|error| transport_hint(transport.root(), error))?
-                }
-            }
-        } else {
-            // Planning checks signed metadata and cached payload geometry;
-            // installation materializes and verifies missing payloads.
-            check_cancel(Some(&report.progress))?;
-
-            match plan_payload_acquisition(
-                &primary,
-                options,
-                &id,
-                &revision,
-                pinned.revision(),
-                &filename,
-                gpu_count,
-                &publishers,
-                &model_root,
-                Some(&report.progress),
-            )? {
-                PayloadAcquisition::Ready(entry) => entry,
-                PayloadAcquisition::Planned { plan, staging } => {
-                    let names = plan.remote_files();
-                    let planned = plan_dependency_download(
-                        &api, &transport, &pinned, &primary, &names, token,
-                        Some(&report.progress),
-                    )?;
-                    let pending = planned.pending.as_ref();
-                    let remaining = pending.and_then(|pending| pending.total);
-                    report
-                        .progress
-                        .record_network_total(remaining.map(|remaining| {
-                            report
-                                .progress
-                                .snapshot()
-                                .network_bytes
-                                .saturating_add(remaining)
-                        }));
-                    announce_space(
-                        &transport,
-                        &model_root,
-                        pending.map(|pending| pending.bound),
-                    );
-                    if !names.is_empty() {
-                        check_cancel(Some(&report.progress))?;
-                    }
-                    report.progress.set_phase(AcquisitionPhase::Downloading);
-                    for (index, name) in names.iter().enumerate() {
-                        fetch_dependency_with_identity(
-                            &api,
-                            &transport,
-                            &pinned,
-                            &primary,
-                            name,
-                            token,
-                            Some(&report.progress),
-                            planned.identities[index].as_ref(),
-                        )?;
-                    }
-                    // A completed transfer ends at exactly the bytes it pulled,
-                    // even when adoption saved more or less than predicted.
-                    report
-                        .progress
-                        .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    check_cancel(Some(&report.progress))?;
-
-                    report.progress.set_phase(AcquisitionPhase::Installing);
-                    finish_payload_acquisition(&primary, &names, plan, staging, &model_root)
-                        .map_err(|error| transport_hint(transport.root(), error))?
-                }
-            }
-        };
-        if expected_model.is_some_and(|model| model != entry.model()) {
-            return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
-        }
-        let (expected_envelope, resolved_sizes) =
-            authenticated_source(&primary, options, gpu_count, &publishers)?;
-        check_cancel(Some(&report.progress))?;
-        remember_download_sizes(
+        if let Some((entry, expected_envelope, resolved_sizes)) = warm_entry_for_commit(
             &model_root,
             id,
             &revision,
             pinned.revision(),
             &filename,
             options,
-            &resolved_sizes,
-            &entry,
-            expected_envelope,
-        )?;
-        // The default switches only after the source mapping is durable; a failed
-        // source recording must not leave a different model version selected.
-        if select_default {
-            flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            gpu_count,
+            publisher_keys,
+            trust_store,
+            supplied_profiles,
+            expected_model,
+        )? {
+            transport.record_ref(&repo.folder_name(), repo.revision(), pinned.revision());
+            check_cancel(Some(&report.progress))?;
+            remember_download_sizes(
+                &model_root,
+                id,
+                &revision,
+                pinned.revision(),
+                &filename,
+                options,
+                &resolved_sizes,
+                &entry,
+                expected_envelope,
+            )?;
+            if select_default {
+                flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            }
+            (entry, pinned.folder_name(), pinned.revision().to_owned(), false)
+        } else {
+            report.progress.set_phase(AcquisitionPhase::Downloading);
+            let primary = fetch_resolved_primary(
+                &api,
+                &transport,
+                &repo,
+                &pinned,
+                &filename,
+                token,
+                Some(&report.progress),
+            )?;
+            let filename = primary
+                .strip_prefix(transport.snapshot_dir(&pinned.folder_name(), pinned.revision()))?
+                .to_str()
+                .ok_or("core filename is not UTF-8")?
+                .to_owned();
+            report.progress.set_phase(AcquisitionPhase::Checking);
+            // The shared resolver supplies remembered and explicit profiles plus the
+            // established identity; download never accepts terms or decodes executables.
+            let resolved = crate::trust::resolve_identity_with(
+                &primary,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            )
+            .map_err(|error| transport_hint(transport.root(), error))?;
+            let publishers = resolved.profiles;
+            if !publishers.iter().any(|publisher| {
+                publisher.fingerprint() == resolved.claim.signer
+                    && publisher.namespace == resolved.claim.namespace
+            }) {
+                return Err(Box::new(PublisherKeyRequired {
+                    primary,
+                    profile_url: api.repo(pinned.clone()).url("publisher.json"),
+                }));
+            }
+            let legacy = flare_helios::core::conversion::form(&primary)
+                .map_err(|error| error.to_string())?
+                .is_none();
+            if let Some(expected) = expected_model.filter(|_| !legacy) {
+                use flare_helios::core::{cache, protection, reader};
+                let metadata = reader::Metadata::open(&primary)?;
+                let catalog = protection::verify(
+                    &metadata.envelope,
+                    &publishers,
+                    protection::Selection::Catalog,
+                )?;
+                let identity = catalog.core().model_identity.as_str();
+                let model = cache::model_key(if identity.is_empty() { id } else { identity })
+                    .map_err(|error| error.to_string())?;
+                if model != expected {
+                    return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+                }
+            }
+            let entry = if legacy {
+                match legacy_warm_entry(
+                    &primary,
+                    options,
+                    &id,
+                    &revision,
+                    pinned.revision(),
+                    &filename,
+                    gpu_count,
+                    &publishers,
+                    &model_root,
+                )? {
+                    Some(entry) => entry,
+                    None => {
+                        let names = dependency_files(&primary, options, gpu_count, &publishers)?;
+                        let planned = plan_dependency_download(
+                            &api, &transport, &pinned, &primary, &names, token,
+                            Some(&report.progress),
+                        )?;
+                        let pending = planned.pending.as_ref();
+                        let remaining = pending.and_then(|pending| pending.total);
+                        report
+                            .progress
+                            .record_network_total(remaining.map(|remaining| {
+                                report
+                                    .progress
+                                    .snapshot()
+                                    .network_bytes
+                                    .saturating_add(remaining)
+                            }));
+                        announce_space(
+                            &transport,
+                            &model_root,
+                            pending.map(|pending| pending.bound),
+                        );
+                        if !names.is_empty() {
+                            check_cancel(Some(&report.progress))?;
+                        }
+                        report.progress.set_phase(AcquisitionPhase::Downloading);
+                        for (index, name) in names.iter().enumerate() {
+                            fetch_dependency_with_identity(
+                                &api,
+                                &transport,
+                                &pinned,
+                                &primary,
+                                name,
+                                token,
+                                Some(&report.progress),
+                                planned.identities[index].as_ref(),
+                            )?;
+                        }
+                        // A completed transfer ends at exactly the bytes it pulled,
+                        // even when adoption saved more or less than predicted.
+                        report
+                            .progress
+                            .record_network_total(Some(report.progress.snapshot().network_bytes));
+                        check_cancel(Some(&report.progress))?;
+
+                        report.progress.set_phase(AcquisitionPhase::Installing);
+                        install_ready(&id, &primary, options, &model_root, gpu_count, &publishers)
+                            .map_err(|error| transport_hint(transport.root(), error))?
+                    }
+                }
+            } else {
+                // Planning checks signed metadata and cached payload geometry;
+                // installation materializes and verifies missing payloads.
+                check_cancel(Some(&report.progress))?;
+
+                match plan_payload_acquisition(
+                    &primary,
+                    options,
+                    &id,
+                    &revision,
+                    pinned.revision(),
+                    &filename,
+                    gpu_count,
+                    &publishers,
+                    &model_root,
+                    Some(&report.progress),
+                )? {
+                    PayloadAcquisition::Ready(entry) => entry,
+                    PayloadAcquisition::Planned { plan, staging } => {
+                        let names = plan.remote_files();
+                        let planned = plan_dependency_download(
+                            &api, &transport, &pinned, &primary, &names, token,
+                            Some(&report.progress),
+                        )?;
+                        let pending = planned.pending.as_ref();
+                        let remaining = pending.and_then(|pending| pending.total);
+                        report
+                            .progress
+                            .record_network_total(remaining.map(|remaining| {
+                                report
+                                    .progress
+                                    .snapshot()
+                                    .network_bytes
+                                    .saturating_add(remaining)
+                            }));
+                        announce_space(
+                            &transport,
+                            &model_root,
+                            pending.map(|pending| pending.bound),
+                        );
+                        if !names.is_empty() {
+                            check_cancel(Some(&report.progress))?;
+                        }
+                        report.progress.set_phase(AcquisitionPhase::Downloading);
+                        for (index, name) in names.iter().enumerate() {
+                            fetch_dependency_with_identity(
+                                &api,
+                                &transport,
+                                &pinned,
+                                &primary,
+                                name,
+                                token,
+                                Some(&report.progress),
+                                planned.identities[index].as_ref(),
+                            )?;
+                        }
+                        // A completed transfer ends at exactly the bytes it pulled,
+                        // even when adoption saved more or less than predicted.
+                        report
+                            .progress
+                            .record_network_total(Some(report.progress.snapshot().network_bytes));
+                        check_cancel(Some(&report.progress))?;
+
+                        report.progress.set_phase(AcquisitionPhase::Installing);
+                        finish_payload_acquisition(&primary, &names, plan, staging, &model_root)
+                            .map_err(|error| transport_hint(transport.root(), error))?
+                    }
+                }
+            };
+            if expected_model.is_some_and(|model| model != entry.model()) {
+                return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+            }
+            let (expected_envelope, resolved_sizes) =
+                authenticated_source(&primary, options, gpu_count, &publishers)?;
+            check_cancel(Some(&report.progress))?;
+            remember_download_sizes(
+                &model_root,
+                id,
+                &revision,
+                pinned.revision(),
+                &filename,
+                options,
+                &resolved_sizes,
+                &entry,
+                expected_envelope,
+            )?;
+            // The default switches only after the source mapping is durable; a failed
+            // source recording must not leave a different model version selected.
+            if select_default {
+                flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            }
+            (entry, pinned.folder_name(), pinned.revision().to_owned(), true)
         }
-        (entry, pinned.folder_name(), pinned.revision().to_owned())
     };
     let mut report = report;
     report.success = true;
@@ -583,20 +660,22 @@ fn download_for_model_at(
     let root = transport.root().to_owned();
     let scope = transport.scope(&installed_folder);
     drop(transport);
-    match crate::download_cache::reclaim_installed(
-        &root,
-        &scope,
-        &installed_folder,
-        &installed_commit,
-    ) {
-        Ok(consumed) if consumed.complete_bytes > 0 => log::info!(
-            "Reclaimed {} bytes of consumed Hugging Face transport content",
-            consumed.complete_bytes
-        ),
-        Ok(_) => {}
-        Err(error) => log::info!(
-            "Warning: the core is installed, but its transport content was not reclaimed: {error}"
-        ),
+    if fetched_transport {
+        match crate::download_cache::reclaim_installed(
+            &root,
+            &scope,
+            &installed_folder,
+            &installed_commit,
+        ) {
+            Ok(consumed) if consumed.complete_bytes > 0 => log::info!(
+                "Reclaimed {} bytes of consumed Hugging Face transport content",
+                consumed.complete_bytes
+            ),
+            Ok(_) => {}
+            Err(error) => log::info!(
+                "Warning: the core is installed, but its transport content was not reclaimed: {error}"
+            ),
+        }
     }
     Ok(path)
 }
@@ -1738,16 +1817,17 @@ fn authenticated_source(
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
-    let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+    let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
         .map_err(|error| error.to_string())?;
+    source_envelope_and_sizes(&source)
+}
+
+fn source_envelope_and_sizes(
+    source: &flare_helios::core::cache::CoreSource<'_>,
+) -> Result<([u8; 32], Vec<u32>)> {
     let mut envelope = None;
     let mut resolved = std::collections::BTreeSet::new();
-    for selection in selections {
-        // The signed envelope and selected deployment are sufficient to establish the
-        // identity. Opening payload companions here would require materializing the
-        // Hub snapshot and duplicate the acquisition's closure work.
-        let verified =
-            flare_helios::core::protection::verify(&metadata.envelope, publishers, selection)?;
+    for verified in source.verified() {
         if envelope.is_none() {
             envelope = Some(verified.envelope_digest());
         }
@@ -1758,6 +1838,18 @@ fn authenticated_source(
     }
     let envelope = envelope.ok_or("authenticated source has no selected deployment")?;
     Ok((envelope, resolved.into_iter().collect()))
+}
+
+fn payload_core_claim(
+    envelope: &[u8],
+) -> Result<flare_helios::runtime_core::CoreClaim> {
+    let claim = flare_helios::core::protection::Claim::read(envelope)?;
+    Ok(flare_helios::runtime_core::CoreClaim {
+        signer: claim.signer,
+        namespace: claim.namespace,
+        official_source: claim.official_source,
+        development: claim.development,
+    })
 }
 
 #[cfg(test)]
@@ -1983,13 +2075,11 @@ fn verify_offline_entry(
         }
     } else {
         let metadata = reader::Metadata::open(&primary)?;
-        let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+        let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        let source = cache::CoreSource::open(&primary, publishers, selections[0])?
-            .union(publishers, &selections)?;
         let model_root = crate::cache_support::model_root(options.core_cache.as_deref())
             .map_err(|error| error.to_string())?;
-        cache::Root::open(&model_root)?.check_ready(entry, &source)?;
+        cache::Root::open(&model_root)?.check_ready_installed(entry, &source)?;
     }
     Ok(())
 }
@@ -2184,6 +2274,180 @@ fn acquisition_candidate(platform: Option<&str>, sizes: &[u32]) -> Result<String
     .ok_or_else(|| "acquisition naming requires at least one non-zero TP size".into())
 }
 
+fn is_fd_exhaustion_message(text: &str) -> bool {
+    text.contains("Too many open files")
+        || text.contains("(os error 24)")
+        || text.contains("(os error 23)")
+}
+
+fn is_fd_exhaustion_error(error: &flare_helios::Error) -> bool {
+    is_fd_exhaustion_message(&error.to_string())
+}
+
+/// Reuse an already-installed, signed-envelope-bound cache entry for the exact
+/// resolved Hub commit before downloading the primary file again.
+///
+/// Any missing, unbound, tampered, or mismatched entry returns `Ok(None)` so
+/// online acquisition falls through to fetch the primary and repair or update
+/// the cache.
+#[allow(clippy::too_many_arguments)]
+fn warm_entry_for_commit(
+    model_root: &Path,
+    repository: &str,
+    revision: &str,
+    commit: &str,
+    filename: &str,
+    options: &HubOptions,
+    gpu_count: usize,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+    expected_model: Option<&str>,
+) -> Result<Option<(flare_helios::core::cache::Entry, [u8; 32], Vec<u32>)>> {
+    let store = flare_helios::core::cache::Root::open(model_root)?;
+    let sizes =
+        crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
+            .map_err(|error| error.to_string())?;
+    let mut filenames = vec![Some(filename)];
+    if options.filename.is_none() {
+        filenames.push(None);
+    }
+    let mut selectors = Vec::new();
+    for source_revision in [revision, commit] {
+        for source_filename in &filenames {
+            for selection in [sizes.as_slice(), &[]] {
+                selectors.push(source_selector(
+                    repository,
+                    source_revision,
+                    *source_filename,
+                    selection,
+                ));
+            }
+        }
+    }
+    for selector in selectors {
+        let (reference, entry) = match store.resolve_source_ref_record(&selector) {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        };
+        if reference.revision() != commit {
+            continue;
+        }
+        let Some(expected_envelope) = reference.expected_envelope() else {
+            continue;
+        };
+        if expected_model.is_some_and(|model| model != entry.model()) {
+            continue;
+        }
+        match store.entry_source(&entry) {
+            Ok(Some(origin)) if origin.revision() != commit => continue,
+            Ok(_) => {}
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        }
+        let Ok(primary) = entry_primary(&entry) else {
+            continue;
+        };
+        let is_payload = match flare_helios::core::conversion::form(&primary) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        };
+        if is_payload {
+            let metadata = match flare_helios::core::reader::Metadata::open(&primary) {
+                Ok(metadata) => metadata,
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
+            };
+            // Check the signed root envelope hash before contacting the publisher
+            // repository or authenticating selected deployments.
+            if *flare_helios::core::PayloadId::of(&metadata.envelope).as_bytes()
+                != expected_envelope
+            {
+                continue;
+            }
+            let Ok(claim) = payload_core_claim(&metadata.envelope) else {
+                continue;
+            };
+            let Ok(resolved) = crate::trust::resolve_identity_for_claim(
+                claim,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            ) else {
+                continue;
+            };
+            let publishers = resolved.profiles;
+            if !publishers.iter().any(|publisher| {
+                publisher.fingerprint() == resolved.claim.signer
+                    && publisher.namespace == resolved.claim.namespace
+            }) {
+                continue;
+            }
+            let Ok(source) = crate::cache_support::select_bound_core_source(
+                metadata,
+                expected_envelope,
+                &publishers,
+                &sizes,
+            ) else {
+                continue;
+            };
+            match store.check_ready_installed(&entry, &source) {
+                Ok(()) => {}
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
+            }
+            let Ok((actual_envelope, resolved_sizes)) = source_envelope_and_sizes(&source) else {
+                continue;
+            };
+            if actual_envelope != expected_envelope {
+                continue;
+            }
+            return Ok(Some((entry, actual_envelope, resolved_sizes)));
+        }
+        let Ok(resolved) = crate::trust::resolve_identity_with(
+            &primary,
+            publisher_keys,
+            supplied_profiles,
+            options,
+            trust_store,
+        ) else {
+            continue;
+        };
+        let publishers = resolved.profiles;
+        if !publishers.iter().any(|publisher| {
+            publisher.fingerprint() == resolved.claim.signer
+                && publisher.namespace == resolved.claim.namespace
+        }) {
+            continue;
+        }
+        if verify_offline_binding(&entry, expected_envelope, repository, revision, &publishers)
+            .is_err()
+        {
+            continue;
+        }
+        match verify_offline_entry(&entry, options, gpu_count, &publishers) {
+            Ok(()) => {}
+            Err(error) if is_fd_exhaustion_message(&error.to_string()) => return Err(error),
+            Err(_) => continue,
+        }
+        let Ok((actual_envelope, resolved_sizes)) =
+            authenticated_source(&primary, options, gpu_count, &publishers)
+        else {
+            continue;
+        };
+        if actual_envelope != expected_envelope {
+            continue;
+        }
+        return Ok(Some((entry, actual_envelope, resolved_sizes)));
+    }
+    Ok(None)
+}
+
 /// Build the shared payload acquisition plan before any dependency fetch.
 ///
 /// The returned plan owns cached object leases and the minimal remote file set.
@@ -2213,10 +2477,8 @@ fn plan_payload_acquisition<'a>(
     let (resolved, cleanup) = resolve_transport(primary, &[], model_root)?;
     let result = (|| {
         let metadata = reader::Metadata::open(&resolved)?;
-        let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+        let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        let source = cache::CoreSource::open(&resolved, publishers, selections[0])?
-            .union(publishers, &selections)?;
         let model_key = acquisition_model_key(&source, repository)?;
         let store = cache::Root::open(model_root)?;
         let (platform, signed_sizes) = signed_hardware(&source)?;
@@ -2242,13 +2504,18 @@ fn plan_payload_acquisition<'a>(
             }
         }
         for selector in selectors {
-            let Ok(Some((stored_revision, entry))) = store.resolve_source_ref(&selector) else {
-                continue;
+            let (stored_revision, entry) = match store.resolve_source_ref(&selector) {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
             };
-            if stored_revision == commit
-                && store.check_ready(&entry, &source).is_ok()
-            {
-                return Ok(PayloadAcquisition::Ready(entry));
+            if stored_revision == commit {
+                match store.check_ready(&entry, &source) {
+                    Ok(()) => return Ok(PayloadAcquisition::Ready(entry)),
+                    Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                    Err(_) => {}
+                }
             }
         }
 
@@ -2529,6 +2796,43 @@ fn resolve_revision(
     Ok(info)
 }
 
+fn resolve_primary_target(
+    api: &Api,
+    repo: &Repo,
+    requested: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<(Repo, String)> {
+    let info = resolve_revision(api, repo, progress)?;
+    let filename = choose_file(
+        info.siblings.into_iter().map(|file| file.rfilename),
+        requested,
+    )?;
+    let pinned = Repo::with_revision(repo.url(), RepoType::Model, info.sha.clone());
+    log::info!("Resolved core: {}@{} / {filename}", repo.url(), info.sha);
+    Ok((pinned, filename))
+}
+
+fn fetch_resolved_primary(
+    api: &Api,
+    transport: &Transport,
+    repo: &Repo,
+    pinned: &Repo,
+    filename: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<PathBuf> {
+    let recovered = transport.adopt_legacy(&pinned.folder_name());
+    if recovered > 0 {
+        log::info!(
+            "Recovered {recovered} bytes of interrupted Hugging Face transfers from an older staging tree"
+        );
+    }
+    let path = fetch_file_with_progress(api, transport, pinned, filename, token, progress)?;
+    transport.record_ref(&repo.folder_name(), repo.revision(), pinned.revision());
+    Ok(path)
+}
+
+#[cfg(test)]
 fn fetch_primary_with_progress(
     api: &Api,
     transport: &Transport,
@@ -2537,21 +2841,8 @@ fn fetch_primary_with_progress(
     token: Option<&str>,
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<(PathBuf, Repo)> {
-    let info = resolve_revision(api, repo, progress)?;
-    let filename = choose_file(
-        info.siblings.into_iter().map(|file| file.rfilename),
-        requested,
-    )?;
-    let pinned = Repo::with_revision(repo.url(), RepoType::Model, info.sha.clone());
-    log::info!("Resolved core: {}@{} / {filename}", repo.url(), info.sha);
-    let recovered = transport.adopt_legacy(&pinned.folder_name());
-    if recovered > 0 {
-        log::info!(
-            "Recovered {recovered} bytes of interrupted Hugging Face transfers from an older staging tree"
-        );
-    }
-    let path = fetch_file_with_progress(api, transport, &pinned, &filename, token, progress)?;
-    transport.record_ref(&repo.folder_name(), repo.revision(), &info.sha);
+    let (pinned, filename) = resolve_primary_target(api, repo, requested, progress)?;
+    let path = fetch_resolved_primary(api, transport, repo, &pinned, &filename, token, progress)?;
     Ok((path, pinned))
 }
 
@@ -2611,7 +2902,7 @@ fn dependency_files(
     gpu_count: usize,
     publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<Vec<String>> {
-    use flare_helios::core::{derivation, protection, reader};
+    use flare_helios::core::{derivation, reader};
 
     let Ok(metadata) = reader::Metadata::open(primary) else {
         return Ok(flare_helios::runtime_core::core_companions(primary)?);
@@ -2619,9 +2910,10 @@ fn dependency_files(
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
-    let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+    let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
         .map_err(|error| error.to_string())?;
-    let placed: std::collections::BTreeMap<Vec<u8>, String> = metadata
+    let placed: std::collections::BTreeMap<Vec<u8>, String> = source
+        .metadata()
         .locations
         .locations
         .iter()
@@ -2630,16 +2922,9 @@ fn dependency_files(
     // The shared cache closure decides which payload identities this selection
     // needs: its required payloads plus the derivation sources they depend on,
     // authorized only by the selected deployments' catalogs.
-    let mut selected = Vec::with_capacity(selections.len());
-    for selection in &selections {
-        selected.push(
-            protection::verify(&metadata.envelope, publishers, *selection)
-                .map_err(|error| error.to_string())?,
-        );
-    }
     let needed = flare_helios::core::cache::selected_derivation_closure(
-        &metadata,
-        &selected,
+        source.metadata(),
+        source.verified(),
         &derivation::Limits::default(),
     )
     .map_err(|error| error.to_string())?;
@@ -7481,12 +7766,8 @@ pub(crate) mod tests {
             "warm download did not reuse the ready entry"
         );
         assert!(
-            !warm.files.keys().any(|name| name.contains("/weights/")),
-            "warm download transferred companions {warm:?}"
-        );
-        assert!(
-            !warm.files.keys().any(|name| name.contains("deployments/")),
-            "warm download transferred executables {warm:?}"
+            warm.files.is_empty() && warm.bytes == 0,
+            "warm download at an unchanged commit must not re-fetch core bytes: {warm:?}"
         );
         let key = flare_helios::core::cache::model_key("owner/offline").unwrap();
         assert_eq!(

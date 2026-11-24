@@ -66,7 +66,12 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Target soft `RLIMIT_NOFILE` raised at CLI startup when the hard limit allows it.
+/// Large TP directory cores and active serving connections exceed the common Unix 1024 default.
+const STARTUP_OPEN_FILE_LIMIT: u64 = 65_536;
+
 fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    flare_helios::raise_open_file_limit(STARTUP_OPEN_FILE_LIMIT);
     let matches = cli::Cli::command().get_matches();
     let mut parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let home = environment::home_directory()?;

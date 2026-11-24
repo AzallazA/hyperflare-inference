@@ -521,6 +521,15 @@ impl Stage {
             } else {
                 "installing".to_owned()
             }
+        } else if self.total.is_none()
+            && self.counter == Counter::Network
+            && done_in_stage == 0
+            && matches!(
+                snapshot.phase,
+                AcquisitionPhase::Resolving | AcquisitionPhase::Checking
+            )
+        {
+            "checking for updates".to_owned()
         } else {
             format_progress(done_in_stage, total, Some(self.rate.bytes_per_second(done)))
         };
@@ -532,6 +541,16 @@ impl Stage {
         // rather than from the last sampled detail. The phase row renders its
         // own elapsed time; the detail carries only the counters.
         self.refresh(counters);
+        let snapshot = counters.snapshot();
+        if self.total.is_none()
+            && self.counter == Counter::Network
+            && snapshot.network_bytes == self.baseline
+            && snapshot.local_source_bytes == 0
+            && snapshot.materialized_bytes() == 0
+            && snapshot.verification_bytes == 0
+        {
+            self.detail = "already up-to-date".to_owned();
+        }
         self.phase.finish(self.detail);
     }
 }
@@ -789,6 +808,27 @@ mod tests {
             finished.detail
         );
         assert!(!finished.detail.contains("installing"), "{}", finished.detail);
+    }
+
+    #[test]
+    fn zero_work_network_stage_checks_for_updates_then_finishes_already_up_to_date() {
+        let (startup, observation) = StartupProgress::observed();
+        let counters = AcquisitionProgress::new();
+        let display = AcquisitionDisplay::new(&startup, &counters);
+        display.stage("Acquire core", Counter::Network, None);
+        let initial = observation.snapshot().expect("initial snapshot");
+        assert_eq!(initial.detail, "checking for updates");
+        counters.set_phase(AcquisitionPhase::Checking);
+        {
+            let mut slot = display.stage.lock().unwrap();
+            slot.as_mut().unwrap().refresh(&counters);
+        }
+        let checking = observation.snapshot().expect("checking snapshot");
+        assert_eq!(checking.detail, "checking for updates");
+        counters.set_phase(AcquisitionPhase::Complete);
+        display.finish();
+        let finished = observation.snapshot().expect("finished snapshot");
+        assert_eq!(finished.detail, "already up-to-date");
     }
 
     impl<'a> AcquisitionDisplay<'a> {

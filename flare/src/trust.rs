@@ -321,6 +321,17 @@ pub fn resolve_identity_with(
     trust_store: Option<&Path>,
 ) -> Result<ResolvedIdentity> {
     let claim = CoreClaim::read(root)?;
+    resolve_identity_for_claim(claim, publisher_keys, supplied, hub, trust_store)
+}
+
+/// Resolve publisher identity from a claim already extracted from primary metadata.
+pub fn resolve_identity_for_claim(
+    claim: CoreClaim,
+    publisher_keys: &[PathBuf],
+    supplied: &[Publisher],
+    hub: &crate::options::HubOptions,
+    trust_store: Option<&Path>,
+) -> Result<ResolvedIdentity> {
     let path = store_path(trust_store)?;
     let store = load_store(&path)?;
     let remembered = store

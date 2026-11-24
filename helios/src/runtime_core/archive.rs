@@ -1114,6 +1114,13 @@ impl super::payload::Files for Archive {
     fn direct_files(&self) -> Box<dyn Iterator<Item = Result<Arc<File>>> + '_> {
         Box::new(self.files.values().map(|file| file.direct()))
     }
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
+        self.files
+            .values()
+            .nth(index)
+            .ok_or_else(|| invalid("payload container index out of range"))?
+            .direct()
+    }
     fn retained_files(&self) -> Result<Vec<Arc<File>>> {
         self.files
             .values()
