@@ -6,6 +6,7 @@
 //! Per-acquisition byte and elapsed-time accounting and its presentation.
 
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex, mpsc, atomic::{AtomicBool, Ordering}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -22,6 +23,8 @@ const LOG_INTERVAL: Duration = Duration::from_secs(1);
 /// Display cap for an estimated remaining time. Longer estimates are noise from
 /// an early sample and would be truncated to a meaningless number anyway.
 const ETA_CAP: Duration = Duration::from_secs(359_999);
+/// Sliding window used for live CLI acquisition throughput and ETA estimates.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
 
 /// One shared handle for an acquisition. Clones observe the same counters.
 #[derive(Clone, Debug)]
@@ -42,6 +45,9 @@ struct Counters {
     materialized_copy_bytes: u64,
     materialized_fill_bytes: u64,
     verification_bytes: u64,
+    /// Most recent transition into `AcquisitionPhase::Downloading` and the
+    /// cumulative `network_bytes` recorded at that boundary.
+    download_started: Option<(Instant, u64)>,
 }
 
 /// Immutable acquisition counters for phase and final reporting.
@@ -141,7 +147,14 @@ impl AcquisitionProgress {
     }
 
     pub fn set_phase(&self, phase: AcquisitionPhase) {
-        self.update(|counters| counters.phase = phase);
+        self.update(|counters| {
+            if phase == AcquisitionPhase::Downloading
+                && counters.phase != AcquisitionPhase::Downloading
+            {
+                counters.download_started = Some((Instant::now(), counters.network_bytes));
+            }
+            counters.phase = phase;
+        });
     }
     pub fn new() -> Self {
         Self {
@@ -213,6 +226,13 @@ impl AcquisitionProgress {
             verification_bytes: counters.verification_bytes,
             elapsed: self.start.elapsed(),
         }
+    }
+
+    fn download_started(&self) -> Option<(Instant, u64)> {
+        self.counters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .download_started
     }
 
     fn update(&self, update: impl FnOnce(&mut Counters)) {
@@ -360,12 +380,76 @@ pub struct AcquisitionDisplay<'a> {
     worker: Option<Worker>,
 }
 
+/// Rolling throughput tracker over a bounded recent window.
+///
+/// Resets cleanly when a network stage transitions into `Downloading` so
+/// metadata planning and checking time do not drag down transfer rate or ETA.
+struct RollingRate {
+    samples: VecDeque<(Instant, u64)>,
+    last_download_started: Option<Instant>,
+}
+
+impl RollingRate {
+    fn start(baseline: u64) -> Self {
+        let mut samples = VecDeque::with_capacity(64);
+        samples.push_back((Instant::now(), baseline));
+        Self {
+            samples,
+            last_download_started: None,
+        }
+    }
+
+    fn sample(&mut self, done: u64, download_started: Option<(Instant, u64)>) -> f64 {
+        let now = Instant::now();
+        if let Some((started_at, started_bytes)) = download_started
+            && self.last_download_started != Some(started_at)
+        {
+            self.last_download_started = Some(started_at);
+            self.samples.clear();
+            self.samples.push_back((started_at, started_bytes));
+        }
+        if let Some(&(_, last_bytes)) = self.samples.back()
+            && done < last_bytes
+        {
+            self.samples.clear();
+            self.samples.push_back((now, done));
+            return 0.0;
+        }
+        let should_push = match self.samples.back() {
+            None => true,
+            Some(&(last_at, last_bytes)) => {
+                now.saturating_duration_since(last_at) >= Duration::from_millis(100)
+                    || (self.samples.len() == 1 && done > last_bytes)
+            }
+        };
+        if should_push {
+            self.samples.push_back((now, done));
+        }
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let Some(&(oldest_at, oldest_bytes)) = self.samples.front() else {
+            return 0.0;
+        };
+        let elapsed = now.saturating_duration_since(oldest_at).as_secs_f64();
+        if elapsed <= 0.0 {
+            return 0.0;
+        }
+        done.saturating_sub(oldest_bytes) as f64 / elapsed
+    }
+}
+
 struct Stage {
     phase: Phase,
     counter: Counter,
     total: Option<u64>,
     baseline: u64,
-    rate: Rate,
+    rate: RollingRate,
     advanced: u64,
     detail: String,
 }
@@ -432,7 +516,7 @@ impl<'a> AcquisitionDisplay<'a> {
             counter,
             total,
             baseline,
-            rate: Rate::start(baseline),
+            rate: RollingRate::start(baseline),
             advanced: 0,
             detail: String::new(),
         };
@@ -499,6 +583,9 @@ impl Stage {
             self.phase.advance_bytes(advanced);
             self.advanced = self.advanced.saturating_add(advanced);
         }
+        let rate_download_started = (self.counter == Counter::Network)
+            .then(|| counters.download_started())
+            .flatten();
         self.detail = if self.total.is_none()
             && self.counter == Counter::Network
             && snapshot.phase == AcquisitionPhase::PreparingDownload
@@ -531,7 +618,11 @@ impl Stage {
         {
             "checking for updates".to_owned()
         } else {
-            format_progress(done_in_stage, total, Some(self.rate.bytes_per_second(done)))
+            format_progress(
+                done_in_stage,
+                total,
+                Some(self.rate.sample(done, rate_download_started)),
+            )
         };
         self.phase.detail(self.detail.clone());
     }
@@ -829,6 +920,21 @@ mod tests {
         display.finish();
         let finished = observation.snapshot().expect("finished snapshot");
         assert_eq!(finished.detail, "already up-to-date");
+    }
+
+    #[test]
+    fn rolling_rate_resets_when_entering_downloading_after_planning() {
+        let mut rate = RollingRate::start(0);
+        let planning_start = Instant::now() - Duration::from_secs(60);
+        rate.samples.clear();
+        rate.samples.push_back((planning_start, 10 << 20));
+        // Entering Downloading with a fresh baseline ignores the 60s planning wait.
+        let download_start = Instant::now() - Duration::from_millis(500);
+        let speed = rate.sample(60 << 20, Some((download_start, 10 << 20)));
+        assert!(
+            speed > (50u64 << 20) as f64,
+            "expected recent transfer rate (~100 MiB/s), got {speed}"
+        );
     }
 
     impl<'a> AcquisitionDisplay<'a> {

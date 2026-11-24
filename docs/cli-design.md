@@ -923,7 +923,7 @@ Both commands accept these download options:
 | `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `ga102`, `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared core filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
-| `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
+| `--token-file PATH` | File containing a Hub access token (must exist and be non-empty when passed) | `HF_TOKEN`, then `$HF_TOKEN_PATH` / `$HF_HOME/token` / `~/.cache/huggingface/token` when present, otherwise unauthenticated |
 | `--offline` | Resolve prepared cores only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local core path | Off |
 | `--tensor-parallel N[,N...]` | Tensor-parallel deployments of the repository's core to install | The selected GPU count, or the core's sole deployment when neither `--tensor-parallel` nor `--gpus` is given |
 | `--core-cache PATH` | Flare prepared-model cache directory | `paths.core_cache`, otherwise `~/.cache/flare/cores` |
@@ -934,27 +934,48 @@ deployments in the Flare model cache. Repository snapshots are hardlinks into th
 shared blob store, so resolved core files are directly readable and identical
 bytes are stored once. The returned core is a leased Flare cache entry.
 
-When a file is absent from a snapshot, Flare checks its Hub ETag and size against
-the blob namespace for that endpoint and repository. An existing blob is
+When a file is absent from a snapshot, Flare resolves its Hub ETag and size and
+checks them against the blob namespace for that endpoint and repository.
+Dependency planning resolves identities and sizes for the pinned commit in batch
+through the Hub tree API, falling back to per-file `Range: bytes=0-0` probes for
+any omitted path or when the tree endpoint is unavailable. An existing blob is
 hardlinked into the snapshot without downloading its body, so revisions of one
 repository share disk storage. Concurrent Flare downloads serialize the content
 lookup and transfer on the content's lock file to preserve that sharing.
 
-Transfers resume a partial file with an open-ended HTTP range request and accept
-only a response that describes exactly the bytes it appends: a `206` with
-`Content-Range` starting at the saved offset and naming the file's declared
-length, or a `200` carrying the complete body for an empty partial. A response
-that cannot be appended reports the retained offset instead of replacing the
-saved bytes. Each body response has a five-minute deadline; a deadline that
-interrupts received bytes resumes from the new offset, and a transfer stops after
-five consecutive attempts that add nothing. Revision resolution and file
-identity requests use the same bounded backoff; authentication, missing
-repository or file, and malformed-response failures are returned immediately.
-A file's identity is taken from the repository response and never from a content
-host, so a CDN ETag cannot change the cache identity. Redirect targets are
-resolved with standard URL reference resolution, followed only for `http` or
-`https` without embedded credentials, at most six hops, and the access token is
-sent only to the original scheme, host, and port.
+Dependency files with distinct content identities download concurrently across up
+to eight file workers, ordered largest first, and paths that share one planned
+ETag link to the completed blob without redundant transfers. Transfers negotiate
+HTTP/2 over TLS (falling back to HTTP/1.1 when the server does not offer `h2`),
+striped across 32 independent connection pools. Transfers resume a
+partial file using HTTP range requests: when at least 8 MiB remain, Flare
+fetches 4 MiB bounded ranges concurrently across a bounded sliding window (up to
+32 streams for one file, 64 streams across active files) and appends completed
+chunks sequentially so the partial stays a contiguous prefix, migrating a
+stalled head-of-line chunk onto a fresh connection stripe once later chunks have
+already finished. The first range
+resolves any Hub redirect; subsequent ranges reuse that resolved URL directly
+without sending the access token off-origin, and re-resolve from the repository
+origin if an off-origin presigned URL returns `401`, `403`, or `410`. When fewer
+than 8 MiB remain, or when the server answers the first range with `200` or an
+unbounded `206`, Flare falls back to a single streaming range request. Every
+transfer accepts only a response that describes exactly the bytes it supplies: a
+`206` with `Content-Range` starting at the requested offset, within the requested
+end for bounded ranges, and naming the file's declared length, or a `200`
+carrying the complete body for an empty partial. A response that cannot be
+appended reports the retained offset instead of replacing the saved bytes. Each
+body response has a five-minute deadline; a deadline that interrupts received
+bytes resumes from the new offset, and a transfer stops after five consecutive
+attempts that add nothing. Revision resolution and file identity requests use
+the same bounded backoff; authentication, missing repository or file, and
+malformed-response failures are returned immediately. A file's identity is taken
+from the repository response and never from a content host, so a CDN ETag cannot
+change the cache identity; when a repository redirect already provides
+`X-Repo-Commit`, `X-Linked-ETag` (or `ETag`), `X-Linked-Size`, and a valid
+`Location`, per-file identity probes return without contacting the content host.
+Redirect targets are resolved with standard URL reference resolution, followed
+only for `http` or `https` without embedded credentials, at most six hops, and
+the access token is sent only to the original scheme, host, and port.
 Retries use bounded exponential backoff from 250 ms up to 10 s, extended to the
 pause a `429` or `503` names in `Retry-After`, in either delta-seconds or
 HTTP-date form, up to 60 s. A streaming response syncs its partial every 64 MiB or
@@ -990,7 +1011,9 @@ only: it returns before a transport exists and never reads the user cache.
 
 The download row's fraction and ETA describe only bytes the network must still
 deliver: completed blobs, saved resume prefixes, certified user-cache files, and
-content shared by several paths count once. While any of those could still be
+content shared by several paths count once. Displayed transfer rate and ETA use
+a rolling window over the active download phase so planning time does not depress
+the reported rate. While any of those could still be
 rejected and fetched instead — an unvalidated user-cache file, a content blob
 whose stated SHA-256 has not been checked, or one identity naming two lengths —
 the row shows transferred bytes and rate without a fraction or ETA, and a
@@ -1023,9 +1046,12 @@ automatically; an explicit `--filename` resolves the corresponding recorded
 core. Missing or evicted entries and unavailable TP deployments fail without
 network access.
 A branch resolves its last successfully acquired commit; requesting another TP
-size cannot silently select an older commit. Cache paths, endpoint, and
-authentication are configured explicitly; native commands do not interpret
-`HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, or `HF_ENDPOINT`.
+size cannot silently select an older commit. Cache paths and endpoint are
+configured explicitly; native commands do not interpret `HF_HUB_CACHE` or
+`HF_ENDPOINT`. Authentication checks `--token-file`, then `HF_TOKEN` (or
+`HUGGING_FACE_HUB_TOKEN`), then `$HF_TOKEN_PATH`, `$HF_HOME/token`, or
+`~/.cache/huggingface/token` so logged-in Hugging Face sessions automatically use
+authenticated Hub connections.
 
 ### Core snapshots
 

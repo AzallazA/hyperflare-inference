@@ -1222,68 +1222,192 @@ impl Root {
         }
         let remote_ids: BTreeSet<Vec<u8>> = remote.keys().cloned().collect();
         if !remote_ids.is_empty() {
-            // Group by companion file so installation opens one transport file at a time.
-            let mut by_file: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+            struct RemoteEntry {
+                id: Vec<u8>,
+                identity: PayloadId,
+                file: String,
+                tensor: String,
+                embedded: bool,
+                companion: Option<String>,
+            }
+            // Group by companion file and assign deterministic companion paths
+            // before installing groups concurrently with bounded workers.
+            let mut by_file: BTreeMap<String, Vec<RemoteEntry>> = BTreeMap::new();
+            let mut parent_dirs: BTreeSet<PathBuf> = BTreeSet::new();
             for id in remote_ids {
                 if present.contains(&id) {
                     continue;
                 }
-                let file = placed
+                let identity = PayloadId::from_bytes(
+                    id.as_slice()
+                        .try_into()
+                        .map_err(|_| "payload identity is not 32 bytes".to_string())?,
+                );
+                let (file, tensor) = placed.get(&id).cloned().unwrap_or_else(|| {
+                    (
+                        format!("companions/{}", identity.file_name()),
+                        COMPANION_TENSOR.to_string(),
+                    )
+                });
+                let embedded = file.is_empty() && source.asset_payloads.contains(&id);
+                let companion = if embedded {
+                    None
+                } else {
+                    let name = companion_name(&file, &tensor, identity, &mut used)?;
+                    if let Some(parent) = staging.directory().join(&name).parent() {
+                        parent_dirs.insert(parent.to_path_buf());
+                    }
+                    Some(name)
+                };
+                let group_key = placed
                     .get(&id)
                     .map(|(file, _)| file.clone())
                     .unwrap_or_default();
-                by_file.entry(file).or_default().push(id);
+                by_file.entry(group_key).or_default().push(RemoteEntry {
+                    id,
+                    identity,
+                    file,
+                    tensor,
+                    embedded,
+                    companion,
+                });
             }
-            for (_, group) in by_file {
-                let payloads = source
-                    .metadata
-                    .payloads(&catalog, group.iter().map(|id| id.as_slice()))?;
-                for id in group {
-                    if present.contains(&id) {
-                        continue;
-                    }
-                    let identity = PayloadId::from_bytes(
-                        id.as_slice()
-                            .try_into()
-                            .map_err(|_| "payload identity is not 32 bytes".to_string())?,
-                    );
-                    let slice = payloads.get(&id)?.clone();
-                    let (file, tensor) = placed.get(&id).cloned().unwrap_or_else(|| {
-                        (
-                            format!("companions/{}", identity.file_name()),
-                            COMPANION_TENSOR.to_string(),
-                        )
-                    });
-                    let object = self.insert_payload(
-                        identity,
-                        slice.len(),
-                        ProgressReader {
-                            inner: SliceReader { slice: slice.clone(), offset: 0 },
-                            progress: progress.clone(),
-                        },
-                    )?;
-                    if file.is_empty() && source.asset_payloads.contains(&id) {
-                        present.insert(id.clone());
-                        if derivation_sources.contains(&identity) {
-                            source_files.insert(identity, SourceBacking::Primary(tensor.clone()));
+            for parent in parent_dirs {
+                fs::create_dir_all(parent).map_err(failure)?;
+            }
+            let groups: Vec<Vec<RemoteEntry>> = by_file.into_values().collect();
+            const INSTALL_WORKERS: usize = 8;
+            let worker_count = groups.len().min(INSTALL_WORKERS).max(1);
+            if worker_count == 1 {
+                for group in &groups {
+                    let payloads = source
+                        .metadata
+                        .payloads(&catalog, group.iter().map(|entry| entry.id.as_slice()))?;
+                    for entry in group {
+                        let slice = payloads.get(&entry.id)?.clone();
+                        let object = self.insert_payload(
+                            entry.identity,
+                            slice.len(),
+                            ProgressReader {
+                                inner: SliceReader { slice: slice.clone(), offset: 0 },
+                                progress: progress.clone(),
+                            },
+                        )?;
+                        if let Some(companion) = &entry.companion {
+                            staging.link_shared(&object, companion)?;
                         }
-                        locations.push(wire::PayloadLocation { payload_id: id, file, tensor });
-                        continue;
                     }
-                    let companion = companion_name(&file, &tensor, identity, &mut used)?;
-                    staging.link(&object, &companion)?;
-                    present.insert(id.clone());
-                    if derivation_sources.contains(&identity) {
-                        source_files.insert(
-                            identity,
-                            SourceBacking::Companion(staging.directory().join(&companion)),
-                        );
+                }
+            } else {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let failed = std::sync::atomic::AtomicBool::new(false);
+                let first_error: std::sync::Mutex<Option<crate::Error>> =
+                    std::sync::Mutex::new(None);
+                let staging_ref = &staging;
+                let source_ref = &source;
+                let catalog_ref = &catalog;
+                let groups_ref = &groups;
+                let progress_ref = &progress;
+                std::thread::scope(|scope| {
+                    for _ in 0..worker_count {
+                        let next = &next;
+                        let failed = &failed;
+                        let first_error = &first_error;
+                        scope.spawn(move || loop {
+                            if failed.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if progress_ref
+                                .as_ref()
+                                .is_some_and(progress::AcquisitionProgress::is_cancelled)
+                            {
+                                failed.store(true, Ordering::Release);
+                                let mut slot = first_error
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(
+                                        "model acquisition cancelled; partial transport content is retained"
+                                            .into(),
+                                    );
+                                }
+                                return;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(group) = groups_ref.get(index) else {
+                                return;
+                            };
+                            let step = (|| -> Result<()> {
+                                let payloads = source_ref.metadata.payloads(
+                                    catalog_ref,
+                                    group.iter().map(|entry| entry.id.as_slice()),
+                                )?;
+                                for entry in group {
+                                    if failed.load(Ordering::Acquire) {
+                                        return Ok(());
+                                    }
+                                    let slice = payloads.get(&entry.id)?.clone();
+                                    let object = self.insert_payload(
+                                        entry.identity,
+                                        slice.len(),
+                                        ProgressReader {
+                                            inner: SliceReader { slice, offset: 0 },
+                                            progress: progress_ref.clone(),
+                                        },
+                                    )?;
+                                    if let Some(companion) = &entry.companion {
+                                        staging_ref.link_shared(&object, companion)?;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                            if let Err(error) = step {
+                                failed.store(true, Ordering::Release);
+                                let mut slot = first_error
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(error);
+                                }
+                                return;
+                            }
+                        });
                     }
-                    locations.push(wire::PayloadLocation {
-                        payload_id: id,
-                        file: companion,
-                        tensor: COMPANION_TENSOR.to_string(),
-                    });
+                });
+                if let Some(error) = first_error
+                    .into_inner()
+                    .unwrap_or_else(|error| error.into_inner())
+                {
+                    return Err(error);
+                }
+            }
+            for group in groups {
+                for entry in group {
+                    present.insert(entry.id.clone());
+                    if entry.embedded {
+                        if derivation_sources.contains(&entry.identity) {
+                            source_files
+                                .insert(entry.identity, SourceBacking::Primary(entry.tensor.clone()));
+                        }
+                        locations.push(wire::PayloadLocation {
+                            payload_id: entry.id,
+                            file: entry.file,
+                            tensor: entry.tensor,
+                        });
+                    } else {
+                        let companion = entry.companion.expect("non-embedded entry has companion");
+                        if derivation_sources.contains(&entry.identity) {
+                            source_files.insert(
+                                entry.identity,
+                                SourceBacking::Companion(staging.directory().join(&companion)),
+                            );
+                        }
+                        locations.push(wire::PayloadLocation {
+                            payload_id: entry.id,
+                            file: companion,
+                            tensor: COMPANION_TENSOR.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1541,7 +1665,7 @@ impl Root {
             )
             .into());
         }
-        self.publish_payload(&transaction, &staged, declared, length)
+        self.publish_verified_payload(&transaction, &staged, declared, length)
     }
 
     /// Stream one payload whose identity is computed from its bytes.
@@ -1552,7 +1676,7 @@ impl Root {
             validate_hit(&object, id, length, None)?;
             return Ok(object);
         }
-        self.publish_payload(&transaction, &staged, id, length)
+        self.publish_verified_payload(&transaction, &staged, id, length)
     }
 
     /// Store a legacy immutable container verbatim under its container digest.
@@ -1806,7 +1930,7 @@ impl Root {
             let _ = fs::remove_file(&staged);
             return Ok(None);
         }
-        self.publish_payload(&transaction, &staged, declared, length)
+        self.publish_verified_payload(&transaction, &staged, declared, length)
             .map(|object| Some((object, true)))
     }
 
@@ -2859,15 +2983,43 @@ impl Root {
 
     fn publish_payload(
         &self,
-        _transaction: &Transaction,
+        transaction: &Transaction,
         staged: &Path,
         id: PayloadId,
         length: u64,
     ) -> Result<PayloadObject> {
+        self.publish_payload_inner(transaction, staged, id, length, true)
+    }
+
+    /// Publish a payload freshly written, hashed, and synced by `stage_payload`.
+    ///
+    /// When `install_payload` hardlinks the newly created immutable inode into
+    /// place under the shared publication lock, its exact bytes were already
+    /// hashed during staging, so re-reading the entire blob is skipped. A race
+    /// against an existing blob still verifies the existing object inside
+    /// `install_payload`.
+    fn publish_verified_payload(
+        &self,
+        transaction: &Transaction,
+        staged: &Path,
+        id: PayloadId,
+        length: u64,
+    ) -> Result<PayloadObject> {
+        self.publish_payload_inner(transaction, staged, id, length, false)
+    }
+
+    fn publish_payload_inner(
+        &self,
+        _transaction: &Transaction,
+        staged: &Path,
+        id: PayloadId,
+        length: u64,
+        verify_newly_installed: bool,
+    ) -> Result<PayloadObject> {
         let _publication = Lock::shared(self.publication_lock())?;
         let result = (|| {
             let destination = self.root.join("blobs").join(id.file_name());
-            self.install_payload(staged, &destination, id, length)?;
+            let newly_installed = self.install_payload(staged, &destination, id, length)?;
             syncdir(&self.root.join("blobs"))?;
             let guard = Lock::shared(self.lock_path("blobs", &id.to_hex()))?;
             let slice = Container::open(&destination)?.tensor(COMPANION_TENSOR)?;
@@ -2878,7 +3030,9 @@ impl Root {
                 )
                 .into());
             }
-            verify_slice(&slice, id, None)?;
+            if verify_newly_installed && newly_installed {
+                verify_slice(&slice, id, None)?;
+            }
             Ok(PayloadObject {
                 id,
                 path: destination,
@@ -2893,18 +3047,20 @@ impl Root {
     }
 
     /// Install one verified wrapper object without ever replacing existing bytes.
+    /// Returns `true` when `staged` was hardlinked into place as the new object,
+    /// or `false` when an existing verified object was already present.
     fn install_payload(
         &self,
         staged: &Path,
         destination: &Path,
         id: PayloadId,
         length: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         make_immutable(staged)?;
         match fs::hard_link(staged, destination) {
             Ok(()) => {
                 remove_file(staged).map_err(failure)?;
-                Ok(())
+                Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let slice = Container::open(destination)?.tensor(COMPANION_TENSOR)?;
@@ -2917,7 +3073,8 @@ impl Root {
                 }
                 verify_slice(&slice, id, None)?;
                 make_immutable(destination)?;
-                remove_file(staged).map_err(failure)
+                remove_file(staged).map_err(failure)?;
+                Ok(false)
             }
             Err(error) => Err(failure(error)),
         }
@@ -3409,10 +3566,14 @@ impl Staging {
 
     /// Link one published object into the staged tree.
     pub fn link(&mut self, object: &PayloadObject, relative: &str) -> Result<()> {
+        self.link_shared(object, relative)
+    }
+
+    fn link_shared(&self, object: &PayloadObject, relative: &str) -> Result<()> {
         self.link_path(object.path(), object.id(), relative)
     }
 
-    fn link_path(&mut self, source: &Path, id: PayloadId, relative: &str) -> Result<()> {
+    fn link_path(&self, source: &Path, id: PayloadId, relative: &str) -> Result<()> {
         validate_relative_path(relative)?;
         let _publication = Lock::shared(self.root.publication_lock())?;
         let destination = self.directory.join(relative);

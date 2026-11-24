@@ -186,7 +186,7 @@ pub struct HubOptions {
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Hugging Face access token file; omit for public repositories.
+    /// Hugging Face access token file [default: HF_TOKEN, else ~/.cache/huggingface/token].
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub token_file: Option<PathBuf>,
 
