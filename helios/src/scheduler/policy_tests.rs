@@ -4764,6 +4764,8 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
             host_stops: false,
             prompt_logprobs: true,
             growable_output: false,
+            reasoning_prompt: false,
+            tools: false,
         })
         .unwrap();
     let (scored_rate, _) = s.service_rates(s.request(scored).unwrap());
@@ -4818,7 +4820,7 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
     // mixed_candidates must not pair the deferred-prefill request into a Mixed step.
     let (values, age_price, _) = s.lane_values(0);
     let mut mixed_out = Vec::new();
-    s.mixed_candidates(&mut mixed_out, &values, age_price, false);
+    s.mixed_candidates(&mut mixed_out, &values, age_price, false, None);
     assert!(
         mixed_out
             .iter()
