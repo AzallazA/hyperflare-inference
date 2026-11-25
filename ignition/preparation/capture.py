@@ -4,7 +4,8 @@
 
 """Compile prepared model forwards and capture CUDA graphs for their shapes."""
 
-from contextlib import nullcontext
+import os
+from contextlib import ExitStack, contextmanager, nullcontext
 from time import monotonic
 
 import torch
@@ -14,7 +15,23 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache, allocation_order
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
+from .export_speed import forward_compile_settings
+from .host_memory import COMPILE_HEADROOM_BYTES
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+
+
+@contextmanager
+def _capture_collectives(collective, *, stream):
+    raw = (() if collective is None
+           else tuple(collective) if isinstance(collective, (tuple, list))
+           else (collective,))
+    seen = set()
+    with ExitStack() as stack:
+        for item in raw:
+            if item is not None and id(item) not in seen:
+                seen.add(id(item))
+                stack.enter_context(item.capture(stream=stream))
+        yield
 
 
 _warmup_streams = {}
@@ -75,6 +92,31 @@ def _capture_order(names, compiled, coordinator):
     return allocation_order(names, sizes, coordinator)
 
 
+def pool_request_report(compiled):
+    """One line: every compiled forward's Inductor graph-pool requests (``capture_allocation_sizes``), largest first.
+
+    TP3 fork diagnostic for the Inductor-planned memory scheme: all serving graphs allocate their combined pools from
+    one shared graph pool, so the largest request bounds the "Graph capture pool" and the KV that remains."""
+    rows = []
+    for name, forward in compiled.items():
+        try:
+            sizes = tuple(forward.capture_allocation_sizes)
+        except AttributeError:  # an eager or guarded forward without an Inductor memory plan
+            continue
+        rows.append((max(sizes, default=0), sum(sizes), name, sizes))
+    if not rows:
+        return "Graph pool requests: no compiled forward reports a memory plan"
+    rows.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+
+    def mib(value):
+        return f"{value / (1 << 20):.1f}"
+
+    entries = ", ".join(f"{name} {mib(total)}" + ("" if len(sizes) <= 1 else f" ({'+'.join(mib(s) for s in sizes)})")
+                        for _, total, name, sizes in rows)
+    return (f"Graph pool requests (MiB, {len(rows)} compiled forwards, largest first; max {mib(rows[0][0])} "
+            f"in {rows[0][2]}): {entries}")
+
+
 @_defer_full_collection()
 def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
@@ -119,11 +161,15 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     warm = _warmup_stream(device)
     _seed_warmup_workspaces(warm, device)
     if compile_decoder:
+        # TP3 fork: FLARE_EXPORT_FORWARD_WORKERS / _WORKER_GIB / _WORKER_VRAM_MIB after tuning (export_speed.py); unset = tuning budget.
+        compile_workers, forward_worker_bytes, forward_worker_device_bytes = forward_compile_settings(session)
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              options=compile_options,
-                             compile_workers=getattr(session, "requested_compile_workers", None),
-                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
+                             compile_workers=compile_workers, forward_worker_bytes=forward_worker_bytes,
+                             forward_worker_device_bytes=forward_worker_device_bytes,
+                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune,
+                             compile_headroom_bytes=getattr(session, "compile_headroom_bytes", COMPILE_HEADROOM_BYTES))
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
         if compile_group is not None:
@@ -167,6 +213,37 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         release_unused()
     elif materialize is not None:
         materialize()
+    # TP3 profiling (opt-in, FLARE_DS41_EAGER_PROFILE=<substring>): run matching forwards eagerly (compiled code,
+    # no graph capture) inside a cudaProfiler range for nsys --capture-range=cudaProfilerApi, then exit.
+    profile_match = os.getenv("FLARE_DS41_EAGER_PROFILE")
+    if profile_match and label != "Prepare and tune kernels":
+        iters = int(os.getenv("FLARE_DS41_EAGER_ITERS", "20"))
+        targets = [name for name in names if profile_match in name]
+        if progress is not None:
+            progress(f"eager-profile targets ({profile_match!r}): {targets} of {list(names)}")
+        if targets:
+            for name in targets:
+                fn = compiled.get(name, functions[name])
+                if coordinator is not None:
+                    coordinator.barrier(f"profile {name}", coordinator.ranks)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with warmup(), torch.cuda.stream(stream):
+                    for _ in range(3):
+                        fn()
+                    stream.synchronize()
+                    torch.cuda.nvtx.range_push(f"ds41_profile_{name}")
+                    torch.cuda.profiler.start()
+                    for _ in range(iters):
+                        torch.cuda.nvtx.range_push("step")
+                        fn()
+                        torch.cuda.nvtx.range_pop()
+                    stream.synchronize()
+                    torch.cuda.profiler.stop()
+                    torch.cuda.nvtx.range_pop()
+            torch.cuda.synchronize(device)
+            import sys
+            sys.stdout.flush()
+            sys.exit(0)
     with phase(progress, "Warm serving graphs", total=len(names)) as stage:
         for name in names:
             function = functions[name]
@@ -187,6 +264,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             stage.update(advance=1)
     stream.wait_stream(warm)
     ordered_names = _capture_order(names, compiled, coordinator)
+    if progress is not None and compiled:
+        progress(pool_request_report({name: compiled[name] for name in ordered_names if name in compiled}))
     with phase(progress, label, total=len(names)) as stage:
         for name in ordered_names:
             function = compiled.get(name, functions[name])
@@ -196,7 +275,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             stream.wait_stream(torch.cuda.current_stream(device))
             exporting = retain_graphs and warmup_storage is not None
             graph = torch.cuda.CUDAGraph(keep_graph=True) if exporting else capture_graph(retain_graphs=retain_graphs)
-            communication = nullcontext() if collective is None else collective.capture(stream=stream)
+            communication = _capture_collectives(collective, stream=stream)
             def memory_detail():
                 free, total = torch.cuda.mem_get_info(device)
                 allocated = torch.cuda.memory_allocated(device)

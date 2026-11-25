@@ -135,6 +135,13 @@ def _finish(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Keys, O
 
 class PreparedLogprobs:
     def __init__(self, logits, completion, slots, epochs, live, frame):
+        # TP3 fork (DS41 tp3.no_generation_logprobs): a completion without generation logprob storage gets an inert
+        # reduction (no kernels); Helios answers logprob requests to such a core with HTTP 400.
+        self.inert = completion.logprobs is None
+        self.statistics = self.normalization = self.candidates = self.finish = None
+        if self.inert:
+            self.logits, self.row_inputs, self.layout, self._preparation = None, (None, None, None), {}, ()
+            return
         validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
@@ -170,7 +177,7 @@ class PreparedLogprobs:
         self.statistics = self.normalization = self.candidates = self.finish = None
 
     def prepare(self):
-        if self.statistics is not None:
+        if self.inert or self.statistics is not None:
             return
         operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
                            for kernel, args, grid, warps in self._preparation)
@@ -192,7 +199,7 @@ class PreparedLogprobs:
 
     def functional(self, *, session=None, dynamic_inputs=False):
         self.release_logits()
-        if dynamic_inputs:
+        if dynamic_inputs and not self.inert:
             self.row_inputs = (None, None, None)
             for operation in (self.statistics, self.normalization, self.candidates, self.finish):
                 start = 3 if operation is self.normalization else 4
@@ -207,6 +214,8 @@ class PreparedLogprobs:
     def run(self, logits, *, slots=None, generations=None, live_rows=None):
         from ignition.preparation.triton import launch_triton
 
+        if self.inert:
+            return
         if self.statistics is None:
             raise RuntimeError("logprob reduction prepare() must finish before capture")
         if logits.ndim == 2:

@@ -154,7 +154,7 @@ fn host_cohort_ranking_matches_greedy_reallocation() {
         let (values, _, _) = scheduler.lane_values(scheduler.window_remaining().unwrap());
         let available: Vec<_> = (0..active).rev().collect();
         for optimistic in [false, true] {
-            let ranking = scheduler.host_prefix_ranking(&available, 7, 8, &values, optimistic);
+            let ranking = scheduler.host_prefix_ranking(&available, active.next_power_of_two(), 7, 8, &values, optimistic);
             for packed in [active, active * 2, active * 4] {
                 let mut lengths = [0; REQUEST_LANES];
                 let mut frontier = std::collections::BinaryHeap::new();

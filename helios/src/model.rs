@@ -101,6 +101,8 @@ pub struct ModelConfig {
     pub eos_token_ids: Vec<u32>,
     pub sampling_defaults: SamplingParameters,
     pub sampling_ranges: SamplingRanges,
+    /// SHA-256 of the prepared activation constants, absent for ordinary cores.
+    pub steering_sidecar_sha256: Option<[u8; 32]>,
     pub max_new_tokens: u32,
     pub speculative_widths: Vec<usize>,
     pub speculative_fixed_width: Option<usize>,
@@ -125,6 +127,8 @@ pub struct SamplingParameters {
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub top_k: i32,
+    #[cfg_attr(feature = "server", serde(default))]
+    pub steering_scale: f32,
 }
 
 impl Default for SamplingParameters {
@@ -138,6 +142,7 @@ impl Default for SamplingParameters {
             presence_penalty: 0.,
             frequency_penalty: 0.,
             top_k: 20,
+            steering_scale: 0.,
         }
     }
 }
@@ -182,6 +187,11 @@ pub struct SamplingRanges {
     pub repetition_penalty: Option<SamplingRange<f32>>,
     pub presence_penalty: Option<SamplingRange<f32>>,
     pub frequency_penalty: Option<SamplingRange<f32>>,
+    #[cfg_attr(
+        any(feature = "server", feature = "runtime-core"),
+        serde(skip_serializing_if = "Option::is_none")
+    )]
+    pub steering_scale: Option<SamplingRange<f32>>,
 }
 
 impl SamplingRanges {
@@ -207,7 +217,8 @@ impl SamplingRanges {
             min_p,
             repetition_penalty,
             presence_penalty,
-            frequency_penalty
+            frequency_penalty,
+            steering_scale
         );
         min.validate()?;
         max.validate()?;
@@ -216,7 +227,7 @@ impl SamplingRanges {
 }
 
 impl SamplingParameters {
-    pub(crate) fn values(&self) -> [f32; 6] {
+    pub(crate) fn values(&self) -> [f32; 7] {
         [
             self.temperature,
             self.top_p,
@@ -224,6 +235,7 @@ impl SamplingParameters {
             self.repetition_penalty,
             self.presence_penalty,
             self.frequency_penalty,
+            self.steering_scale,
         ]
     }
     pub fn validate(&self) -> Result<()> {
@@ -242,6 +254,7 @@ impl SamplingParameters {
         if self.values().iter().any(|value| !value.is_finite())
             || !(0. < self.top_p && self.top_p <= 1.)
             || !(0. ..=1.).contains(&self.min_p)
+            || !(0. ..=1.).contains(&self.steering_scale)
             || self.repetition_penalty <= 0.
             || [self.temperature, self.top_p, self.repetition_penalty]
                 .iter()
@@ -347,7 +360,12 @@ pub fn scheduler_capabilities_with_manifest(
         return Err("model completion capacity differs from its execution manifest".into());
     }
     let mut capabilities = scheduler_capabilities(config);
-    for graph in &manifest.graphs {
+    // TP3 fork: a context variant shares its base's shape and input plan (catalog::validate).
+    for graph in manifest
+        .graphs
+        .iter()
+        .filter(|graph| !catalog::is_context_variant(&graph.name))
+    {
         let semantics = config.contract.graph(&graph.name)?;
         let inputs: Vec<_> = semantics.inputs.iter().filter(|binding|
             matches!(binding.source, ValueSource::PendingToken | ValueSource::PromptAndPendingToken)

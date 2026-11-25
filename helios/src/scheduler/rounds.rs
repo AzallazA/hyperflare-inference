@@ -306,12 +306,13 @@ impl RequestScheduler {
         for slot in bits(mask) { lengths[slot] = 1; }
         let remaining = packed.saturating_sub(mask.count_ones() as usize);
         if remaining == 0 { return lengths; }
+        let alpha = self.policy.alpha_for_batch(batch);
         let probabilities: [Vec<f64>; REQUEST_LANES] = std::array::from_fn(|slot| {
             if mask & (1 << slot) == 0 { return Vec::new(); }
             let request = self.slots[slot].request.as_ref().unwrap();
             if gpu { self.speculative_curve(request, optimistic) }
             else { request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha) * values[slot].output_token).collect() }
+                .into_iter().map(|probability| probability.powf(alpha) * values[slot].output_token).collect() }
         });
         let mut positions = Vec::new();
         for slot in bits(mask) {
@@ -326,15 +327,16 @@ impl RequestScheduler {
         lengths
     }
 
-    pub(super) fn host_prefix_ranking(&self, available: &[usize], drafts: usize, width: usize,
+    pub(super) fn host_prefix_ranking(&self, available: &[usize], batch: usize, drafts: usize, width: usize,
         values: &[LaneValue; REQUEST_LANES], optimistic: bool) -> HostPrefixRanking {
+        let alpha = self.policy.alpha_for_batch(batch);
         let mut probabilities = vec![vec![0.0; self.capabilities.completion_token_capacity - 1]; REQUEST_LANES];
         let mut scores = Vec::new();
         for &slot in available {
             let request = self.slots[slot].request.as_ref().unwrap();
             let limit = self.speculative_tokens(request, width.min(drafts + 1));
             probabilities[slot] = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha)).collect();
+                .into_iter().map(|probability| probability.powf(alpha)).collect();
             for position in 0..limit.saturating_sub(1) {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
             }
@@ -355,17 +357,18 @@ impl RequestScheduler {
                 |forecast| forecast.prefixes[depth].weight_at(request.generated_tokens))
     }
 
-    pub(super) fn expected_speculative_tokens(&self, request: &LiveRequest, width: usize) -> f64 {
-        self.proposal_forecast_tokens(request, width, false)
+    pub(super) fn expected_speculative_tokens(&self, request: &LiveRequest, batch: usize, width: usize) -> f64 {
+        self.proposal_forecast_tokens(request, batch, width, false)
     }
 
-    fn proposal_forecast_tokens(&self, request: &LiveRequest, width: usize, optimistic: bool) -> f64 {
-        forecast_tokens(&self.powered_curve(request, optimistic), width)
+    fn proposal_forecast_tokens(&self, request: &LiveRequest, batch: usize, width: usize, optimistic: bool) -> f64 {
+        forecast_tokens(&self.powered_curve(request, batch, optimistic), width)
     }
 
-    /// Prefix survival raised to the adaptive verification exponent.
-    pub(super) fn powered_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
-        self.speculative_curve(request, optimistic).into_iter().map(|p| p.powf(self.policy.adaptive_verification_alpha)).collect()
+    /// Prefix survival raised to the adaptive verification exponent for `batch`.
+    pub(super) fn powered_curve(&self, request: &LiveRequest, batch: usize, optimistic: bool) -> Vec<f64> {
+        let alpha = self.policy.alpha_for_batch(batch);
+        self.speculative_curve(request, optimistic).into_iter().map(|p| p.powf(alpha)).collect()
     }
 
     pub(super) fn speculative_duration(&self, request: &LiveRequest, batch: usize, width: usize) -> Option<u64> {
@@ -524,24 +527,28 @@ impl RequestScheduler {
         let mut forecasts = HashMap::new();
         let mut fixed_prefixes = HashMap::new();
         let mut host_rankings = HashMap::new();
-        // Lane forecasts stay fixed while shapes compete; evaluate each at most once.
-        let mut curves: [Option<Vec<f64>>; REQUEST_LANES] = std::array::from_fn(|_| None);
+        // Raw lane curves stay fixed while shapes compete; powered curves are cached per
+        // distinct batch-schedule alpha value.
+        let mut raw_curves: [Option<Vec<f64>>; REQUEST_LANES] = std::array::from_fn(|_| None);
+        let mut powered_curves: HashMap<(u64, usize), Vec<f64>> = HashMap::new();
         let mut order = Vec::with_capacity(available.len());
         let mut frontier = std::collections::BinaryHeap::new();
         for shape in self.costs.packed_round_shapes() {
             if shape.batch > self.limits.max_active.next_power_of_two()
                 || !self.speculative_catalog[shape.batch.ilog2() as usize].contains(&shape.width) { continue; }
+            let alpha = self.policy.alpha_for_batch(shape.batch);
+            let alpha_bits = alpha.to_bits();
             if self.speculative_fixed_width.is_some()
                 && !self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens) {
-                let prefixes = fixed_prefixes.entry((shape.drafts, shape.width)).or_insert_with(|| {
+                let prefixes = fixed_prefixes.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(|| {
                     available.iter().map(|&slot| {
                         let request = self.slots[slot].request.as_ref().unwrap();
                         let length = self.speculative_tokens(request, shape.width.min(shape.drafts + 1));
                         let expected = f64::from(length != 0) + request.acceptance.curve(
                             self.proposal_source, request.generated_tokens, false)[..length.saturating_sub(1)]
                             .iter().map(|&probability| {
-                                if self.policy.adaptive_verification_alpha == 1.0 { probability }
-                                else { probability.powf(self.policy.adaptive_verification_alpha) }
+                                if alpha == 1.0 { probability }
+                                else { probability.powf(alpha) }
                             }).sum::<f64>();
                         (slot, length, expected)
                     }).collect::<Vec<_>>()
@@ -552,15 +559,18 @@ impl RequestScheduler {
                 continue;
             }
             // Speculative positions ranked by marginal forecast tokens; shapes with equal
-            // draft and width bounds share the ranking.
+            // alpha, draft, and width bounds share the ranking.
             let gpu_alloc = self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens);
             let depth_cap = shape.drafts.min(shape.width.saturating_sub(1));
-            let forecast = forecasts.entry((shape.drafts, shape.width)).or_insert_with(|| {
+            let forecast = forecasts.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(|| {
                 let mut scores = Vec::new();
                 for &slot in &available {
                     let request = self.slots[slot].request.as_ref().unwrap();
                     let limit = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
-                    let curve = curves[slot].get_or_insert_with(|| self.powered_curve(request, optimistic));
+                    let curve = powered_curves.entry((alpha_bits, slot)).or_insert_with(|| {
+                        let raw = raw_curves[slot].get_or_insert_with(|| self.speculative_curve(request, optimistic));
+                        raw.iter().map(|&p| p.powf(alpha)).collect()
+                    });
                     let mut before = 1.0;
                     for position in 0..limit.saturating_sub(1) {
                         let total = forecast_tokens(curve, position + 2);
@@ -587,8 +597,8 @@ impl RequestScheduler {
             let host_ranking = if gpu_alloc {
                 None
             } else {
-                Some(host_rankings.entry((shape.drafts, shape.width)).or_insert_with(||
-                    self.host_prefix_ranking(&available, shape.drafts, shape.width, values, optimistic)))
+                Some(host_rankings.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(||
+                    self.host_prefix_ranking(&available, shape.batch, shape.drafts, shape.width, values, optimistic)))
             };
             let nanos = shape.nanos;
             let mut base = [0.0; REQUEST_LANES];
@@ -655,7 +665,7 @@ impl RequestScheduler {
                         }
                         let effective_draft = if lanes >= 2 && draft_budget > 0 && draft_budget < total_ceiling_drafts {
                             let surplus = surplus_table.as_ref().map_or(1.0, |t|
-                                t.factor(lanes, draft_budget, self.policy.adaptive_verification_alpha));
+                                t.factor(lanes, draft_budget, alpha));
                             (draft_value * surplus).min(draft_cap)
                         } else {
                             draft_value

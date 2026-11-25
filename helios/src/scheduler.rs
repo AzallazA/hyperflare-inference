@@ -17,7 +17,7 @@ mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
-pub use policy::{PolicyConfig, RequestAccounting};
+pub use policy::{PolicyConfig, PrefillTailMerge, RequestAccounting, TtftOrder};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
@@ -142,6 +142,10 @@ pub struct SchedulerStats {
     pub checkpoint_skip_storage: u64,
     pub checkpoint_extra_work_ns: u64,
     pub checkpoint_anchor_guards: usize,
+    /// TP3 fork: prefill chunks the runtime ran on a long-context variant graph
+    /// (`<base>-split-ctx<N>`), and their prompt tokens.
+    pub context_variant_chunks: u64,
+    pub context_variant_tokens: u64,
 }
 
 #[derive(Clone)]
@@ -157,6 +161,13 @@ pub struct RequestSpec {
     /// request decodes. When pages run out the scheduler may preempt such a request:
     /// it finishes through its terminal checkpoint and the runtime readmits its history.
     pub growable_output: bool,
+    /// The rendered prompt includes tool definitions (`PrefillTailMerge::ToolsOnly`).
+    pub tools: bool,
+    /// Fork (TP3): the generation prompt opens a reasoning block (thinking mode). A template
+    /// that drops reasoning from history (DeepSeek V4.1 without tools) renders this turn
+    /// differently in the next one, so only the last message's checkpoint prefixes it
+    /// (`PrefillTailMerge::applies`).
+    pub reasoning_prompt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,6 +273,8 @@ pub struct LiveRequest {
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     growable_output: bool,
+    tools: bool,
+    reasoning_prompt: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
@@ -549,6 +562,7 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    cleared_pages: Vec<PageId>,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
@@ -651,6 +665,8 @@ pub struct RequestScheduler {
     free_snapshots: BTreeSet<SnapshotId>,
     snapshot_pages: Vec<std::ops::Range<u32>>,
     page_snapshot_refs: Vec<u32>,
+    /// Released alias pages whose bytes are snapshot rows, not KV, until cleared.
+    page_holds_row_bytes: Vec<bool>,
     retired: Vec<RetiredRequest>,
     submissions: BTreeMap<Fence, Submission>,
     completed: Fence,
@@ -684,6 +700,10 @@ pub struct RequestScheduler {
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
     admissions: u64,
+    /// Rounds left before the TTFT guard forces the overdue request again.
+    ttft_interleave: u32,
+    /// `TtftOrder::Shortest`: the next guarded round belongs to the oldest overdue request.
+    ttft_owe_oldest: bool,
 }
 
 fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
@@ -747,6 +767,7 @@ impl RequestScheduler {
             free_snapshots: (0..limits.snapshots).map(SnapshotId).collect(),
             snapshot_pages: Vec::new(),
             page_snapshot_refs: vec![0; limits.pages as usize],
+            page_holds_row_bytes: vec![false; limits.pages as usize],
             retired: Vec::new(),
             submissions: BTreeMap::new(),
             completed: Fence(0),
@@ -778,6 +799,8 @@ impl RequestScheduler {
             evictions: Vec::new(),
             evictions_lost: false,
             admissions: 0,
+            ttft_interleave: 0,
+            ttft_owe_oldest: false,
         })
     }
 
@@ -814,6 +837,48 @@ impl RequestScheduler {
         }
         self.prefill_catalog = catalog;
         Ok(())
+    }
+
+    /// The shape catalogs of a prepared model, in start-up order: mixed, scored prefill,
+    /// terminal prefill, prefill, and speculative shapes. TP3 fork: context variants
+    /// (`<base>-split-ctx<N>`) are left out; they share their base's shape and the runtime swaps
+    /// them in at submit.
+    pub fn shape_catalogs(&mut self, graphs: &[crate::execution::GraphDescriptor]) -> Result<()> {
+        let graphs = crate::model::catalog::scheduling_graphs(graphs);
+        let of = |kind: GraphKind| graphs.iter().filter(move |g| g.kind == kind);
+        self.mixed_graphs(
+            &of(GraphKind::Mixed)
+                .map(|g| (g.batch_capacity, g.token_capacity, g.prefill_capacity))
+                .collect::<Vec<_>>(),
+        )?;
+        self.scored_prefill_graphs(
+            &of(GraphKind::ScoredPrefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.terminal_prefill_graphs(
+            &of(GraphKind::TerminalPrefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.prefill_graphs(
+            &of(GraphKind::Prefill)
+                .map(|g| g.token_capacity)
+                .collect::<Vec<_>>(),
+        )?;
+        self.speculative_graphs(
+            &of(GraphKind::Speculative)
+                .map(|g| (g.batch_capacity, g.token_capacity))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// TP3 fork: the runtime ran a prefill chunk of `tokens` prompt tokens on a context variant.
+    pub fn record_context_variant(&mut self, tokens: usize) {
+        self.stats.context_variant_chunks += 1;
+        self.stats.context_variant_tokens += tokens as u64;
     }
 
     pub fn scored_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
@@ -1188,6 +1253,13 @@ impl RequestScheduler {
         self.submissions
             .get(&fence)
             .map(|submission| &submission.step)
+            .ok_or_else(|| "unknown scheduled submission".into())
+    }
+    /// Pages whose snapshot-row bytes every rank clears before the submission's graph.
+    pub fn cleared_pages(&self, fence: Fence) -> Result<&[PageId]> {
+        self.submissions
+            .get(&fence)
+            .map(|submission| submission.cleared_pages.as_slice())
             .ok_or_else(|| "unknown scheduled submission".into())
     }
     pub fn cache(&self) -> &PrefixCheckpointCache {
@@ -1782,6 +1854,8 @@ impl RequestScheduler {
             vision_patches: VecDeque::new(),
             prefill_spans: Vec::new(),
             growable_output: spec.growable_output,
+            tools: spec.tools,
+            reasoning_prompt: spec.reasoning_prompt,
             preempted: false,
             admission_order: self.admissions,
         });
@@ -2375,7 +2449,11 @@ impl RequestScheduler {
         let expected_tokens = std::array::from_fn(|slot| step.lanes.iter().enumerate()
             .find(|(_, lane)| lane.request.slot as usize == slot).map_or(0.0, |(row, lane)| {
                 if step.lane_kind(row) == GraphKind::Speculative {
-                    self.expected_speculative_tokens(self.request(lane.request).unwrap(), expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]))
+                    self.expected_speculative_tokens(
+                        self.request(lane.request).unwrap(),
+                        step.batch_capacity,
+                        expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]),
+                    )
                 } else if matches!(step.lane_kind(row), GraphKind::Decode | GraphKind::Resume) { 1.0 }
                 else if step.lane_kind(row).is_prefill() { lane.tokens as f64 } else { 0.0 }
             }));
@@ -2401,12 +2479,13 @@ impl RequestScheduler {
         self.commit_checkpoint_plans(&plan.checkpoint_plans)?;
         self.commit_checkpoint_copies(step)?;
         let non_terminal_prefill = self.is_non_terminal_prefill(step.kind, step.token_capacity);
+        let mut cleared_pages = Vec::new();
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
                 .collect();
-            request.private_pages.extend(allocated);
+            request.private_pages.extend_from_slice(&allocated);
             request.scheduled_consumed = next_consumed_ceiling;
             if non_terminal_prefill {
                 request.deferred_prefill = true;
@@ -2416,7 +2495,13 @@ impl RequestScheduler {
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
             }
+            for page in allocated {
+                if std::mem::take(&mut self.page_holds_row_bytes[page.0 as usize]) {
+                    cleared_pages.push(page);
+                }
+            }
         }
+        self.note_ttft_round(step);
         self.submitted = fence;
         self.refresh.commit(origin, fence, step);
         self.costs.record_attempt(key);
@@ -2431,6 +2516,7 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                cleared_pages,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,
@@ -2648,7 +2734,7 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        self.observe_execution(&submission.step, timing);
+        self.costs.observe(&submission.step, timing);
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;

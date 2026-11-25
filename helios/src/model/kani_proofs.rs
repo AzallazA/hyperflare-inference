@@ -92,6 +92,7 @@ fn completion_fixture(tokens_below_vocabulary: bool) -> CompletionFixture {
         eos_token_ids: Vec::new(),
         sampling_defaults: Default::default(),
         sampling_ranges: Default::default(),
+        steering_sidecar_sha256: None,
         max_new_tokens: 1,
         speculative_widths: Vec::new(),
         speculative_fixed_width: None,

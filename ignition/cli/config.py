@@ -25,7 +25,7 @@ _SECTIONS = {
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
+    "preparation": {"compile_workers": int, "compile_headroom": str, "autotune_effort": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
@@ -40,6 +40,7 @@ _BUILT_IN = {
     "memory.reserve": "0",
     "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
+    "preparation.compile_headroom": "8G",
     "preparation.autotune_effort": "default",
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
@@ -98,6 +99,7 @@ class Configuration:
                 raise UsageError(f"{resolved}: unknown section [{section}]")
         configuration = cls(resolved, values, True)
         parse_size(configuration.get("memory.reserve").value)
+        parse_size(configuration.get("preparation.compile_headroom").value, "compile_headroom in [preparation]")
         for key in ("prefix_cache.memory", "prefix_cache.disk_limit"):
             if configuration.get(key).value:
                 parse_size(configuration.get(key).value, key.replace(".", " "))
@@ -195,6 +197,8 @@ class Configuration:
             '# speculative_graph_budget = 64  # packed round graphs; excludes width-one and ordinary graphs',
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
+            f'# compile_headroom = "{self.get("preparation.compile_headroom").value}"'
+            '        # system memory compiler and tuning pools leave free per host',
             '# force_moe_decode_a16 = false   # Qwen Flash NVFP4 decode/verify A16, calibrated A4 prefill',
             '# autotune_effort = "default"    # off, default, audit',
             "", "[memory]",

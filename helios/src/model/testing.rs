@@ -246,11 +246,13 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         for b in &graph.inputs {
             use ValueSource::*;
             let width = match b.source {
-                SamplingParameters => 6,
+                SamplingParameters => {
+                    if config.steering_sidecar_sha256.is_some() { 7 } else { 6 }
+                }
                 EosTokenIds | LiveStateRows => 8,
                 PromptHistogram => config.contract.vocabulary,
                 GrammarMask => config.contract.vocabulary.div_ceil(32),
-                PageTable => config.prepared_sequence_tokens / config.contract.cache.page_tokens,
+                PageTable => config.prepared_sequence_tokens.div_ceil(config.contract.cache.page_tokens),
                 CopyTokenIds => config.speculative_widths.iter().copied().max().unwrap_or(8).saturating_sub(1).max(1),
                 CopyGrammarMask => config.speculative_widths.iter().copied().max().unwrap_or(8) * config.contract.vocabulary.div_ceil(32),
                 PromptPosition => 3,

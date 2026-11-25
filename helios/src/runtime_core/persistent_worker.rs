@@ -1986,7 +1986,7 @@ extern "C" __global__ void step_emit_completion(
         };
 
         for step in 0..5u64 {
-            let fence = executor.submit(0, &[], false).unwrap().expect("expected submission fence");
+            let fence = executor.submit(0, &[], &[], false).unwrap().expect("expected submission fence");
             let poll_deadline = Instant::now() + Duration::from_secs(2);
             let done = loop {
                 if let Some(c) = executor.poll().unwrap() {

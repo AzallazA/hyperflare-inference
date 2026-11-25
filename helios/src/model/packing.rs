@@ -153,8 +153,9 @@ impl Inputs {
                         }
                         if binding.source == PageTable
                             && width
-                                < config.prepared_sequence_tokens
-                                    / config.contract.cache.page_tokens
+                                < config
+                                    .prepared_sequence_tokens
+                                    .div_ceil(config.contract.cache.page_tokens)
                         {
                             return Err("page-table view cannot cover the prepared context".into());
                         }
@@ -174,7 +175,9 @@ impl Inputs {
                             }
                         }
                         let expected_width = match binding.source {
-                            ValueSource::SamplingParameters => 6,
+                            ValueSource::SamplingParameters => {
+                                if config.steering_sidecar_sha256.is_some() { 7 } else { 6 }
+                            }
                             ValueSource::EosTokenIds => 8,
                             ValueSource::LiveStateRows => {
                                 if width < semantics.state_rows_per_request {
@@ -484,6 +487,7 @@ impl Inputs {
                             .sampling
                             .values()
                             .into_iter()
+                            .take(input.width)
                             .flat_map(f32::to_le_bytes),
                     );
                     continue;

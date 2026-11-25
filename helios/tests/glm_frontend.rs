@@ -80,6 +80,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         eos_token_ids: vec![154820, 154827, 154829],
         sampling_ranges: Default::default(),
         sampling_defaults: SamplingParameters::default(),
+        steering_sidecar_sha256: None,
         max_new_tokens: 128,
         speculative_widths: vec![],
         speculative_fixed_width: None,

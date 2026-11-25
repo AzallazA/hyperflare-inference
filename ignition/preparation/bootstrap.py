@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
 from ignition.preparation.tuning_replicas import TuningReplica
 
 
@@ -26,6 +27,7 @@ class BasePreparationConfig:
     """Common preparation settings accepted by every model recipe bootstrap."""
 
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     autotune_effort: str = "default"
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
@@ -50,6 +52,7 @@ def common_preparation_kwargs(plan, *, compile_forwards: bool, kernel_cache: Pat
     return {
         "mtp_only": plan.speculation is not None and plan.speculation.mtp_only,
         "compile_workers": plan.compile_workers,
+        "compile_headroom_bytes": plan.compile_headroom_bytes,
         "autotune_effort": plan.autotune_effort,
         "tuning_replica": plan.tuning_replica,
         "native_dense_activations": plan.native_dense_activations,

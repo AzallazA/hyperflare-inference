@@ -105,6 +105,8 @@ pub struct Sampling {
     pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steering_scale: Option<f64>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constraint {
@@ -230,6 +232,19 @@ fn content(parts: &[Part]) -> Result<Value> {
     }
 }
 
+/// Requires history tool-call arguments to be a JSON object, or text that encodes one.
+pub fn object_arguments(v: &Value) -> Result<Value> {
+    let value = if let Some(text) = v.as_str() {
+        serde_json::from_str(text).map_err(|e| format!("invalid tool arguments JSON: {e}"))?
+    } else {
+        v.clone()
+    };
+    if !value.is_object() {
+        return Err("tool arguments must be a JSON object".into());
+    }
+    Ok(value)
+}
+
 /// Converts semantic parts to the message context consumed by prepared templates.
 /// `failure_text` begins each failed tool result with a text part saying it
 /// failed, for prompt formats that have no tool-error syntax; every result keeps
@@ -240,10 +255,48 @@ pub fn template_messages(
     hints: &[(usize, usize)],
     failure_text: bool,
 ) -> Result<Vec<Value>> {
+    lower_messages(messages, tool_choice, hints, failure_text, true, false)
+}
+
+/// Converts semantic parts to the message context of an official DeepSeek encoder.
+///
+/// With `instructions_in_place` (DeepSeek V4.1), system and developer messages stay where they
+/// are and a developer message becomes a system turn, as the DeepSeek reference does for the
+/// Responses API (deepseek-recipe protocol/openai/responses/request/convert.rs `push_message`);
+/// a mid-conversation instruction then leaves the earlier prompt prefix unchanged. Without it
+/// (DeepSeek V4, which has no mid-conversation system turn), instructions merge as for
+/// templates. Required tool choice is the encoder's own option, so no instruction is appended.
+/// History arguments that are not a JSON object stay text; the encoder renders them as one
+/// `arguments` string parameter, as the reference does.
+pub fn native_messages(
+    messages: &[Message],
+    hints: &[(usize, usize)],
+    failure_text: bool,
+    instructions_in_place: bool,
+) -> Result<Vec<Value>> {
+    lower_messages(
+        messages,
+        ToolChoice::Auto,
+        hints,
+        failure_text,
+        !instructions_in_place,
+        true,
+    )
+}
+
+fn lower_messages(
+    messages: &[Message],
+    tool_choice: ToolChoice,
+    hints: &[(usize, usize)],
+    failure_text: bool,
+    merge_instructions: bool,
+    text_arguments: bool,
+) -> Result<Vec<Value>> {
     let mut out = Vec::new();
-    let lower_instructions = messages
-        .iter()
-        .any(|message| message.role == Role::Developer);
+    let lower_instructions = merge_instructions
+        && messages
+            .iter()
+            .any(|message| message.role == Role::Developer);
     let instructions: Vec<_> = messages
         .iter()
         .filter(|m| lower_instructions && matches!(m.role, Role::System | Role::Developer))
@@ -284,7 +337,12 @@ pub fn template_messages(
             assistant_start = Some(out.len());
         }
         let before = out.len();
-        let mut current = json!({"role": message.role, "content": ""});
+        let role = if message.role == Role::Developer {
+            Role::System
+        } else {
+            message.role
+        };
+        let mut current = json!({"role": role, "content": ""});
         let mut ordinary = Vec::new();
         let mut ordinary_hints = Vec::new();
         let flush = |current: &mut Value,
@@ -304,7 +362,7 @@ pub fn template_messages(
             {
                 out.push(current.clone());
             }
-            *current = json!({"role": message.role, "content":""});
+            *current = json!({"role": role, "content":""});
             Ok(())
         };
         for (part_index, part) in message.parts.iter().enumerate() {
@@ -337,6 +395,11 @@ pub fn template_messages(
                     if current.get("tool_calls").is_none() {
                         current["tool_calls"] = json!([]);
                     }
+                    let arguments = if text_arguments {
+                        arguments.clone()
+                    } else {
+                        object_arguments(arguments)?
+                    };
                     let mut call =
                         json!({"type":"function","function":{"name":name,"arguments":arguments}});
                     if let Some(source) = arguments_source {
@@ -376,7 +439,7 @@ pub fn template_messages(
         }
         flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
         if before == out.len() {
-            out.push(json!({"role":message.role,"content":""}));
+            out.push(json!({"role": role, "content": ""}));
         }
     }
     if let Some(start) = assistant_start {

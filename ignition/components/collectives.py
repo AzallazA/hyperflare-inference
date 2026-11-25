@@ -12,7 +12,7 @@ output its consumers read.
 """
 
 import itertools
-from math import prod
+from math import gcd, prod
 import weakref
 from dataclasses import dataclass
 
@@ -880,9 +880,12 @@ class PreparedChunkedAllReduce:
     for decode can also reduce prefill activations; the chunks run in order on one stream.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, max_part_rows=0, tail_runtime=None):
         rows = source.shape[0]
         step = rows
+        if type(max_part_rows) is not int or max_part_rows < 0:
+            raise ValueError("max_part_rows must be a non-negative integer")
+        part_specs = None
         if runtime is not None and _roce(runtime):
             row_bytes = source[0].numel() * source.element_size()
             step = min(rows, max(runtime.max_size, runtime.pipe_bytes) // row_bytes)
@@ -892,22 +895,82 @@ class PreparedChunkedAllReduce:
             from b12x.comm import pcie
 
             if isinstance(runtime, pcie.DmaAllReduce):
-                row_bytes = source[0].numel() * source.element_size()
-                step = min(rows, runtime.max_bytes // row_bytes)
-                while step > 1 and not runtime.should_allreduce(source[:step]):
-                    step -= 1
+                if tail_runtime is not None:
+                    part_specs = self._plan_dma_with_tail(
+                        source, runtime=runtime, tail_runtime=tail_runtime,
+                        accepts=runtime.should_allreduce, max_part_rows=max_part_rows,
+                    )
+                else:
+                    row_bytes = source[0].numel() * source.element_size()
+                    step = min(rows, runtime.max_bytes // row_bytes)
+                    if max_part_rows:
+                        step = min(step, max_part_rows)
+                    while step > 1 and not runtime.should_allreduce(source[:step]):
+                        step -= 1
             else:
                 # One-shot pools answer through their stream channel; hierarchical runtimes directly.
                 accepts = (runtime.for_stream().should_allreduce
                            if runtime.algorithm == "oneshot"
                            else runtime.should_allreduce)
+                if max_part_rows:
+                    # Parts of at most max_part_rows rows, cut at that size (4096 rows at 768: 5 x 768 + 256) rather
+                    # than by halving (4096 at 768-row capacity: 8 x 512); halving resumes only if the runtime refuses.
+                    step = min(rows, max_part_rows)
                 while step > 1 and not accepts(source[:step]):
                     step = (step + 1) // 2
-        self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]
-        self.parts = [PreparedAllReduce(source[begin:end], output[begin:end], runtime=runtime, session=session,
-                                        coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}")
-                      for index, (begin, end) in enumerate(self.bounds)]
+        if part_specs is None:
+            part_specs = [((start, min(start + step, rows)), runtime) for start in range(0, rows, step)]
+        self.bounds = [bound for bound, _ in part_specs]
+        self.parts = [
+            PreparedAllReduce(source[begin:end], output[begin:end], runtime=part_runtime, session=session,
+                              coordinator=coordinator,
+                              name=name if len(part_specs) == 1 else f"{name}.{index}")
+            for index, ((begin, end), part_runtime) in enumerate(part_specs)
+        ]
         self.output = output
+
+    @staticmethod
+    def _plan_dma_with_tail(source, *, runtime, tail_runtime, accepts, max_part_rows):
+        """Partition rows into world*8-element-aligned DMA chunks plus tail_runtime chunks for any remainder."""
+        rows = source.shape[0]
+        row_elems = source[0].numel()
+        req = runtime.world_size * 8
+        row_align = req // gcd(req, row_elems)
+
+        def chunk_tail(begin, end):
+            t_rows = end - begin
+            t_step = min(t_rows, max_part_rows) if max_part_rows else t_rows
+            if tail_runtime is not None and not _roce(tail_runtime):
+                t_accepts = (tail_runtime.for_stream().should_allreduce
+                             if tail_runtime.algorithm == "oneshot"
+                             else tail_runtime.should_allreduce)
+                while t_step > 1 and not t_accepts(source[begin:begin + t_step]):
+                    t_step = (t_step + 1) // 2
+            return [((s, min(s + t_step, end)), tail_runtime) for s in range(begin, end, t_step)]
+
+        max_bytes = getattr(runtime, "max_bytes", None)
+        if max_bytes is not None:
+            row_bytes = row_elems * source.element_size()
+            cap = min(rows, max_bytes // row_bytes)
+        else:
+            cap = rows
+        step = min(cap, max_part_rows) if max_part_rows else cap
+        step -= step % row_align
+        while step >= row_align and not accepts(source[:step]):
+            step = ((step // row_align) // 2) * row_align if max_bytes is None else step - row_align
+        if step < row_align:
+            return chunk_tail(0, rows)
+        dma_end = rows - (rows % row_align)
+        specs = []
+        for start in range(0, dma_end, step):
+            end = min(start + step, dma_end)
+            if accepts(source[start:end]):
+                specs.append(((start, end), runtime))
+            else:
+                specs.extend(chunk_tail(start, end))
+        if dma_end < rows:
+            specs.extend(chunk_tail(dma_end, rows))
+        return specs
 
     def functional(self, *, session):
         """Allocate one destination shared by the ordered row chunks."""

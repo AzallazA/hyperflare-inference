@@ -189,6 +189,19 @@ class RecordedExportGraph:
         self.owners = ()
 
 
+def mixed_device_bytes(region) -> int:
+    """VRAM prefix a mixed region's package allocation declares: its mapped prefix, or a recipe's larger declared
+    prefix (``declared_device_bytes``, whole granules, within the extent)."""
+    declared = getattr(region, "declared_device_bytes", None)
+    if declared is None:
+        return region.device_bytes
+    declared = int(declared)
+    if not region.device_bytes <= declared <= region.extent or declared % region.granularity:
+        raise ValueError(f"mixed region {getattr(region, 'name', '?')}: declared VRAM prefix {declared} must be whole "
+                         f"granules between the mapped {region.device_bytes} and the extent {region.extent} bytes")
+    return declared
+
+
 def record_export_graph(graph, storage, *, owners=()):
     """Retain a captured template, its executable and external export resources.
 
@@ -299,6 +312,15 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
                        for segment in storage.graph_pool.snapshot(include_traces=False))
     inactive = storage.unused_ranges()
     zero_ranges.extend((start, end - start) for start, end in inactive)
+    # cuBLAS's own pool (library_scratch.py): never addressed by a graph; not zeroed, only excluded from
+    # the exporter's conservative reachability so a coincidental value cannot retain it.
+    from .library_scratch import live_inactive
+    scratch = live_inactive(getattr(images, "library_scratch", ()), images.allocations)
+    if scratch:
+        import sys
+        print(f"rank {storage.rank}: library scratch excluded from export reachability: " + ", ".join(
+            f"{(end - start) / (1 << 20):.0f} MiB at {start:#x}" for start, end in scratch), file=sys.stderr, flush=True)
+    inactive = sorted([*inactive, *scratch])
     transports = [runtime.native_description() for runtime in storage.transports]
     for runtime in storage.transports:
         runtime.close()
@@ -315,6 +337,13 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
     allocations.extend(Allocation(f"host-{index}", region.address, region.extent, alignment=4096,
         preserve_address=True, memory="mapped_host") for index, region in enumerate(storage.host_regions)
         if not region.closed)
+    # TP3 merged expert banks: one allocation per bank; Helios maps its first <device bytes> as VRAM
+    # and the rest as pinned host-NUMA memory, so the bank stays one contiguous range.
+    # A recipe may declare a larger VRAM prefix than it mapped during the export (exp/ds41-exl3: hot rows promoted
+    # after tuning headroom; the content is the same virtual range either way).
+    for index, region in enumerate(r for r in getattr(storage, "mixed_regions", ()) if not r.closed):
+        allocations.append(Allocation(f"mixed-{index}-{mixed_device_bytes(region)}", region.address, region.extent,
+            alignment=storage.granularity, preserve_address=True))
     allocations.extend(Allocation(region.name, region.address, region.extent, alignment=storage.granularity,
         initialize="zero", preserve_address=True, sizing=dict(capacity=region.group,
         unit_bytes=region.unit_bytes, maximum=region.maximum)) for region in dynamic)

@@ -34,6 +34,7 @@ impl Chunk {
         geometry: &CacheGeometry,
         execution: u64,
         aliases: &mut [Range<u32>],
+        mut padding: Option<&mut [bool]>,
     ) {
         if self.row_bytes == 0 {
             return;
@@ -51,6 +52,10 @@ impl Chunk {
                 let range = &mut aliases[(id - execution) as usize];
                 range.start = range.start.min((first / unit) as u32);
                 range.end = range.end.max(last.div_ceil(unit) as u32);
+            } else if let Some(padding) = padding.as_deref_mut() {
+                // The piece lies wholly in the granule padding past the last
+                // page: it shares bytes with no KV page, so it adds no conflict.
+                padding[(id - execution) as usize] = true;
             }
         }
     }
@@ -131,6 +136,7 @@ impl Layout {
         let row_end = (geometry.row_capacity * row_bytes).div_ceil(row_alignment) * row_alignment;
         let snapshots = geometry.row_capacity - execution;
         let mut aliases = vec![u32::MAX..0; snapshots as usize];
+        let mut padding = vec![false; snapshots as usize];
         let mut cursor = fixed_bytes;
         let mut chunks = Vec::new();
         let largest = geometry.planes.iter().map(|p| p.unit_bytes).max().unwrap();
@@ -184,7 +190,7 @@ impl Layout {
                     row_offset: cursor,
                     row_bytes: mapped,
                 };
-                chunk.record_conflicts(geometry, execution, &mut aliases);
+                chunk.record_conflicts(geometry, execution, &mut aliases, Some(&mut padding));
                 chunks.push(chunk);
                 cursor += mapped;
                 if mapped > 0 && mapped < bytes {
@@ -222,8 +228,11 @@ impl Layout {
         if cursor < row_end {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
-        for range in &mut aliases {
-            if *range == (u32::MAX..0) {
+        for (snapshot, range) in aliases.iter_mut().enumerate() {
+            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+                *range = 0..0;
+            } else if range.start >= range.end && padding[snapshot] {
+                // Backed only by padding past the last page: no KV page conflicts.
                 *range = 0..0;
             } else if range.start >= range.end {
                 return Err(invalid("continuation alias lacks a KV conflict range"));
@@ -413,7 +422,7 @@ impl Layout {
                 row_offset: cursor,
                 row_bytes: length,
             };
-            chunk.record_conflicts(geometry, execution, &mut aliases);
+            chunk.record_conflicts(geometry, execution, &mut aliases, None);
             chunks.push(chunk);
             cursor = end;
         }
@@ -1066,6 +1075,34 @@ mod tests {
             }
         }
         assert!(unconflicted > 0);
+    }
+
+    #[test]
+    fn rows_backed_only_by_granule_padding_have_no_conflict() {
+        // TP2 mini8 (EXL3): rows smaller than the 2 MiB granule and a single
+        // alias-eligible plane, so rows can map wholly past the last page.
+        let alignment = 2 << 20;
+        let mut padded = 0;
+        for pages in (3_000_000u64..3_000_200).chain(4_479_768..4_479_868) {
+            for execution in [8u64, 9, 16, 17] {
+                let rows = execution + 200;
+                let geometry = geometry(781_312, &[18_432, 4_352], pages, rows);
+                let layout = Layout::new(&geometry, execution, &[alignment; 2], alignment)
+                    .unwrap_or_else(|e| panic!("pages {pages} execution {execution}: {e:?}"));
+                for row in execution..rows {
+                    let range = &layout.aliases[(row - execution) as usize];
+                    let pages = conflicts(&layout, &geometry, row);
+                    if pages.is_empty() {
+                        padded += u64::from(range.is_empty());
+                        assert_eq!(*range, 0..0, "row {row}");
+                    } else {
+                        assert!(range.start as u64 <= *pages.first().unwrap(), "row {row}");
+                        assert!(range.end as u64 > *pages.last().unwrap(), "row {row}");
+                    }
+                }
+            }
+        }
+        assert!(padded > 0, "sweep never produced a padding-only row");
     }
 
     #[test]

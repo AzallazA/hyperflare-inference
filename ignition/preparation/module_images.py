@@ -39,12 +39,16 @@ def global_symbols(image):
 class ModuleImages:
     """Keep native module images and driver allocation records through export."""
 
+    active = 0
+
     def __init__(self, library=None):
         from flare_heliopause import NativeModuleRecorder
 
         self.native = NativeModuleRecorder(str(cupti_library(library)))
         self._active = False
         self._token = None
+        # cuBLAS's own pool, recorded by library_scratch.prime (export excludes it from reachability)
+        self.library_scratch = []
 
     @classmethod
     def current(cls):
@@ -59,12 +63,21 @@ class ModuleImages:
         return self.native.allocation_contexts()
 
     def __enter__(self):
+        import os
+        if os.getenv("FLARE_DS41_EAGER_PROFILE"):
+            # An external CUPTI profiler is attached; skip our recorder (CUPTI allows one subscriber).
+            ModuleImages.active += 1
+            return self
         self.native.start()
         self._token = _CURRENT.set(self)
         self._active = True
         return self
 
     def __exit__(self, kind, value, traceback):
+        import os
+        if os.getenv("FLARE_DS41_EAGER_PROFILE") and not self._active:
+            ModuleImages.active -= 1
+            return
         try:
             self.native.stop()
         finally:

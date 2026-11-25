@@ -43,7 +43,10 @@ class CompletionOutputs:
     _private: list = field(default_factory=list, compare=False, repr=False)
 
     @classmethod
-    def allocate(cls, shape, *, device):
+    def allocate(cls, shape, *, device, generation_logprobs=True):
+        """``generation_logprobs=False`` (TP3 fork, DS41 tp3.no_generation_logprobs): no generation logprob storage or
+        request flags; ``buffers()`` omits them, so the package's manifest declares no generation logprobs and Helios
+        answers logprob requests with HTTP 400 (``max_top_logprobs() == 0``). The logprob reductions become inert."""
         if len(shape) != 3:
             raise ValueError("completion records require [2,slots,16+token_capacity]")
         frames, slots, fields = shape
@@ -51,11 +54,14 @@ class CompletionOutputs:
                 or type(fields) is not int or fields <= VECTOR_TOKENS_FIELD):
             raise ValueError("completion records require [2,slots,16+token_capacity] with positive slots and token capacity")
         tokens = completion_token_capacity(fields - VECTOR_TOKENS_FIELD)
+        if type(generation_logprobs) is not bool:
+            raise TypeError("generation_logprobs must be a boolean")
+        logprob = generation_logprobs
         return cls(torch.zeros(shape, dtype=torch.int64, device=device),
-            torch.zeros((frames, slots, tokens, LOGPROB_FIELDS), dtype=torch.int32, device=device),
-            torch.zeros(slots, dtype=torch.int32, device=device),
-            torch.zeros((slots, MAX_LOGPROB_TOKEN_IDS), dtype=torch.int32, device=device),
-            torch.zeros(slots, dtype=torch.int32, device=device),
+            torch.zeros((frames, slots, tokens, LOGPROB_FIELDS), dtype=torch.int32, device=device) if logprob else None,
+            torch.zeros(slots, dtype=torch.int32, device=device) if logprob else None,
+            torch.zeros((slots, MAX_LOGPROB_TOKEN_IDS), dtype=torch.int32, device=device) if logprob else None,
+            torch.zeros(slots, dtype=torch.int32, device=device) if logprob else None,
             torch.full((frames, slots, tokens - 1), -1., dtype=torch.float32, device=device) if tokens > 1 else None)
 
     @property
@@ -63,9 +69,10 @@ class CompletionOutputs:
         return completion_record_capacity(self.records)
 
     def buffers(self):
-        result = dict(completion_records=self.records, completion_logprobs=self.logprobs,
-                      logprob_requested=self.requested, logprob_token_ids=self.token_ids,
-                      logprob_token_id_counts=self.token_id_counts)
+        result = dict(completion_records=self.records)
+        if self.logprobs is not None:
+            result.update(completion_logprobs=self.logprobs, logprob_requested=self.requested,
+                          logprob_token_ids=self.token_ids, logprob_token_id_counts=self.token_id_counts)
         if self.speculative_survival is not None:
             result["completion_speculative_survival"] = self.speculative_survival
         return result
@@ -82,7 +89,8 @@ class CompletionOutputs:
         """Allocate disjoint mixed-role outputs while sharing request flags."""
         device = self.records.device
         child = CompletionOutputs(persistent_zeros(self.records.shape, torch.int64, device),
-            persistent_zeros(self.logprobs.shape, torch.int32, device), self.requested,
+            None if self.logprobs is None else persistent_zeros(self.logprobs.shape, torch.int32, device),
+            self.requested,
             self.token_ids, self.token_id_counts,
             persistent_zeros(self.speculative_survival.shape, torch.float32, device).fill_(-1.)
             if self.speculative_survival is not None else None)
@@ -104,6 +112,8 @@ class CompletionOutputs:
             mask = role.view(1, -1, *([1] * (output.ndim - 2)))
             output.index_copy_(0, index, torch.where(mask,
                 -1. if output is self.speculative_survival else a.index_select(0, index), b.index_select(0, index)))
+        if self.logprobs is None:
+            return
         from .logprobs import _merge
         torch.library.wrap_triton(_merge)[(self.records.shape[1], tokens)](
             self.logprobs, prompt.logprobs, decode.logprobs, self.token_id_counts,
