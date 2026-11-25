@@ -226,7 +226,7 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
     manifest.graphs[0].input_bindings[2].nbytes = buffer.nbytes;
     manifest.input_frame_bytes = 16 + buffer.nbytes;
     manifest.validate().unwrap();
-    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 6);
+    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 7);
     for (sender, receiver) in [crate::execution::rank_stream::test_pair().unwrap(),
                                (client.into(), server.into())] {
         let mut sender = Channel::new(sender).unwrap();
