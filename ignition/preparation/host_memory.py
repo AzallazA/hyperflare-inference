@@ -152,7 +152,8 @@ def worker_limit(limit, *, pools=1, available=None, device_bytes=0, headroom_byt
 
 
 def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persistent_bytes=0,
-                            compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+                            compile_headroom_bytes=COMPILE_HEADROOM_BYTES,
+                            tuning_growth_bytes=_TUNING_GROWTH_BYTES):
     """Leave physical memory for tuning fixtures, modules, and pending plan storage."""
     import torch
 
@@ -163,11 +164,12 @@ def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persis
         available = (available - max(compile_headroom_bytes, headroom_bytes)) // pools
     else:
         available -= headroom_bytes
-    return max(0, available - _TUNING_GROWTH_BYTES - pending_persistent_bytes)
+    return max(0, available - tuning_growth_bytes - pending_persistent_bytes)
 
 
 def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None,
-                  compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+                  compile_headroom_bytes=COMPILE_HEADROOM_BYTES,
+                  tuning_growth_bytes=_TUNING_GROWTH_BYTES):
     """Size compiler pools and candidate races against their physical memory supply."""
     import torch
 
@@ -175,7 +177,7 @@ def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=Non
         free = device_memory_info(device)[0]
         # Candidate fixtures and loaded modules grow after reserving the kernel scratch arena.
         # Bound each device independently; compiler processes still share the host RAM budget.
-        usable = free - headroom_bytes - _TUNING_GROWTH_BYTES
+        usable = free - headroom_bytes - tuning_growth_bytes
         race = max(1, usable // 4)
         if race_budget is not None:
             race = min(race, race_budget)
@@ -184,7 +186,7 @@ def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=Non
     if os.name == "nt":
         available = min(available, available_bytes())
     headroom = max(compile_headroom_bytes, headroom_bytes)
-    usable = (available - headroom) // pools - _TUNING_GROWTH_BYTES
+    usable = (available - headroom) // pools - tuning_growth_bytes
     if usable <= 0:
         raise MemoryError(f"kernel tuning needs more than {(headroom + pools * _TUNING_GROWTH_BYTES) >> 20} MiB "
                           f"available shared memory; found {available >> 20} MiB")

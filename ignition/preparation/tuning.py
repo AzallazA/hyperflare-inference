@@ -25,9 +25,12 @@ from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
 from .scratch_preference import from_environment as scratch_preference_from_environment
-from .export_speed import TUNE_ONLY_ENV, tune_only
+from .export_speed import TUNE_ONLY_ENV, tune_only, tuning_margin_bytes
 from .tuning_shards import component_key, local_components, materialization_key, portable_declaration
-from .host_memory import COMPILE_HEADROOM_BYTES, candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
+from .host_memory import (
+    COMPILE_HEADROOM_BYTES, _TUNING_GROWTH_BYTES, candidate_scratch_limit, cpu_workers,
+    release_unused, tuning_limits,
+)
 
 
 # Requests per tuning job on an integrated GPU: collective declarations with a coordinator,
@@ -497,9 +500,12 @@ class RecordedPreparationSession(PreparationSession):
             pools = 1 if self._coordinator is None else self._coordinator.local_ranks
             if self.tuning_replica is not None:
                 pools = self.tuning_replica.processes
+            margin = None if self._integrated else tuning_margin_bytes()
             limit = candidate_scratch_limit(self.device.ordinal, pools=pools,
-                headroom_bytes=self.headroom_bytes, pending_persistent_bytes=envelope.pending_persistent_nbytes,
-                compile_headroom_bytes=self.compile_headroom_bytes)
+                headroom_bytes=0 if margin is not None else self.headroom_bytes,
+                pending_persistent_bytes=envelope.pending_persistent_nbytes,
+                compile_headroom_bytes=self.compile_headroom_bytes,
+                tuning_growth_bytes=_TUNING_GROWTH_BYTES if margin is None else margin)
             if self._replica_coordinator is not None:
                 limit = min(self._replica_coordinator.gather(limit))
             elif self._coordinator is not None:
@@ -598,9 +604,12 @@ class RecordedPreparationSession(PreparationSession):
             preserve_default = self.requested_compile_workers is None and self.tuning_replica is None
             self.configure_compile_workers(None if preserve_default else
                 cpu_workers(self.requested_compile_workers, pools=pools))
+            margin = None if self._integrated else tuning_margin_bytes()
             bounded, self.race_budget = tuning_limits(self.device.ordinal, self.compile_workers,
-                pools=pools, headroom_bytes=self.headroom_bytes, race_budget=self.race_budget,
-                compile_headroom_bytes=self.compile_headroom_bytes)
+                pools=pools, headroom_bytes=0 if margin is not None else self.headroom_bytes,
+                race_budget=self.race_budget,
+                compile_headroom_bytes=self.compile_headroom_bytes,
+                tuning_growth_bytes=_TUNING_GROWTH_BYTES if margin is None else margin)
             if self._integrated and self.compile_workers:
                 # Compiling in this process would keep every program it compiles through serving;
                 # one compiler process returns its memory at the end of each tuning job.

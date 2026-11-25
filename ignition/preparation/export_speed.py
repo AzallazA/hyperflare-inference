@@ -25,6 +25,12 @@ FLARE_EXPORT_TUNE_ONLY=1
     kernel cache, closes its session and exits the way a tuning replica does (TuningComplete);
     `ignition export` then returns 0 without compiling, capturing or writing a package. Use it
     for the warm-up before a cold-cache export (handbook D.2.2).
+FLARE_EXPORT_TUNING_MARGIN_MIB=M
+    Discrete-GPU VRAM margin in MiB kept free during kernel tuning (replaces the default
+    headroom_bytes + 1 GiB tuning-growth reservation inside candidate_scratch_limit and
+    tuning_limits). Intended for warm-cache exports with tight pre-tuning VRAM (e.g. high
+    HOT with --row-shard-attention) where declaration buffers are released immediately after
+    tuning. Unset keeps the upstream reservation. Zero is allowed.
 
 None of these values reaches a cache key, a tuning namespace or the package: the compiled
 forward cache key is (namespace, Inductor options without compile_threads, torch, runtime
@@ -39,6 +45,7 @@ FORWARD_WORKERS_ENV = "FLARE_EXPORT_FORWARD_WORKERS"
 FORWARD_WORKER_GIB_ENV = "FLARE_EXPORT_FORWARD_WORKER_GIB"
 FORWARD_WORKER_VRAM_MIB_ENV = "FLARE_EXPORT_FORWARD_WORKER_VRAM_MIB"
 TUNE_ONLY_ENV = "FLARE_EXPORT_TUNE_ONLY"
+TUNING_MARGIN_MIB_ENV = "FLARE_EXPORT_TUNING_MARGIN_MIB"
 
 
 def _positive_int(name):
@@ -48,6 +55,21 @@ def _positive_int(name):
     if not text.isdecimal() or int(text) < 1:
         raise ValueError(f"{name} must be a positive integer, not {text!r}")
     return int(text)
+
+
+def _nonnegative_int(name):
+    text = os.environ.get(name, "").strip()
+    if not text:
+        return None
+    if not text.isdecimal():
+        raise ValueError(f"{name} must be a nonnegative integer, not {text!r}")
+    return int(text)
+
+
+def tuning_margin_bytes():
+    """Discrete-GPU VRAM margin reserved during kernel tuning, in bytes, or None for upstream defaults."""
+    mib = _nonnegative_int(TUNING_MARGIN_MIB_ENV)
+    return None if mib is None else mib << 20
 
 
 def forward_workers():

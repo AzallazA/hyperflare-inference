@@ -252,3 +252,36 @@ def test_tuning_races_and_compilers_share_one_ram_budget(monkeypatch, pools, hea
         assert race <= race_budget
     if race_budget == 1 << 20:
         assert race == race_budget
+
+
+def test_tuning_margin_override_parses_nonnegative_mib(monkeypatch):
+    from ignition.preparation import export_speed
+
+    monkeypatch.delenv(export_speed.TUNING_MARGIN_MIB_ENV, raising=False)
+    assert export_speed.tuning_margin_bytes() is None
+
+    monkeypatch.setenv(export_speed.TUNING_MARGIN_MIB_ENV, "0")
+    assert export_speed.tuning_margin_bytes() == 0
+
+    monkeypatch.setenv(export_speed.TUNING_MARGIN_MIB_ENV, "256")
+    assert export_speed.tuning_margin_bytes() == 256 << 20
+
+    monkeypatch.setenv(export_speed.TUNING_MARGIN_MIB_ENV, "-1")
+    with pytest.raises(ValueError):
+        export_speed.tuning_margin_bytes()
+
+
+def test_discrete_candidate_scratch_limit_respects_custom_tuning_growth(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1459 << 20, 96 << 30))
+    assert host_memory.candidate_scratch_limit("cuda:0", headroom_bytes=1 << 30) == 0
+    assert host_memory.candidate_scratch_limit(
+        "cuda:0", headroom_bytes=0, tuning_growth_bytes=256 << 20, pending_persistent_bytes=64 << 20
+    ) == (1459 - 256 - 64) << 20
+    workers, race = host_memory.tuning_limits(
+        "cuda:0", 0, headroom_bytes=0, tuning_growth_bytes=256 << 20
+    )
+    assert workers == 0
+    assert race == ((1459 - 256) << 20) // 4
