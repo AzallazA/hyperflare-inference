@@ -353,10 +353,7 @@ speculation, selected preparation settings (including prompt logprobs,
 autotune effort, native dense activations, and GPU clock locking), and
 canonical `ignition export` reproduction arguments in `reproduction_args`
 without host-local paths or secrets. A local checkpoint override
-is marked explicitly and carries no asserted upstream revision. Runtime
-collective preparation records the complete offline ladder as
-`RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
-original ladder file path. Helios does not interpret that preparation input.
+is marked explicitly and carries no asserted upstream revision.
 
 Online MXFP8 conversion records its resolved projection group in
 `RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,

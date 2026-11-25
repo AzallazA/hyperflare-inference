@@ -184,30 +184,6 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
-`--collective-tuning static|runtime` selects when collective choices become fixed.
-`static` uses ordinary preparation-time autotuning and emits no collective startup
-tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
-overrides the recipe default; the command-line option overrides configuration.
-`runtime` requires `--collective-ladder PATH` and uses the file's final joint
-kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
-compiles that geometry without racing alternatives. A captured tuner selects
-among the supplied submode and active-CTA profiles when the core loads,
-including with autotune effort `off`; geometry stays fixed and no search runs
-during requests. Other collective paths retain their preparation policy. The
-[GB202 PCIe TP4 ladder](../ignition/preparation/ladders/README.md) covers four
-SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
-
-```sh
---collective-tuning runtime \
---collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
-```
-
-Startup races in one preparation share fixture and timing storage. Cold races
-read an existing checkpoint allocation on the same GPU when it is at least
-twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
-enough, the races use one shared eviction buffer. A core's resident startup
-storage is fixed at export.
-
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving

@@ -309,8 +309,6 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
         args.append('--joint-tuning')
     if not plan.stream_overlap and plan.recipe.stream_overlap:
         args.append('--no-stream-overlap')
-    if plan.collective_tuning:
-        args.extend(['--collective-tuning', plan.collective_tuning])
     if effort := getattr(plan, 'autotune_effort', ''):
         args.extend(['--autotune-effort', effort])
     if getattr(plan, 'lock_gpu_clocks', False):
@@ -335,16 +333,11 @@ def from_plan(model, plan, *, compiled_forwards, multi_host=False):
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
-        collective_tuning=plan.collective_tuning,
         autotune_effort=getattr(plan, 'autotune_effort', ''),
         native_dense_activations=bool(getattr(plan, 'native_dense_activations', False)),
         lock_gpu_clocks=bool(getattr(plan, 'lock_gpu_clocks', False)),
         reproduction_args=reproduction_arguments(
             model, plan, compiled_forwards=compiled_forwards, multi_host=multi_host))
-    if plan.collective_ladder is not None:
-        import json
-
-        result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
     if plan.force_moe_decode_a16:

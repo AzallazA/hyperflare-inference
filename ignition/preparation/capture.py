@@ -14,7 +14,6 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
-from .startup_tuning import capture_consumers
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
 
 
@@ -224,14 +223,10 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     with torch.cuda.stream(warm):
                         before_run(name)
                     stream.wait_stream(warm)
-                with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
+                with communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
                 if exporting:
-                    recorded = record_export_graph(graph, warmup_storage, owners=(function,))
-                    registry = getattr(session, "_startup_collectives", None)
-                    if registry is not None:
-                        registry.captures[id(recorded)] = registry.captures.pop(id(graph))
-                    graph = recorded
+                    graph = record_export_graph(graph, warmup_storage, owners=(function,))
                 elif retain_graphs:
                     if progress is not None:
                         progress(f"instantiating {name}: {memory_detail()}")

@@ -25,7 +25,7 @@ _SECTIONS = {
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
+    "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
@@ -41,7 +41,6 @@ _BUILT_IN = {
     "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
-    "preparation.collective_tuning": None,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
@@ -130,8 +129,6 @@ class Configuration:
                     raise UsageError(f'prefix_cache {key} {text!r} must be {"on, " if key == "drain_on_shutdown" else ""}off, or a positive duration such as 90s or 2m')
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
-            if key == "collective_tuning" and value not in ("static", "runtime"):
-                raise UsageError(f"{path}: collective_tuning must be static or runtime")
             if key == "port" and not 1 <= value <= 65535:
                 raise UsageError(f"{path}: port in [{section}] must be 1 through 65535")
             if key == "thinking_token_budget" and not 1 <= value <= 2**32 - 1:
@@ -200,7 +197,6 @@ class Configuration:
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
             '# force_moe_decode_a16 = false   # Qwen Flash NVFP4 decode/verify A16, calibrated A4 prefill',
             '# autotune_effort = "default"    # off, default, audit',
-            '# collective_tuning = "static"  # static, runtime; omitted uses recipe default',
             "", "[memory]",
             f'# reserve = "{self.get("memory.reserve").value}"'
             "                   # GPU memory left untouched for processes that start later",

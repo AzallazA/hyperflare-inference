@@ -13,11 +13,10 @@ from dataclasses import replace
 
 from ignition import planning
 from ignition.errors import CapacityError, FlareError, PreparationError, UsageError
-from ignition.preparation.collective_ladder import resolve as resolve_collective_ladder
 
 from . import display, environment
 
-from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+from .preparation import (Host, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -204,11 +203,8 @@ def _export_hosts(args):
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode,
                          row_shard_prefill=args.row_shard_prefill)
-    collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   collective_tuning=collective_mode,
-                   collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
@@ -276,7 +272,6 @@ def _prepare(args):
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
-                      collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
@@ -303,7 +298,6 @@ def _prepare(args):
             serial += " · experimental RoCE ring (native neighbor relays)"
         if plan.roce_chain:
             serial += " · experimental RoCE chain (native neighbor relays, open ends)"
-        ladder_name = f" · ladder {plan.collective_ladder['name']}" if plan.collective_ladder is not None else ""
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
@@ -312,7 +306,7 @@ def _prepare(args):
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
-                     f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
+                     f" · autotune effort {plan.autotune_effort}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
                      f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
                      f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
@@ -475,11 +469,8 @@ def debug_serve(args) -> int:
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
                          row_shard_prefill=args.row_shard_prefill)
-    collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   collective_tuning=collective_mode,
-                   collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)

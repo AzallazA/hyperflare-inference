@@ -25,13 +25,6 @@ class PreparedModel(PreparedExecution):
                  forwards=None, embedding_catalog=None, rebuild_weights=None,
                  benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None,
                  benchmark_prefills=None, benchmark_observers=None, **kwargs):
-        registry = getattr(session, "_startup_collectives", None)
-        if registry is not None:
-            buffers, tuners, bindings, owners = registry.catalog(kwargs["graphs"])
-            kwargs["buffers"] = {**kwargs["buffers"], **buffers}
-            kwargs["resources"] = (*kwargs.get("resources", ()), *owners)
-            kwargs["tuning_graphs"] = tuners
-            kwargs["tuned_bindings"] = bindings
         super().__init__(**kwargs)
         if forwards is not None and set(forwards) != set(self.serving_graphs):
             raise ValueError("retained forwards must cover exactly the captured graphs")
@@ -41,7 +34,7 @@ class PreparedModel(PreparedExecution):
             contract["graphs"] = [dict(graph, tuned_bindings=[dict(buffer=value.buffer, tuning_graph=value.tuning_graph)
                 for value in self.tuned_bindings.get(graph["graph"], ())]) for graph in contract["graphs"]]
             self.server_config["model_contract"] = contract
-        self.memory_report = memory_report if registry is None else {**memory_report, **registry.memory_report()}
+        self.memory_report = memory_report
         self.session = session
         self.core_data = core_data
         self.rebuild_weights = rebuild_weights

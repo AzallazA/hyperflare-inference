@@ -188,8 +188,6 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
-    collective_ladder: dict | None = None
-    collective_tuning: str | None = None
     joint_tuning: bool = False
     shard_hyperconnections: bool = False
     # Prefill replaces eligible tensor-parallel all-reduces with reduce-scatters into each rank's
@@ -252,19 +250,6 @@ class Plan:
                 raise UsageError("benchmark chunk must match --prefill-chunk-size")
             if self.prompt_logprobs or self.mixed_prefill:
                 raise UsageError("benchmark graph preparation does not implement scored or mixed prefill")
-        if self.collective_tuning is None:
-            object.__setattr__(self, "collective_tuning", self.recipe.collective_tuning)
-        if self.collective_tuning not in ("static", "runtime"):
-            raise UsageError("--collective-tuning must be static or runtime")
-        if self.collective_ladder is not None:
-            from ignition.preparation.collective_ladder import validate
-
-            ladder = validate(self.collective_ladder)
-            if self.collective_tuning != "runtime":
-                raise UsageError("--collective-ladder requires --collective-tuning runtime")
-            if self.world_size != ladder["world_size"] or any(
-                    tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
-                raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
         if self.force_moe_decode_a16:
             intermediate = self.recipe.moe_decode_a16_intermediate_width
             if intermediate is None:
@@ -411,8 +396,6 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
-            "collective_tuning": self.collective_tuning,
-            "collective_ladder": self.collective_ladder,
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "row_shard_prefill": self.row_shard_prefill,

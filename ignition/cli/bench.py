@@ -164,7 +164,7 @@ def run(args):
         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
         stream_overlap=stream_overlap(args, model),
         compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
-        autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
+        autotune_effort=args.autotune_effort,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
@@ -241,7 +241,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
-            "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
+            "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
             "row_shard_prefill",
             "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}

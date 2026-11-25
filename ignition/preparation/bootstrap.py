@@ -25,8 +25,6 @@ def validate_host_topology(roce_ring: bool, roce_chain: bool, hosts: tuple[str, 
 class BasePreparationConfig:
     """Common preparation settings accepted by every model recipe bootstrap."""
 
-    collective_tuning: str = "static"
-    collective_ladder: dict | None = None
     compile_workers: int | None = None
     autotune_effort: str = "default"
     native_dense_activations: bool = False
@@ -51,8 +49,6 @@ def common_preparation_kwargs(plan, *, compile_forwards: bool, kernel_cache: Pat
     """Extract the shared PreparationConfig keyword arguments from a sizing Plan."""
     return {
         "mtp_only": plan.speculation is not None and plan.speculation.mtp_only,
-        "collective_tuning": plan.collective_tuning,
-        "collective_ladder": plan.collective_ladder,
         "compile_workers": plan.compile_workers,
         "autotune_effort": plan.autotune_effort,
         "tuning_replica": plan.tuning_replica,

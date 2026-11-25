@@ -48,17 +48,13 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, online_mxfp8_scope: str | None = None, language_model_only: bool = False,
-           compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
+           compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
            row_shard_prefill: bool = False,
            force_moe_decode_a16: bool | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
-    from ignition.preparation.collective_ladder import resolve as resolve_ladder
-
-    mode = collective_tuning_mode(configuration, model, collective_tuning)
-    ladder = resolve_ladder(mode, collective_ladder)
     workers = compiler_workers(configuration, compile_workers)
     result = planning.plan(
         model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
@@ -72,7 +68,6 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         mla_compute_mode=mla_compute_mode, row_shard_prefill=row_shard_prefill)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
-                     collective_tuning=mode, collective_ladder=ladder,
                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", force_moe_decode_a16).value,
                      joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
@@ -89,14 +84,6 @@ def tuning_effort(configuration, flag=None):
     value = configuration.get("preparation.autotune_effort", flag).value
     if value not in AUTOTUNE_EFFORTS:
         raise UsageError(f"--autotune-effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
-    return value
-
-
-def collective_tuning_mode(configuration, model, flag=None):
-    value = configuration.get("preparation.collective_tuning", flag).value
-    value = model.recipe.collective_tuning if value is None else value
-    if value not in ("static", "runtime"):
-        raise UsageError("--collective-tuning must be static or runtime")
     return value
 
 

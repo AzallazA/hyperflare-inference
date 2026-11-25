@@ -108,10 +108,8 @@ message RebuildManifest {
   bool joint_tuning = 23;
   // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
   bool shard_hyperconnections = 24;
-  // Preparation-time collective selection policy: static or runtime.
-  string collective_tuning = 25;
-  // Preparation-only offline geometry and runtime profile recommendations.
-  string collective_ladder_json = 26;
+  reserved 25, 26;
+  reserved "collective_tuning", "collective_ladder_json";
   // Preparation-only routed W4A16 decode/verification with calibrated A4 prefill.
   bool force_moe_decode_a16 = 27;
   // Preparation-only row-sharded prefill collectives; requires RoCE proxy ABI 11+ or PCIe DMA row-shard surfaces.

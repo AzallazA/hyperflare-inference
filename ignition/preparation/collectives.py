@@ -89,8 +89,7 @@ def warmup_wait(runtime, coordinator):
         runtime.spin_limit = limit
 
 
-def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
-                              collective_tuning="static"):
+def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2):
     """Allocate one b12x IPC channel for the largest hidden activation.
 
     Every rank supplies identical capacities before preparing graph variants.
@@ -102,14 +101,11 @@ def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=Non
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
-    if collective_tuning not in ("static", "runtime"):
-        raise ValueError("collective_tuning must be static or runtime")
     nbytes = max_tokens * hidden_size * element_bytes
     if nbytes % 16:
         raise ValueError("all-reduce capacity must occupy complete 16-byte packs")
     return AllReduce.from_exchange_group(exchange_group=group, device=device, single_channel=True,
-                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc,
-                                         joint=collective_tuning == "runtime")
+                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc)
 
 
 def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):

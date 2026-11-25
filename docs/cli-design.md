@@ -463,8 +463,6 @@ explicit flags take precedence.
 | `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
 | `--shard-hyperconnections` | Partition Qwen3.8 Flash target and MTP hyperconnection bottlenecks across TP ranks and all-reduce BF16 gate logits before sigmoid. Requires TP2 or TP4. Command line only; changing it requires re-export. | off (replicated) |
 | `--row-shard-prefill` | Replace eligible tensor-parallel prefill all-reduces with reduce-scatters into each rank's contiguous row shard, run row-local residual mixing on that shard, and gather normalized branch inputs back to full rows. Preparation requires multi-host RoCE (proxy ABI 11 or later) or single-host PCIe `DmaAllReduce` row-shard surfaces and a tensor-parallel size declared in the recipe's `row_shard_prefill_world_sizes`; SM103 and `--joint-tuning` are refused, and layers or capacities whose row count or row-shard capacity do not fit keep the full-row all-reduce path. Command line only; changing it requires re-export. | off |
-| `--collective-ladder PATH` | JSON file of final joint collective geometries and runtime profiles. Required when the resolved collective tuning policy is `runtime`; rejected with `static`. See [offline ladders](../ignition/preparation/ladders/README.md). | None |
-| `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime uses the required ladder file for final compiled geometry and captures runtime submode/active-CTA selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
@@ -1340,7 +1338,6 @@ max_concurrency = 4
 # force_moe_decode_a16 = false    # Qwen Flash NVFP4: A16 decode/verify, calibrated A4 prefill.
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
-# collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
 # checkpoint_token_file = "~/.config/flare/agent.token"  # Shared token for multi-host preparation.
 
 [memory]
@@ -1435,7 +1432,6 @@ Configuration assigns each decision to one owner:
 | Weight format, KV precision, page geometry, kernel plans | Checkpoint metadata and recipe preparation |
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
-| Collective selection | `--collective-tuning`, then `[preparation] collective_tuning`, otherwise the recipe default (`static`) |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |

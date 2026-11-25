@@ -59,8 +59,6 @@ def _roce_plan(runtime, coordinator, surface):
 @torch.library.custom_op("flare::pcie_all_reduce", mutates_args=("output",))
 def _all_reduce(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, plan=owner.plan)
 
 
@@ -72,8 +70,6 @@ def _fake_all_reduce(source, output, handle):
 @torch.library.custom_op("flare::pcie_all_reduce_addend", mutates_args=("output",))
 def _all_reduce_addend(source: torch.Tensor, addend: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, addend=addend, plan=owner.plan)
 
 
@@ -85,8 +81,6 @@ def _fake_all_reduce_addend(source, addend, output, handle):
 @torch.library.custom_op("flare::pcie_all_reduce_dep", mutates_args=("output",))
 def _all_reduce_dep(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor], handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, plan=owner.plan)
 
 
@@ -99,8 +93,6 @@ def _fake_all_reduce_dep(source, output, dependencies, handle):
 def _all_reduce_addend_dep(source: torch.Tensor, addend: torch.Tensor, output: torch.Tensor,
                            dependencies: list[torch.Tensor], handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, addend=addend, plan=owner.plan)
 
 
@@ -121,8 +113,6 @@ def _start_all_reduce(source: torch.Tensor, output: torch.Tensor, dependencies: 
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
     auxiliary.wait_stream(torch.cuda.current_stream(source.device))
     with torch.cuda.stream(auxiliary):
-        from ignition.preparation.startup_tuning import record_consumer
-        record_consumer(owner)
         owner.runtime.all_reduce(send, out=output, plan=owner.plan)
 
 
@@ -207,7 +197,6 @@ class PreparedAllReduce:
 
         self.runtime, self.output = runtime, output
         self.fused_addend = False
-        startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -250,35 +239,10 @@ class PreparedAllReduce:
             if (runtime.world_size < 2 or runtime.algorithm != "oneshot"
                     or not runtime.single_channel):
                 raise ValueError("prepared PCIe reductions require single-channel b12x direct all-reduce")
-            from b12x.comm.pcie import CollectiveConfig
-
             channel = runtime.for_stream()
-            startup_joint = (getattr(session, "collective_tuning", "static") == "runtime"
-                             and source.dtype == torch.bfloat16
-                             and getattr(channel, "_joint_workspace", None) is not None)
             plan_options = {}
-            if startup_joint:
-                from ignition.preparation.collective_ladder import select
-
-                ladder = session.collective_ladder
-                if ladder is None:
-                    raise ValueError("runtime collective tuning requires a collective ladder")
-                row = select(ladder, source.numel() * source.element_size(), world_size=runtime.world_size,
-                             capability=torch.cuda.get_device_capability(source.device),
-                             inplace=source.data_ptr() == output.data_ptr())
-                self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
-                self.runtime_cache_policy = ladder["cache_policy"]
-                cluster_size = row.get("cluster_size", 1)
-                mode, active = self.runtime_profiles[0]
-                # Phased modes need a complete cluster, so use a declared clustered profile.
-                initial_active = active if cluster_size > 1 else 1
-                plan_options = dict(joint_only=True, override=CollectiveConfig(
-                    implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-                    submode=mode, active_blocks=initial_active))
-                if cluster_size > 1:
-                    plan_options["joint_cluster_size"] = cluster_size
-            elif (has_addend and source.dtype == torch.bfloat16
-                  and getattr(channel, "_eager_ptrs", None) is not None):
+            if (has_addend and source.dtype == torch.bfloat16
+                    and getattr(channel, "_eager_ptrs", None) is not None):
                 plan_options["has_addend"] = True
                 self.fused_addend = True
             self.plan = runtime.plan(source, out=output, **plan_options)
@@ -310,9 +274,6 @@ class PreparedAllReduce:
         request = self.plan.request(name=name, prepare_call=prepare,
             collective=CollectiveRequirement(key=name, ranks=ranks))
         declare(session, (request,), coordinator=coordinator)
-        if startup_joint:
-            from ignition.preparation.startup_tuning import register_collective
-            register_collective(self, session)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
@@ -376,8 +337,6 @@ def row_shard_surfaces(runtime):
 @torch.library.custom_op("flare::roce_reduce_scatter", mutates_args=("output",))
 def _reduce_scatter(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.reduce_scatter(source, out=output, plan=owner.plan)
 
 
@@ -387,8 +346,6 @@ def _fake_reduce_scatter(source, output, handle):
 
 
 def _dma_reduce_scatter_exec(owner, source, output):
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.reduce_scatter(source, out=output, plan=owner.plan)
 
 
@@ -588,8 +545,6 @@ class PreparedReduceScatter:
 @torch.library.custom_op("flare::roce_gather_shards", mutates_args=("output",))
 def _gather_shards(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.gather_shards(source, out=output, plan=owner.plan)
 
 
@@ -599,8 +554,6 @@ def _fake_gather_shards(source, output, handle):
 
 
 def _dma_gather_shards_exec(owner, source, output):
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     owner.runtime.all_gather(
         source, out=output.view(owner.runtime.world_size, *source.shape), plan=owner.plan
     )
@@ -1147,8 +1100,6 @@ def _gather_transport_view(tensor):
 
 def _gather_columns(source, output, handle, gate=None):
     owner = _OWNERS[handle]
-    from ignition.preparation.startup_tuning import record_consumer
-    record_consumer(owner)
     runtime = owner.runtime
     if owner.dma:
         runtime.all_gather(source, out=output, plan=owner.plan)
@@ -1505,30 +1456,10 @@ class PreparedAllGather:
         self.runtime, self.output = runtime, output
         call = {"local_input": transport_source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
                 "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
-        runtime_tuning = getattr(session, "collective_tuning", "static") == "runtime"
-        if has_gate and not runtime_tuning:
+        if has_gate:
             call["has_gate"] = True
             self.gated = True
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
-        startup = False
-        if runtime_tuning:
-            from dataclasses import replace
-            from b12x.preparation import FrozenMapping
-            from ignition.preparation.collective_ladder import select_gather
-
-            ladder = session.collective_ladder
-            if ladder is None:
-                raise ValueError("runtime collective tuning requires a collective ladder")
-            if ladder["all_gather"] is not None:
-                row = select_gather(ladder, source.numel() * source.element_size(),
-                    world_size=runtime.world_size, capability=torch.cuda.get_device_capability(source.device))
-                self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
-                self.runtime_cache_policy = ladder["cache_policy"]
-                query = replace(query, call=FrozenMapping(dict(query.call,
-                    gather_transport=row["implementation"].removeprefix("gather_"),
-                    threads=row["threads"], block_limit=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1)))
-                startup = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if self.gated else None
@@ -1538,9 +1469,6 @@ class PreparedAllGather:
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(**prepare_call_kwargs), output=output,
                                                     owners=(runtime,) if one_gate is None else (runtime, one_gate)),
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
-        if startup:
-            from ignition.preparation.startup_tuning import register_collective
-            register_collective(self, session)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
