@@ -32,9 +32,14 @@ mod payload;
 mod peer_access;
 mod persistent_worker;
 pub use persistent_worker::WorkerState;
+pub mod preparation;
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
+pub use preparation::{
+    PREPARATION_MANIFEST_VERSION, compatible_for_combine, compatible_for_weight_reuse,
+    from_legacy_rebuild_manifest, resolve_preparation, validate_preparation_manifest,
+};
 pub fn validate_sampling_defaults(value: &wire::DefaultSamplingParameters) -> crate::Result<()> {
     protobuf::sampling_defaults(value.clone()).map(|_| ())
 }

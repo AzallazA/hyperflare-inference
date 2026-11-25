@@ -259,7 +259,11 @@ def _graphs(graphs, *, recorder=None):
 def _cache_options(cache, options=None):
     reuse = None if cache is None else cache.reuse_weights
     if reuse is not None:
-        reuse = dict(reuse, rebuild_manifest=None if options is None else options.get('rebuild_manifest'))
+        reuse = dict(
+            reuse,
+            preparation_manifest=None if options is None else options.get('preparation_manifest'),
+            rebuild_manifest=None if options is None else options.get('rebuild_manifest'),
+        )
     return dict(cache=None if cache is None else str(cache.cache), no_weights=False if cache is None else cache.no_weights,
                 reuse_weights=reuse)
 

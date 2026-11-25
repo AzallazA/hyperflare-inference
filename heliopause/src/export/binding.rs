@@ -997,15 +997,46 @@ pub(crate) fn serving_metadata(
         ));
     }
     index.frontend = Some(frontend);
-    if let Some(rebuild) = server.remove("rebuild_manifest") {
-        if rebuild.get("speculation").and_then(|s| s.get("history_drafts")).is_some() {
-            return Err(super::invalid("history_drafts is a runtime option and cannot be exported"));
+    let preparation = server.remove("preparation_manifest");
+    let rebuild = server.remove("rebuild_manifest");
+    if preparation.is_some() && rebuild.is_some() {
+        return Err(super::invalid(
+            "cannot specify both preparation_manifest and deprecated rebuild_manifest",
+        ));
+    }
+    if let Some(preparation) = preparation {
+        let manifest: super::wire::PreparationManifest =
+            message("PreparationManifest", &preparation)?;
+        if manifest
+            .parameters
+            .iter()
+            .any(|parameter| parameter.key == "speculation.history_drafts")
+        {
+            return Err(super::invalid(
+                "history_drafts is a runtime option and cannot be exported",
+            ));
         }
-        let manifest: super::wire::RebuildManifest = message("RebuildManifest", &rebuild)?;
-        if manifest.reproduction_args.iter().any(|arg| arg.is_empty()) {
-            return Err(super::invalid("reproduction_args entries must be non-empty"));
+        helios_core::runtime_core::validate_preparation_manifest(&manifest)?;
+        index.preparation = Some(manifest);
+    }
+    if let Some(rebuild) = rebuild {
+        #[allow(deprecated)]
+        {
+            if rebuild
+                .get("speculation")
+                .and_then(|s| s.get("history_drafts"))
+                .is_some()
+            {
+                return Err(super::invalid(
+                    "history_drafts is a runtime option and cannot be exported",
+                ));
+            }
+            let manifest: super::wire::RebuildManifest = message("RebuildManifest", &rebuild)?;
+            if manifest.reproduction_args.iter().any(|arg| arg.is_empty()) {
+                return Err(super::invalid("reproduction_args entries must be non-empty"));
+            }
+            index.rebuild = Some(manifest);
         }
-        index.rebuild = Some(manifest);
     }
     server
         .entry("speculative_proposal_source")
@@ -1323,6 +1354,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(deprecated)]
     fn export_embeds_reproduction_arguments_and_rejects_empty_entries() {
         let base = || {
             serde_json::json!({
@@ -1334,29 +1366,30 @@ mod tests {
                     "frequency_penalty": 0.0
                 },
                 "assets": {"chat_template": "t", "tokenizer": "k"},
-                "rebuild_manifest": {
+                "preparation_manifest": {
                     "version": 1,
                     "recipe": "kimi31",
-                    "prompt_logprobs": true,
-                    "autotune_effort": "default",
-                    "native_dense_activations": true,
-                    "lock_gpu_clocks": true,
                     "reproduction_args": [
                         "ignition", "export", "moonshotai/Kimi-K3.1-Pro@d9e99b07",
                         "--gpus", "0-15", "--online-mxfp8", "--online-mxfp8-scope", "kda-input"
+                    ],
+                    "parameters": [
+                        {"key": "autotune_effort", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"string_value": "default"}},
+                        {"key": "lock_gpu_clocks", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+                        {"key": "native_dense_activations", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+                        {"key": "prompt_logprobs", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}}
                     ]
                 }
             })
         };
         let mut index = super::super::wire::ModelIndex::default();
         serving_metadata(&mut index, &base()).unwrap();
-        let rebuild = index.rebuild.expect("rebuild manifest embedded");
-        assert!(rebuild.prompt_logprobs);
-        assert_eq!(rebuild.autotune_effort, "default");
-        assert!(rebuild.native_dense_activations);
-        assert!(rebuild.lock_gpu_clocks);
+        assert!(index.rebuild.is_none());
+        let preparation = index.preparation.expect("preparation manifest embedded");
+        assert_eq!(preparation.recipe, "kimi31");
+        assert_eq!(preparation.parameters.len(), 4);
         assert_eq!(
-            rebuild.reproduction_args,
+            preparation.reproduction_args,
             vec![
                 "ignition", "export", "moonshotai/Kimi-K3.1-Pro@d9e99b07",
                 "--gpus", "0-15", "--online-mxfp8", "--online-mxfp8-scope", "kda-input"
@@ -1364,10 +1397,35 @@ mod tests {
         );
 
         let mut bad = base();
-        bad["rebuild_manifest"]["reproduction_args"] = serde_json::json!(["ignition", ""]);
+        bad["preparation_manifest"]["reproduction_args"] = serde_json::json!(["ignition", ""]);
         let mut index = super::super::wire::ModelIndex::default();
         let error = serving_metadata(&mut index, &bad).unwrap_err();
         assert!(error.to_string().contains("reproduction_args"));
+
+        let mut unsorted = base();
+        unsorted["preparation_manifest"]["parameters"] = serde_json::json!([
+            {"key": "z_param", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": true}},
+            {"key": "a_param", "scope": "PREPARATION_PARAMETER_SCOPE_DEPLOYMENT", "value": {"bool_value": false}}
+        ]);
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(serving_metadata(&mut index, &unsorted).is_err());
+
+        let mut both = base();
+        both["rebuild_manifest"] = serde_json::json!({"version": 1, "recipe": "kimi31"});
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(serving_metadata(&mut index, &both).is_err());
+
+        let mut history = base();
+        history["preparation_manifest"]["parameters"] = serde_json::json!([
+            {"key": "speculation.history_drafts", "scope": "PREPARATION_PARAMETER_SCOPE_COMBINE", "value": {"bool_value": true}}
+        ]);
+        let mut index = super::super::wire::ModelIndex::default();
+        assert!(
+            serving_metadata(&mut index, &history)
+                .unwrap_err()
+                .to_string()
+                .contains("runtime option and cannot be exported")
+        );
     }
     #[test]
     fn execution_buffers_resolve_allocation_relative_offsets() {

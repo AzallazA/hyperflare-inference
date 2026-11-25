@@ -15,6 +15,7 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
 }
 
+#[allow(deprecated)]
 impl wire::RebuildManifest {
     /// Resolve the recorded draft-body conversion for preparation compatibility.
     /// An omitted DFlash2 override inherits online conversion's `all` scope;
@@ -454,6 +455,7 @@ mod tests {
     use prost::Message;
 
     #[test]
+    #[allow(deprecated)]
     fn draft_body_precision_resolves_only_documented_inheritance() {
         for (method, online, scope, explicit, expected) in [
             ("dflash2", true, "all", None, Some("mxfp8")),

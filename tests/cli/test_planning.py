@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Recipe-free planning, world-size validation, and RebuildManifest serialization."""
+"""Recipe-free planning, world-size validation, and PreparationManifest serialization."""
 
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
@@ -92,9 +92,18 @@ def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monk
     for candidate in (ordinary, sharded, fitted):
         manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), candidate, compiled_forwards=True)
         assert ("--row-shard-prefill" in manifest["reproduction_args"]) == candidate.row_shard_prefill
-        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
-        decoded = proto.RebuildManifest.FromString(encoded.SerializeToString())
-        assert decoded.row_shard_prefill == candidate.row_shard_prefill
+        encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
+        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString())
+        keys = [parameter.key for parameter in decoded.parameters]
+        assert keys == sorted(keys) and len(keys) == len(set(keys))
+        by_key = {parameter.key: parameter for parameter in decoded.parameters}
+        assert by_key["row_shard_prefill"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
+        assert by_key["row_shard_prefill"].value.bool_value == candidate.row_shard_prefill
+        assert by_key["online_mxfp8"].scope == proto.PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT
+        assert by_key["online_mxfp8_scope"].scope == proto.PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT
+        assert by_key["online_mxfp8_scope"].value.string_value == "all"
+        assert by_key["speculation.has_draft"].scope == proto.PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT
+        assert by_key["speculation.has_draft"].value.bool_value is True
 
     # Unsupported recipe is rejected explicitly by alias.
     with pytest.raises(UsageError, match="--row-shard-prefill is not supported by plain-alias"):
@@ -127,3 +136,73 @@ def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monk
                       row_shard_prefill=True)
     with pytest.raises(UsageError, match="--row-shard-prefill cannot be combined with --joint-tuning"):
         replace(sharded, joint_tuning=True)
+
+
+def test_preparation_manifest_resolves_scopes_and_dflash2_inheritance(monkeypatch):
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    dflash = Speculation(draft_tokens=3, method="dflash2")
+    recipe = replace(
+        _recipe("dflash", ranks=(1,), speculation=dflash),
+        online_mxfp8=True,
+        online_mxfp8_scopes=("all", "kda-input"),
+    )
+    gpu = (_gpu(0),)
+
+    def decode_params(plan):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
+        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString(deterministic=True))
+        keys = [parameter.key for parameter in decoded.parameters]
+        assert keys == sorted(keys) and len(keys) == len(set(keys))
+        return {parameter.key: parameter for parameter in decoded.parameters}
+
+    # Inherited DFlash2 MXFP8 body quantization resolves explicitly when online_mxfp8 + all scope.
+    inherited = planning.plan(recipe, recipe.checkpoints[0], gpu, selected=(0,), concurrency=4,
+                              reserve_bytes=0, speculation=dflash, online_mxfp8=True, online_mxfp8_scope="all")
+    params = decode_params(inherited)
+    assert params["speculation.draft_body_quantization"].scope == proto.PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT
+    assert params["speculation.draft_body_quantization"].value.string_value == "mxfp8"
+    assert params["speculation.has_draft"].scope == proto.PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT
+    assert params["speculation.has_draft"].value.bool_value is True
+
+    # Scoped online_mxfp8 (kda-input) does not inherit MXFP8 for the draft body.
+    scoped = planning.plan(recipe, recipe.checkpoints[0], gpu, selected=(0,), concurrency=4,
+                           reserve_bytes=0, speculation=dflash, online_mxfp8=True, online_mxfp8_scope="kda-input")
+    scoped_params = decode_params(scoped)
+    assert "speculation.draft_body_quantization" not in scoped_params
+    assert scoped_params["online_mxfp8_scope"].value.string_value == "kda-input"
+
+    # Target-only export (--no-mtp) emits no draft-weight parameters.
+    target_only = planning.plan(recipe, recipe.checkpoints[0], gpu, selected=(0,), concurrency=4,
+                                reserve_bytes=0, speculation=None, online_mxfp8=True, online_mxfp8_scope="all")
+    target_params = decode_params(target_only)
+    assert not any(
+        parameter.scope == proto.PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT
+        for parameter in target_params.values()
+    )
+
+    # End-to-end handoff through Heliopause's native serving-metadata encoder.
+    import json
+    import flare_heliopause
+
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), inherited, compiled_forwards=True)
+    server = {
+        "model_id": "example/dflash",
+        "frontend": {"eos_token_ids": [1]},
+        "sampling_defaults": {
+            "seed": 0, "temperature": 1.0, "top_k": -1, "top_p": 1.0,
+            "min_p": 0.0, "repetition_penalty": 1.0, "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+        },
+        "assets": {"chat_template": "t", "tokenizer": "k"},
+        "preparation_manifest": manifest,
+    }
+    encoded_index = flare_heliopause.export_serving(
+        proto.ModelIndex(version=4).SerializeToString(),
+        json.dumps(server),
+    )
+    decoded_index = proto.ModelIndex.FromString(encoded_index)
+    assert decoded_index.HasField("preparation")
+    assert not decoded_index.HasField("rebuild")
+    expected = json_format.ParseDict(manifest, proto.PreparationManifest())
+    assert decoded_index.preparation.SerializeToString(deterministic=True) == expected.SerializeToString(deterministic=True)

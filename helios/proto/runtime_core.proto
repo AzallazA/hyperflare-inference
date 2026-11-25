@@ -72,14 +72,74 @@ message ModelIndex {
   // loads the one it serves.
   Cluster cluster = 9;
   ServingContract contract = 10;
-  // Preparation-only metadata. Absence means no rebuild description was recorded;
-  // serving uses contract and rank bundles regardless of this field's version.
-  RebuildManifest rebuild = 11;
+  // Deprecated preparation metadata retained to decode legacy cores.
+  RebuildManifest rebuild = 11 [deprecated = true];
+  // Preparation provenance and Ignition-owned options. Absence means no
+  // preparation description was recorded; serving uses contract and rank
+  // bundles regardless of this field's version.
+  PreparationManifest preparation = 12;
 }
 
-// Identifies the preparation inputs without embedding source code or checkpoint config files.
-// A compatible Ignition importer is required to prepare graphs from stored weight views.
+// Preparation provenance and Ignition-owned options. Serving ignores this
+// message regardless of its version.
+message PreparationManifest {
+  uint32 version = 1;
+  string recipe = 2;
+  string source_identity = 3;
+  string checkpoint_repository = 4;
+  string checkpoint_revision = 5;
+  // Local checkpoint overrides have no asserted upstream revision.
+  bool local_checkpoint = 6;
+  // Canonical `ignition export` arguments reproducing this deployment's
+  // preparation inputs, without host-local paths or secrets.
+  repeated string reproduction_args = 7;
+  // Ignition-owned preparation parameters, ordered strictly by unique key.
+  repeated PreparationParameter parameters = 8;
+}
+
+enum PreparationParameterScope {
+  PREPARATION_PARAMETER_SCOPE_UNSPECIFIED = 0;
+  // Deployment-local preparation option (capacities, transport, compiler,
+  // tuning). Preserved for inspection and reproduction; ignored by core
+  // combination and cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_DEPLOYMENT = 1;
+  // Shared preparation semantics that must agree across combined deployments
+  // without constraining target-only cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_COMBINE = 2;
+  // Target-model weight preparation semantics that must agree for both core
+  // combination and cached-weight reuse.
+  PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT = 3;
+  // Draft-model weight preparation semantics that must agree for core
+  // combination and for cached-weight reuse when the export prepares a draft
+  // model.
+  PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT = 4;
+}
+
+message PreparationParameter {
+  string key = 1;
+  PreparationParameterScope scope = 2;
+  PreparationValue value = 3;
+}
+
+message PreparationValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    uint64 uint_value = 3;
+    double float_value = 4;
+    string string_value = 5;
+    PreparationValueList list_value = 6;
+  }
+}
+
+message PreparationValueList {
+  repeated PreparationValue values = 1;
+}
+
+// Deprecated preparation input schema retained for compatibility with existing
+// cores. New exports write PreparationManifest instead.
 message RebuildManifest {
+  option deprecated = true;
   uint32 version = 1;
   string recipe = 2;
   string source_identity = 3;
@@ -131,6 +191,7 @@ message RebuildManifest {
   repeated string reproduction_args = 36;
 }
 message RebuildSpeculation {
+  option deprecated = true;
   uint32 draft_tokens = 1;
   bool adaptive = 2;
   string proposal_source = 3;

@@ -696,6 +696,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn rebuild_speculation_preserves_mtp_only_and_defaults_its_absence_to_false() {
         for mtp_only in [false, true] {
             let metadata = wire::RebuildSpeculation { mtp_only, ..Default::default() };

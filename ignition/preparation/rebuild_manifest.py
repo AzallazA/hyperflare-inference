@@ -318,53 +318,140 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
     return args
 
 
+SCOPE_DEPLOYMENT = 'PREPARATION_PARAMETER_SCOPE_DEPLOYMENT'
+SCOPE_COMBINE = 'PREPARATION_PARAMETER_SCOPE_COMBINE'
+SCOPE_TARGET_WEIGHT = 'PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT'
+SCOPE_DRAFT_WEIGHT = 'PREPARATION_PARAMETER_SCOPE_DRAFT_WEIGHT'
+
+
+def _preparation_value(value):
+    if isinstance(value, bool):
+        return {'bool_value': value}
+    if isinstance(value, int):
+        return {'uint_value': value} if value >= 0 else {'int_value': value}
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError('preparation parameter float value must be finite')
+        return {'float_value': value}
+    if isinstance(value, str):
+        return {'string_value': value}
+    if isinstance(value, (list, tuple)):
+        return {'list_value': {'values': [_preparation_value(item) for item in value]}}
+    raise TypeError(f'unsupported preparation parameter value type: {type(value).__name__}')
+
+
 def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     from .source_identity import source_identity
 
-    result = dict(version=1, recipe=plan.recipe.name, source_identity=source_identity(),
-        checkpoint_repository=plan.checkpoint.repository,
-        checkpoint_revision=plan.checkpoint.revision if model.directory is None else '',
-        local_checkpoint=model.directory is not None, tensor_parallel=plan.world_size,
-        max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
-        image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
-        context_parallel_size=(plan.context_parallel_size or plan.world_size) if plan.context_parallel else 0,
-        stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
-        prompt_logprobs=bool(getattr(plan, 'prompt_logprobs', False)),
-        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,
-        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
-        autotune_effort=getattr(plan, 'autotune_effort', ''),
-        native_dense_activations=bool(getattr(plan, 'native_dense_activations', False)),
-        lock_gpu_clocks=bool(getattr(plan, 'lock_gpu_clocks', False)),
-        reproduction_args=reproduction_arguments(
-            model, plan, compiled_forwards=compiled_forwards, multi_host=multi_host))
+    entries: dict[str, tuple[str, object]] = {}
+
+    def add(key, scope, value):
+        if value is None:
+            return
+        if key in entries:
+            raise ValueError(f'duplicate preparation parameter key {key!r}')
+        entries[key] = (scope, value)
+
+    # Target-model weight preparation semantics (must agree across combine and --reuse-weights).
+    online_mxfp8_scope = plan.online_mxfp8_scope or 'all'
+    add('online_mxfp8', SCOPE_TARGET_WEIGHT, bool(plan.online_mxfp8))
+    add('online_mxfp8_scope', SCOPE_TARGET_WEIGHT, online_mxfp8_scope)
     if plan.expert_scale_compression is not None:
-        result['expert_scale_compression'] = plan.expert_scale_compression
-    if plan.force_moe_decode_a16:
-        result['force_moe_decode_a16'] = True
-    if plan.shard_hyperconnections:
-        result['shard_hyperconnections'] = True
-    if plan.row_shard_prefill:
-        result['row_shard_prefill'] = True
-    if plan.joint_tuning:
-        result['joint_tuning'] = True
+        add('expert_scale_compression', SCOPE_TARGET_WEIGHT, plan.expert_scale_compression)
+
+    # Shared core-combination semantics (must agree across combined deployments).
+    add('language_model_only', SCOPE_COMBINE, bool(plan.language_model_only))
+    add('mla_compute_mode', SCOPE_COMBINE, plan.mla_compute_mode)
+
+    # Deployment-local Ignition options (preserved for inspection and reproduction;
+    # ignored by core combination and cached-weight reuse).
+    add('autotune_effort', SCOPE_DEPLOYMENT, getattr(plan, 'autotune_effort', ''))
+    add('compiled_forwards', SCOPE_DEPLOYMENT, bool(compiled_forwards))
+    add('context_parallel', SCOPE_DEPLOYMENT, bool(plan.context_parallel))
+    add(
+        'context_parallel_size',
+        SCOPE_DEPLOYMENT,
+        (plan.context_parallel_size or plan.world_size) if plan.context_parallel else 0,
+    )
+    add('force_moe_decode_a16', SCOPE_DEPLOYMENT, bool(plan.force_moe_decode_a16))
+    add('image_concurrency', SCOPE_DEPLOYMENT, int(plan.image_concurrency))
+    add('joint_tuning', SCOPE_DEPLOYMENT, bool(plan.joint_tuning))
+    add('lock_gpu_clocks', SCOPE_DEPLOYMENT, bool(getattr(plan, 'lock_gpu_clocks', False)))
+    add('max_concurrency', SCOPE_DEPLOYMENT, int(plan.concurrency))
+    add('mixed_prefill', SCOPE_DEPLOYMENT, bool(plan.mixed_prefill))
+    add(
+        'native_dense_activations',
+        SCOPE_DEPLOYMENT,
+        bool(getattr(plan, 'native_dense_activations', False)),
+    )
+    add('prefill_chunk', SCOPE_DEPLOYMENT, int(plan.prefill_chunk))
+    add('prompt_logprobs', SCOPE_DEPLOYMENT, bool(getattr(plan, 'prompt_logprobs', False)))
+    add('reserve_bytes', SCOPE_DEPLOYMENT, int(plan.reserve_bytes))
+    add('roce_chain', SCOPE_DEPLOYMENT, bool(plan.roce_chain))
+    add('roce_ring', SCOPE_DEPLOYMENT, bool(plan.roce_ring))
+    add('row_shard_prefill', SCOPE_DEPLOYMENT, bool(plan.row_shard_prefill))
+    add('shard_hyperconnections', SCOPE_DEPLOYMENT, bool(plan.shard_hyperconnections))
+    add('stream_overlap', SCOPE_DEPLOYMENT, bool(plan.stream_overlap))
+    add('tensor_parallel', SCOPE_DEPLOYMENT, int(plan.world_size))
+
     if (s := plan.speculation) is not None:
-        result['speculation'] = dict(draft_tokens=s.draft_tokens,
-            mtp_only=s.mtp_only,
-            adaptive=s.adaptive,
-            token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
-            draft_prefix_selection=s.draft_prefix_selection,
-            vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
-        if s.method is not None:
-            result['speculation']['method'] = s.method
         if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
-            raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
+            raise ValueError('packed speculative preparation metadata requires an explicit graph budget')
+
+        # Draft-model weight semantics. Ignition resolves effective DFlash2 inheritance
+        # before export so Rust compatibility checks remain generic.
+        add('speculation.has_draft', SCOPE_DRAFT_WEIGHT, True)
+        effective_draft_body = s.draft_body_quantization
+        if (
+            effective_draft_body is None
+            and s.method == 'dflash2'
+            and plan.online_mxfp8
+            and online_mxfp8_scope == 'all'
+        ):
+            effective_draft_body = 'mxfp8'
+        if effective_draft_body is not None:
+            add('speculation.draft_body_quantization', SCOPE_DRAFT_WEIGHT, effective_draft_body)
+        if s.draft_head_quantization is not None:
+            add('speculation.draft_head_quantization', SCOPE_DRAFT_WEIGHT, s.draft_head_quantization)
+        if s.markov_head_quantization is not None:
+            add('speculation.markov_head_quantization', SCOPE_DRAFT_WEIGHT, s.markov_head_quantization)
+
+        # Shared speculative combination semantics.
+        add(
+            'speculation.vocabulary_parallel_sampling',
+            SCOPE_COMBINE,
+            bool(s.vocabulary_parallel_sampling),
+        )
+
+        # Deployment-local speculative options.
+        add('speculation.adaptive', SCOPE_DEPLOYMENT, bool(s.adaptive))
+        if s.draft_prefix_selection:
+            add('speculation.draft_prefix_selection', SCOPE_DEPLOYMENT, s.draft_prefix_selection)
+        add('speculation.draft_tokens', SCOPE_DEPLOYMENT, int(s.draft_tokens))
         if s.graph_budget is not None:
-            result['speculation']['graph_budget'] = s.graph_budget
-        for field in ('draft_body_quantization', 'draft_head_quantization', 'markov_head_quantization'):
-            if (value := getattr(s, field)) is not None:
-                result['speculation'][field] = value
-    return result
+            add('speculation.graph_budget', SCOPE_DEPLOYMENT, int(s.graph_budget))
+        if s.method is not None:
+            add('speculation.method', SCOPE_DEPLOYMENT, s.method)
+        add('speculation.mtp_only', SCOPE_DEPLOYMENT, bool(s.mtp_only))
+        add('speculation.packed_verification', SCOPE_DEPLOYMENT, bool(s.packed_verification))
+        add('speculation.token_capacity', SCOPE_DEPLOYMENT, int(plan.speculative_token_capacity))
+
+    parameters = [
+        {'key': key, 'scope': scope, 'value': _preparation_value(value)}
+        for key, (scope, value) in sorted(entries.items())
+    ]
+    return {
+        'version': 1,
+        'recipe': plan.recipe.name,
+        'source_identity': source_identity(),
+        'checkpoint_repository': plan.checkpoint.repository,
+        'checkpoint_revision': plan.checkpoint.revision if model.directory is None else '',
+        'local_checkpoint': model.directory is not None,
+        'reproduction_args': reproduction_arguments(
+            model, plan, compiled_forwards=compiled_forwards, multi_host=multi_host
+        ),
+        'parameters': parameters,
+    }
 
 
 def weight_views(roots):
