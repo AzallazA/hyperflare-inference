@@ -249,7 +249,8 @@ def _export_hosts(args):
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode,
-                         row_shard_prefill=args.row_shard_prefill)
+                         row_shard_prefill=args.row_shard_prefill,
+                         row_shard_attention=args.row_shard_attention)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
@@ -324,6 +325,7 @@ def _prepare(args):
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       row_shard_prefill=args.row_shard_prefill,
+                      row_shard_attention=args.row_shard_attention,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
@@ -363,7 +365,8 @@ def _prepare(args):
                      f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
                      f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}"
-                     f"{' · row-sharded prefill' if plan.row_shard_prefill else ''}")
+                     f"{' · row-sharded prefill' if plan.row_shard_prefill else ''}"
+                     f"{' · row-sharded attention' if plan.row_shard_attention else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -533,7 +536,8 @@ def debug_serve(args) -> int:
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
-                         row_shard_prefill=args.row_shard_prefill)
+                         row_shard_prefill=args.row_shard_prefill,
+                         row_shard_attention=args.row_shard_attention)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
