@@ -780,6 +780,7 @@ impl DiskReader {
                             std::thread::Builder::new()
                                 .name(format!("flare-table-io-{}", index + 1))
                                 .spawn_scoped(scope, move || {
+                                    crate::os::unpin_current_thread();
                                     lane.gather(files, reads, fragments, output, stats)
                                 })
                                 .map_err(|e| format!("start embedding read worker: {e}"))?,
@@ -901,6 +902,7 @@ fn copy_cached_hits(
         let first = parts.next().unwrap_or(&[]);
         for part in parts {
             scope.spawn(move || {
+                crate::os::unpin_current_thread();
                 copy_cached_hits_slice(part, requests, output_base, scale_base, weights, scales);
             });
         }
