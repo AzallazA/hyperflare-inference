@@ -272,9 +272,9 @@ pub(super) fn plan_ranks(
     let headroom = match options.memory_limit {
         None => reserve,
         Some(MemoryLimit::Reserve(user)) => user
-            .checked_add(memory::headroom_bytes())
+            .checked_add(memory::headroom_bytes()?)
             .ok_or_else(|| invalid("memory reserve overflows the device budget"))?,
-        Some(_) => memory::headroom_bytes(),
+        Some(_) => memory::headroom_bytes()?,
     };
     let mut ranks = Vec::with_capacity(cores.len());
     let mut available = Vec::with_capacity(cores.len());

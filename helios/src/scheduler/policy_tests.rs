@@ -4475,6 +4475,82 @@ fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration()
     assert!(s.terminal_prefill_graphs(&[512]).is_err());
 }
 
+#[test]
+fn terminal_prefill_protected_by_ttft_guard_when_overdue() {
+    let mut s = engine(2, false);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.terminal_prefill_graphs(&[256, 512]).unwrap();
+    let mut graphs = super::tests::duration_graphs(2);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &[64usize, 128, 256, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill-{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 200 * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &capacity in &[256usize, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("terminal-prefill-{capacity}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 1000 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 250 * MS,
+            input_bindings: vec![],
+        });
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    // Make Decode much higher value rate than TerminalPrefill so ordinary scheduling picks Decode.
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 1 * MS);
+    s.configure_policy(ttft_policy(50.0, 0, 1)).unwrap();
+
+    // Request 1: already decoding.
+    let decoder = add(&mut s, 1, 64, 64);
+    let _ = run_prefill_sequence(&mut s, decoder);
+    while s.request(decoder).unwrap().phase != RequestPhase::Decode {
+        let step = s.plan().unwrap();
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&step, fence).unwrap();
+        complete(&mut s, &step, fence, 0, false);
+    }
+    assert_eq!(s.request(decoder).unwrap().phase, RequestPhase::Decode);
+
+    // Request 2: 512-token prompt (single terminal prefill chunk) admitted and initialized.
+    let prompt = add(&mut s, 2, 512, 8);
+    let init = s.phase_plan(GraphKind::Init, Some(prompt));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Before the TTFT target elapses, cheap Decode beats expensive TerminalPrefill.
+    assert_eq!(s.plan().unwrap().kind, GraphKind::Decode);
+
+    // Once the prompt is overdue past the TTFT target, TerminalPrefill must preempt Decode.
+    s.now_ns += 100 * MS;
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::TerminalPrefill);
+    assert_eq!(plan.token_capacity, 512);
+    assert_eq!(plan.lanes[0].request, prompt);
+    assert_eq!(plan.lanes[0].tokens, 512);
+}
+
 fn ttft_policy(target_ms: f64, max_chunk: usize, interleave: u32) -> PolicyConfig {
     PolicyConfig { ttft_target_ms: target_ms, ttft_max_chunk: max_chunk, ttft_decode_interleave: interleave,
         ..PolicyConfig::default() }

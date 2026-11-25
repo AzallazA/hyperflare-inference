@@ -1369,7 +1369,9 @@ impl RequestScheduler {
             let progress = |c: &Candidate| {
                 if c.mask & (1 << slot) == 0 { return None; }
                 match c.kind {
-                    GraphKind::Prefill | GraphKind::ScoredPrefill => (c.capacity <= chunk).then_some(c.work),
+                    GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => {
+                        (c.capacity <= chunk).then_some(c.work)
+                    }
                     GraphKind::Mixed => (c.prefill_slot == Some(slot) && c.prefill_capacity <= chunk)
                         .then(|| self.prefill_work(r, c.prefill_capacity)),
                     _ => Some(0),
@@ -1394,13 +1396,13 @@ impl RequestScheduler {
                     if candidate.cost_key() != target {
                         return false;
                     }
-                    if candidate.kind == GraphKind::Prefill {
+                    if matches!(candidate.kind, GraphKind::Prefill | GraphKind::TerminalPrefill) {
                         let slot = bits(candidate.mask).next().unwrap();
                         let request = self.slots[slot].request.as_ref().unwrap();
                         let cut = self.checkpoint_cut(request);
                         let work = self.prefill_work_through(request, candidate.capacity, cut);
                         if self.resolve_prefill_kind(request, candidate.capacity, work, cut)
-                            != GraphKind::Prefill
+                            != candidate.kind
                         {
                             return false;
                         }
@@ -1440,6 +1442,11 @@ impl RequestScheduler {
             self.mixed_candidates(output, values, age_price, false, Some(slot));
             for &capacity in self.prefill_catalog(kind) {
                 self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+            }
+            if kind == GraphKind::Prefill {
+                for &capacity in &self.terminal_prefill_catalog {
+                    self.add_candidate(output, GraphKind::TerminalPrefill, 1, capacity, 1 << slot, values, age_price);
+                }
             }
         } else if kind == GraphKind::Vision {
             for &capacity in &self.capabilities.vision.patch_capacities {

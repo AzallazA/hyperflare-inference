@@ -232,7 +232,7 @@ impl Layout {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
         for (snapshot, range) in aliases.iter_mut().enumerate() {
-            if *range == (u32::MAX..0) {
+            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
                 *range = 0..0;
             } else if range.start >= range.end && padding[snapshot] {
                 // Backed only by padding past the last page: no KV page conflicts.

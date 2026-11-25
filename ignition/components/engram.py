@@ -214,6 +214,11 @@ class PreparedEngramLookupLocal:
         self.weights = inputs.weights[:tokens * 24]
         self.scales = inputs.scales[:tokens * 24]
         self.hashes = inputs.hashes[:tokens]
+        if self.scales.shape[-1] != 8 or self.scales.dtype != torch.uint8:
+            raise ValueError(
+                "rank-local Engram lookup requires 8-byte uint8 E8M0 scales, "
+                f"got shape={tuple(self.scales.shape)} dtype={self.scales.dtype}"
+            )
         self.count = count
         self.handle = inputs.ready.cuda_event
         self.world = int(shard.world_size)
