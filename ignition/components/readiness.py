@@ -9,14 +9,18 @@ import triton.language as tl
 from triton.language.extra.cuda import globaltimer
 
 
-@triton.jit
-def _timestamp(timestamps, frame, STRIDE: tl.constexpr, SLOT: tl.constexpr):
+@triton.jit(do_not_specialize=["write_next"])
+def _timestamp(timestamps, frame, write_next, STRIDE: tl.constexpr, SLOT: tl.constexpr):
     index = tl.load(frame)
-    tl.store(timestamps + index * STRIDE + SLOT, globaltimer())
+    now = globaltimer()
+    base = timestamps + index * STRIDE + SLOT
+    tl.store(base, now)
+    if write_next != 0:
+        tl.store(base + 1, now)
 
 
-def record_timestamp(timestamps, frame, slot):
-    _timestamp[(1,)](timestamps, frame, timestamps.shape[1], slot, num_warps=1)
+def record_timestamp(timestamps, frame, slot, *, write_next=0):
+    _timestamp[(1,)](timestamps, frame, write_next, timestamps.shape[1], slot, num_warps=1)
 
 
 def wait_for_readiness(source, event, timings, frame, interval, barrier_input, barrier_output, barrier_handle):
@@ -29,10 +33,12 @@ def wait_for_readiness(source, event, timings, frame, interval, barrier_input, b
     status, = driver.cuStreamWaitEvent(driver.CUstream(stream.cuda_stream), driver.CUevent(event), flags)
     if int(status):
         raise RuntimeError(f"embedding readiness wait failed: {status}")
-    record_timestamp(timings, frame, 3 * interval + 1)
     if barrier_handle > 0:
+        record_timestamp(timings, frame, 3 * interval + 1)
         _all_reduce(barrier_input, barrier_output, barrier_handle - 1)
-    record_timestamp(timings, frame, 3 * interval + 2)
+        record_timestamp(timings, frame, 3 * interval + 2)
+    else:
+        record_timestamp(timings, frame, 3 * interval + 1, write_next=1)
 
 
 class ReadinessTimings:
@@ -63,6 +69,13 @@ class PreparedReadinessWait:
         self.barrier = PreparedAllReduce(self.input, self.output, runtime=runtime, session=session,
                                         coordinator=coordinator, name=name)
         self.handle = 0 if self.barrier.single else self.barrier.handle + 1
+        if self.handle == 0:
+            from ignition.preparation.persistent import persistent_zeros
+
+            self._dummy_in = persistent_zeros((1,), torch.bfloat16, timings.frame.device)
+            self._dummy_out = persistent_zeros((1,), torch.bfloat16, timings.frame.device)
+        else:
+            self._dummy_in = self._dummy_out = None
 
     def functional(self, *, session):
         self.barrier.functional(session=session)
@@ -70,6 +83,8 @@ class PreparedReadinessWait:
         return self
 
     def operands(self, source):
+        if self._dummy_in is not None:
+            return self._dummy_in, self._dummy_out
         if self.input is not None:
             return self.input, self.output
         barrier_input = torch.zeros((1, 8), dtype=torch.bfloat16, device=source.device)
