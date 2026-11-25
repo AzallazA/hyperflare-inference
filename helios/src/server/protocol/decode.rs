@@ -61,16 +61,16 @@ fn strings(v: Option<&Value>) -> Result<Vec<String>> {
         _ => Err("stops must be a string or an array of strings".into()),
     }
 }
+/// History arguments: a JSON object, or text that does not encode one, kept as a string. Each
+/// encoder decides what such text means (see `inference::object_arguments`).
 fn arguments(v: &Value) -> Result<Value> {
-    let value = if let Some(text) = v.as_str() {
-        serde_json::from_str(text).map_err(|e| format!("invalid tool arguments JSON: {e}"))?
-    } else {
-        v.clone()
-    };
-    if !value.is_object() {
-        return Err("tool arguments must be a JSON object".into());
+    match v.as_str() {
+        Some(text) => Ok(serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| v.clone())),
+        None => object_arguments(v),
     }
-    Ok(value)
 }
 fn qualified(name: &str, namespace: Option<&str>) -> String {
     namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}__{name}"))
@@ -585,12 +585,32 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
         }
     }
     if present(body, "chat_template_kwargs") {
-        options.template.extend(
-            body["chat_template_kwargs"]
-                .as_object()
-                .ok_or("chat_template_kwargs must be an object")?
-                .clone(),
-        );
+        let mut template = body["chat_template_kwargs"]
+            .as_object()
+            .ok_or("chat_template_kwargs must be an object")?
+            .clone();
+        if let Some(value) = template.remove("steering_scale").filter(|value| !value.is_null()) {
+            let nested = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or("steering_scale must be a finite number")?;
+            if options
+                .sampling
+                .steering_scale
+                .is_some_and(|top_level| top_level != nested)
+            {
+                return Err("top-level and chat_template_kwargs steering_scale must match".into());
+            }
+            options.sampling.steering_scale = Some(nested);
+        }
+        options.template.extend(template);
+    }
+    if options.sampling.steering_scale.is_some_and(|scale| scale != 0.0)
+        && !matches!(protocol, Protocol::Chat | Protocol::Completions)
+    {
+        return Err(unsupported(
+            "steering_scale requires Chat Completions or raw Completions",
+        ));
     }
     Ok(options)
 }
@@ -1103,7 +1123,13 @@ mod native_prompt_tests {
                     _ => unreachable!(),
                 };
                 *malformed.pointer_mut(pointer).unwrap() = json!(invalid);
-                let error = decode(protocol, malformed, false).err().unwrap().to_string();
+                // Decoding keeps the text; chat templates still reject it at preparation.
+                let decoded = decode(protocol, malformed, false).unwrap();
+                let Input::Conversation(messages) = &decoded.request.input else { panic!() };
+                assert!(matches!(&messages[0].parts[0], Part::ToolCall { arguments, .. } if arguments == &json!(invalid)));
+                let error = crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                ).err().unwrap().to_string();
                 assert!(error.contains("invalid tool arguments JSON") || error.contains("tool arguments must be a JSON object"), "{error}");
             }
             let decoded = decode(protocol, body, false).unwrap();

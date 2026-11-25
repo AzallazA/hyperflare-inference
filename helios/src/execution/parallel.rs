@@ -16,7 +16,10 @@ use super::{
     ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, RankStream, Upload,
     threaded::protocol,
 };
-use crate::{Error, Result, Shutdown, cache::Fence};
+use crate::{
+    Error, Result, Shutdown,
+    cache::{Fence, PageId},
+};
 use wire::*;
 
 struct Peer {
@@ -28,6 +31,7 @@ struct Pending {
     graph: usize,
     grammar: bool,
     uploads: Vec<OwnedUpload>,
+    cleared_pages: Vec<PageId>,
     dispatched: Instant,
     committed: bool,
     queued: bool,
@@ -80,7 +84,8 @@ fn completion_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, 
     Ok(frame)
 }
 fn window_available(pending: &VecDeque<Pending>, grammar: bool, manifest: &ExecutionManifest) -> bool {
-    protocol::can_submit_pending(pending, grammar, manifest)
+    (!super::single_submission() || pending.is_empty())
+        && protocol::can_submit_pending(pending, grammar, manifest)
 }
 
 fn identity(fence: Fence, graph: usize) -> Vec<u8> {
@@ -251,6 +256,7 @@ impl TensorParallelExecutor {
         &mut self,
         graph: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar: bool,
     ) -> Result<Option<Fence>> {
         if let Some(error) = &self.poison {
@@ -262,7 +268,7 @@ impl TensorParallelExecutor {
         let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
             Some(super::GraphKind::Decode | super::GraphKind::Speculative));
         if !self.can_submit(barrier) { return Ok(None); }
-        let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
+        let Some(fence) = self.local.validate_submission(graph, uploads, cleared_pages, grammar)? else {
             return Ok(None);
         };
         let queued = !self.pending.is_empty();
@@ -271,10 +277,11 @@ impl TensorParallelExecutor {
             uploads: uploads.iter().map(|u| OwnedUpload {
                 buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
             }).collect(),
+            cleared_pages: cleared_pages.to_vec(),
             ready: vec![false; self.peers.len()],
             completions: (0..=self.peers.len()).map(|_| None).collect(),
         });
-        let result = wire::prepare(self.local.manifest(), fence, graph, grammar, uploads, |tag, bytes| {
+        let result = wire::prepare(self.local.manifest(), fence, graph, grammar, uploads, cleared_pages, |tag, bytes| {
             for peer in &mut self.peers { peer.channel.send(tag, bytes)?; }
             Ok(())
         });
@@ -344,13 +351,13 @@ impl TensorParallelExecutor {
             if frame.committed { continue; }
             if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.uploads();
-            if self.local.validate_submission(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
+            if self.local.validate_submission(frame.graph, &uploads, &frame.cleared_pages, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
             for peer in &mut self.peers {
                 peer.channel.send(COMMIT, &identity(frame.fence, frame.graph))?;
             }
-            if self.local.submit(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
+            if self.local.submit(frame.graph, &uploads, &frame.cleared_pages, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero submission changed after coordinated validation"));
             }
             frame.committed = true;
@@ -576,7 +583,7 @@ pub unsafe fn serve_rank(
             }
             executor.finish_startup()?;
             channel.send(STARTED, &[])?;
-            let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>)> = None;
+            let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>, Vec<PageId>)> = None;
             let mut prepared_at: Option<Instant> = None;
             let mut started = VecDeque::new();
             loop {
@@ -600,22 +607,22 @@ pub unsafe fn serve_rank(
                         }
                         PREPARE | PREPARE_MORE => {
                             if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                            let (fence, graph, grammar, owned) =
+                            let (fence, graph, grammar, owned, cleared) =
                                 receive_prepare(&mut channel, executor.manifest(), tag, bytes)?;
                             let uploads: Vec<_> = owned.iter().map(|upload| Upload {
                                 buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
                             }).collect();
-                            if executor.validate_submission(graph, &uploads, grammar)? != Some(fence) {
+                            if executor.validate_submission(graph, &uploads, &cleared, grammar)? != Some(fence) {
                                 return Err(invalid("rank submission sequence or capacity differs"));
                             }
                             channel.send(READY, &identity(fence, graph))?;
-                            prepared = Some((fence, graph, grammar, owned));
+                            prepared = Some((fence, graph, grammar, owned, cleared));
                             prepared_at = Some(Instant::now());
                         }
                         COMMIT => {
                             let (fence, graph) = read_identity(&bytes)?;
                             prepared_at = None;
-                            let (expected, expected_graph, grammar, owned) = prepared.take()
+                            let (expected, expected_graph, grammar, owned, cleared) = prepared.take()
                                 .ok_or_else(|| invalid("rank commit arrived without preparation"))?;
                             if fence != expected || graph != expected_graph {
                                 return Err(invalid("rank commit identity differs"));
@@ -623,7 +630,7 @@ pub unsafe fn serve_rank(
                             let uploads: Vec<_> = owned.iter().map(|upload| Upload {
                                 buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
                             }).collect();
-                            if executor.submit(graph, &uploads, grammar)? != Some(fence) {
+                            if executor.submit(graph, &uploads, &cleared, grammar)? != Some(fence) {
                                 return Err(invalid("rank lost its prepared submission"));
                             }
                             started.push_back(Instant::now());

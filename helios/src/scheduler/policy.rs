@@ -11,7 +11,51 @@ use super::{
     *,
 };
 
-#[derive(Clone, Copy, Debug)]
+/// When the prefill tail merge (upstream PR #69) absorbs a short final message segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefillTailMerge {
+    /// One prefill graph per message segment.
+    Off,
+    /// Upstream behaviour (merge for every request), except a request without tools whose
+    /// generation prompt opens a reasoning block (`RequestSpec::reasoning_prompt`): a thinking
+    /// template that drops reasoning from history (DeepSeek V4.1) renders that turn differently
+    /// in the next one, so it keeps its last message's checkpoint, as under `ToolsOnly`. With
+    /// tools DeepSeek V4.1 keeps the `<think>` header in history, and without reasoning the
+    /// generation prompt is re-rendered unchanged, so a merged turn's next turn resumes at its
+    /// prompt-end checkpoint.
+    On,
+    /// Fork rule (default): merge only for requests that render tools. Without tools,
+    /// thinking-mode templates such as DeepSeek V4.1's render earlier assistant turns
+    /// differently from the generation prompt, so the next turn can only resume from the
+    /// last message's checkpoint, which the merge would never capture.
+    ToolsOnly,
+}
+
+impl PrefillTailMerge {
+    pub fn applies(self, tools: bool, reasoning_prompt: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => tools || !reasoning_prompt,
+            Self::ToolsOnly => tools,
+        }
+    }
+}
+
+/// Which overdue request the TTFT guard protects first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TtftOrder {
+    /// The request that arrived first (fork behaviour through 11-15).
+    #[default]
+    Oldest,
+    /// The request with the fewest remaining prompt chunks (arrival breaks ties), so a short
+    /// request arriving while long prompts load is served by the next guarded round. Every
+    /// guarded prompt round given to a request other than the oldest overdue one is followed by
+    /// a guarded round owed to the oldest, so the oldest keeps at least every second guarded
+    /// round and no first token waits forever behind a stream of shorter requests.
+    Shortest,
+}
+
+#[derive(Clone, Debug)]
 pub struct PolicyConfig {
     pub output_token_value: f64,
     pub token_fairness: f64,
@@ -22,7 +66,31 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    /// Optional per-batch `(max_batch, alpha)` schedule with strictly ascending positive batch
+    /// limits and finite positive exponents. When non-empty, `alpha_for_batch` picks the first
+    /// entry with `batch <= max_batch` and falls back to the last entry for larger batches; when
+    /// empty, `adaptive_verification_alpha` applies to every batch size.
+    pub adaptive_verification_alpha_by_batch: Vec<(usize, f64)>,
     pub checkpoint_extra_work_fraction: f64,
+    /// Wait since arrival after which a request still awaiting its first token takes the next
+    /// round; zero disables the guard.
+    pub ttft_target_ms: f64,
+    /// Largest prefill chunk a guarded round may use; zero allows the largest prepared one.
+    pub ttft_max_chunk: usize,
+    /// Rounds other work may take between two guarded rounds of one overdue request.
+    pub ttft_decode_interleave: u32,
+    /// Which overdue request the guard serves: the oldest, or the one closest to its first token.
+    pub ttft_order: TtftOrder,
+    /// Absorb a short final message segment into the preceding prefill chunk (upstream PR #69):
+    /// always, never, or only for requests that render tools (fork default).
+    pub prefill_tail_merge: PrefillTailMerge,
+    /// Offer message checkpoints to the host cache at capture, even when the prompt
+    /// checkpoint follows within one page (upstream PR #227); false restores the
+    /// deferral until exact reuse.
+    pub eager_message_offers: bool,
+    /// Fork: a prefill piece shorter than this many tokens joins the pieces after it instead of
+    /// running as its own prefill graph; zero (default) keeps one graph per message piece.
+    pub prefill_merge_min_rows: usize,
 }
 
 impl Default for PolicyConfig {
@@ -38,6 +106,14 @@ impl Default for PolicyConfig {
             estimate_ttl_ns: 30_000_000_000,
             checkpoint_extra_work_fraction: 0.05,
             adaptive_verification_alpha: 1.0,
+            adaptive_verification_alpha_by_batch: Vec::new(),
+            ttft_target_ms: 0.0,
+            ttft_max_chunk: 0,
+            ttft_decode_interleave: 1,
+            ttft_order: TtftOrder::Oldest,
+            prefill_tail_merge: PrefillTailMerge::ToolsOnly,
+            eager_message_offers: true,
+            prefill_merge_min_rows: 0,
         }
     }
 }
@@ -47,6 +123,72 @@ impl PolicyConfig {
     /// the frequency of output bursts or their age separately.
     pub fn throughput() -> Self {
         Self { delivery_fairness: 0.0, decode_age_price: 0.0, ..Self::default() }
+    }
+
+    /// Balanced service, but a prompt waiting 50 ms for its first token takes the next round.
+    pub fn interactive() -> Self {
+        Self { ttft_target_ms: 50.0, ..Self::default() }
+    }
+
+    /// Adaptive verification exponent for a physical round batch capacity.
+    pub fn alpha_for_batch(&self, batch: usize) -> f64 {
+        if self.adaptive_verification_alpha_by_batch.is_empty() {
+            return self.adaptive_verification_alpha;
+        }
+        self.adaptive_verification_alpha_by_batch
+            .iter()
+            .find(|&&(max_batch, _)| batch <= max_batch)
+            .or_else(|| self.adaptive_verification_alpha_by_batch.last())
+            .map_or(self.adaptive_verification_alpha, |&(_, alpha)| alpha)
+    }
+
+    /// Parse either a single positive finite exponent (`0.8`) or a comma-separated
+    /// `max_batch:alpha` schedule with strictly ascending positive batch limits
+    /// (`8:0.8,16:0.55`).
+    pub fn parse_adaptive_verification_alpha(
+        spec: &str,
+    ) -> std::result::Result<(f64, Vec<(usize, f64)>), String> {
+        if !spec.contains(':') && !spec.contains(',') {
+            let alpha = spec
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| {
+                    "adaptive verification alpha must be finite and greater than zero".to_owned()
+                })?;
+            return Ok((alpha, Vec::new()));
+        }
+        let mut schedule = Vec::new();
+        let mut previous_batch = 0usize;
+        for entry in spec.split(',') {
+            let Some((batch_text, alpha_text)) = entry.split_once(':') else {
+                return Err(
+                    "adaptive verification alpha schedule entries must use max_batch:alpha"
+                        .to_owned(),
+                );
+            };
+            let max_batch = batch_text.parse::<usize>().ok().filter(|&b| b > 0).ok_or_else(|| {
+                "adaptive verification alpha schedule batch limits must be positive integers"
+                    .to_owned()
+            })?;
+            if max_batch <= previous_batch {
+                return Err(
+                    "adaptive verification alpha schedule batch limits must be strictly ascending"
+                        .to_owned(),
+                );
+            }
+            let alpha = alpha_text
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| {
+                    "adaptive verification alpha schedule values must be finite and greater than zero"
+                        .to_owned()
+                })?;
+            previous_batch = max_batch;
+            schedule.push((max_batch, alpha));
+        }
+        Ok((schedule[0].1, schedule))
     }
 }
 
@@ -211,6 +353,13 @@ impl RequestScheduler {
         if !policy.adaptive_verification_alpha.is_finite() || policy.adaptive_verification_alpha <= 0.0 {
             return Err("adaptive verification alpha must be finite and greater than zero".into());
         }
+        let mut previous_batch = 0usize;
+        for &(max_batch, alpha) in &policy.adaptive_verification_alpha_by_batch {
+            if max_batch <= previous_batch || !alpha.is_finite() || alpha <= 0.0 {
+                return Err("adaptive verification alpha schedule must use strictly ascending positive batch limits and finite positive values".into());
+            }
+            previous_batch = max_batch;
+        }
         if !policy.output_token_value.is_finite()
             || policy.output_token_value <= 0.0
             || !policy.adaptation_ms.is_finite()
@@ -222,6 +371,7 @@ impl RequestScheduler {
                 policy.decode_age_price,
                 policy.terminal_value,
                 policy.terminal_age_price,
+                policy.ttft_target_ms,
             ]
             .into_iter()
             .any(|v| !v.is_finite() || v < 0.0)
@@ -229,7 +379,7 @@ impl RequestScheduler {
             return Err("invalid scheduler utility coefficients or estimation intervals".into());
         }
         self.policy = policy;
-        self.costs.advance_to(self.now_ns, policy.estimate_ttl_ns);
+        self.costs.advance_to(self.now_ns, self.policy.estimate_ttl_ns);
         Ok(())
     }
 
@@ -330,16 +480,33 @@ impl RequestScheduler {
         }
     }
 
+    /// A trailing message segment shorter than this is absorbed into the
+    /// preceding chunk instead of running as its own prefill graph.
+    fn prefill_tail_merge_limit(capacity: usize) -> usize {
+        (capacity / 16).clamp(64, 512)
+    }
+
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         self.prefill_work_through(request, capacity, self.estimated_checkpoint_cut(request))
     }
 
     pub(super) fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
         let start = request.consumed_tokens as usize;
+        let limit = request.prefill_limit();
         let mut end = cut
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
-            .min(request.prefill_limit());
+            .min(limit);
+        if self
+            .policy
+            .prefill_tail_merge
+            .applies(request.tools, request.reasoning_prompt)
+            && end < request.prompt_tokens
+            && request.prompt_tokens <= start.saturating_add(capacity).min(limit)
+            && request.prompt_tokens - end <= Self::prefill_tail_merge_limit(capacity)
+        {
+            end = request.prompt_tokens;
+        }
         if let Some(span) = request
             .prefill_spans
             .iter()
@@ -488,7 +655,7 @@ impl RequestScheduler {
                 }
             }
         } else {
-            let mut curve = None;
+            let mut curve: Option<(u64, Vec<f64>)> = None;
             for batch in crate::execution::BATCH_CAPACITIES
                 .into_iter()
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
@@ -503,11 +670,17 @@ impl RequestScheduler {
                         consider(ns, value.decode(1.0, ns as f64 / 1e6));
                     }
                 } else {
+                    let alpha_bits = self.policy.alpha_for_batch(batch).to_bits();
                     for &width in &self.speculative_catalog[batch.ilog2() as usize] {
                         if let Some(ns) = self.speculative_duration(r, batch, width)
                         {
-                            let curve = curve.get_or_insert_with(|| self.powered_curve(r, false));
-                            let expected = super::rounds::forecast_tokens(curve, self.speculative_tokens(r, width));
+                            if curve.as_ref().is_none_or(|(bits, _)| *bits != alpha_bits) {
+                                curve = Some((alpha_bits, self.powered_curve(r, batch, false)));
+                            }
+                            let expected = super::rounds::forecast_tokens(
+                                &curve.as_ref().unwrap().1,
+                                self.speculative_tokens(r, width),
+                            );
                             consider(ns, value.decode(expected, ns as f64 / 1e6));
                         }
                     }
@@ -732,7 +905,7 @@ impl RequestScheduler {
                 }
                 let offer = (
                     slot,
-                    self.lane_value(request, role, extent, horizon, values[slot]),
+                    self.lane_value(request, role, batch, extent, horizon, values[slot]),
                 );
                 if mixed && role == GraphKind::Prefill {
                     let best = &mut prompts[usize::from(promoted)];
@@ -840,12 +1013,13 @@ impl RequestScheduler {
         &self,
         r: &LiveRequest,
         kind: GraphKind,
+        batch: usize,
         capacity: usize,
         duration_ns: u64,
         value: LaneValue,
     ) -> f64 {
         self.lane_value_for_tokens(
-            r, kind, self.lane_tokens(r, kind, capacity), duration_ns, value,
+            r, kind, batch, self.lane_tokens(r, kind, capacity), duration_ns, value,
         )
     }
 
@@ -853,6 +1027,7 @@ impl RequestScheduler {
         &self,
         r: &LiveRequest,
         kind: GraphKind,
+        batch: usize,
         tokens: usize,
         duration_ns: u64,
         value: LaneValue,
@@ -863,7 +1038,7 @@ impl RequestScheduler {
                 r.consumed_tokens + tokens as u64 == r.prompt_tokens as u64,
             ),
             GraphKind::Decode | GraphKind::Speculative => value.decode(
-                self.expected_speculative_tokens(r, tokens),
+                self.expected_speculative_tokens(r, batch, tokens),
                 duration_ns as f64 / 1e6,
             ),
             GraphKind::Resume => value.decode(1.0, duration_ns as f64 / 1e6),
@@ -914,7 +1089,7 @@ impl RequestScheduler {
             }
             offers[count] = (
                 slot,
-                self.lane_value(r, kind, capacity, duration_ns, values[slot]),
+                self.lane_value(r, kind, batch, capacity, duration_ns, values[slot]),
             );
             count += 1;
         }
@@ -985,7 +1160,7 @@ impl RequestScheduler {
         age_price: f64,
     ) {
         output.clear();
-        self.mixed_candidates(output, values, age_price, false);
+        self.mixed_candidates(output, values, age_price, false, None);
         self.packed_round_candidates(output, values, age_price, false);
         for kind in [
             GraphKind::Prefill,
@@ -1051,6 +1226,7 @@ impl RequestScheduler {
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
         optimistic: bool,
+        prompt_slot: Option<usize>,
     ) {
         let decode = if self.speculative_widths.is_empty() {
             GraphKind::Decode
@@ -1073,7 +1249,10 @@ impl RequestScheduler {
                 };
                 let kind = self.request_kind(r);
                 match kind {
-                    Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
+                    Some(GraphKind::Prefill)
+                        if self.prefill_work(r, prefill) > 0
+                            && prompt_slot.is_none_or(|prompt| prompt == slot) =>
+                    {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
                                 && self.prefill_work(r, smaller) == self.prefill_work(r, prefill)
@@ -1083,6 +1262,7 @@ impl RequestScheduler {
                         let value = self.lane_value(
                             r,
                             GraphKind::Prefill,
+                            batch,
                             prefill,
                             duration_ns,
                             values[slot],
@@ -1095,14 +1275,17 @@ impl RequestScheduler {
                         decoders[count] = (
                             slot,
                             if optimistic { values[slot].decode(self.optimistic_tokens(r, self.speculative_tokens(r, width)), duration_ns as f64 / 1e6) }
-                            else { self.lane_value(r, decode, width, duration_ns, values[slot]) },
+                            else { self.lane_value(r, decode, batch, width, duration_ns, values[slot]) },
                         );
                         count += 1;
                     }
                     _ => {}
                 }
             }
-            for prompt in std::iter::once(None).chain(prompt.map(Some)) {
+            for prompt in std::iter::once(None)
+                .filter(|_| prompt_slot.is_none())
+                .chain(prompt.map(Some))
+            {
                 if prompt.is_none() && duration_ns == 0
                     && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                         b == batch && w == width && smaller < prefill
@@ -1175,6 +1358,29 @@ impl RequestScheduler {
         if ordinary.rate.duration_ns == 0 {
             return self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Discovery);
         }
+        // An overdue first token outranks cost refresh and acceptance probes, not discovery.
+        if self.ttft_interleave == 0 && let Some(r) = self.ttft_overdue().filter(|r| self.eligible(r)) {
+            let slot = r.handle.slot as usize;
+            let chunk = if self.policy.ttft_max_chunk == 0 { usize::MAX } else { self.policy.ttft_max_chunk };
+            let mut forced = Vec::new();
+            self.ttft_candidates(&mut forced, r, &values, age_price);
+            let count = self.prune_padding(&mut forced);
+            // Prompt tokens the round advances; fewest chunks first, then value rate.
+            let progress = |c: &Candidate| {
+                if c.mask & (1 << slot) == 0 { return None; }
+                match c.kind {
+                    GraphKind::Prefill | GraphKind::ScoredPrefill => (c.capacity <= chunk).then_some(c.work),
+                    GraphKind::Mixed => (c.prefill_slot == Some(slot) && c.prefill_capacity <= chunk)
+                        .then(|| self.prefill_work(r, c.prefill_capacity)),
+                    _ => Some(0),
+                }
+            };
+            if let Some((_, forced)) = forced[..count].iter()
+                .filter_map(|c| progress(c).map(|work| (work, c)))
+                .max_by(|(x, a), (y, b)| x.cmp(y).then_with(|| compare(a, b))) {
+                return self.available_plan(*forced, &values, age_price, log_scale, PlanOrigin::Ordinary);
+            }
+        }
         if self.refresh_ready() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
                 .map(|key| (self.costs.refresh_order(key), key)).collect();
@@ -1217,6 +1423,117 @@ impl RequestScheduler {
             }
         }
         self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Ordinary)
+    }
+
+    /// Rounds that advance `r` itself: its prompt alone or as the mixed prompt row, or its
+    /// lifecycle step batched with peers in the same phase.
+    fn ttft_candidates(
+        &self,
+        output: &mut Vec<Candidate>,
+        r: &LiveRequest,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+    ) {
+        let slot = r.handle.slot as usize;
+        let Some(kind) = self.request_kind(r) else { return };
+        if kind.is_prefill() {
+            self.mixed_candidates(output, values, age_price, false, Some(slot));
+            for &capacity in self.prefill_catalog(kind) {
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+            }
+        } else if kind == GraphKind::Vision {
+            for &capacity in &self.capabilities.vision.patch_capacities {
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+            }
+        } else {
+            let mask = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry
+                        .request
+                        .as_ref()
+                        .is_some_and(|peer| self.eligible(peer) && self.request_kind(peer) == Some(kind))
+                })
+                .fold(0u64, |mask, (peer, _)| mask | 1 << peer);
+            for batch in crate::execution::BATCH_CAPACITIES
+                .into_iter()
+                .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
+            {
+                self.add_candidate(output, kind, batch, 1, mask, values, age_price);
+            }
+        }
+    }
+
+    /// The request the guard protects among those past the TTFT target that have not produced
+    /// their first token: the oldest, or under `TtftOrder::Shortest` the one with the fewest
+    /// remaining prompt chunks unless a guarded round is owed to the oldest.
+    pub(super) fn ttft_overdue(&self) -> Option<&LiveRequest> {
+        if self.policy.ttft_order == TtftOrder::Oldest || self.ttft_owe_oldest {
+            return self.ttft_oldest_overdue();
+        }
+        self.ttft_overdue_requests()
+            .min_by_key(|r| (self.ttft_remaining_chunks(r), r.accounting.arrival_ns, r.admission_order))
+    }
+
+    /// The oldest request past the TTFT target that has not produced its first token.
+    pub(super) fn ttft_oldest_overdue(&self) -> Option<&LiveRequest> {
+        self.ttft_overdue_requests()
+            .min_by_key(|r| (r.accounting.arrival_ns, r.admission_order))
+    }
+
+    fn ttft_overdue_requests(&self) -> impl Iterator<Item = &LiveRequest> {
+        let target = (self.policy.ttft_target_ms * 1e6) as u64;
+        self.slots
+            .iter()
+            .filter_map(|s| s.request.as_ref())
+            .filter(move |_| self.policy.ttft_target_ms > 0.0)
+            .filter(move |r| {
+                awaiting_first_token(r)
+                    && self.request_kind(r).is_some()
+                    && self.now_ns.saturating_sub(r.accounting.arrival_ns) >= target
+            })
+    }
+
+    /// Prefill chunks of the scheduler's chunk size left before `r`'s prompt is consumed; a
+    /// cached or restored prefix counts as consumed.
+    pub(super) fn ttft_remaining_chunks(&self, r: &LiveRequest) -> u64 {
+        (r.prompt_tokens as u64)
+            .saturating_sub(r.consumed_tokens)
+            .div_ceil(self.limits.prefill_chunk_size.max(1) as u64)
+    }
+
+    /// Rounds other work may take before the overdue request is forced again: refilled by a
+    /// prompt or image chunk of it, kept by its lifecycle steps, spent by any other round, and
+    /// cleared when nothing is overdue. Under `TtftOrder::Shortest` a prompt or image chunk of
+    /// a protected request other than the oldest overdue one owes the next guarded round to the
+    /// oldest; a chunk of the oldest repays it.
+    pub(super) fn note_ttft_round(&mut self, step: &ScheduledStep) {
+        if self.policy.ttft_target_ms <= 0.0 {
+            return;
+        }
+        let Some(overdue) = self.ttft_overdue().map(|r| r.handle) else {
+            self.ttft_interleave = 0;
+            self.ttft_owe_oldest = false;
+            return;
+        };
+        let role = step
+            .lanes
+            .iter()
+            .position(|lane| lane.request == overdue)
+            .map(|row| step.lane_kind(row));
+        let chunk = matches!(role, Some(kind) if kind.is_prefill() || kind == GraphKind::Vision);
+        self.ttft_interleave = match role {
+            _ if chunk => self.policy.ttft_decode_interleave,
+            Some(GraphKind::Decode | GraphKind::Speculative) | None => {
+                self.ttft_interleave.saturating_sub(1)
+            }
+            Some(_) => self.ttft_interleave,
+        };
+        if chunk && self.policy.ttft_order == TtftOrder::Shortest {
+            self.ttft_owe_oldest = self.ttft_oldest_overdue().map(|r| r.handle) != Some(overdue);
+        }
     }
 
     pub(super) fn available_plan(
@@ -1295,11 +1612,11 @@ impl RequestScheduler {
         candidate.duration_ns = duration_ns;
         let slot = request.handle.slot as usize;
         let kind = if mixed { GraphKind::Prefill } else { candidate.kind };
-        let mut expected = self.lane_value_for_tokens(request, kind, work, duration_ns, values[slot]);
+        let mut expected = self.lane_value_for_tokens(request, kind, candidate.batch, work, duration_ns, values[slot]);
         if mixed {
             let decode = if self.speculative_widths.is_empty() { GraphKind::Decode } else { GraphKind::Speculative };
             expected += bits(candidate.mask & !(1 << slot)).map(|slot| {
-                self.lane_value(self.slots[slot].request.as_ref().unwrap(), decode,
+                self.lane_value(self.slots[slot].request.as_ref().unwrap(), decode, candidate.batch,
                     candidate.capacity, duration_ns, values[slot])
             }).sum::<f64>();
         }
@@ -1436,6 +1753,21 @@ impl RequestScheduler {
         let origin = if candidate.rate.duration_ns == 0 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary };
         self.materialize(candidate, scale, origin)
     }
+}
+
+/// Admitted and still before its first output token, excluding terminal cleanup.
+pub(super) fn awaiting_first_token(request: &LiveRequest) -> bool {
+    request.generated_tokens == 0
+        && matches!(
+            request.phase,
+            RequestPhase::Initialize
+                | RequestPhase::Restore
+                | RequestPhase::Vision
+                | RequestPhase::Prefill
+                | RequestPhase::Resume
+                | RequestPhase::Snapshot
+        )
+        && !terminal_cleanup(request)
 }
 
 pub(super) fn terminal_cleanup(request: &LiveRequest) -> bool {

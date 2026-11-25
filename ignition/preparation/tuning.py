@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import gc
+import warnings
 from collections import Counter
 from collections.abc import Hashable
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -23,8 +24,10 @@ from b12x.preparation.session import _declaration_key, _plans_of
 from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
+from .scratch_preference import from_environment as scratch_preference_from_environment
+from .export_speed import TUNE_ONLY_ENV, tune_only
 from .tuning_shards import component_key, local_components, materialization_key, portable_declaration
-from .host_memory import candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
+from .host_memory import COMPILE_HEADROOM_BYTES, candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
 
 
 # Requests per tuning job on an integrated GPU: collective declarations with a coordinator,
@@ -51,7 +54,7 @@ def _local_tuning_catalog(requests):
 
 
 def _prepare_compiler_toolchain():
-    """Resolve forward math libraries before native program identities are recorded."""
+    """Resolve forward math libraries before any Triton program identity is recorded."""
     from ignition import runtime_patches
 
     runtime_patches.apply()
@@ -60,10 +63,16 @@ def _prepare_compiler_toolchain():
 
     from .compilation import _OPTIONS
 
-    # Inductor selects the CUDA toolkit's libdevice for eager precision. Native
-    # discovery and later materialization must see that same library identity.
+    # Inductor selects the CUDA toolkit's libdevice for eager precision. Every
+    # Triton compile in the process must see that same library identity: Triton
+    # memoizes compiled kernels per specialization without the library path, so
+    # a kernel compiled against the bundled library before the switch would be
+    # reused with a program identity that native discovery never declared.
     with config.patch(emulate_precision_casts=_OPTIONS["emulate_precision_casts"]):
         _set_triton_libdevice_path()
+
+
+_prepare_compiler_toolchain()
 
 
 def with_autotune_effort(prepare):
@@ -91,7 +100,8 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", native_dense_activations=False, lock_gpu_clocks=False):
+                 tuning_replica=None, autotune_effort="default", native_dense_activations=False, lock_gpu_clocks=False,
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
@@ -105,7 +115,6 @@ class RecordedPreparationSession(PreparationSession):
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
         self.lock_gpu_clocks = lock_gpu_clocks
-        _prepare_compiler_toolchain()
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
                              namespace=identity, race_budget=race_budget, prime=False,
@@ -113,9 +122,26 @@ class RecordedPreparationSession(PreparationSession):
         if type(headroom_bytes) is not int or headroom_bytes < 0:
             raise ValueError("headroom_bytes must be a nonnegative byte count")
         self.headroom_bytes = headroom_bytes
+        if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
+            raise ValueError("compile_headroom_bytes must be a nonnegative byte count")
+        self.compile_headroom_bytes = compile_headroom_bytes
+        # Near-equal race candidates resolve to the smaller workspace (tp3 b12x patch).
+        self.scratch_preference = scratch_preference_from_environment()
+        if self.scratch_preference is not None:
+            configure = getattr(self, "configure_scratch_preference", None)
+            if configure is None:
+                warnings.warn("FLARE_TUNE_SCRATCH_TOLERANCE needs tp3-patches/flashinfer-tuning-scratch-preference"
+                              ".patch; tuning keeps the fastest candidates", RuntimeWarning, stacklevel=2)
+                self.scratch_preference = None
+            else:
+                configure(self.scratch_preference)
         cpu_workers(compile_workers)
         self.requested_compile_workers = compile_workers
         self.tuning_replica = tuning_replica
+        # TP3 fork (export_speed.py): FLARE_EXPORT_TUNE_ONLY=1 ends preparation after tuning, as a replica does.
+        self._tune_only = tune_only()
+        if self._tune_only and tuning_replica is not None:
+            raise ValueError(f"{TUNE_ONLY_ENV}=1 does not combine with --tuning-gpus replicas")
         self._replica_coordinator = None
         self._coordinator = coordinator
         self._recorded_requests = {}
@@ -472,7 +498,8 @@ class RecordedPreparationSession(PreparationSession):
             if self.tuning_replica is not None:
                 pools = self.tuning_replica.processes
             limit = candidate_scratch_limit(self.device.ordinal, pools=pools,
-                headroom_bytes=self.headroom_bytes, pending_persistent_bytes=envelope.pending_persistent_nbytes)
+                headroom_bytes=self.headroom_bytes, pending_persistent_bytes=envelope.pending_persistent_nbytes,
+                compile_headroom_bytes=self.compile_headroom_bytes)
             if self._replica_coordinator is not None:
                 limit = min(self._replica_coordinator.gather(limit))
             elif self._coordinator is not None:
@@ -572,7 +599,8 @@ class RecordedPreparationSession(PreparationSession):
             self.configure_compile_workers(None if preserve_default else
                 cpu_workers(self.requested_compile_workers, pools=pools))
             bounded, self.race_budget = tuning_limits(self.device.ordinal, self.compile_workers,
-                pools=pools, headroom_bytes=self.headroom_bytes, race_budget=self.race_budget)
+                pools=pools, headroom_bytes=self.headroom_bytes, race_budget=self.race_budget,
+                compile_headroom_bytes=self.compile_headroom_bytes)
             if self._integrated and self.compile_workers:
                 # Compiling in this process would keep every program it compiles through serving;
                 # one compiler process returns its memory at the end of each tuning job.
@@ -671,6 +699,8 @@ class RecordedPreparationSession(PreparationSession):
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,
+                "compile_headroom_bytes": self.compile_headroom_bytes,
+                "scratch_preference": None if self.scratch_preference is None else self.scratch_preference.identity,
                 "cache_hits": sum(result.cache_hits for result in results),
                 "benchmarked_candidates": sum(result.benchmarked_candidates for result in results),
                 "restored_candidates": sum(result.restored_candidates for result in results),
@@ -733,7 +763,8 @@ class RecordedPreparationSession(PreparationSession):
                     self._tune_status = "failed"
                     raise
             self._replica_coordinator = None
-            if self._tune_status == "ready" and self.tuning_replica is not None and self.tuning_replica.index:
+            replica = self.tuning_replica is not None and self.tuning_replica.index
+            if self._tune_status == "ready" and (replica or getattr(self, "_tune_only", False)):
                 from .tuning_replicas import TuningComplete
 
                 if self._coordinator is not None:
@@ -801,7 +832,6 @@ def declare(session, requests, *, coordinator=None):
     if isinstance(session, RecordedPreparationSession):
         session.declare(requests, coordinator=coordinator)
     else:
-        _prepare_compiler_toolchain()
         options = {} if coordinator is None else {"coordinator": coordinator}
         session.prepare(requests, **options)
 

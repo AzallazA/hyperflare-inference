@@ -239,7 +239,7 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
                             buffer: "tokens", offset: 8 + index * 80 * 1024 * 1024 / parts, bytes,
                         }).collect();
                     let mut packets = 0;
-                    wire::prepare(&manifest, Fence(7), 0, true, &uploads, |tag, data| {
+                    wire::prepare(&manifest, Fence(7), 0, true, &uploads, &[], |tag, data| {
                         assert!(data.len() <= 64 * 1024 * 1024);
                         assert_eq!(tag, if packets == 0 { PREPARE_MORE } else { PREPARE });
                         packets += 1;
@@ -249,9 +249,10 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
                     sender.send(DRAIN, &[]).unwrap();
                 });
                 let (tag, packet) = receiver.wait(false).unwrap();
-                let (fence, graph, grammar, owned) =
+                let (fence, graph, grammar, owned, cleared) =
                     receive_prepare(&mut receiver, &manifest, tag, packet).unwrap();
                 assert_eq!((fence, graph, grammar), (Fence(7), 0, true));
+                assert!(cleared.is_empty());
                 assert!(owned.len() > parts);
                 let mut offset = 8;
                 for upload in &owned {
@@ -281,13 +282,14 @@ fn small_prepare_preserves_one_packet_and_upload_extents() {
     let (sender, receiver) = crate::execution::rank_stream::test_pair().unwrap();
     let mut sender = Channel::new(sender).unwrap();
     let mut receiver = Channel::new(receiver).unwrap();
-    wire::prepare(&manifest, Fence(3), 0, false, &input, |tag, data| {
+    wire::prepare(&manifest, Fence(3), 0, false, &input, &[], |tag, data| {
         assert_eq!(tag, PREPARE);
         sender.send(tag, data)
     }).unwrap();
     let (tag, packet) = receiver.wait(false).unwrap();
-    let (fence, graph, grammar, owned) = receive_prepare(&mut receiver, &manifest, tag, packet).unwrap();
+    let (fence, graph, grammar, owned, cleared) = receive_prepare(&mut receiver, &manifest, tag, packet).unwrap();
     assert_eq!((fence, graph, grammar), (Fence(3), 0, false));
+    assert!(cleared.is_empty());
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].offset, 8);
     assert_eq!(owned[0].bytes, bytes);
@@ -543,7 +545,7 @@ fn logprob_uploads_budget_count_and_prefix_wire_bytes_separately() {
     let manifest = super::super::tests::with_logprobs(crate::execution::MAX_LOGPROB_TOKEN_IDS);
     let measure = |uploads: &[Upload<'_>]| {
         let mut size = 0;
-        wire::prepare(&manifest, Fence(1), 0, false, uploads, |_, bytes| {
+        wire::prepare(&manifest, Fence(1), 0, false, uploads, &[], |_, bytes| {
             size += bytes.len();
             Ok(())
         })
@@ -587,7 +589,7 @@ fn two_frame_window_retains_preparing_and_unconsumed_completions() {
     let mut manifest = crate::execution::tests::manifest();
     manifest.graphs[0].kind = crate::execution::GraphKind::Decode;
     let frame = |sequence| Pending {
-        fence: Fence(sequence), graph: 0, grammar: false, uploads: Vec::new(),
+        fence: Fence(sequence), graph: 0, grammar: false, cleared_pages: Vec::new(), uploads: Vec::new(),
         dispatched: Instant::now(), committed: false, queued: sequence > 1,
         ready: vec![false; 3], completions: (0..4).map(|_| None).collect(),
     };

@@ -49,13 +49,32 @@ impl ToolDialect for ArgumentTags {
             .and_then(Value::as_object);
         let mut arguments = RawArguments::new();
         while !rest.trim().is_empty() {
-            let key = rest
-                .trim_start()
-                .strip_prefix("<arg_key>")
-                .ok_or("GLM tool call requires an argument key")?;
+            let remaining = rest.trim_start();
+            let key = remaining.strip_prefix("<arg_key>").ok_or_else(|| {
+                // Name what follows instead of echoing generated text into the error.
+                let marker = if remaining.starts_with("</arg_value>") {
+                    "closing-arg-value"
+                } else if remaining.starts_with("</tool_call>") {
+                    "closing-tool-call"
+                } else if remaining.starts_with("<arg_value>") {
+                    "arg-value-without-key"
+                } else if remaining.starts_with("<arg_key") {
+                    "malformed-arg-key"
+                } else if remaining.starts_with('<') {
+                    "unexpected-tag"
+                } else {
+                    "unexpected-text"
+                };
+                format!(
+                    "GLM tool call requires an argument key (remaining_bytes={}, next_marker={marker})",
+                    remaining.len()
+                )
+            })?;
             let (key, tail) = key
                 .split_once("</arg_key>")
                 .ok_or("unterminated GLM argument key")?;
+            // Keys are trimmed as vLLM's GLM-4.7 parser does (`key.strip()`); values stay raw.
+            let key = key.trim();
             if key.is_empty() || arguments.contains_key(key) {
                 return Err("GLM argument names must be nonempty and unique".into());
             }
@@ -76,13 +95,24 @@ impl ToolDialect for ArgumentTags {
                 rest = next;
                 continue;
             }
-            let (value, tail) = value
-                .split_once("</arg_value>")
-                .ok_or("unterminated GLM argument value")?;
+            let end = value_end(value).ok_or("unterminated GLM argument value")?;
+            let (value, tail) = (&value[..end], &value[end + VALUE_END.len()..]);
             if let Some(raw_json) = strict_nonstring_raw(value, schema.filter(|_| strict)) {
                 arguments.insert(key.to_owned(), raw_json);
             } else {
-                arguments.insert_value(key.to_owned(), &parameter_value(value, schema)?)?;
+                // Off-schema values are retained (parameter_value); only an invalid type declaration fails here.
+                let converted = parameter_value(value, schema).map_err(|error| {
+                    let declared = schema
+                        .and_then(|schema| schema.get("type"))
+                        .map_or_else(|| "<missing-or-union>".into(), Value::to_string);
+                    crate::FrontendError::Input(crate::Failure::caused_by(
+                        format!(
+                            "GLM argument '{key}' (declared type {declared}) failed conversion: {error}"
+                        ),
+                        error,
+                    ))
+                })?;
+                arguments.insert_value(key.to_owned(), &converted)?;
             }
             rest = tail;
         }
@@ -114,6 +144,30 @@ impl ToolDialect for ArgumentTags {
             Some(false)
         }
     }
+}
+
+const VALUE_END: &str = "</arg_value>";
+
+/// Byte offset of the `</arg_value>` that closes a value, in the text after `<arg_value>`.
+///
+/// Values are raw text, so code or XML passed as a string can contain `</arg_value>` itself
+/// (vLLM's non-greedy regex splits there). A closing tag ends the value only when, after optional
+/// whitespace, the next argument key or the end of the call body follows; the body handed to
+/// `parse` stops before `</tool_call>`, so that tag counts as the end. Any other closing tag is
+/// value text. A value that literally contains `</arg_value><arg_key>` stays ambiguous and ends
+/// there. When no closing tag qualifies, the first one ends the value as before, so a malformed
+/// remainder still gets the next-marker diagnostic. Whole calls are parsed only after their
+/// closing tag arrives, so streaming never emits a value prefix that a later tag could extend.
+fn value_end(value: &str) -> Option<usize> {
+    let mut first = None;
+    for (at, _) in value.match_indices(VALUE_END) {
+        first.get_or_insert(at);
+        let next = value[at + VALUE_END.len()..].trim_start();
+        if next.is_empty() || next.starts_with("<arg_key>") {
+            return Some(at);
+        }
+    }
+    first
 }
 
 #[cfg(test)]

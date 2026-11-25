@@ -10,7 +10,7 @@ use super::*;
 use crate::{
     cache::Fence,
     execution::{CompletionRecord, GraphKind},
-    scheduler::{RequestScheduler, RequestSpec, SchedulerLimits},
+    scheduler::{RequestHandle, RequestScheduler, RequestSpec, SchedulerLimits},
 };
 
 #[test]
@@ -46,6 +46,7 @@ pub(super) fn config() -> ModelConfig {
         eos_token_ids: vec![248046, 248044],
         sampling_ranges: Default::default(),
         sampling_defaults: SamplingParameters::default(),
+        steering_sidecar_sha256: None,
         max_new_tokens: 256,
         speculative_widths: Vec::new(),
         speculative_fixed_width: None,
@@ -54,6 +55,45 @@ pub(super) fn config() -> ModelConfig {
         history_drafts: true,
         speculative_proposal_source: Default::default(),
     }
+}
+#[test]
+fn steering_capability_selects_legacy_or_extended_parameter_rows() {
+    let stock = config();
+    let stock_manifest = manifest(&stock);
+    let width = |manifest: &crate::execution::ExecutionManifest| {
+        manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "admission_parameters")
+            .unwrap()
+            .shape[1]
+    };
+    assert_eq!(width(&stock_manifest), 6);
+    Inputs::new(&stock, &stock_manifest).unwrap();
+
+    let mut steered = stock;
+    steered.steering_sidecar_sha256 = Some([9; 32]);
+    let steered_manifest = manifest(&steered);
+    assert_eq!(width(&steered_manifest), 7);
+    Inputs::new(&steered, &steered_manifest).unwrap();
+
+    let handle = RequestHandle { slot: 0, generation: 1 };
+    let admission = Admission {
+        handle,
+        sampling: SamplingParameters { steering_scale: 1., ..Default::default() },
+        max_new_tokens: 1,
+        prompt: vec![7],
+        data: PromptData {
+            positions: vec![[0; 3]],
+            vision_token_indices: vec![-1],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    };
+    assert!(admission.validate(&config()).is_err());
+    admission.validate(&steered).unwrap();
 }
 
 #[test]
@@ -78,6 +118,8 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -226,6 +268,8 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -538,6 +582,8 @@ fn packing_follows_value_bindings_after_buffers_and_model_are_renamed() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -675,6 +721,8 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: false,
+                    tools: false,
+                    reasoning_prompt: false,
                 })
                 .unwrap()
         })
@@ -912,6 +960,8 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: false,
+                    tools: false,
+                    reasoning_prompt: false,
                 })
                 .unwrap();
             admissions[h.slot as usize] = Some(Admission {
@@ -1103,16 +1153,10 @@ fn state_transfer_and_resume_upload_fixture() {
         scheduler_capabilities(&config),
     )
     .unwrap();
-    let mut manifest = manifest(&config);
-    // Keep transfer copies within the default checkpoint work allowance.
-    for graph in &mut manifest.graphs {
-        if graph.kind == GraphKind::Snapshot {
-            graph.estimated_duration_ns = 1;
-        }
-    }
-    scheduler.prefill_graphs(&[config.limits.prefill_chunk_size]).unwrap();
-    scheduler.measured_graph_durations(&manifest.graphs).unwrap();
-    let mut inputs = Inputs::new(&config, &manifest).unwrap();
+    scheduler
+        .measured_graph_durations(&self::manifest(&config).graphs)
+        .unwrap();
+    let mut inputs = Inputs::new(&config, &manifest(&config)).unwrap();
     for cycle in 0..2 {
         let prompt = vec![7; 64];
         let handle = scheduler
@@ -1125,6 +1169,8 @@ fn state_transfer_and_resume_upload_fixture() {
                 host_stops: false,
                 prompt_logprobs: false,
                 growable_output: false,
+                tools: false,
+                reasoning_prompt: false,
             })
             .unwrap();
         let mut admissions: [_; 4] = std::array::from_fn(|_| None);
@@ -1159,11 +1205,7 @@ fn state_transfer_and_resume_upload_fixture() {
             ]
         } {
             let fence = Fence(cycle * 5 + offset);
-            let step = scheduler.plan().unwrap_or_else(|| {
-                let request = scheduler.request(handle).unwrap();
-                panic!("missing {kind:?} in cycle {cycle}: phase {:?}, accounting {:?}",
-                    request.phase, request.checkpoint_accounting());
-            });
+            let step = scheduler.plan().unwrap();
             assert_eq!(step.kind, kind);
             scheduler.commit(&step, fence).unwrap();
             crate::model::pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions)
@@ -1208,9 +1250,9 @@ fn state_transfer_and_resume_upload_fixture() {
                 status,
                 ..Default::default()
             };
-            let mut timing = crate::execution::ExecutionTiming::default();
-            timing.gpu_ns[0] = Some(step.estimated_duration_ns());
-            scheduler.complete(fence, &records, timing).unwrap();
+            scheduler
+                .complete(fence, &records, Default::default())
+                .unwrap();
         }
         scheduler.finish(handle).unwrap();
     }
@@ -1344,6 +1386,8 @@ fn grammar_packing_fixture() -> (
                 host_stops: false,
                 prompt_logprobs: false,
                 growable_output: false,
+                tools: false,
+                reasoning_prompt: false,
             })
             .unwrap();
         admissions.push(Some(Admission {
@@ -1577,6 +1621,8 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
             host_stops: false,
             prompt_logprobs: false,
             growable_output: true,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     scheduler
@@ -1685,7 +1731,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
             }
             scheduler.measured_graph_durations(&manifest.graphs).unwrap();
             let handle = scheduler.admit(RequestSpec { message_boundaries: vec![], prompt: vec![7; 64], conditioning: vec![],
-                max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false }).unwrap();
+                max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false, tools: false, reasoning_prompt: false }).unwrap();
             let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
             admissions[handle.slot as usize] = Some(Admission { handle, sampling: SamplingParameters::default(),
                 max_new_tokens: 64, prompt: vec![7; 64], data: PromptData {
@@ -1749,4 +1795,40 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
             }
         }
     }
+}
+
+#[test]
+fn partial_last_pages_cover_a_context_the_page_size_does_not_divide() {
+    // Three-rank context-parallel GLM pages hold 768 positions (256 local records per rank), which do not
+    // divide a 2^20 context; the page tables round up and a full-context request ends on a partial page.
+    let mut config = config();
+    config.contract.cache.page_tokens = 768;
+    config.prepared_sequence_tokens = 8192;
+    config.limits.max_sequence_tokens = 8192;
+    config.limits.pages = 64;
+    config.limits.max_active = 1;
+    let numbered = |mut manifest: crate::execution::ExecutionManifest| {
+        manifest.graphs.retain(|graph| graph.batch_capacity == 1 && graph.kind != GraphKind::Speculative);
+        for (index, graph) in manifest.graphs.iter_mut().enumerate() {
+            graph.handle = index + 1;
+        }
+        manifest
+    };
+    let full = numbered(manifest(&config));
+    let names: std::collections::HashSet<_> = full.graphs.iter().map(|graph| graph.name.clone()).collect();
+    config.contract.graphs.retain(|graph| names.contains(&graph.graph));
+    catalog::validate(&config, &full).unwrap();
+    Inputs::new(&config, &full).unwrap();
+    config.fit_context();
+    assert_eq!(config.limits.max_sequence_tokens, 8192);
+    // A floored page table (10 columns, 7680 positions) cannot hold the prepared context's last 512 positions.
+    let mut floored = config.clone();
+    floored.prepared_sequence_tokens = 7680;
+    let error = Inputs::new(&config, &numbered(manifest(&floored))).err().unwrap().to_string();
+    assert!(error.contains("page-table view cannot cover"), "{error}");
+    // Fewer pages than the context still cap requests at whole pages.
+    config.limits.pages = 8;
+    config.fit_context();
+    assert_eq!(config.limits.max_sequence_tokens, 8 * 768);
+    catalog::validate(&config, &full).unwrap();
 }

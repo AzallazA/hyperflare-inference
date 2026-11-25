@@ -35,7 +35,7 @@ from ignition import runtime_patches
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
                           _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
-from .host_memory import release_unused
+from .host_memory import COMPILE_HEADROOM_BYTES, release_unused
 
 _GUARD_LOCK = RLock()
 _GUARD_TENSOR_MODE = ContextVar("flare_guard_tensor_mode", default=None)
@@ -681,7 +681,8 @@ class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
     def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
-                 lock_gpu_clocks=False):
+                 lock_gpu_clocks=False, compile_headroom_bytes=COMPILE_HEADROOM_BYTES, forward_worker_bytes=None,
+                 forward_worker_device_bytes=None):
         runtime_patches.apply()
         import flashinfer
         from torch._inductor.codecache import torch_key
@@ -689,7 +690,12 @@ class ForwardCache:
         self.device = torch.device(device)
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
+        # Host admission estimate per forward compiler (None: host_memory.FORWARD_WORKER_BYTES); not in the cache key.
+        self.forward_worker_bytes = forward_worker_bytes
+        # Device admission estimate per forward compiler on a discrete GPU (None: compile_pool's 1 GiB); not keyed.
+        self.forward_worker_device_bytes = forward_worker_device_bytes
         self.lock_gpu_clocks = lock_gpu_clocks
+        self.compile_headroom_bytes = compile_headroom_bytes
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
@@ -827,7 +833,10 @@ class ForwardCache:
                                         source_identity=self.root.name)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
-                headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
+                headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers,
+                compile_headroom_bytes=self.compile_headroom_bytes,
+                forward_worker_bytes=getattr(self, "forward_worker_bytes", None),
+                forward_worker_device_bytes=getattr(self, "forward_worker_device_bytes", None)) as compiler:
             def finish():
                 name, bound, path = _completed(pending)
                 try:
@@ -896,7 +905,7 @@ class ForwardCache:
         """
         import torch.distributed as dist
         from ignition.progress import phase
-        from .compile_pool import CompilePool, allocate_workers, compiler_resources
+        from .compile_pool import CompilePool, admission_report, allocate_workers, compiler_resources
         from .inductor_tuning import InductorSelections
 
         group, ranks = coordinator.group, coordinator.ranks
@@ -939,7 +948,10 @@ class ForwardCache:
             dist.barrier(group=group)
             try:
                 resources = compiler_resources(self.device, headroom_bytes=self.headroom_bytes,
-                    options=self.options, compile_workers=self.compile_workers)
+                    options=self.options, compile_workers=self.compile_workers,
+                    compile_headroom_bytes=self.compile_headroom_bytes,
+                    forward_worker_bytes=getattr(self, "forward_worker_bytes", None),
+                    forward_worker_device_bytes=getattr(self, "forward_worker_device_bytes", None))
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
@@ -951,6 +963,9 @@ class ForwardCache:
                 counts = [count for count, _, _ in demand]
                 workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
                 stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
+                if progress is not None:
+                    # TP3 fork (export_speed.py): the admission sample behind the count, one line in the log.
+                    progress(admission_report([resources for _, resources, _ in demand], counts, workers))
                 assigned = [[] for _ in ranks]
                 for host in dict.fromkeys(coordinator.hosts):
                     members = [index for index, name in enumerate(coordinator.hosts) if name == host]

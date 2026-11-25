@@ -7,7 +7,10 @@
 //! Coordinated CUDA ranks sharing one process address space.
 
 use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
-use crate::{Error, ExecutionError, Result, Shutdown, cache::Fence};
+use crate::{
+    Error, ExecutionError, Result, Shutdown,
+    cache::{Fence, PageId},
+};
 use std::{
     collections::VecDeque,
     sync::{Arc, mpsc},
@@ -50,6 +53,7 @@ struct Step {
     graph: usize,
     grammar: bool,
     uploads: Vec<OwnedUpload>,
+    cleared_pages: Vec<PageId>,
 }
 impl Step {
     fn uploads(&self) -> Vec<Upload<'_>> {
@@ -173,6 +177,7 @@ impl ThreadedExecutor {
             let thread = thread::Builder::new()
                 .name(format!("flare-rank-{}", index + 1))
                 .spawn(move || {
+                    crate::os::pin_current_thread(1 + index);
                     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
                         Ok(executor) => executor,
                         Err(error) => {
@@ -309,6 +314,7 @@ impl ThreadedExecutor {
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
+            && (!super::single_submission() || self.pending.is_empty())
             && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
@@ -328,13 +334,14 @@ impl ThreadedExecutor {
         &mut self,
         graph: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar: bool,
     ) -> Result<Option<Fence>> {
         self.next_fence()?;
         let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
             Some(super::GraphKind::Decode | super::GraphKind::Speculative));
         if !self.can_submit(barrier) { return Ok(None); }
-        let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
+        let Some(fence) = self.local.validate_submission(graph, uploads, cleared_pages, grammar)? else {
             return Ok(None);
         };
         let step = Arc::new(Step {
@@ -342,6 +349,7 @@ impl ThreadedExecutor {
             uploads: uploads.iter().map(|u| OwnedUpload {
                 buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
             }).collect(),
+            cleared_pages: cleared_pages.to_vec(),
         });
         let queued = !self.pending.is_empty();
         self.pending.push_back(Pending {
@@ -399,12 +407,12 @@ impl ThreadedExecutor {
             if frame.committed { continue; }
             if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.step.uploads();
-            if self.local.validate_submission(frame.step.graph, &uploads, frame.step.grammar)?
+            if self.local.validate_submission(frame.step.graph, &uploads, &frame.step.cleared_pages, frame.step.grammar)?
                 != Some(frame.step.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
             protocol::dispatch_commit(&self.peers, frame.step.fence, frame.step.graph)?;
-            if self.local.submit(frame.step.graph, &uploads, frame.step.grammar)? != Some(frame.step.fence) {
+            if self.local.submit(frame.step.graph, &uploads, &frame.step.cleared_pages, frame.step.grammar)? != Some(frame.step.fence) {
                 return Err(invalid("rank-zero fence changed after validation"));
             }
             frame.committed = true;
@@ -514,7 +522,9 @@ fn rank_loop(
     let mut prepared: Option<Arc<Step>> = None;
     let mut prepared_at: Option<Instant> = None;
     let mut started = VecDeque::new();
+    let mut idle_polls = 0u32;
     loop {
+        let mut active = false;
         let command = if executor.outstanding() == 0 && prepared.is_none() {
             match receive(&commands, None) { Ok(command) => Some(command), Err(_) => return Ok(()) }
         } else {
@@ -524,6 +534,9 @@ fn rank_loop(
                 Err(_) => return Err(invalid("rank coordinator disconnected during execution")),
             }
         };
+        if command.is_some() {
+            active = true;
+        }
         match command {
             Some(Command::Tune(index)) => {
                 let status = executor.run_tuning_graph(index);
@@ -538,7 +551,7 @@ fn rank_loop(
             }
             Some(Command::Prepare(step)) => {
                 if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                if executor.validate_submission(step.graph, &step.uploads(), step.grammar)? != Some(step.fence) {
+                if executor.validate_submission(step.graph, &step.uploads(), &step.cleared_pages, step.grammar)? != Some(step.fence) {
                     return Err(invalid("rank submission fence differs"));
                 }
                 send(Reply::Ready(step.fence, step.graph))?;
@@ -549,7 +562,7 @@ fn rank_loop(
                 prepared_at = None;
                 let step = prepared.take().ok_or_else(|| invalid("rank commit arrived without preparation"))?;
                 if step.fence != fence || step.graph != graph { return Err(invalid("rank commit identity differs")); }
-                if executor.submit(graph, &step.uploads(), step.grammar)? != Some(fence) {
+                if executor.submit(graph, &step.uploads(), &step.cleared_pages, step.grammar)? != Some(fence) {
                     return Err(invalid("rank fence changed after validation"));
                 }
                 started.push_back(Instant::now());
@@ -565,6 +578,7 @@ fn rank_loop(
             None => {}
         }
         if let Some(completion) = executor.poll()? {
+            active = true;
             started.pop_front();
             send(Reply::Complete(completion))?;
         }
@@ -574,7 +588,21 @@ fn rank_loop(
         if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
             return Err(invalid("rank graph completion deadline expired"));
         }
-        if executor.outstanding() != 0 || prepared.is_some() { thread::yield_now(); }
+        if executor.outstanding() != 0 || prepared.is_some() {
+            if active {
+                idle_polls = 0;
+            } else {
+                idle_polls += 1;
+                if idle_polls >= 64 {
+                    idle_polls = 0;
+                    thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        } else {
+            idle_polls = 0;
+        }
     }
 }
 
@@ -757,6 +785,7 @@ mod tests {
                                 hashes: "hashes".into(),
                                 event: "ready".into(),
                                 request: Some("requests".into()),
+                                hash: None,
                             }],
                         },
                         if partitioned { 1 } else { 4 },
@@ -858,7 +887,7 @@ mod tests {
                             nbytes: (100 + rank) * row_bytes, row_bytes,
                         }),
                         heads: 24, weights: "weights".into(), scales: "scales".into(),
-                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
+                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()), hash: None,
                     }] }, if partitioned { 1 } else { 4 })
                 }).collect();
                 let ranks: Vec<_> = (0..4).map(|rank| {

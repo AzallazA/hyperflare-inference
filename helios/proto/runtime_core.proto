@@ -200,6 +200,8 @@ message ServingContract {
   // checkpoint; absent when the recipe declares none. Multiplied by steps per second it is the
   // memory bandwidth the model consumes, which integrated GPUs do not measure.
   optional uint64 decode_weight_bytes = 25;
+  // Lowercase SHA-256 of activation constants embedded in steering-enabled graphs.
+  optional string steering_sidecar_sha256 = 26;
 }
 message ModelContract {
   uint32 version = 1;
@@ -458,6 +460,7 @@ message DefaultSamplingParameters {
   optional float frequency_penalty = 8;
   // Absent parameter ranges fix those parameters at their declared defaults.
   SamplingRanges ranges = 9;
+  optional float steering_scale = 10;
 }
 message SamplingFloatRange {
   optional float min = 1;
@@ -475,6 +478,7 @@ message SamplingRanges {
   SamplingFloatRange repetition_penalty = 5;
   SamplingFloatRange presence_penalty = 6;
   SamplingFloatRange frequency_penalty = 7;
+  SamplingFloatRange steering_scale = 8;
 }
 message FrontendSettings {
   TokenizerSettings tokenizer = 1;
@@ -556,7 +560,7 @@ message Engram {
   repeated EngramTable tables = 4;
 }
 message EngramTable {
-  enum Encoding { UNSPECIFIED = 0; FP8_E4M3_E8M0 = 1; NVFP4_E4M3_GLOBAL = 2; }
+  enum Encoding { UNSPECIFIED = 0; FP8_E4M3_E8M0 = 1; NVFP4_E4M3_GLOBAL = 2; MXFP4_E2M1_E8M0 = 3; INT4_FP16_BLOCK32 = 16; }
   uint32 layer = 1;
   uint64 rows = 2;
   uint32 embedding_width = 3;

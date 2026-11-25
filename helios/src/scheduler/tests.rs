@@ -217,6 +217,8 @@ pub(super) fn spec(tokens: usize, max_new: u32) -> RequestSpec {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
+        reasoning_prompt: false,
     }
 }
 fn records(
@@ -2564,6 +2566,8 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     assert_eq!(s.request(handle).unwrap().state_slot, StateSlotId(1));
@@ -3947,9 +3951,9 @@ fn core_capacity_bounds_catalog_and_request_profiles() {
         let handle = scheduler.admit(spec(1, 32)).unwrap();
         let request = scheduler.request(handle).unwrap();
         assert_eq!(request.acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
-        let powered = scheduler.powered_curve(request, false);
+        let powered = scheduler.powered_curve(request, 1, false);
         assert_eq!(powered.len(), capacity - 1);
-        assert_eq!(scheduler.expected_speculative_tokens(request, capacity),
+        assert_eq!(scheduler.expected_speculative_tokens(request, 1, capacity),
             1.0 + powered.iter().sum::<f64>());
     }
 }

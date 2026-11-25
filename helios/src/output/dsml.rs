@@ -29,6 +29,8 @@ pub(crate) const CONTROL_MARKERS: [&str; 2] = [
 #[derive(Default)]
 struct Call {
     name: String,
+    /// The name is complete and arguments may follow.
+    named: bool,
     arguments: String,
     strict: bool,
     /// Where the current `string="false"` value starts in `arguments`.
@@ -132,6 +134,7 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                     if call.name.is_empty() {
                         return Err("tool function name is empty".into());
                     }
+                    call.named = true;
                 }
                 OutputAction::LabelToolCallArguments(label) if !repeated => {
                     let call = self
@@ -176,8 +179,12 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                     call.close_literal();
                     call.arguments.push_str(closing_text);
                     call.check_size()?;
-                    validate_arguments(&call.arguments)?;
                     let index = self.calls;
+                    let end = if validate_arguments(&call.arguments).is_ok() {
+                        Event::ToolEnd { index }
+                    } else {
+                        Event::ToolEndRaw { index }
+                    };
                     events.extend([
                         Event::ToolBegin {
                             index,
@@ -188,7 +195,7 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                             index,
                             text: call.arguments,
                         },
-                        Event::ToolEnd { index },
+                        end,
                     ]);
                     self.calls += 1;
                 }
@@ -376,8 +383,26 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
         if !self.verbatim {
             self.apply(machine.finish(), &mut events)?;
         }
-        if self.call.take().is_some() && cause == Termination::Eos {
-            return Err("incomplete DeepSeek tool call at end of response".into());
+        if let Some(call) = self.call.take().filter(|_| cause == Termination::Eos) {
+            // The reference returns a call that the model left open, such as one whose parameter
+            // lacks its string attribute, with the arguments written so far.
+            if !call.named {
+                return Err("incomplete DeepSeek tool call at end of response".into());
+            }
+            let index = self.calls;
+            events.extend([
+                Event::ToolBegin {
+                    index,
+                    name: call.name,
+                    id: None,
+                },
+                Event::ToolArguments {
+                    index,
+                    text: call.arguments,
+                },
+                Event::ToolEndRaw { index },
+            ]);
+            self.calls += 1;
         }
         Ok(events)
     }

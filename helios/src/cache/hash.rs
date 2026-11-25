@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use blake2::digest::consts::U16;
+use blake2::digest::consts::{U16, U32};
 use blake2::{Blake2b, Digest};
 
 use crate::Result;
@@ -15,6 +15,22 @@ pub use flare_selene::{HASH_BLOCK_TOKENS, PrefixKey};
 pub struct ConditioningEvent {
     pub position: u64,
     pub identity: [u8; 32],
+}
+pub fn steering_conditioning_event(
+    sidecar_sha256: [u8; 32],
+    scale: f32,
+) -> Option<ConditioningEvent> {
+    if scale == 0. {
+        return None;
+    }
+    let mut hash = Blake2b::<U32>::new();
+    hash.update(b"flare-steering-v1\0");
+    hash.update(sidecar_sha256);
+    hash.update(scale.to_bits().to_le_bytes());
+    Some(ConditioningEvent {
+        position: 0,
+        identity: hash.finalize().into(),
+    })
 }
 
 /// Incremental token and conditioning identity for a single model/recipe.

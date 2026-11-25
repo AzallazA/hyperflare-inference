@@ -13,6 +13,12 @@ const MS: u64 = 1_000_000;
 #[path = "planning_tests.rs"]
 mod planning_tests;
 
+#[path = "ttft_order_tests.rs"]
+mod ttft_order_tests;
+
+#[path = "prefill_merge_tests.rs"]
+mod prefill_merge_tests;
+
 #[test]
 fn padding_pruning_keeps_three_requests_on_batch_four_and_two_requests_on_batch_two() {
     let mut s = engine(8, false);
@@ -145,6 +151,8 @@ fn add(s: &mut RequestScheduler, id: u32, prompt: usize, output: u32) -> Request
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
+        reasoning_prompt: false,
     })
     .unwrap()
 }
@@ -756,7 +764,7 @@ fn neglected_stale_shapes_require_funding_while_the_winner_stays_fresh() {
     let mut s = cold_engine(1, true);
     s.configure_policy(PolicyConfig {
         estimate_ttl_ns: 20 * MS,
-        ..s.policy
+        ..s.policy.clone()
     })
     .unwrap();
     let h = add(&mut s, 1, 1, 1024);
@@ -1221,6 +1229,8 @@ fn long_conversations_use_work_budget_and_cross_unselected_messages() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         }).unwrap());
     }
     let mut full_chunks = 0;
@@ -1446,7 +1456,7 @@ fn decode_waiting_selects_a_smaller_prefill_at_the_efficiency_knee() {
         token_fairness: 0.0,
         delivery_fairness: 0.0,
         decode_age_price: 0.04,
-        ..s.policy
+        ..s.policy.clone()
     })
     .unwrap();
     set_cost(&mut s, GraphKind::Prefill, 1, 512, 8 * MS);
@@ -1726,6 +1736,8 @@ fn prerequisite_cohort_accounts_for_ready_batch_mates() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     for handle in [decode, prefill] {
@@ -1916,7 +1928,7 @@ fn mixed_prefill_capacity_matches_quoted_work_without_snapshot_storage() {
                 assert_eq!(plan.selection_value_rate(), before.selection_value_rate());
                 continue;
             }
-            let output = s.expected_speculative_tokens(s.request(decoder).unwrap(), plan.lanes[0].tokens);
+            let output = s.expected_speculative_tokens(s.request(decoder).unwrap(), plan.batch_capacity, plan.lanes[0].tokens);
             let expected = (plan.lanes[1].tokens as f64 + 64.0 * output
                 + if prompt_tokens <= 512 { 64.0 } else { 0.0 })
                 / (plan.estimated_duration_ns() as f64 / 1e6);
@@ -2357,6 +2369,8 @@ fn mixed_cancellation_keeps_other_rows_live_and_retires_pages_only_after_complet
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .is_err()
     );
@@ -3058,7 +3072,7 @@ fn terminal_snapshot_publishes_exact_partial_page_for_shared_cache_geometries() 
         s.commit(&plan, fence).unwrap();
         let spec = RequestSpec { prompt: vec![1; page_tokens + 1], message_boundaries: vec![],
             conditioning: vec![], max_new_tokens: 1, grammar_constrained: false,
-            host_stops: false, prompt_logprobs: false, growable_output: false };
+            host_stops: false, prompt_logprobs: false, growable_output: false, tools: false, reasoning_prompt: false };
         assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), 0);
         assert_eq!(s.stats().snapshot_publications, publications);
         complete_timed(&mut s, &plan, fence, 0, true, gpu_time(MS / 10));
@@ -3154,6 +3168,8 @@ fn feedback_prefill_tails_progress_before_existing_generations_finish() {
                         host_stops: false,
                         prompt_logprobs: false,
                         growable_output: true,
+                        tools: false,
+                        reasoning_prompt: false,
                     })
                     .unwrap()
                 })
@@ -3944,7 +3960,7 @@ fn fixed_host_cohort_competes_by_full_prefix_utility_within_the_row_budget() {
     for (handle, value) in handles.iter().zip([11.0, 6.0, 5.0, 1.0]) {
         let request = scheduler.request(*handle).unwrap();
         let length = (request.max_new_tokens - request.generated_tokens) as usize;
-        values[handle.slot as usize].output_token = value / scheduler.expected_speculative_tokens(request, length);
+        values[handle.slot as usize].output_token = value / scheduler.expected_speculative_tokens(request, 4, length);
     }
     let mut candidates = Vec::new();
     scheduler.packed_round_candidates(&mut candidates, &values, 0.0, false);
@@ -4007,7 +4023,7 @@ fn fixed_host_cohort_enforces_lane_capacity_when_three_short_tails_would_be_more
     for (handle, value) in handles.iter().zip([6.0, 5.0, 4.0, 4.0]) {
         let request = scheduler.request(*handle).unwrap();
         let length = (request.max_new_tokens - request.generated_tokens) as usize;
-        values[handle.slot as usize].output_token = value / scheduler.expected_speculative_tokens(request, length);
+        values[handle.slot as usize].output_token = value / scheduler.expected_speculative_tokens(request, 2, length);
     }
     let mut candidates = Vec::new();
     scheduler.packed_round_candidates(&mut candidates, &values, 0.0, false);
@@ -4070,7 +4086,7 @@ fn cached_host_prefix_ranks_match_greedy_allocation_for_every_small_cohort_order
                 let mut values = [utility::LaneValue::default(); REQUEST_LANES];
                 for (&slot, weight) in available.iter().zip(weights) { values[slot].output_token = weight; }
                 for optimistic in [false, true] {
-                    let ranking = scheduler.host_prefix_ranking(&available, 7, 8, &values, optimistic);
+                    let ranking = scheduler.host_prefix_ranking(&available, 4, 7, 8, &values, optimistic);
                     for a in 0..4 { for b in 0..4 { for c in 0..4 { for d in 0..4 {
                         let order = [a, b, c, d];
                         if order.iter().fold(0, |mask, index| mask | 1 << index) != 15 { continue; }
@@ -4412,6 +4428,8 @@ fn terminal_prefill_runs_at_checkpoint_boundary_cut() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let init = s.plan().unwrap();
@@ -4455,4 +4473,382 @@ fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration()
     s.terminal_prefill_graphs(&[256, 512]).unwrap();
     let _ = add(&mut s, 1, 64, 1);
     assert!(s.terminal_prefill_graphs(&[512]).is_err());
+}
+
+fn ttft_policy(target_ms: f64, max_chunk: usize, interleave: u32) -> PolicyConfig {
+    PolicyConfig { ttft_target_ms: target_ms, ttft_max_chunk: max_chunk, ttft_decode_interleave: interleave,
+        ..PolicyConfig::default() }
+}
+
+/// DS41 TP3-like costs: prefill 2048 ≈ 194 ms and 4096 ≈ 368 ms, speculative k5 rounds 13-17 ms.
+fn ds41_engine(active: usize) -> RequestScheduler {
+    tp3_engine(active, |kind, batch, tokens| match kind {
+        GraphKind::Prefill => 20 * MS + tokens * 85_000,
+        GraphKind::Decode => 12 * MS + (batch - 1) * MS / 4,
+        GraphKind::Speculative => 12_500_000 + (tokens - 1) * 300_000 + (batch - 1) * 300_000,
+        _ => MS,
+    })
+}
+
+/// GLM-5.3-Flash TP3 DCP3-like costs (package 092348, 4096-token prefill chunks): 32K prefill
+/// ~11.1K tok/s (2.9 s), so 2048 ≈ 200 ms and 4096 ≈ 380 ms; k5 rounds at 32K 108/75/43 per s
+/// at c1/c4/c8 (9.3/13.3/23 ms), 2.36 tokens per round.
+fn glm_engine(active: usize) -> RequestScheduler {
+    tp3_engine(active, |kind, batch, tokens| match kind {
+        GraphKind::Prefill => 20 * MS + tokens * 88_000,
+        GraphKind::Decode => 8 * MS + (batch - 1) * MS / 2,
+        GraphKind::Speculative => (tokens - 1) * 250_000 + if batch <= 4 {
+            8_050_000 + (batch - 1) * 1_330_000
+        } else {
+            12_050_000 + (batch - 4) * 2_430_000
+        },
+        _ => MS,
+    })
+}
+
+fn tp3_engine(active: usize, cost: fn(GraphKind, u64, u64) -> u64) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [41; 32],
+        SchedulerLimits {
+            max_active: active,
+            request_slots: active.next_power_of_two(),
+            max_sequence_tokens: 65536,
+            prefill_chunk_size: 4096,
+            pages: 32768,
+            snapshots: 256,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.prefill_graphs(&prefill_capacities(4096).collect::<Vec<_>>()).unwrap();
+    s.enable_speculation(&[1, 6]).unwrap();
+    let mut graphs = super::tests::duration_graphs(active);
+    for g in &mut graphs {
+        g.estimated_duration_ns = cost(g.kind, g.batch_capacity as u64, g.token_capacity as u64);
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s
+}
+
+/// `step` whose speculative records offer no more drafts than a short lane's tokens allow.
+fn ds41_step(s: &mut RequestScheduler, accepted: usize) -> ScheduledPlan {
+    let plan = s.plan().expect("runnable trace must make progress");
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    s.advance_to(s.now_ns + plan.estimated_duration_ns()).unwrap();
+    let mut records = completion_records(s, &plan, fence, accepted);
+    for lane in &plan.lanes {
+        if let Some(vector) = records[lane.request.slot as usize].vector.as_mut() {
+            vector.offered_drafts = vector.offered_drafts.min(lane.tokens as i64 - 1);
+        }
+    }
+    for token in s.complete(fence, &records, gpu_time(plan.estimated_duration_ns())).unwrap() {
+        s.published_output(token.request, fence).unwrap();
+    }
+    let finished: Vec<_> = s.slots.iter().filter_map(|slot| slot.request.as_ref())
+        .filter(|r| r.phase == RequestPhase::Finishing && r.pending == 0).map(|r| r.handle).collect();
+    for h in finished {
+        s.finish(h).unwrap();
+    }
+    plan
+}
+
+fn ds41_decoders(s: &mut RequestScheduler, count: usize) -> Vec<RequestHandle> {
+    tp3_decoders(s, count, 3)
+}
+
+fn tp3_decoders(s: &mut RequestScheduler, count: usize, accepted: usize) -> Vec<RequestHandle> {
+    let handles: Vec<_> = (0..count).map(|i| add(s, i as u32 + 1, 64, 60_000)).collect();
+    ready(s, &handles);
+    for _ in 0..64 {
+        ds41_step(s, accepted);
+    }
+    handles
+}
+
+fn first_token(s: &RequestScheduler, h: RequestHandle) -> bool {
+    s.request(h).map_or(true, |r| r.generated_tokens > 0)
+}
+
+#[derive(Debug, Default)]
+struct ProbeLoad {
+    ttft_ms: Vec<f64>,
+    decoder_gap_ms: f64,
+    decoder_tokens_per_s: f64,
+}
+
+impl ProbeLoad {
+    fn percentile(&self, p: f64) -> f64 {
+        let mut sorted = self.ttft_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        sorted[((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1]
+    }
+}
+
+/// 1.9K-token prompts (16 output tokens) arriving every 3 ± 1 s next to `decoders` streams
+/// accepting 3 drafts per round; one request at a time, as `ttft_under_load.py probe` does.
+fn simulate_probe_load(policy: PolicyConfig, decoders: usize, seconds: u64) -> ProbeLoad {
+    simulate_probe_load_on(ds41_engine, 3, policy, decoders, seconds)
+}
+
+/// `simulate_probe_load` on another engine whose decoders accept `accepted` drafts per round.
+fn simulate_probe_load_on(engine: fn(usize) -> RequestScheduler, accepted: usize, policy: PolicyConfig,
+    decoders: usize, seconds: u64) -> ProbeLoad {
+    let mut s = engine(decoders + 1);
+    s.configure_policy(policy).unwrap();
+    let streams = tp3_decoders(&mut s, decoders, accepted);
+    let start = s.now_ns;
+    let tokens = |s: &RequestScheduler| streams.iter().map(|h| u64::from(s.request(*h).unwrap().generated_tokens)).sum::<u64>();
+    let initial = tokens(&s);
+    let mut load = ProbeLoad::default();
+    let mut arrival = start + 1000 * MS;
+    let mut probe: Option<(RequestHandle, bool)> = None;
+    let mut last = vec![start; decoders];
+    while s.now_ns < start + seconds * 1000 * MS {
+        if probe.is_none() && s.now_ns >= arrival {
+            let id = 1000 + load.ttft_ms.len() as u32;
+            let h = add(&mut s, id, 1900, 16);
+            s.set_arrival(h, arrival).unwrap();
+            probe = Some((h, false));
+        }
+        ds41_step(&mut s, accepted);
+        for (i, h) in streams.iter().enumerate() {
+            let output = s.request(*h).unwrap().accounting.last_output_ns.unwrap();
+            load.decoder_gap_ms = load.decoder_gap_ms.max((output.max(last[i]) - last[i]) as f64 / 1e6);
+            last[i] = output.max(last[i]);
+        }
+        if let Some((h, seen)) = probe.as_mut() {
+            if !*seen && first_token(&s, *h) {
+                *seen = true;
+                load.ttft_ms.push((s.now_ns - arrival) as f64 / 1e6);
+                arrival += (2000 + (load.ttft_ms.len() as u64 * 7919) % 2000) * MS;
+            }
+            if s.request(*h).is_err() {
+                probe = None;
+            }
+        }
+    }
+    load.decoder_tokens_per_s = (tokens(&s) - initial) as f64 / ((s.now_ns - start) as f64 / 1e9);
+    load
+}
+
+#[test]
+fn ttft_guard_off_reproduces_default_selection() {
+    let trace = |policy: PolicyConfig| {
+        let mut s = ds41_engine(6);
+        s.configure_policy(policy).unwrap();
+        ds41_decoders(&mut s, 4);
+        let long = add(&mut s, 50, 9000, 64);
+        let short = add(&mut s, 51, 1900, 16);
+        let mut plans = Vec::new();
+        while !(first_token(&s, long) && first_token(&s, short)) && plans.len() < 2000 {
+            let plan = ds41_step(&mut s, 3);
+            plans.push((plan.step.clone(), plan.estimated_duration_ns()));
+        }
+        plans
+    };
+    let defaults = trace(PolicyConfig::default());
+    assert!(defaults.iter().any(|(step, _)| step.kind == GraphKind::Prefill));
+    assert_eq!(defaults, trace(ttft_policy(0.0, 1024, 3)));
+    let mut s = ds41_engine(2);
+    s.configure_policy(ttft_policy(0.0, 0, 0)).unwrap();
+    let h = add(&mut s, 1, 1900, 16);
+    s.advance_to(10_000 * MS).unwrap();
+    assert!(s.ttft_overdue().is_none());
+    assert!(s.request(h).is_ok());
+}
+
+#[test]
+fn overdue_prompt_preempts_four_and_eight_speculative_decoders_within_target() {
+    for decoders in [4, 8] {
+        let mut s = ds41_engine(decoders + 1);
+        s.configure_policy(ttft_policy(50.0, 0, 1)).unwrap();
+        ds41_decoders(&mut s, decoders);
+        let arrival = s.now_ns;
+        let probe = add(&mut s, 100, 1900, 16);
+        let mut prefill = None;
+        while !first_token(&s, probe) {
+            let waited = s.now_ns - arrival;
+            let plan = ds41_step(&mut s, 3);
+            if waited >= 50 * MS {
+                assert!(plan.lanes.iter().any(|lane| lane.request == probe), "decoders={decoders} {plan:?}");
+            }
+            if plan.kind == GraphKind::Prefill {
+                prefill = Some((plan.token_capacity, plan.lanes[0].tokens));
+            }
+        }
+        assert_eq!(prefill, Some((2048, 1900)), "one chunk finishes the prompt");
+        let ttft = s.now_ns - arrival;
+        assert!(ttft < 50 * MS + 20 * MS + 200 * MS, "decoders={decoders} ttft={} ms", ttft / MS);
+    }
+}
+
+#[test]
+fn ttft_interleave_bounds_decoder_gaps_for_a_32k_prompt() {
+    for interleave in [0, 1, 2] {
+        let mut s = ds41_engine(5);
+        s.configure_policy(ttft_policy(50.0, 0, interleave)).unwrap();
+        let decoders = ds41_decoders(&mut s, 4);
+        let arrival = s.now_ns;
+        let prompt = add(&mut s, 100, 32768, 16);
+        let mut last = s.now_ns;
+        let mut gap = 0;
+        let mut between = Vec::new();
+        let mut rounds = 0;
+        while !first_token(&s, prompt) {
+            let plan = ds41_step(&mut s, 3);
+            if plan.lanes.iter().any(|lane| lane.request == prompt) && plan.kind.is_prefill() {
+                assert_eq!(plan.token_capacity, 4096);
+                between.push(rounds);
+                rounds = 0;
+            } else if plan.lanes.iter().any(|lane| decoders.contains(&lane.request)) {
+                gap = gap.max(s.now_ns - plan.estimated_duration_ns() - last);
+                last = s.now_ns;
+                rounds += 1;
+            }
+        }
+        gap = gap.max(s.now_ns - last);
+        assert_eq!(between.len(), 8);
+        // Decode rounds between two guarded chunks never exceed the interleave.
+        assert!(between[1..].iter().all(|n| *n == interleave as usize), "{interleave}: {between:?}");
+        let ttft = s.now_ns - arrival;
+        if interleave == 0 {
+            assert!(gap > 8 * 368 * MS, "gap={} ms", gap / MS);
+        } else {
+            assert!(gap < 368 * MS + 20 * MS, "interleave={interleave} gap={} ms", gap / MS);
+        }
+        assert!(ttft < 50 * MS + 8 * 368 * MS + 8 * u64::from(interleave) * 20 * MS + 20 * MS,
+            "interleave={interleave} ttft={} ms", ttft / MS);
+    }
+}
+
+#[test]
+fn mixed_candidates_satisfy_the_ttft_guard() {
+    let shapes = [(4, 8, 512, 22 * MS), (4, 8, 1024, 30 * MS), (4, 8, 2048, 45 * MS)];
+    for (max_chunk, expected) in [(0, (GraphKind::Mixed, 2048)), (1024, (GraphKind::Mixed, 1024)),
+        (256, (GraphKind::Prefill, 256))] {
+        let mut s = mixed_engine(4, true, &shapes);
+        for capacity in [64, 128, 256, 512, 1024, 2048, 4096] {
+            set_cost(&mut s, GraphKind::Prefill, 1, capacity, 20 * MS + capacity as u64 * 85_000);
+        }
+        let decoders: Vec<_> = (0..3).map(|i| add(&mut s, i + 1, 64, 4096)).collect();
+        ready(&mut s, &decoders);
+        let probe = add(&mut s, 100, 1900, 16);
+        initialize(&mut s, probe);
+        s.advance_to(s.now_ns + 60 * MS).unwrap();
+        s.policy = ttft_policy(50.0, max_chunk, 1);
+        let plan = s.plan().unwrap();
+        let size = if plan.kind == GraphKind::Mixed { plan.prefill_capacity() } else { plan.token_capacity };
+        assert_eq!((plan.kind, size), expected, "max chunk {max_chunk}");
+        let row = plan.lanes.iter().position(|lane| lane.request == probe).unwrap();
+        assert!(plan.lane_kind(row).is_prefill());
+        if plan.kind == GraphKind::Mixed {
+            assert_eq!(plan.mixed.as_ref().unwrap().prefill_row, Some(row));
+            assert_eq!(plan.lanes.len(), 4);
+        }
+    }
+}
+
+#[test]
+fn overdue_restore_snapshot_and_resume_steps_are_forced() {
+    let mut s = ds41_engine(5);
+    s.configure_policy(ttft_policy(50.0, 0, 0)).unwrap();
+    for kind in [GraphKind::Restore, GraphKind::Snapshot, GraphKind::Resume, GraphKind::Init] {
+        for batch in [1, 2, 4, 8] {
+            set_cost(&mut s, kind, batch, 1, 30 * MS);
+        }
+    }
+    let seed = add(&mut s, 77, 1024, 1);
+    while s.request(seed).is_ok() {
+        ds41_step(&mut s, 3);
+    }
+    ds41_decoders(&mut s, 4);
+    for (prompt, boundaries) in [(1024 + 1900, vec![2048]), (1024, vec![])] {
+        let arrival = s.now_ns;
+        let probe = s.admit(RequestSpec { prompt: vec![77; prompt], message_boundaries: boundaries,
+            conditioning: vec![], max_new_tokens: 16, grammar_constrained: false, host_stops: false,
+            prompt_logprobs: false, growable_output: false, tools: false, reasoning_prompt: false }).unwrap();
+        let mut kinds = Vec::new();
+        while !first_token(&s, probe) {
+            let waited = s.now_ns - arrival;
+            let plan = ds41_step(&mut s, 3);
+            if let Some(row) = plan.lanes.iter().position(|lane| lane.request == probe) {
+                kinds.push(plan.lane_kind(row));
+            } else {
+                assert!(waited < 50 * MS, "an overdue prompt waited behind {:?}", plan.kind);
+            }
+        }
+        let expected: &[GraphKind] = if prompt == 1024 { &[GraphKind::Restore, GraphKind::Resume] }
+            else { &[GraphKind::Restore, GraphKind::Prefill, GraphKind::Snapshot, GraphKind::Prefill] };
+        assert_eq!(kinds, expected);
+        while s.request(probe).is_ok() {
+            ds41_step(&mut s, 3);
+        }
+    }
+}
+
+#[test]
+fn ttft_under_decode_load_cpu() {
+    for decoders in [3, 4, 7] {
+        let guarded = simulate_probe_load(ttft_policy(50.0, 0, 1), decoders, 60);
+        let balanced = simulate_probe_load(PolicyConfig::default(), decoders, 60);
+        let throughput = simulate_probe_load(PolicyConfig::throughput(), decoders, 60);
+        eprintln!("decoders={decoders} p50/p90/max TTFT ms, decoder tok/s, max gap ms: guard {:.0}/{:.0}/{:.0} {:.0} {:.0}; \
+            balanced {:.0}/{:.0}/{:.0} {:.0} {:.0}; throughput {:.0}/{:.0}/{:.0} {:.0} {:.0}",
+            guarded.percentile(0.5), guarded.percentile(0.9), guarded.percentile(1.0), guarded.decoder_tokens_per_s, guarded.decoder_gap_ms,
+            balanced.percentile(0.5), balanced.percentile(0.9), balanced.percentile(1.0), balanced.decoder_tokens_per_s, balanced.decoder_gap_ms,
+            throughput.percentile(0.5), throughput.percentile(0.9), throughput.percentile(1.0), throughput.decoder_tokens_per_s, throughput.decoder_gap_ms);
+        assert!(guarded.ttft_ms.len() >= 15);
+        assert!(guarded.percentile(0.9) < 350.0, "decoders={decoders}: {guarded:?}");
+        assert!(balanced.percentile(0.9) > 1000.0, "decoders={decoders}: {balanced:?}");
+        assert!(guarded.decoder_gap_ms < 300.0, "decoders={decoders}: {guarded:?}");
+    }
+}
+
+#[test]
+fn glm_ttft_under_decode_load_cpu() {
+    for decoders in [3, 7] {
+        let guarded = simulate_probe_load_on(glm_engine, 1, ttft_policy(50.0, 0, 1), decoders, 60);
+        let balanced = simulate_probe_load_on(glm_engine, 1, PolicyConfig::default(), decoders, 60);
+        eprintln!("GLM decoders={decoders} p50/p90/max TTFT ms, decoder tok/s, max gap ms: guard {:.0}/{:.0}/{:.0} {:.0} {:.0}; \
+            balanced {:.0}/{:.0}/{:.0} {:.0} {:.0}",
+            guarded.percentile(0.5), guarded.percentile(0.9), guarded.percentile(1.0), guarded.decoder_tokens_per_s, guarded.decoder_gap_ms,
+            balanced.percentile(0.5), balanced.percentile(0.9), balanced.percentile(1.0), balanced.decoder_tokens_per_s, balanced.decoder_gap_ms);
+        assert!(guarded.ttft_ms.len() >= 15);
+        // One 2048 chunk (~200 ms) after the 50 ms target plus at most one in-flight round.
+        assert!(guarded.percentile(0.9) < 350.0, "decoders={decoders}: {guarded:?}");
+        assert!(guarded.decoder_gap_ms < 300.0, "decoders={decoders}: {guarded:?}");
+        assert!(guarded.decoder_tokens_per_s > 0.6 * balanced.decoder_tokens_per_s, "decoders={decoders}");
+    }
+}
+
+#[test]
+fn the_oldest_overdue_prompt_is_forced_before_a_longer_newer_prompt() {
+    for guard in [false, true] {
+        let mut s = ds41_engine(6);
+        s.configure_policy(ttft_policy(if guard { 50.0 } else { 0.0 }, 0, 1)).unwrap();
+        ds41_decoders(&mut s, 4);
+        let older = add(&mut s, 100, 1024, 16);
+        s.advance_to(s.now_ns + 10 * MS).unwrap();
+        let newer = add(&mut s, 101, 1900, 16);
+        initialize(&mut s, older);
+        initialize(&mut s, newer);
+        s.advance_to(s.now_ns + 60 * MS).unwrap();
+        let plan = s.plan().unwrap();
+        if guard {
+            assert_eq!((plan.kind, plan.token_capacity, plan.lanes[0].request, plan.lanes[0].tokens),
+                (GraphKind::Prefill, 1024, older, 1024));
+        } else {
+            assert!(plan.lanes.iter().all(|lane| lane.request != older), "{plan:?}");
+        }
+    }
 }

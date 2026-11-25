@@ -38,7 +38,7 @@ impl Parsed {
                 self.calls.push((name, String::new()));
             }
             Event::ToolArguments { index, text } => self.calls[index].1.push_str(&text),
-            Event::ToolEnd { index } => {
+            Event::ToolEnd { index } | Event::ToolEndRaw { index, .. } => {
                 assert_eq!(index, self.ended);
                 self.ended += 1;
             }

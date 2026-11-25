@@ -33,6 +33,8 @@ def identity() -> str:
     for path in sorted(Path(__file__).parent.glob("*.py")):
         key.update(path.name.encode())
         key.update(path.read_bytes())
+    from .memory_planning import FLAT_POOL_SWITCH, flat_pool_enabled
+    key.update(f"{FLAT_POOL_SWITCH}={int(flat_pool_enabled())}".encode())
     return "ignition-runtime-patches-" + key.hexdigest()
 
 

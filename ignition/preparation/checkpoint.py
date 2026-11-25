@@ -94,7 +94,7 @@ def _parse_json(raw: bytes, source: str) -> dict:
     return value
 
 
-_DTYPE_BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1,
+_DTYPE_BYTES = {"BF16": 2, "F16": 2, "I16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1,  # F16/I16: EXL3 (exp/ds41-exl3)
                 "I8": 1, "U8": 1, "U16": 2, "I32": 4, "U32": 4, "I64": 8}
 
 

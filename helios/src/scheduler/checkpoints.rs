@@ -505,22 +505,44 @@ impl RequestScheduler {
         (accounting, unknown, budget)
     }
 
-    pub(super) fn estimated_checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
-        let (accounting, _, _) = self.checkpoint_selection_cached(request, false);
+    fn next_checkpoint_cut(
+        &self,
+        request: &LiveRequest,
+        accounting: &CheckpointAccounting,
+    ) -> Option<usize> {
+        let start = request.consumed_tokens as usize;
+        let rows = self.policy.prefill_merge_min_rows;
+        let min_end = if rows > 0 && start as u64 == request.prefix_tokens {
+            start.saturating_add(rows)
+        } else {
+            0
+        };
+        let kept = if self
+            .policy
+            .prefill_tail_merge
+            .applies(request.tools, request.reasoning_prompt)
+        {
+            None
+        } else {
+            request.message_boundaries.last().copied()
+        };
         accounting
             .cuts
             .iter()
-            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
             .map(|cut| cut.endpoint)
+            .find(|&end| {
+                end > start && (end >= min_end || Some(end) == kept || end == request.prompt_tokens)
+            })
+    }
+
+    pub(super) fn estimated_checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
+        let (accounting, _, _) = self.checkpoint_selection_cached(request, false);
+        self.next_checkpoint_cut(request, &accounting)
     }
 
     pub(super) fn checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
         let (accounting, _, _) = self.checkpoint_selection(request);
-        accounting
-            .cuts
-            .iter()
-            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
-            .map(|cut| cut.endpoint)
+        self.next_checkpoint_cut(request, &accounting)
     }
 
     pub(super) fn plan_checkpoints(&self, step: &ScheduledStep) -> Vec<CapturePlan> {

@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from .scratch_preference import from_environment, select_shard_winner
+
 
 def host_identity():
     """This boot of this host; ranks sharing it can map each other's memory through CUDA IPC."""
@@ -161,6 +163,7 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
 
 def _tuning_results(contributions):
     """Forward finalist shards in rank order and select ordinary race winners."""
+    preference = from_environment()
     races = {}
     for item in contributions:
         races.setdefault(item.key, []).append(item)
@@ -176,7 +179,7 @@ def _tuning_results(contributions):
             completed = [item for item in members if item.assignment is not None]
             if not completed:
                 raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
-            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+            results.append(select_shard_winner(completed, preference))
     return tuple(results)
 
 
