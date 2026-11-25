@@ -207,12 +207,15 @@ impl ResidentMapping {
             .into());
         }
         let mapping = Self { address: address as usize, nbytes };
+        #[cfg(target_os = "linux")]
         if unsafe { libc::madvise(address, nbytes, libc::MADV_NOHUGEPAGE) } != 0 {
-            return Err(format!(
-                "disable huge pages for private embedding table: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EPERM)) {
+                return Err(format!(
+                    "disable huge pages for private embedding table: {error}"
+                )
+                .into());
+            }
         }
         Ok(mapping)
     }
@@ -1138,6 +1141,7 @@ struct GatherShared {
     job: std::sync::Mutex<GatherJob>,
     wake: std::sync::Condvar,
     remaining: std::sync::atomic::AtomicUsize,
+    panicked: std::sync::atomic::AtomicBool,
 }
 
 struct GatherPool {
@@ -1164,19 +1168,22 @@ impl GatherPool {
                 }),
                 wake: std::sync::Condvar::new(),
                 remaining: std::sync::atomic::AtomicUsize::new(0),
+                panicked: std::sync::atomic::AtomicBool::new(false),
             });
-            for worker_id in 0..workers {
+            let mut spawned = 0usize;
+            for _ in 0..workers {
+                let worker_id = spawned;
                 let s = shared.clone();
-                let _ = std::thread::Builder::new()
+                if std::thread::Builder::new()
                     .name(format!("flare-gather-{}", worker_id + 1))
                     .spawn(move || {
                         crate::os::unpin_current_thread();
                         let mut seen = 0u64;
                         loop {
                             let (data, data_len, ids, ids_len, output, row_bytes, threads) = {
-                                let mut guard = s.job.lock().unwrap();
+                                let mut guard = s.job.lock().unwrap_or_else(|e| e.into_inner());
                                 while guard.generation == seen {
-                                    guard = s.wake.wait(guard).unwrap();
+                                    guard = s.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
                                 }
                                 seen = guard.generation;
                                 (
@@ -1191,29 +1198,38 @@ impl GatherPool {
                             };
                             let chunk_idx = worker_id + 1;
                             if chunk_idx < threads {
-                                let rows_per = ids_len.div_ceil(threads);
-                                let start = chunk_idx * rows_per;
-                                if start < ids_len {
-                                    let end = (start + rows_per).min(ids_len);
-                                    unsafe {
-                                        let data_slice = std::slice::from_raw_parts(data, data_len);
-                                        let ids_slice = std::slice::from_raw_parts(ids.add(start), end - start);
-                                        let out_slice = std::slice::from_raw_parts_mut(
-                                            output.add(start * row_bytes),
-                                            (end - start) * row_bytes,
-                                        );
-                                        copy_rows(data_slice, row_bytes, ids_slice, out_slice);
+                                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let rows_per = ids_len.div_ceil(threads);
+                                    let start = chunk_idx * rows_per;
+                                    if start < ids_len {
+                                        let end = (start + rows_per).min(ids_len);
+                                        unsafe {
+                                            let data_slice = std::slice::from_raw_parts(data, data_len);
+                                            let ids_slice = std::slice::from_raw_parts(ids.add(start), end - start);
+                                            let out_slice = std::slice::from_raw_parts_mut(
+                                                output.add(start * row_bytes),
+                                                (end - start) * row_bytes,
+                                            );
+                                            copy_rows(data_slice, row_bytes, ids_slice, out_slice);
+                                        }
                                     }
+                                }));
+                                if res.is_err() {
+                                    s.panicked.store(true, Ordering::Release);
                                 }
                                 s.remaining.fetch_sub(1, Ordering::Release);
                             }
                         }
-                    });
+                    })
+                    .is_ok()
+                {
+                    spawned += 1;
+                }
             }
             GatherPool {
                 dispatch_lock: std::sync::Mutex::new(()),
                 shared,
-                workers,
+                workers: spawned,
             }
         })
     }
@@ -1224,7 +1240,7 @@ impl GatherPool {
             copy_rows(data, row_bytes, ids, output);
             return;
         }
-        let _dispatch = self.dispatch_lock.lock().unwrap();
+        let _dispatch = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let rows_per = ids.len().div_ceil(threads);
         let active_chunks = ids.len().div_ceil(rows_per);
         if active_chunks <= 1 {
@@ -1232,9 +1248,10 @@ impl GatherPool {
             return;
         }
         let worker_chunks = active_chunks - 1;
+        self.shared.panicked.store(false, Ordering::Release);
         self.shared.remaining.store(worker_chunks, Ordering::Release);
         {
-            let mut job = self.shared.job.lock().unwrap();
+            let mut job = self.shared.job.lock().unwrap_or_else(|e| e.into_inner());
             job.data = data.as_ptr();
             job.data_len = data.len();
             job.ids = ids.as_ptr();
@@ -1247,9 +1264,17 @@ impl GatherPool {
         }
         // Calling thread executes chunk 0 immediately while persistent workers execute chunks 1..active_chunks.
         let end0 = rows_per.min(ids.len());
-        copy_rows(data, row_bytes, &ids[..end0], &mut output[..end0 * row_bytes]);
+        let local_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy_rows(data, row_bytes, &ids[..end0], &mut output[..end0 * row_bytes]);
+        }));
         while self.shared.remaining.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
+        }
+        if let Err(payload) = local_res {
+            std::panic::resume_unwind(payload);
+        }
+        if self.shared.panicked.load(Ordering::Acquire) {
+            panic!("engram gather worker panicked");
         }
     }
 }

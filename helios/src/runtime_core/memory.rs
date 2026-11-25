@@ -36,14 +36,15 @@ pub(super) fn parse_headroom_mib(value: &str) -> std::result::Result<u64, String
 }
 
 /// Engine headroom in bytes: [`HEADROOM_ENV`] when set, else [`HEADROOM_BYTES`]. Read once per process.
-pub(super) fn headroom_bytes() -> u64 {
-    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| match std::env::var(HEADROOM_ENV) {
-        Ok(value) if !value.trim().is_empty() => {
-            parse_headroom_mib(&value).unwrap_or_else(|error| panic!("{error}"))
-        }
-        _ => HEADROOM_BYTES,
-    })
+pub(super) fn headroom_bytes() -> Result<u64> {
+    static VALUE: std::sync::OnceLock<std::result::Result<u64, String>> = std::sync::OnceLock::new();
+    VALUE
+        .get_or_init(|| match std::env::var(HEADROOM_ENV) {
+            Ok(value) if !value.trim().is_empty() => parse_headroom_mib(&value),
+            _ => Ok(HEADROOM_BYTES),
+        })
+        .clone()
+        .map_err(invalid)
 }
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
@@ -199,7 +200,7 @@ pub(super) fn headroom(config: &serde_json::Value) -> Result<u64> {
         .transpose()?
         .unwrap_or(0);
     reserve
-        .checked_add(headroom_bytes())
+        .checked_add(headroom_bytes()?)
         .ok_or_else(|| invalid("memory reserve overflows the device budget"))
 }
 
@@ -266,12 +267,13 @@ pub(super) fn limited_budget(
     integrated: bool,
     future: u64,
 ) -> Result<u64> {
+    let base_headroom = headroom_bytes()?;
     let headroom = match limit {
         None => default_headroom,
         Some(MemoryLimit::Reserve(reserve)) => reserve
-            .checked_add(headroom_bytes())
+            .checked_add(base_headroom)
             .ok_or_else(|| invalid("memory reserve overflows the device budget"))?,
-        Some(_) => headroom_bytes(),
+        Some(_) => base_headroom,
     };
     let available = budget(
         memory.free.min(memory.total),
@@ -287,7 +289,7 @@ pub(super) fn limited_budget(
     // and driver allowance are part of its occupied budget.
     let required = loaded
         .checked_add(future)
-        .and_then(|n| n.checked_add(headroom_bytes()))
+        .and_then(|n| n.checked_add(base_headroom))
         .and_then(|n| n.checked_add(if integrated { INTEGRATED_HOST_BYTES } else { 0 }))
         .ok_or_else(|| invalid("loaded memory footprint overflows the device budget"))?;
     let remaining = cap.checked_sub(required).ok_or_else(|| invalid(format!(
@@ -986,7 +988,7 @@ impl NativeModel {
         );
         match options
             .memory_limit
-            .unwrap_or(MemoryLimit::Reserve(reserve - headroom_bytes()))
+            .unwrap_or(MemoryLimit::Reserve(reserve - headroom_bytes()?))
         {
             MemoryLimit::Reserve(0) => {}
             MemoryLimit::Reserve(bytes) => {
