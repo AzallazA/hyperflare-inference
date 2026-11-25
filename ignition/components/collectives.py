@@ -247,27 +247,27 @@ class PreparedAllReduce:
                 self.fused_addend = True
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
-            zero_addend = torch.zeros_like(source) if self.fused_addend else None
+            fused_addend = self.fused_addend
 
             def prepare(state):
                 if state.query.surface == "PCIeTwoShotBF16.all_reduce":
                     from b12x.comm.pcie._twoshot_preparation import prepared_call
 
-                    if zero_addend is not None:
-                        call = prepared_call(state, payload=source, out=output, addend=zero_addend)
+                    if fused_addend:
+                        call = prepared_call(state, payload=source, out=output, addend=source)
                         return PreparedCall(
                             run=call.run,
                             output=call.output,
                             capture_safe=call.capture_safe,
-                            owners=(*call.owners, runtime, zero_addend),
+                            owners=(*call.owners, runtime),
                         )
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
                 return PreparedCall(
-                    run=((lambda: state.run_plain(source, output, addend=zero_addend))
-                         if zero_addend is not None else (lambda: state.run_plain(source, output))),
+                    run=((lambda: state.run_plain(source, output, addend=source))
+                         if fused_addend else (lambda: state.run_plain(source, output))),
                     output=output,
-                    owners=(runtime,) if zero_addend is None else (runtime, zero_addend),
+                    owners=(runtime,),
                 )
 
         ranks = tuple(dist.get_process_group_ranks(group))
@@ -1525,12 +1525,17 @@ class PreparedAllGather:
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
-        one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if self.gated else None
         run_call = {k: v for k, v in call.items() if k != "has_gate"}
-        prepare_call_kwargs = run_call if one_gate is None else {**run_call, "gate": one_gate}
+        gated = self.gated
+
+        def prepare_gather(state):
+            one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if gated else None
+            kwargs = run_call if one_gate is None else {**run_call, "gate": one_gate}
+            return PreparedCall(run=lambda: state.run(**kwargs), output=output,
+                                owners=(runtime,) if one_gate is None else (runtime, one_gate))
+
         declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: PreparedCall(run=lambda: state.run(**prepare_call_kwargs), output=output,
-                                                    owners=(runtime,) if one_gate is None else (runtime, one_gate)),
+            prepare_call=prepare_gather,
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
