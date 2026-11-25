@@ -262,6 +262,9 @@ pub struct LiveRequest {
     reserved_pages: Vec<PageId>,
     max_new_tokens: u32,
     scheduled_consumed: u64,
+    /// True after a non-terminal prefill chunk skips trailing continuation layers
+    /// on a core with `GraphKind::TerminalPrefill`, until `TerminalPrefill` completes.
+    deferred_prefill: bool,
     last_use: Fence,
     pending: usize,
     terminal_snapshot_ready: bool,
@@ -912,6 +915,10 @@ impl RequestScheduler {
         Ok(())
     }
 
+    pub(super) fn is_non_terminal_prefill(&self, kind: GraphKind, capacity: usize) -> bool {
+        kind == GraphKind::Prefill && self.terminal_prefill_catalog.binary_search(&capacity).is_ok()
+    }
+
     pub(super) fn terminal_prefill_window(&self) -> usize {
         if self.terminal_prefill_catalog.is_empty() {
             return 0;
@@ -1528,6 +1535,7 @@ impl RequestScheduler {
         request.phase = RequestPhase::Finishing;
         if request.consumed_tokens <= request.prefix_tokens
             || request.error_code.is_some()
+            || request.deferred_prefill
         {
             return Ok(());
         }
@@ -1839,6 +1847,7 @@ impl RequestScheduler {
             reserved_pages,
             max_new_tokens: spec.max_new_tokens,
             scheduled_consumed: consumed,
+            deferred_prefill: false,
             last_use: Fence(0),
             pending: 0,
             terminal_snapshot_ready: false,
@@ -2470,6 +2479,7 @@ impl RequestScheduler {
         self.commit_checkpoint_plans(&plan.checkpoint_plans)?;
         self.commit_checkpoint_copies(step)?;
         let mut cleared_pages = Vec::new();
+        let non_terminal_prefill = self.is_non_terminal_prefill(step.kind, step.token_capacity);
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
@@ -2477,6 +2487,9 @@ impl RequestScheduler {
                 .collect();
             request.private_pages.extend_from_slice(&allocated);
             request.scheduled_consumed = next_consumed_ceiling;
+            if non_terminal_prefill {
+                request.deferred_prefill = true;
+            }
             request.last_use = fence;
             request.pending += 1;
             if let Some(prefix) = request.prefix {
@@ -2812,6 +2825,9 @@ impl RequestScheduler {
                 request.accounting.credit(prefill, output, now_ns);
                 useful_tokens[lane.request.slot as usize] = prefill + u64::from(output);
             }
+            if kind == GraphKind::TerminalPrefill && record.status != 3 {
+                request.deferred_prefill = false;
+            }
             request.consumed_tokens = record.consumed_tokens as u64;
             if record.generated_tokens > request.generated_tokens as i64 {
                 request.accounting.pending_publication_fence = Some(fence);
@@ -2831,6 +2847,7 @@ impl RequestScheduler {
             request.phase = if finished {
                 if request.consumed_tokens > request.prefix_tokens
                     && request.error_code.is_none()
+                    && !request.deferred_prefill
                 {
                     RequestPhase::Snapshot
                 } else {

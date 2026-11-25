@@ -588,10 +588,17 @@ impl RequestScheduler {
             }
             let service = self.projected_service(r);
             if let Some(rate) = tokens {
-                token_log[slot] = service
+                let mut price = service
                     .tokens
-                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64))
-                    .log_price(self.policy.token_fairness);
+                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64));
+                if let Some(previous) = service.prefill_rate {
+                    if r.consumed_tokens < r.prompt_tokens as u64 {
+                        price.rebase(previous, rate);
+                    } else {
+                        price.rebase_upward(previous, rate);
+                    }
+                }
+                token_log[slot] = price.log_price(self.policy.token_fairness);
             }
             if let Some(reference) = references[slot].filter(|_| deliveries.is_some()) {
                 delivery_log[slot] = service
@@ -694,7 +701,10 @@ impl RequestScheduler {
             else {
                 continue;
             };
-            if r.consumed_tokens < r.prompt_tokens as u64 {
+            if r.consumed_tokens < r.prompt_tokens as u64
+                && !r.prompt_logprobs
+                && !r.deferred_prefill
+            {
                 let work = self.prefill_work(r, prefill);
                 if work > 0 {
                     consider(
@@ -871,7 +881,7 @@ impl RequestScheduler {
                     .flatten();
                 let accepts = |k: GraphKind| {
                     if mixed {
-                        k == GraphKind::Prefill || k == decode
+                        (k == GraphKind::Prefill && !request.deferred_prefill) || k == decode
                     } else if following == GraphKind::TerminalPrefill {
                         k == GraphKind::Prefill
                     } else {
@@ -1250,7 +1260,8 @@ impl RequestScheduler {
                 let kind = self.request_kind(r);
                 match kind {
                     Some(GraphKind::Prefill)
-                        if self.prefill_work(r, prefill) > 0
+                        if !r.deferred_prefill
+                            && self.prefill_work(r, prefill) > 0
                             && prompt_slot.is_none_or(|prompt| prompt == slot) =>
                     {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
