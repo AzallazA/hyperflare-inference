@@ -98,7 +98,7 @@ def test_static_prepared_all_reduce_enables_fused_addend(monkeypatch, surface):
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
 
     def two_call(state, *, payload, out, addend=None):
-        run_calls.append(("two", addend is not None))
+        run_calls.append(("two", addend is source))
         return PreparedCall(run=lambda: out.copy_(payload + addend), output=out, capture_safe=False,
                             owners=(state, payload, out))
 
@@ -113,10 +113,14 @@ def test_static_prepared_all_reduce_enables_fused_addend(monkeypatch, surface):
 
     state = SimpleNamespace(query=plan.query,
         bind_input=lambda tensor: run_calls.append(("bind", tensor is source)),
-        run_plain=lambda inp, out, addend=None: (run_calls.append(("plain", addend is not None)), out.copy_(inp + addend)))
+        run_plain=lambda inp, out, addend=None: (run_calls.append(("plain", addend is source)), out.copy_(inp + addend)))
     prepared = callbacks[0]["prepare_call"](state)
     prepared.run()
-    assert torch.equal(output, source)
+    assert torch.equal(output, source + source)
+    if surface == "PCIeTwoShotBF16.all_reduce":
+        assert prepared.owners == (state, source, output, runtime)
+    else:
+        assert prepared.owners == (runtime,)
     assert run_calls == ([("two", True)] if surface == "PCIeTwoShotBF16.all_reduce"
                          else [("bind", True), ("plain", True)])
 
