@@ -979,6 +979,12 @@ impl RequestScheduler {
         if self.prefill_work_through(request, max_capacity, cut) < remaining {
             return false;
         }
+        if request.deferred_prefill {
+            return self
+                .terminal_prefill_catalog
+                .iter()
+                .any(|&cap| cap >= remaining);
+        }
         let Some(&smallest_fit) = self.prefill_catalog.iter().find(|&&cap| cap >= remaining) else {
             return false;
         };
@@ -2895,10 +2901,12 @@ impl RequestScheduler {
                 if !finished && request.consumed_tokens < request.prompt_tokens as u64 {
                     request.phase = request.prompt_phase();
                 }
-                if let Some(capture) = request.checkpoint_capture {
-                    if capture.endpoint == endpoint {
-                        let kind = if endpoint == request.prompt_tokens as u64 { BoundaryKind::Prompt } else { BoundaryKind::Message };
-                        captures.push((lane.request, Some(kind), endpoint, request.phase));
+                if !request.deferred_prefill {
+                    if let Some(capture) = request.checkpoint_capture {
+                        if capture.endpoint == endpoint {
+                            let kind = if endpoint == request.prompt_tokens as u64 { BoundaryKind::Prompt } else { BoundaryKind::Message };
+                            captures.push((lane.request, Some(kind), endpoint, request.phase));
+                        }
                     }
                 }
             }

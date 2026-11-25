@@ -109,7 +109,7 @@ impl RequestScheduler {
                             if let Some(ns) = self.speculative_duration(
                                 self.slots[slot].request.as_ref().unwrap(), batch, width) {
                                 eligible |= 1 << slot;
-                                nanos = Some(ns);
+                                nanos = cost::min_measured_duration(nanos, ns);
                             }
                         }
                         if let Some(ns) = nanos { consider(ns, batch, eligible); }

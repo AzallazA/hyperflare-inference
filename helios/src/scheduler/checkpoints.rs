@@ -591,7 +591,9 @@ impl RequestScheduler {
                 .cuts
                 .iter()
                 .find(|cut| {
-                    cut.endpoint == end && !self.is_non_terminal_prefill(kind, step.token_capacity)
+                    cut.endpoint == end
+                        && !(request.deferred_prefill && kind != GraphKind::TerminalPrefill)
+                        && !self.is_non_terminal_prefill(step.kind, step.token_capacity)
                 })
                 .copied();
             let reserve_guard = cut.is_some_and(|cut| cut.endpoint < anchor)
