@@ -581,6 +581,8 @@ mod tests {
                     allocation: "worker_ctrl".into(),
                     offset: 0,
                 }),
+                metrics: None,
+                metrics_count: 0,
             }];
             core
         };
@@ -642,6 +644,8 @@ mod tests {
                     allocation: "worker_ctrl".into(),
                     offset: 4,
                 }),
+                metrics: None,
+                metrics_count: 0,
             });
         let multi_worker_err = LoadOptions {
             max_concurrency: Some(1),
