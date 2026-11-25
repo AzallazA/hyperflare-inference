@@ -1417,6 +1417,8 @@ impl RequestScheduler {
                         let work = self.prefill_work_through(request, candidate.capacity, cut);
                         if self.resolve_prefill_kind(request, candidate.capacity, work, cut)
                             != candidate.kind
+                            || (candidate.kind == GraphKind::Prefill
+                                && self.prefill_requires_terminal_completion(request, cut))
                         {
                             return false;
                         }
@@ -1578,7 +1580,9 @@ impl RequestScheduler {
             let cut = self.checkpoint_cut(request);
             let actual_work = self.prefill_work_through(request, capacity, cut);
             let kind_changed = candidate.kind != GraphKind::Mixed
-                && self.resolve_prefill_kind(request, capacity, actual_work, cut) != candidate.kind;
+                && (self.resolve_prefill_kind(request, capacity, actual_work, cut) != candidate.kind
+                    || (candidate.kind == GraphKind::Prefill
+                        && self.prefill_requires_terminal_completion(request, cut)));
             if actual_work != work || kind_changed {
                 if let Some(resized) =
                     self.resize_prefill(candidate, request, cut, values, age_price)
@@ -1589,6 +1593,8 @@ impl RequestScheduler {
                     } else {
                         PlanOrigin::Ordinary
                     };
+                } else if kind_changed {
+                    return None;
                 }
             }
         }
@@ -1621,7 +1627,12 @@ impl RequestScheduler {
         } else {
             let catalog = self.prefill_catalog(request.prefill_kind());
             let work = self.prefill_work_through(request, *catalog.last()?, cut);
-            let capacity = *catalog.iter().find(|&&capacity| capacity >= work)?;
+            let target_catalog = if self.prefill_requires_terminal_completion(request, cut) {
+                &self.terminal_prefill_catalog
+            } else {
+                catalog
+            };
+            let capacity = *target_catalog.iter().find(|&&capacity| capacity >= work)?;
             let kind = self.resolve_prefill_kind(request, capacity, work, cut);
             (kind, capacity, 0, work)
         };
