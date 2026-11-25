@@ -166,13 +166,16 @@ class ConcurrentAllReduce:
         self.reduce.functional(session=session)
         return self
 
-    def start(self, source, output=None, *, dependencies=()):
+    def start(self, source, output=None, *, dependencies=(), own_source=False):
         if output is None:
             output = self.reduce.output
         if output is None:
             shape, stride, dtype = self.reduce.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        send = source.clone() if self.reduce.concurrent_input is None else source
+        if self.reduce.concurrent_input is not None or (own_source and self.reduce.output is None):
+            send = source
+        else:
+            send = source.clone()
         deps = list(dependencies)
         _start_all_reduce(send, output, deps, self.reduce.handle, self.stream_handle)
         return PendingAllReduce(send, output, deps)
@@ -1521,8 +1524,25 @@ class PreparedAllGather:
                 "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
         if has_gate:
             call["has_gate"] = True
-            self.gated = True
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
+        if has_gate:
+            if getattr(query, "call", None) is not None and not query.call.get("has_gate", False):
+                if query.call.get("disjoint_output", False) and query.call.get("pack_aligned", False):
+                    from dataclasses import replace
+                    from b12x.preparation import FrozenMapping
+
+                    shape = query.call["shape"]
+                    element = 1 if query.call["dtype"] == "torch.float8_e4m3fn" else 2
+                    row_bytes = shape[1] * shape[2] * element
+                    if row_bytes >= 16 and row_bytes % 16 == 0:
+                        query = replace(query, call=FrozenMapping(dict(query.call,
+                            gather_transport="selected_barrier",
+                            threads=128, block_limit=8,
+                            submode="barrier", active_blocks=8,
+                            has_gate=True)))
+                        self.gated = True
+            else:
+                self.gated = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         run_call = {k: v for k, v in call.items() if k != "has_gate"}
