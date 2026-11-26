@@ -674,6 +674,8 @@ pub(crate) fn publish_payload(
                 span,
                 &staging,
                 &format!("frontend-{position}.payload"),
+                None,
+                None,
             )?;
             let tensor = format!(
                 "frontend.{}",
@@ -763,6 +765,8 @@ pub(crate) fn publish_payload(
                     &staging,
                     &deployment_id,
                     &mut engram_payloads,
+                    cache_root.as_ref(),
+                    &mut leases,
                 )
             })
             .transpose()? };
@@ -1030,14 +1034,37 @@ type Materialized = (helios_core::core::PayloadId, u64, PathBuf);
 
 const MAX_PLANE_WORKERS: usize = 8;
 
-/// Resolve each `(span, staging name)` plane with [`payload_source`] on parallel readers, largest
-/// first. Each plane is hashed by one synchronous reader, so hashing the planes one at a time
-/// leaves the device mostly idle. Returns the sources in the order of `planes`; the first error
-/// stops scheduling and is returned once running planes finish.
+fn hash_pieces(pieces: &[FileSource]) -> Result<helios_core::core::PayloadId> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    for piece in pieces {
+        let mut source = File::open(&piece.path)?;
+        source.seek(std::io::SeekFrom::Start(piece.offset))?;
+        let mut remaining = piece.nbytes;
+        while remaining > 0 {
+            let chunk = remaining.min(buffer.len() as u64) as usize;
+            source.read_exact(&mut buffer[..chunk])?;
+            hasher.update(&buffer[..chunk]);
+            remaining -= chunk as u64;
+        }
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(helios_core::core::PayloadId::from_bytes(digest))
+}
+
+/// Resolve each `(span, staging name)` plane with [`payload_source_shared`] on parallel readers,
+/// largest first. Each plane is hashed by one synchronous reader, so hashing the planes one at a
+/// time leaves the device mostly idle. Returns the sources in the order of `planes`; the first
+/// error stops scheduling and is returned once running planes finish.
 fn plane_sources(
     payload: &[FilePart],
     planes: &[(&wire::Span, String)],
     staging: &Path,
+    cache: Option<&helios_core::core::cache::Root>,
+    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
 ) -> Result<
     Vec<(
         helios_core::core::PayloadId,
@@ -1057,6 +1084,7 @@ fn plane_sources(
     let cursor = AtomicUsize::new(0);
     let failure = Mutex::new(None);
     let resolved = Mutex::new((0..planes.len()).map(|_| None).collect::<Vec<_>>());
+    let shared_leases = Mutex::new(leases);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
@@ -1067,7 +1095,14 @@ fn plane_sources(
                     break;
                 };
                 let (span, name) = &planes[index];
-                match payload_source(payload, span, staging, name) {
+                match payload_source_shared(
+                    payload,
+                    span,
+                    staging,
+                    name,
+                    cache,
+                    Some(&shared_leases),
+                ) {
                     Ok(source) => resolved.lock().unwrap()[index] = Some(source),
                     Err(error) => {
                         failure.lock().unwrap().get_or_insert(error);
@@ -1088,11 +1123,17 @@ fn plane_sources(
         .collect())
 }
 
-fn payload_source(
+fn payload_source_shared(
     payload: &[FilePart],
     span: &wire::Span,
     staging: &Path,
     name: &str,
+    cache: Option<&helios_core::core::cache::Root>,
+    leases: Option<
+        &std::sync::Mutex<
+            &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
+        >,
+    >,
 ) -> Result<(
     helios_core::core::PayloadId,
     u64,
@@ -1108,8 +1149,45 @@ fn payload_source(
         )?;
         return Ok((source.digest()?, span.nbytes, source));
     }
+    if let (Some(root), Some(leases)) = (cache, leases) {
+        let id = hash_pieces(&pieces)?;
+        if let Some(slice) = leases
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|existing| existing.length() == span.nbytes)
+            .map(|existing| existing.slice().clone())
+        {
+            return Ok((id, span.nbytes, slice));
+        }
+        if let Some(object) = root.payload(id)?
+            && object.length() == span.nbytes
+        {
+            let slice = object.slice().clone();
+            leases.lock().unwrap().entry(id).or_insert(object);
+            return Ok((id, span.nbytes, slice));
+        }
+    }
     let (id, nbytes, path) = materialize(payload, span, staging, name)?;
     Ok((id, nbytes, pin_file(&path, nbytes)?))
+}
+
+fn payload_source(
+    payload: &[FilePart],
+    span: &wire::Span,
+    staging: &Path,
+    name: &str,
+    cache: Option<&helios_core::core::cache::Root>,
+    leases: Option<
+        &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
+    >,
+) -> Result<(
+    helios_core::core::PayloadId,
+    u64,
+    helios_core::core::container::Slice,
+)> {
+    let leases = leases.map(std::sync::Mutex::new);
+    payload_source_shared(payload, span, staging, name, cache, leases.as_ref())
 }
 
 fn materialize(
@@ -1389,6 +1467,8 @@ fn core_engram(
     staging: &Path,
     deployment: &str,
     installed: &mut Vec<helios_core::core::export::PublishPayload>,
+    cache: Option<&helios_core::core::cache::Root>,
+    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
 ) -> Result<helios_core::core::schema::wire::Engram> {
     use helios_core::core::schema::wire as pwire;
     let use_of = |id: &helios_core::core::PayloadId, nbytes: u64| pwire::PayloadUse {
@@ -1448,7 +1528,7 @@ fn core_engram(
             ));
         }
     }
-    let mut sources = plane_sources(payload, &planes, staging)?.into_iter();
+    let mut sources = plane_sources(payload, &planes, staging, cache, leases)?.into_iter();
     let mut next = || sources.next().expect("one source per listed plane");
     let mut tables = Vec::new();
     for (index, table) in engram.tables.iter().enumerate() {
@@ -3855,7 +3935,8 @@ mod payload_export_tests {
             ..Default::default()
         };
         let staging = base.path().join("absent-staging");
-        let (id, nbytes, source) = payload_source(&parts, &span, &staging, "unused").unwrap();
+        let (id, nbytes, source) =
+            payload_source(&parts, &span, &staging, "unused", None, None).unwrap();
         assert_eq!(id, PayloadId::of(b"weights"));
         assert_eq!(nbytes, 7);
         assert_eq!(source.offset(), 7);
@@ -3902,7 +3983,8 @@ mod payload_export_tests {
             nbytes: 4,
             ..Default::default()
         };
-        let (id, nbytes, source) = payload_source(&parts, &span, base.path(), "joined").unwrap();
+        let (id, nbytes, source) =
+            payload_source(&parts, &span, base.path(), "joined", None, None).unwrap();
         assert_eq!(id, PayloadId::of(b"cdef"));
         assert_eq!(nbytes, 4);
         assert_eq!(fs::read(base.path().join("joined")).unwrap(), b"cdef");
@@ -3958,7 +4040,8 @@ mod payload_export_tests {
             (&large_span, "large.payload".to_string()),
         ];
         // Planes are scheduled largest first but returned in declared order.
-        let sources = plane_sources(&payload, &planes, &staging).unwrap();
+        let mut leases = BTreeMap::new();
+        let sources = plane_sources(&payload, &planes, &staging, None, &mut leases).unwrap();
         let split = [split_a, split_b].concat();
         assert_eq!(sources.len(), 3);
         for ((id, nbytes, _), bytes) in sources.iter().zip([&small, &split, &large]) {
@@ -3970,8 +4053,63 @@ mod payload_export_tests {
             (&large_span, "a.payload".to_string()),
             (&beyond, "b.payload".to_string()),
         ];
-        assert!(plane_sources(&payload, &planes, &staging).is_err());
+        assert!(plane_sources(&payload, &planes, &staging, None, &mut leases).is_err());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn payload_source_reuses_cached_blob_for_fragmented_range_without_staging() {
+        use helios_core::core::{PayloadId, cache::Root};
+        let base = tempfile::tempdir().unwrap();
+        let first = base.path().join("first.bin");
+        let second = base.path().join("second.bin");
+        fs::write(&first, b"xxabcdyy").unwrap();
+        fs::write(&second, b"zefghzz").unwrap();
+        let parts = [
+            FilePart {
+                offset: 100,
+                source: FileSource {
+                    path: first,
+                    offset: 2,
+                    nbytes: 4,
+                },
+            },
+            FilePart {
+                offset: 104,
+                source: FileSource {
+                    path: second,
+                    offset: 1,
+                    nbytes: 4,
+                },
+            },
+        ];
+        let span = wire::Span {
+            offset: 102,
+            nbytes: 4,
+            ..Default::default()
+        };
+        let root = Root::open(base.path().join("cache")).unwrap();
+        let expected_id = PayloadId::of(b"cdef");
+        root.insert_payload(expected_id, 4, std::io::Cursor::new(b"cdef"))
+            .unwrap();
+        let absent_staging = base.path().join("absent-staging");
+        let mut leases = BTreeMap::new();
+        let (id, nbytes, source) = payload_source(
+            &parts,
+            &span,
+            &absent_staging,
+            "joined",
+            Some(&root),
+            Some(&mut leases),
+        )
+        .unwrap();
+        assert_eq!(id, expected_id);
+        assert_eq!(nbytes, 4);
+        assert!(!absent_staging.exists());
+        assert!(leases.contains_key(&expected_id));
+        let mut bytes = [0; 4];
+        source.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"cdef");
     }
 
     #[test]
@@ -4113,12 +4251,15 @@ mod payload_export_tests {
         let assembly = base.join("assembly");
         fs::create_dir(&assembly).unwrap();
         let mut installed = Vec::new();
+        let mut leases = BTreeMap::new();
         core_engram(
             rank.index.engram.as_ref().unwrap(),
             &rank.payload,
             &assembly,
             "gb202-tp2",
             &mut installed,
+            None,
+            &mut leases,
         )
         .unwrap();
         assert_eq!(installed.len(), 6);
