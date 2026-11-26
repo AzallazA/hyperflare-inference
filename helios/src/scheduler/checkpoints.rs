@@ -812,7 +812,13 @@ impl RequestScheduler {
         let (mut accounting, _, _) = self.checkpoint_selection(request);
         accounting.cuts.clear();
         accounting.reserved_ns = 0;
-        let Some(cost) = self.costs.fresh_duration(GraphKind::Snapshot, 1) else {
+        let fresh = self.costs.fresh_duration(GraphKind::Snapshot, 1);
+        let probe = fresh.is_none();
+        let Some(cost) = fresh.or_else(|| {
+            (self.policy.checkpoint_extra_work_fraction > 0.0)
+                .then(|| self.costs.probe_duration(GraphKind::Snapshot, 1))
+                .flatten()
+        }) else {
             self.stats.checkpoint_skip_unknown_cost += 1;
             return Ok(None);
         };
@@ -841,6 +847,9 @@ impl RequestScheduler {
         };
         let snapshot = rows.and_then(|rows| rows.first().copied());
         if snapshot.is_some() {
+            if probe {
+                self.costs.record_probe(GraphKind::Snapshot, 1);
+            }
             accounting.reserved_ns = cost;
             let request = self.request_mut(handle)?;
             request.checkpoint_copy_ns = cost;
@@ -1699,5 +1708,36 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    #[test]
+    fn unmeasured_snapshot_cost_is_probed_by_one_terminal_capture_per_ttl() {
+        let mut scheduler = super::super::tests::scheduler(4, 128, 16);
+        let graphs = super::super::tests::duration_graphs(4);
+        scheduler.graph_durations(&graphs).unwrap();
+        // Prefill is measured, but Snapshot(1) remains unmeasured (nanos == 0).
+        measure(&mut scheduler, GraphKind::Prefill, 128, 100_000);
+        let h1 = scheduler.admit(super::super::tests::spec(64, 3)).unwrap();
+        let h2 = scheduler.admit(super::super::tests::spec(64, 3)).unwrap();
+        let h3 = scheduler.admit(super::super::tests::spec(64, 3)).unwrap();
+        // First terminal capture probes the unmeasured Snapshot graph.
+        assert!(
+            scheduler.allocate_terminal_capture(h1).unwrap().is_some(),
+            "first terminal capture should probe unmeasured Snapshot(1)"
+        );
+        // Second within TTL is skipped as unknown_cost.
+        let before = scheduler.stats.checkpoint_skip_unknown_cost;
+        assert!(
+            scheduler.allocate_terminal_capture(h2).unwrap().is_none(),
+            "second terminal capture within TTL must wait for probe measurement"
+        );
+        assert_eq!(scheduler.stats.checkpoint_skip_unknown_cost, before + 1);
+        // After TTL elapses without measurement, another probe is allowed.
+        scheduler.advance_to(scheduler.policy.estimate_ttl_ns + 1).unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 128, 100_000);
+        assert!(
+            scheduler.allocate_terminal_capture(h3).unwrap().is_some(),
+            "terminal capture after TTL should probe Snapshot(1) again"
+        );
     }
 }

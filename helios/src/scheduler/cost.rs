@@ -236,6 +236,25 @@ impl ActionCosts {
             .map(|estimate| estimate.nanos)
     }
 
+    pub fn probe_duration(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
+        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        self.entry(key)
+            .filter(|estimate| {
+                !estimate.fresh(self.now_ns, self.ttl_ns)
+                    && (estimate.last_attempt_ns == 0
+                        || self.now_ns.saturating_sub(estimate.last_attempt_ns) >= self.ttl_ns)
+            })
+            .map(|estimate| estimate.nanos)
+    }
+
+    pub fn record_probe(&mut self, kind: GraphKind, tokens: usize) {
+        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        if let Some(&index) = self.index.get(&key) {
+            // Zero denotes no attempt, so a probe at time zero is recorded as one.
+            self.entries[index].1.last_attempt_ns = self.now_ns.max(1);
+        }
+    }
+
     pub fn stale_keys(&self) -> impl Iterator<Item = Key> + '_ {
         self.entries.iter().filter(|(_, estimate)| estimate.nanos != 0
             && !estimate.fresh(self.now_ns, self.ttl_ns)).map(|(key, _)| *key)

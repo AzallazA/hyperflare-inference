@@ -32,7 +32,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Default)]
@@ -274,17 +274,30 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
-                // The GPU publishes this step's n-gram ids part-way through the step,
-                // milliseconds away, and two frames are pipelined: spinning a full
-                // step here holds a core that the model threads need, and eight such
-                // threads hold eight. Spin only long enough to catch an id set that
-                // lands immediately, then park in progressively longer naps.
+                // Spin actively for up to FLARE_ENGRAM_SPIN_US (default 2000 us; 0 restores
+                // legacy 4096-iter spin + progressive 25..250 us nap) so active decode steps
+                // catch GPU-published n-gram ids in <1 us instead of sleeping through Layer 0.
+                let spin_budget_us = engram_spin_us();
                 let mut spins = 0u32;
+                let mut deadline: Option<Instant> = None;
                 while ready.load(Ordering::Acquire) != sequence {
                     if cancelled.load(Ordering::Acquire) {
                         return Err("n-gram request cancelled".into());
                     }
-                    if spins < IDLE_SPIN_ROUNDS {
+                    if spin_budget_us > 0 {
+                        if spins & 0x3ff == 0 {
+                            let limit = *deadline.get_or_insert_with(|| {
+                                Instant::now() + Duration::from_micros(spin_budget_us)
+                            });
+                            if Instant::now() >= limit {
+                                let nap = u64::from(((spins >> 10).saturating_sub(1)).min(IDLE_STEPS)) + 1;
+                                thread::sleep(Duration::from_micros(nap * IDLE_STEP_US));
+                                spins = spins.saturating_add(1);
+                                continue;
+                            }
+                        }
+                        std::hint::spin_loop();
+                    } else if spins < IDLE_SPIN_ROUNDS {
                         std::hint::spin_loop();
                     } else {
                         let nap = u64::from((spins - IDLE_SPIN_ROUNDS).min(IDLE_STEPS)) + 1;
@@ -296,6 +309,15 @@ impl Requests {
             }
         }
     }
+}
+fn engram_spin_us() -> u64 {
+    static SPIN_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SPIN_US.get_or_init(|| {
+        std::env::var("FLARE_ENGRAM_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2000)
+    })
 }
 const STAGING_FRAMES: usize = 2;
 /// Spins taken before a waiting gather parks instead of holding a core.
