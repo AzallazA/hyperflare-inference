@@ -5321,6 +5321,7 @@ fn terminal_prefill_protected_by_ttft_guard_when_overdue() {
             kind: GraphKind::Prefill,
             sampling_mode: SamplingMode::General,
             draft_tokens: 0,
+            draft_source: None,
             handle: 100 + capacity,
             batch_capacity: 1,
             token_capacity: capacity,
@@ -5338,6 +5339,7 @@ fn terminal_prefill_protected_by_ttft_guard_when_overdue() {
             kind: GraphKind::TerminalPrefill,
             sampling_mode: SamplingMode::General,
             draft_tokens: 0,
+            draft_source: None,
             handle: 1000 + capacity,
             batch_capacity: 1,
             token_capacity: capacity,
@@ -6373,6 +6375,8 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
             host_stops: false,
             prompt_logprobs: true,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     assert_eq!(measured_step(&mut scored, 150_000, 0).kind, GraphKind::Init);
@@ -6401,6 +6405,8 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     assert_eq!(measured_step(&mut cut_sched, 150_000, 0).kind, GraphKind::Init);

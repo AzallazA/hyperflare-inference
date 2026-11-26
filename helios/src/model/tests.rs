@@ -927,6 +927,8 @@ fn history_draft_packing_forwards_per_request_prompt_sam_continuations() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -2093,6 +2095,8 @@ fn wide_copy_verify_catalog_packs_23_sam_tokens_and_preserves_legacy_w8_cores() 
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);

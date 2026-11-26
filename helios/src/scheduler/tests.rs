@@ -4218,6 +4218,8 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
+        reasoning_prompt: false,
     };
     let h = sched.admit(req_spec).unwrap();
     let mut fence = 1u64;
@@ -4355,6 +4357,8 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     for _ in 0..4 {
@@ -4409,6 +4413,8 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     let hb = sched
@@ -4421,6 +4427,8 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     for _ in 0..8 {
@@ -4477,6 +4485,8 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
         })
         .unwrap();
     sched.cancel(ha).unwrap();

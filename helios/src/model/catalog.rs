@@ -402,7 +402,7 @@ mod context_variant_tests {
 
     fn graph(name: &str, kind: GraphKind, tokens: usize, inputs: &[&str]) -> GraphDescriptor {
         GraphDescriptor {
-            tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+            tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
             name: name.into(), kind, sampling_mode: SamplingMode::General, handle: 0x5000,
             batch_capacity: 1, token_capacity: tokens, prefill_capacity: 0, estimated_duration_ns: 0,
             input_bindings: inputs.iter().map(|b| InputBinding { buffer_name: (*b).into(), host_offset: 0, nbytes: 4 }).collect(),
