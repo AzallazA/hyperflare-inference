@@ -316,7 +316,7 @@ fn engram_spin_us() -> u64 {
         std::env::var("FLARE_ENGRAM_SPIN_US")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(2000)
+            .unwrap_or(0)
     })
 }
 const STAGING_FRAMES: usize = 2;
