@@ -6,27 +6,34 @@
 
 //! Coordinated CUDA ranks sharing one process address space.
 
-use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
+use super::{ExecutionManifest, FrameCompletion, GraphExecutor, Upload};
 use crate::{
     Error, ExecutionError, Result, Shutdown,
     cache::{Fence, PageId},
 };
 use std::{
+    cell::UnsafeCell,
     collections::VecDeque,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 const HANDOFF_POLL: Duration = Duration::from_micros(500);
+const STACK_UPLOAD_CAPACITY: usize = 64;
+const MAX_RANKS: usize = 16;
 
 pub(super) mod protocol;
 #[cfg(test)]
 mod protocol_tests;
 
-// Prepare/commit and completion/prepare exchanges are brief. Poll that interval
-// before parking a rank, while retaining blocking waits for idle serving.
+// Startup and drain replies are brief. Poll that interval before parking a rank,
+// while retaining blocking waits for idle or slow tuning graphs.
 fn receive<T>(receiver: &mpsc::Receiver<T>, timeout: Option<Duration>) -> std::result::Result<T, mpsc::RecvTimeoutError> {
     let started = Instant::now();
     let poll = timeout.map_or(HANDOFF_POLL, |limit| limit.min(HANDOFF_POLL));
@@ -48,37 +55,475 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::execution(ExecutionError::Worker, message)
 }
 
-struct Step {
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
+#[derive(Clone, Copy)]
+struct SlotUpload {
+    name_start: usize,
+    name_end: usize,
+    offset: usize,
+    data_start: usize,
+    data_end: usize,
+}
+
+/// Reusable ping-pong upload slot shared between rank zero and peer rank threads.
+struct StepSlot {
     fence: Fence,
     graph: usize,
     grammar: bool,
-    uploads: Vec<OwnedUpload>,
+    names: String,
+    payload: Vec<u8>,
+    uploads: Vec<SlotUpload>,
     cleared_pages: Vec<PageId>,
 }
-impl Step {
-    fn uploads(&self) -> Vec<Upload<'_>> {
-        self.uploads
-            .iter()
-            .map(|u| Upload {
-                buffer: &u.buffer,
-                offset: u.offset,
-                bytes: &u.bytes,
-            })
-            .collect()
+
+impl StepSlot {
+    fn with_capacity(payload_bytes: usize, upload_count: usize) -> Self {
+        Self {
+            fence: Fence(0),
+            graph: 0,
+            grammar: false,
+            names: String::with_capacity(upload_count.saturating_mul(24)),
+            payload: Vec::with_capacity(payload_bytes),
+            uploads: Vec::with_capacity(upload_count),
+            cleared_pages: Vec::with_capacity(64),
+        }
+    }
+
+    fn write(
+        &mut self,
+        fence: Fence,
+        graph: usize,
+        grammar: bool,
+        uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
+    ) {
+        self.fence = fence;
+        self.graph = graph;
+        self.grammar = grammar;
+        self.names.clear();
+        self.payload.clear();
+        self.uploads.clear();
+        self.cleared_pages.clear();
+        self.cleared_pages.extend_from_slice(cleared_pages);
+        for upload in uploads {
+            let name_start = self.names.len();
+            self.names.push_str(upload.buffer);
+            let name_end = self.names.len();
+            let data_start = self.payload.len();
+            self.payload.extend_from_slice(upload.bytes);
+            let data_end = self.payload.len();
+            self.uploads.push(SlotUpload {
+                name_start,
+                name_end,
+                offset: upload.offset,
+                data_start,
+                data_end,
+            });
+        }
+    }
+
+    fn upload(&self, src: &SlotUpload) -> Upload<'_> {
+        Upload {
+            buffer: &self.names[src.name_start..src.name_end],
+            offset: src.offset,
+            bytes: &self.payload[src.data_start..src.data_end],
+        }
+    }
+
+    fn with_uploads<R>(&self, f: impl FnOnce(&[Upload<'_>]) -> R) -> R {
+        let len = self.uploads.len();
+        if len <= STACK_UPLOAD_CAPACITY {
+            let mut stack: [std::mem::MaybeUninit<Upload<'_>>; STACK_UPLOAD_CAPACITY] =
+                [const { std::mem::MaybeUninit::uninit() }; STACK_UPLOAD_CAPACITY];
+            for (dst, src) in stack.iter_mut().zip(&self.uploads) {
+                dst.write(self.upload(src));
+            }
+            // SAFETY: The first `len` elements were initialized in the loop above.
+            let slice = unsafe { std::slice::from_raw_parts(stack.as_ptr().cast::<Upload<'_>>(), len) };
+            f(slice)
+        } else {
+            let uploads: Vec<Upload<'_>> = self.uploads.iter().map(|src| self.upload(src)).collect();
+            f(&uploads)
+        }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchEvent {
+    Step,
+    Drain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecisionEvent {
+    Commit,
+    Cancel,
+    Drain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitPeersError {
+    PeerExited,
+    Timeout,
+}
+
+/// Single-producer, multi-consumer lock-free ping-pong dispatch ring for local ranks.
+///
+/// Each coordinated step runs an inline Prepare -> Ready -> Commit/Cancel barrier over
+/// cache-aligned atomics without per-step heap allocations or control-channel traffic:
+/// 1. Rank zero writes `slots[epoch & 1]` (only while no in-flight frame occupies that parity
+///    slot) and publishes `prepare_epoch = epoch`.
+/// 2. Every peer thread validates its local upload layout, cleared pages, frame capacity, and
+///    rank-local Engram staging state without launching CUDA work, then stores `epoch << 1` in
+///    its `peer_ack` slot.
+/// 3. Only after every peer acknowledges readiness does rank zero submit locally and publish
+///    `decision = (epoch << 1) | 1` (`Commit`). If any peer fails validation or exits, rank
+///    zero requests drain without launching locally, preventing stranded collectives. If rank
+///    zero encounters `Ok(None)` backpressure, it publishes `decision = epoch << 1` (`Cancel`),
+///    waits for peers to acknowledge `(epoch << 1) | 1`, and returns `Ok(None)` without poisoning.
+/// 4. Rank zero never reuses `slots[epoch & 1]` while any peer can still borrow it: every peer
+///    drops its `&StepSlot` for `epoch - 1` before reading `prepare_epoch >= epoch` and drops its
+///    borrow for a cancelled `epoch` before storing its cancel acknowledgement.
+struct DispatchRing {
+    slots: [CacheAligned<UnsafeCell<StepSlot>>; 2],
+    prepare_epoch: CacheAligned<AtomicU64>,
+    peer_ack: [CacheAligned<AtomicU64>; MAX_RANKS],
+    decision: CacheAligned<AtomicU64>,
+    drain: CacheAligned<AtomicBool>,
+    peer_exited: CacheAligned<AtomicBool>,
+    parked: CacheAligned<AtomicUsize>,
+    idle_lock: Mutex<()>,
+    idle_wake: Condvar,
+}
+
+// SAFETY: Rank zero is the sole writer to `slots[epoch & 1]` and writes a parity slot only
+// after every peer has dropped any borrow of the prior step occupying that slot. Peers obtain
+// shared `&StepSlot` references only after observing `prepare_epoch >= step_epoch` and drop them
+// before advancing to the next epoch or acknowledging cancel.
+unsafe impl Sync for DispatchRing {}
+
+impl DispatchRing {
+    fn new(payload_bytes: usize, upload_count: usize) -> Self {
+        Self {
+            slots: [
+                CacheAligned(UnsafeCell::new(StepSlot::with_capacity(payload_bytes, upload_count))),
+                CacheAligned(UnsafeCell::new(StepSlot::with_capacity(payload_bytes, upload_count))),
+            ],
+            prepare_epoch: CacheAligned(AtomicU64::new(0)),
+            peer_ack: std::array::from_fn(|_| CacheAligned(AtomicU64::new(0))),
+            decision: CacheAligned(AtomicU64::new(0)),
+            drain: CacheAligned(AtomicBool::new(false)),
+            peer_exited: CacheAligned(AtomicBool::new(false)),
+            parked: CacheAligned(AtomicUsize::new(0)),
+            idle_lock: Mutex::new(()),
+            idle_wake: Condvar::new(),
+        }
+    }
+
+    /// Stage one step into its parity slot and publish `prepare_epoch` for peer validation.
+    ///
+    /// # Safety
+    /// Caller must be the sole producer and guarantee no peer is still reading `slots[epoch & 1]`.
+    unsafe fn prepare(
+        &self,
+        epoch: u64,
+        fence: Fence,
+        graph: usize,
+        grammar: bool,
+        uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
+    ) {
+        let slot = (epoch as usize) & 1;
+        // SAFETY: Exclusive write access to this parity slot is guaranteed by the caller.
+        unsafe { (*self.slots[slot].0.get()).write(fence, graph, grammar, uploads, cleared_pages) };
+        self.prepare_epoch.0.store(epoch, Ordering::SeqCst);
+        if self.parked.0.load(Ordering::SeqCst) != 0 {
+            let _guard = self.idle_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.idle_wake.notify_all();
+        }
+    }
+
+    fn mark_peer_ready(&self, peer_index: usize, epoch: u64) {
+        self.peer_ack[peer_index].0.store(epoch << 1, Ordering::Release);
+    }
+
+    fn mark_peer_cancelled(&self, peer_index: usize, epoch: u64) {
+        self.peer_ack[peer_index].0.store((epoch << 1) | 1, Ordering::Release);
+    }
+
+    fn commit(&self, epoch: u64) {
+        self.decision.0.store((epoch << 1) | 1, Ordering::SeqCst);
+    }
+
+    fn cancel(&self, epoch: u64) {
+        self.decision.0.store(epoch << 1, Ordering::SeqCst);
+    }
+
+    fn wait_peer_acks(
+        &self,
+        peer_count: usize,
+        target: u64,
+        timeout: Duration,
+    ) -> std::result::Result<(), WaitPeersError> {
+        let first_pending = || {
+            (0..peer_count)
+                .find(|&index| self.peer_ack[index].0.load(Ordering::Acquire) < target)
+        };
+        for _ in 0..32 {
+            if first_pending().is_none() {
+                return Ok(());
+            }
+            if self.peer_exited() {
+                return Err(WaitPeersError::PeerExited);
+            }
+            std::hint::spin_loop();
+        }
+        let started = Instant::now();
+        loop {
+            let Some(pending_peer) = first_pending() else {
+                return Ok(());
+            };
+            if self.peer_exited() {
+                return Err(WaitPeersError::PeerExited);
+            }
+            if started.elapsed() > timeout {
+                return Err(WaitPeersError::Timeout);
+            }
+            #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
+            {
+                let seen = self.peer_ack[pending_peer].0.load(Ordering::Acquire);
+                if seen < target && !self.peer_exited() {
+                    let _ = super::transport::host_wait::wait_u64_change(
+                        &self.peer_ack[pending_peer].0,
+                        seen,
+                        25,
+                    );
+                }
+            }
+            #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
+            {
+                let _ = pending_peer;
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn poll_decision(&self, epoch: u64) -> Option<DecisionEvent> {
+        if self.drain.0.load(Ordering::Acquire) {
+            return Some(DecisionEvent::Drain);
+        }
+        let value = self.decision.0.load(Ordering::Acquire);
+        if (value >> 1) >= epoch {
+            return Some(if (value & 1) != 0 {
+                DecisionEvent::Commit
+            } else {
+                DecisionEvent::Cancel
+            });
+        }
+        None
+    }
+
+    fn wait_decision(&self, epoch: u64, timeout: Duration) -> Result<DecisionEvent> {
+        for _ in 0..32 {
+            if let Some(event) = self.poll_decision(epoch) {
+                return Ok(event);
+            }
+            std::hint::spin_loop();
+        }
+        let started = Instant::now();
+        loop {
+            if let Some(event) = self.poll_decision(epoch) {
+                return Ok(event);
+            }
+            if started.elapsed() > timeout {
+                return Err(invalid("rank step decision deadline expired"));
+            }
+            #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
+            {
+                let seen = self.decision.0.load(Ordering::Acquire);
+                if (seen >> 1) < epoch && !self.drain.0.load(Ordering::Acquire) {
+                    let _ = super::transport::host_wait::wait_u64_change(&self.decision.0, seen, 25);
+                }
+            }
+            #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
+            {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn request_drain(&self) {
+        self.drain.0.store(true, Ordering::SeqCst);
+        let _guard = self.idle_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.idle_wake.notify_all();
+    }
+
+    fn mark_peer_exited(&self) {
+        self.peer_exited.0.store(true, Ordering::SeqCst);
+    }
+
+    fn peer_exited(&self) -> bool {
+        self.peer_exited.0.load(Ordering::Acquire)
+    }
+
+    fn has_step(&self, next_epoch: u64) -> bool {
+        self.prepare_epoch.0.load(Ordering::Acquire) >= next_epoch
+    }
+
+    fn poll_next(&self, next_epoch: u64) -> Option<DispatchEvent> {
+        if self.drain.0.load(Ordering::Acquire) {
+            return Some(DispatchEvent::Drain);
+        }
+        if self.prepare_epoch.0.load(Ordering::Acquire) >= next_epoch {
+            return Some(DispatchEvent::Step);
+        }
+        None
+    }
+
+    fn wait_next(&self, next_epoch: u64) -> DispatchEvent {
+        // Fast spin before touching the monotonic clock so back-to-back handoffs incur zero vDSO reads.
+        for _ in 0..32 {
+            if let Some(event) = self.poll_next(next_epoch) {
+                return event;
+            }
+            std::hint::spin_loop();
+        }
+        let started = Instant::now();
+        let expected_prev = next_epoch - 1;
+        while started.elapsed() < HANDOFF_POLL {
+            if let Some(event) = self.poll_next(next_epoch) {
+                return event;
+            }
+            #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
+            {
+                let _ = super::transport::host_wait::wait_u64_change(
+                    &self.prepare_epoch.0,
+                    expected_prev,
+                    25,
+                );
+            }
+            #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
+            {
+                let _ = expected_prev;
+                std::hint::spin_loop();
+            }
+        }
+        let mut guard = self.idle_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.parked.0.fetch_add(1, Ordering::SeqCst);
+        loop {
+            if self.drain.0.load(Ordering::SeqCst) {
+                self.parked.0.fetch_sub(1, Ordering::Release);
+                return DispatchEvent::Drain;
+            }
+            if self.prepare_epoch.0.load(Ordering::SeqCst) >= next_epoch {
+                self.parked.0.fetch_sub(1, Ordering::Release);
+                return DispatchEvent::Step;
+            }
+            guard = self.idle_wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Borrow the immutable slot for `step_epoch` after observing `prepare_epoch >= step_epoch`.
+    ///
+    /// # Safety
+    /// Caller must have observed `prepare_epoch >= step_epoch` and must drop the returned
+    /// reference before advancing to `step_epoch + 1` or acknowledging cancel.
+    unsafe fn slot(&self, step_epoch: u64) -> &StepSlot {
+        let index = (step_epoch as usize) & 1;
+        // SAFETY: Acquire/SeqCst load of `prepare_epoch >= step_epoch` synchronizes with `prepare`.
+        unsafe { &*self.slots[index].0.get() }
+    }
+}
+
+/// Coordinate peer pre-launch validation, rank-zero submission, and commit/cancel over `ring`.
+///
+/// # Safety
+/// Caller must be the sole producer and guarantee no peer still reads `ring.slots[*next_epoch & 1]`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn coordinate_step<F>(
+    ring: &DispatchRing,
+    peer_count: usize,
+    next_epoch: &mut u64,
+    fence: Fence,
+    graph: usize,
+    grammar: bool,
+    uploads: &[Upload<'_>],
+    cleared_pages: &[PageId],
+    timeout: Duration,
+    on_peer_exit: impl FnOnce() -> Error,
+    local_submit: F,
+) -> Result<Option<Fence>>
+where
+    F: FnOnce() -> Result<Option<Fence>>,
+{
+    let epoch = *next_epoch;
+    // SAFETY: Caller guarantees exclusive write access to `slots[epoch & 1]`.
+    unsafe {
+        ring.prepare(epoch, fence, graph, grammar, uploads, cleared_pages);
+    }
+    match ring.wait_peer_acks(peer_count, epoch << 1, timeout) {
+        Ok(()) => {}
+        Err(WaitPeersError::PeerExited) => {
+            ring.request_drain();
+            return Err(on_peer_exit());
+        }
+        Err(WaitPeersError::Timeout) => {
+            ring.request_drain();
+            return Err(invalid("rank thread readiness deadline expired"));
+        }
+    }
+    match local_submit() {
+        Ok(Some(local_fence)) if local_fence == fence => {
+            ring.commit(epoch);
+            *next_epoch += 1;
+            Ok(Some(fence))
+        }
+        Ok(None) => {
+            ring.cancel(epoch);
+            match ring.wait_peer_acks(peer_count, (epoch << 1) | 1, timeout) {
+                Ok(()) => {
+                    *next_epoch += 1;
+                    Ok(None)
+                }
+                Err(WaitPeersError::PeerExited) => {
+                    ring.request_drain();
+                    Err(on_peer_exit())
+                }
+                Err(WaitPeersError::Timeout) => {
+                    ring.request_drain();
+                    Err(invalid("rank cancel acknowledgement deadline expired"))
+                }
+            }
+        }
+        Ok(Some(_)) => {
+            ring.request_drain();
+            Err(invalid("rank-zero fence changed after validation"))
+        }
+        Err(error) => {
+            ring.request_drain();
+            Err(error)
+        }
+    }
+}
+
+struct PeerExitGuard(Arc<DispatchRing>);
+impl Drop for PeerExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_peer_exited();
+    }
+}
+
 enum Command {
     Tune(usize),
     FinishStartup,
-    Prepare(Arc<Step>),
-    Commit(Fence, usize),
     Drain,
 }
 enum Reply {
     Initialized,
     Tuned(usize, Result<()>),
     Started,
-    Ready(Fence, usize),
     Complete(FrameCompletion),
     Drained,
 }
@@ -99,52 +544,88 @@ impl Peer {
     }
 }
 
-struct Pending {
-    step: Arc<Step>,
+struct InFlightFrame {
+    fence: Fence,
+    graph: usize,
+    grammar: bool,
     dispatched: Instant,
-    committed: bool,
     queued: bool,
-    ready: Vec<bool>,
-    completions: Vec<Option<FrameCompletion>>,
+    world_size: usize,
+    completions: [Option<FrameCompletion>; MAX_RANKS],
 }
 
-impl protocol::PendingFrame for Pending {
-    fn fence(&self) -> Fence {
-        self.step.fence
+fn can_submit_window(
+    pending: &VecDeque<InFlightFrame>,
+    barrier: bool,
+    manifest: &ExecutionManifest,
+) -> bool {
+    pending.len() < 2
+        && (!barrier || pending.is_empty())
+        && !pending.iter().any(|frame| {
+            frame.grammar
+                || !matches!(
+                    manifest.graphs[frame.graph].kind,
+                    super::GraphKind::Decode | super::GraphKind::Speculative
+                )
+        })
+}
+
+fn record_local_completion(
+    pending: &mut VecDeque<InFlightFrame>,
+    completion: FrameCompletion,
+) -> Result<()> {
+    let frame = pending
+        .iter_mut()
+        .find(|frame| frame.fence == completion.fence)
+        .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
+    if frame.graph != completion.graph_index {
+        return Err(invalid("rank-zero completion identity or state differs"));
     }
-    fn graph(&self) -> usize {
-        self.step.graph
+    if frame.completions[0].is_some() {
+        return Err(invalid("duplicate rank-zero completion"));
     }
-    fn grammar(&self) -> bool {
-        self.step.grammar
+    frame.completions[0] = Some(completion);
+    Ok(())
+}
+
+fn record_peer_completion(
+    pending: &mut VecDeque<InFlightFrame>,
+    peer: usize,
+    completion: FrameCompletion,
+) -> Result<()> {
+    let expected = pending
+        .iter_mut()
+        .find(|frame| frame.completions[peer + 1].is_none())
+        .ok_or_else(|| invalid("unexpected rank completion"))?;
+    if expected.fence != completion.fence || expected.graph != completion.graph_index {
+        return Err(invalid("rank completion order or identity differs"));
     }
-    fn committed(&self) -> bool {
-        self.committed
+    expected.completions[peer + 1] = Some(completion);
+    Ok(())
+}
+
+fn pop_completed_front(pending: &mut VecDeque<InFlightFrame>) -> Option<InFlightFrame> {
+    if !pending
+        .front()
+        .is_some_and(|frame| frame.completions[..frame.world_size].iter().all(Option::is_some))
+    {
+        return None;
     }
-    fn ready(&self) -> &[bool] {
-        &self.ready
-    }
-    fn ready_mut(&mut self) -> &mut [bool] {
-        &mut self.ready
-    }
-    fn completions(&self) -> &[Option<FrameCompletion>] {
-        &self.completions
-    }
-    fn completions_mut(&mut self) -> &mut [Option<FrameCompletion>] {
-        &mut self.completions
-    }
+    pending.pop_front()
 }
 
 pub(crate) struct ThreadedExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
-    pending: VecDeque<Pending>,
+    ring: Arc<DispatchRing>,
+    next_epoch: u64,
+    pending: VecDeque<InFlightFrame>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
 }
 impl ThreadedExecutor {
     pub unsafe fn new(manifest: ExecutionManifest, ranks: Vec<ExecutionManifest>) -> Result<Self> {
-        if ranks.len() >= 16 {
+        if ranks.len() >= MAX_RANKS {
             return Err(invalid("tensor parallelism supports at most sixteen ranks"));
         }
         if ranks.is_empty() {
@@ -163,10 +644,20 @@ impl ThreadedExecutor {
                 return Err(invalid("rank graph I/O schemas differ"));
             }
         }
+        let max_uploads = manifest
+            .graphs
+            .iter()
+            .map(|graph| graph.input_bindings.len())
+            .max()
+            .unwrap_or(0)
+            .max(16);
+        let ring = Arc::new(DispatchRing::new(manifest.input_frame_bytes, max_uploads));
         let local = unsafe { GraphExecutor::new_unstarted(manifest)? };
         let mut result = Self {
             local,
             peers: Vec::new(),
+            ring,
+            next_epoch: 1,
             pending: VecDeque::with_capacity(2),
             poison: None,
             shutdown: None,
@@ -174,9 +665,11 @@ impl ThreadedExecutor {
         for (index, manifest) in ranks.into_iter().enumerate() {
             let (sender, commands) = mpsc::channel();
             let (replies, receiver) = mpsc::channel();
+            let peer_ring = result.ring.clone();
             let thread = thread::Builder::new()
                 .name(format!("flare-rank-{}", index + 1))
                 .spawn(move || {
+                    let _exit_guard = PeerExitGuard(peer_ring.clone());
                     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
                         Ok(executor) => executor,
                         Err(error) => {
@@ -191,13 +684,14 @@ impl ThreadedExecutor {
                     // Pin after GraphExecutor creation so lazily spawned CUDA driver threads do not inherit affinity.
                     crate::os::pin_current_thread(2 + index);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rank_loop(&mut executor, commands, &replies)
+                        rank_loop(index, &mut executor, commands, &replies, &peer_ring)
                     }))
                     .unwrap_or_else(|_| Err(invalid("rank execution thread panicked")));
                     match result {
                         Ok(()) => executor.close(),
                         Err(error) => {
                             let _ = replies.send(Err(error.clone()));
+                            peer_ring.mark_peer_exited();
                             executor.abandon(error)
                         }
                     }
@@ -271,6 +765,7 @@ impl ThreadedExecutor {
         })();
         if let Err(error) = startup {
             // Every issued tuning command has a completed acknowledgement here.
+            result.ring.request_drain();
             let sent: Vec<_> = result.peers.iter().map(|peer| peer.send(Command::Drain).is_ok()).collect();
             for (peer, sent) in result.peers.iter_mut().zip(sent) {
                 if sent {
@@ -312,11 +807,14 @@ impl ThreadedExecutor {
     pub fn outstanding(&self) -> usize {
         self.pending.len()
     }
+    pub fn park(&self) -> bool {
+        self.local.park()
+    }
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
             && (!super::single_submission() || self.pending.is_empty())
-            && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
+            && can_submit_window(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
     pub fn next_fence(&self) -> Result<Fence> {
@@ -326,10 +824,17 @@ impl ThreadedExecutor {
         if self.shutdown.is_some() {
             return Err(invalid("rank executor is closed"));
         }
-        match self.pending.back() {
-            Some(frame) if !frame.committed => Ok(Fence(frame.step.fence.0 + 1)),
-            _ => self.local.next_fence(),
+        self.local.next_fence()
+    }
+    fn surface_peer_error(peers: &[Peer]) -> Error {
+        for peer in peers {
+            while let Ok(reply) = peer.receiver.try_recv() {
+                if let Err(error) = reply {
+                    return error;
+                }
+            }
         }
+        invalid("rank thread disconnected")
     }
     pub fn submit(
         &mut self,
@@ -339,32 +844,56 @@ impl ThreadedExecutor {
         grammar: bool,
     ) -> Result<Option<Fence>> {
         self.next_fence()?;
+        if self.ring.peer_exited() {
+            let error = Self::surface_peer_error(&self.peers);
+            self.poison = Some(error.clone());
+            return Err(error);
+        }
         let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
             Some(super::GraphKind::Decode | super::GraphKind::Speculative));
         if !self.can_submit(barrier) { return Ok(None); }
         let Some(fence) = self.local.validate_submission(graph, uploads, cleared_pages, grammar)? else {
             return Ok(None);
         };
-        let step = Arc::new(Step {
-            fence, graph, grammar,
-            uploads: uploads.iter().map(|u| OwnedUpload {
-                buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
-            }).collect(),
-            cleared_pages: cleared_pages.to_vec(),
-        });
         let queued = !self.pending.is_empty();
-        self.pending.push_back(Pending {
-            step: step.clone(), dispatched: Instant::now(), committed: false, queued,
-            ready: vec![false; self.peers.len()],
-            completions: (0..=self.peers.len()).map(|_| None).collect(),
-        });
-        for peer in &self.peers {
-            if let Err(error) = peer.send(Command::Prepare(step.clone())) {
+        let dispatched = Instant::now();
+        let peers = &self.peers;
+        // SAFETY: `can_submit` limits `self.pending.len() < 2` and every prior frame in parity
+        // slot `next_epoch & 1` has already been released by every peer.
+        let coordinated = unsafe {
+            coordinate_step(
+                &self.ring,
+                peers.len(),
+                &mut self.next_epoch,
+                fence,
+                graph,
+                grammar,
+                uploads,
+                cleared_pages,
+                TIMEOUT,
+                || Self::surface_peer_error(peers),
+                || self.local.submit(graph, uploads, cleared_pages, grammar),
+            )
+        };
+        match coordinated {
+            Ok(Some(submitted_fence)) => {
+                self.pending.push_back(InFlightFrame {
+                    fence: submitted_fence,
+                    graph,
+                    grammar,
+                    dispatched,
+                    queued,
+                    world_size: self.peers.len() + 1,
+                    completions: std::array::from_fn(|_| None),
+                });
+                Ok(Some(submitted_fence))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
                 self.poison = Some(error.clone());
-                return Err(error);
+                Err(error)
             }
         }
-        Ok(Some(fence))
     }
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
         if let Some(error) = &self.poison {
@@ -384,7 +913,7 @@ impl ThreadedExecutor {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
         if let Some(completion) = self.local.poll()? {
-            protocol::record_local_completion(&mut self.pending, completion)?;
+            record_local_completion(&mut self.pending, completion)?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             loop {
@@ -394,34 +923,17 @@ impl ThreadedExecutor {
                     Err(_) => return Err(invalid("rank thread disconnected")),
                 };
                 match reply {
-                    Reply::Ready(fence, graph) => {
-                        protocol::record_ready(&mut self.pending, index, fence, graph)?;
-                    }
                     Reply::Complete(completion) => {
-                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
+                        record_peer_completion(&mut self.pending, index, completion)?;
                     }
                     _ => return Err(invalid("unexpected rank thread reply")),
                 }
             }
         }
-        for frame in &mut self.pending {
-            if frame.committed { continue; }
-            if !protocol::ready_to_commit(frame) { break; }
-            let uploads = frame.step.uploads();
-            if self.local.validate_submission(frame.step.graph, &uploads, &frame.step.cleared_pages, frame.step.grammar)?
-                != Some(frame.step.fence) {
-                return Err(invalid("rank-zero reservation changed before commit"));
-            }
-            protocol::dispatch_commit(&self.peers, frame.step.fence, frame.step.graph)?;
-            if self.local.submit(frame.step.graph, &uploads, &frame.step.cleared_pages, frame.step.grammar)? != Some(frame.step.fence) {
-                return Err(invalid("rank-zero fence changed after validation"));
-            }
-            frame.committed = true;
-        }
-        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else { return Ok(None); };
+        let Some(mut frame) = pop_completed_front(&mut self.pending) else { return Ok(None); };
         let mut root = frame.completions[0].take().unwrap();
-        for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
-            let completion = completion.unwrap();
+        for index in 0..self.peers.len() {
+            let completion = frame.completions[index + 1].take().unwrap();
             let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
                 super::parallel::agree_speculative
             } else { super::parallel::agree };
@@ -444,9 +956,7 @@ impl ThreadedExecutor {
             if let Some(error) = &self.poison {
                 return Err(error.clone());
             }
-            for peer in &self.peers {
-                peer.send(Command::Drain)?;
-            }
+            self.ring.request_drain();
             for peer in &mut self.peers {
                 if !matches!(peer.receive()?, Reply::Drained) {
                     return Err(invalid("rank thread did not drain"));
@@ -469,9 +979,7 @@ impl ThreadedExecutor {
         if result.is_err() {
             // Best-effort drain and join of any peers that can still exit cleanly so live
             // peer threads are not detached on poisoned teardown.
-            for peer in &self.peers {
-                let _ = peer.sender.send(Command::Drain);
-            }
+            self.ring.request_drain();
             for peer in &mut self.peers {
                 if peer.thread.is_none() {
                     continue;
@@ -509,10 +1017,27 @@ impl Drop for ThreadedExecutor {
     }
 }
 
+fn drain_rank(executor: &mut GraphExecutor, send: &impl Fn(Reply) -> Result<()>) -> Result<()> {
+    if executor.outstanding() != 0 {
+        return Err(invalid("rank drain arrived with outstanding frames"));
+    }
+    let shutdown = executor.close();
+    if !shutdown.drained {
+        return Err(invalid("rank streams did not drain"));
+    }
+    if let Some(error) = shutdown.error {
+        return Err(error);
+    }
+    send(Reply::Drained)?;
+    Ok(())
+}
+
 fn rank_loop(
+    peer_index: usize,
     executor: &mut GraphExecutor,
     commands: mpsc::Receiver<Command>,
     replies: &mpsc::Sender<Result<Reply>>,
+    ring: &DispatchRing,
 ) -> Result<()> {
     let send = |reply| {
         replies
@@ -520,89 +1045,96 @@ fn rank_loop(
             .map_err(|_| invalid("rank coordinator disconnected"))
     };
     send(Reply::Initialized)?;
-    let mut prepared: Option<Arc<Step>> = None;
-    let mut prepared_at: Option<Instant> = None;
-    let mut started = VecDeque::new();
-    let mut idle_polls = 0u32;
+    // Startup phase: run startup tuning graphs and FinishStartup over the control channel.
     loop {
-        let mut active = false;
-        let command = if executor.outstanding() == 0 && prepared.is_none() {
-            match receive(&commands, None) { Ok(command) => Some(command), Err(_) => return Ok(()) }
-        } else {
-            match commands.try_recv() {
-                Ok(command) => Some(command),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(_) => return Err(invalid("rank coordinator disconnected during execution")),
-            }
-        };
-        if command.is_some() {
-            active = true;
-        }
-        match command {
-            Some(Command::Tune(index)) => {
+        match receive(&commands, None) {
+            Ok(Command::Tune(index)) => {
                 let status = executor.run_tuning_graph(index);
                 send(Reply::Tuned(index, status))?;
             }
-            Some(Command::FinishStartup) => {
+            Ok(Command::FinishStartup) => {
                 if let Err(error) = executor.finish_startup() {
                     let _ = replies.send(Err(error));
                     return Ok(());
                 }
                 send(Reply::Started)?;
+                break;
             }
-            Some(Command::Prepare(step)) => {
-                if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                if executor.validate_submission(step.graph, &step.uploads(), &step.cleared_pages, step.grammar)? != Some(step.fence) {
+            Ok(Command::Drain) => {
+                return drain_rank(executor, &send);
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+    // Serving phase: lock-free Prepare -> Ready -> Commit/Cancel step dispatch over DispatchRing.
+    let mut next_epoch = 1u64;
+    let mut started = VecDeque::with_capacity(2);
+    loop {
+        let event = if executor.outstanding() == 0 {
+            Some(ring.wait_next(next_epoch))
+        } else {
+            ring.poll_next(next_epoch)
+        };
+        match event {
+            Some(DispatchEvent::Step) => {
+                // SAFETY: `ring` published `prepare_epoch >= next_epoch`; this borrow ends
+                // before signalling readiness or cancel acknowledgement.
+                let (fence, graph, grammar, validated) = {
+                    let slot = unsafe { ring.slot(next_epoch) };
+                    let fence = slot.fence;
+                    let graph = slot.graph;
+                    let grammar = slot.grammar;
+                    let validated = slot.with_uploads(|uploads| {
+                        executor.validate_submission(graph, uploads, &slot.cleared_pages, grammar)
+                    })?;
+                    (fence, graph, grammar, validated)
+                };
+                if validated != Some(fence) {
                     return Err(invalid("rank submission fence differs"));
                 }
-                send(Reply::Ready(step.fence, step.graph))?;
-                prepared = Some(step);
-                prepared_at = Some(Instant::now());
-            }
-            Some(Command::Commit(fence, graph)) => {
-                prepared_at = None;
-                let step = prepared.take().ok_or_else(|| invalid("rank commit arrived without preparation"))?;
-                if step.fence != fence || step.graph != graph { return Err(invalid("rank commit identity differs")); }
-                if executor.submit(graph, &step.uploads(), &step.cleared_pages, step.grammar)? != Some(fence) {
-                    return Err(invalid("rank fence changed after validation"));
+                ring.mark_peer_ready(peer_index, next_epoch);
+                match ring.wait_decision(next_epoch, TIMEOUT)? {
+                    DecisionEvent::Commit => {
+                        // SAFETY: Rank zero committed `next_epoch` and retains slot ownership
+                        // until this peer finishes submission and advances `next_epoch`.
+                        let submitted = {
+                            let slot = unsafe { ring.slot(next_epoch) };
+                            slot.with_uploads(|uploads| {
+                                executor.submit(graph, uploads, &slot.cleared_pages, grammar)
+                            })?
+                        };
+                        if submitted != Some(fence) {
+                            return Err(invalid("rank submission fence differs"));
+                        }
+                        next_epoch += 1;
+                        started.push_back(Instant::now());
+                    }
+                    DecisionEvent::Cancel => {
+                        ring.mark_peer_cancelled(peer_index, next_epoch);
+                        next_epoch += 1;
+                    }
+                    DecisionEvent::Drain => {
+                        return drain_rank(executor, &send);
+                    }
                 }
-                started.push_back(Instant::now());
             }
-            Some(Command::Drain) => {
-                if prepared.is_some() || executor.outstanding() != 0 { return Err(invalid("rank drain arrived with outstanding frames")); }
-                let shutdown = executor.close();
-                if !shutdown.drained { return Err(invalid("rank streams did not drain")); }
-                if let Some(error) = shutdown.error { return Err(error); }
-                send(Reply::Drained)?;
-                return Ok(());
+            Some(DispatchEvent::Drain) => {
+                return drain_rank(executor, &send);
             }
             None => {}
         }
         if let Some(completion) = executor.poll()? {
-            active = true;
             started.pop_front();
             send(Reply::Complete(completion))?;
-        }
-        if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {
-            return Err(invalid("rank commit deadline expired after preparation"));
         }
         if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
             return Err(invalid("rank graph completion deadline expired"));
         }
-        if executor.outstanding() != 0 || prepared.is_some() {
-            if active {
-                idle_polls = 0;
-            } else {
-                idle_polls += 1;
-                if idle_polls >= 64 {
-                    idle_polls = 0;
-                    thread::yield_now();
-                } else {
-                    std::hint::spin_loop();
-                }
+        if executor.outstanding() != 0 && !ring.has_step(next_epoch) {
+            if !executor.park() {
+                std::hint::spin_loop();
+                thread::yield_now();
             }
-        } else {
-            idle_polls = 0;
         }
     }
 }
@@ -919,6 +1451,410 @@ mod tests {
                 bad.buffers[2].shape[1] += 1;
                 assert!(!same_layout(&ranks[0], &bad));
             }
+        }
+    }
+
+    #[test]
+    fn dispatch_ring_ten_thousand_steps_across_four_ranks_without_races_or_drops() {
+        const STEPS: u64 = 10_000;
+        const PEERS: usize = 3; // 4 ranks total (coordinator + 3 worker threads)
+
+        let ring = Arc::new(DispatchRing::new(4096, 16));
+        let mut receivers = Vec::with_capacity(PEERS);
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let (tx, rx) = mpsc::channel::<(Fence, usize, u64)>();
+            let peer_ring = ring.clone();
+            let handle = thread::spawn(move || {
+                let mut next_epoch = 1u64;
+                loop {
+                    match peer_ring.wait_next(next_epoch) {
+                        DispatchEvent::Step => {
+                            let (fence, graph) = {
+                                let slot = unsafe { peer_ring.slot(next_epoch) };
+                                (slot.fence, slot.graph)
+                            };
+                            peer_ring.mark_peer_ready(peer_id, next_epoch);
+                            match peer_ring.wait_decision(next_epoch, Duration::from_secs(10)).unwrap() {
+                                DecisionEvent::Commit => {
+                                    let slot = unsafe { peer_ring.slot(next_epoch) };
+                                    assert_eq!(slot.cleared_pages, &[PageId((fence.0 % 1024) as u32)]);
+                                    let checksum = slot.with_uploads(|uploads| {
+                                        assert_eq!(uploads.len(), 3);
+                                        assert_eq!(uploads[0].buffer, "slot_ids");
+                                        assert_eq!(uploads[1].buffer, "positions");
+                                        assert_eq!(uploads[2].buffer, "tokens");
+                                        let mut acc = 0u64;
+                                        for u in uploads {
+                                            for chunk in u.bytes.chunks_exact(8) {
+                                                acc = acc.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+                                            }
+                                        }
+                                        acc ^ (peer_id as u64)
+                                    });
+                                    tx.send((fence, graph, checksum)).unwrap();
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Cancel => {
+                                    peer_ring.mark_peer_cancelled(peer_id, next_epoch);
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Drain => break,
+                            }
+                        }
+                        DispatchEvent::Drain => break,
+                    }
+                }
+                next_epoch - 1
+            });
+            receivers.push(rx);
+            workers.push(handle);
+        }
+
+        // Exercise rapid back-to-back 2-deep pipelining across all 10,000 steps.
+        let mut in_flight: VecDeque<(u64, usize, u64)> = VecDeque::with_capacity(2);
+        let mut next_epoch = 1u64;
+        let mut buf0 = [0u8; 64];
+        let mut buf1 = [0u8; 64];
+        let mut buf2 = [0u8; 64];
+        for step in 1..=STEPS {
+            if in_flight.len() == 2 {
+                let (expected_fence, expected_graph, expected_sum) = in_flight.pop_front().unwrap();
+                for (peer_id, rx) in receivers.iter().enumerate() {
+                    let (fence, graph, sum) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(fence, Fence(expected_fence));
+                    assert_eq!(graph, expected_graph);
+                    assert_eq!(sum, expected_sum ^ (peer_id as u64));
+                }
+            }
+            let v0 = step.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let v1 = step.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let v2 = step.wrapping_mul(0x94D0_49BB_1331_11EB);
+            for chunk in buf0.chunks_exact_mut(8) { chunk.copy_from_slice(&v0.to_le_bytes()); }
+            for chunk in buf1.chunks_exact_mut(8) { chunk.copy_from_slice(&v1.to_le_bytes()); }
+            for chunk in buf2.chunks_exact_mut(8) { chunk.copy_from_slice(&v2.to_le_bytes()); }
+            let expected_sum = v0.wrapping_mul(8)
+                .wrapping_add(v1.wrapping_mul(8))
+                .wrapping_add(v2.wrapping_mul(8));
+            let uploads = [
+                Upload { buffer: "slot_ids", offset: 0, bytes: &buf0 },
+                Upload { buffer: "positions", offset: 64, bytes: &buf1 },
+                Upload { buffer: "tokens", offset: 128, bytes: &buf2 },
+            ];
+            let cleared = [PageId((step % 1024) as u32)];
+            let graph = (step as usize) % 7;
+            let submitted = unsafe {
+                coordinate_step(
+                    &ring,
+                    PEERS,
+                    &mut next_epoch,
+                    Fence(step),
+                    graph,
+                    false,
+                    &uploads,
+                    &cleared,
+                    Duration::from_secs(10),
+                    || invalid("unexpected peer exit"),
+                    || Ok(Some(Fence(step))),
+                )
+                .unwrap()
+            };
+            assert_eq!(submitted, Some(Fence(step)));
+            in_flight.push_back((step, graph, expected_sum));
+        }
+        while let Some((expected_fence, expected_graph, expected_sum)) = in_flight.pop_front() {
+            for (peer_id, rx) in receivers.iter().enumerate() {
+                let (fence, graph, sum) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(fence, Fence(expected_fence));
+                assert_eq!(graph, expected_graph);
+                assert_eq!(sum, expected_sum ^ (peer_id as u64));
+            }
+        }
+        ring.request_drain();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), STEPS);
+        }
+        // Verify ping-pong slot allocations stayed bounded without per-step growth.
+        for index in 0..2 {
+            let slot = unsafe { &*ring.slots[index].0.get() };
+            assert!(slot.payload.capacity() <= 4096);
+            assert!(slot.uploads.capacity() <= 16);
+            assert!(slot.cleared_pages.capacity() <= 64);
+        }
+    }
+
+    #[test]
+    fn dispatch_ring_wakes_parked_peers_and_tracks_peer_exit() {
+        let ring = Arc::new(DispatchRing::new(512, 8));
+        let (tx, rx) = mpsc::channel();
+        let peer_ring = ring.clone();
+        let worker = thread::spawn(move || {
+            let _guard = PeerExitGuard(peer_ring.clone());
+            assert_eq!(peer_ring.wait_next(1), DispatchEvent::Step);
+            peer_ring.mark_peer_ready(0, 1);
+            assert_eq!(
+                peer_ring.wait_decision(1, Duration::from_secs(2)).unwrap(),
+                DecisionEvent::Commit
+            );
+            let slot = unsafe { peer_ring.slot(1) };
+            tx.send((slot.fence, slot.graph)).unwrap();
+            assert_eq!(peer_ring.wait_next(2), DispatchEvent::Drain);
+        });
+        // Wait past HANDOFF_POLL so the peer parks on the Condvar.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ring.parked.0.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "peer never entered idle park");
+            thread::sleep(Duration::from_micros(200));
+        }
+        assert!(!ring.peer_exited());
+        let data = 42u64.to_le_bytes();
+        let uploads = [Upload { buffer: "tokens", offset: 0, bytes: &data }];
+        let mut next_epoch = 1u64;
+        let fence = unsafe {
+            coordinate_step(
+                &ring,
+                1,
+                &mut next_epoch,
+                Fence(1),
+                3,
+                false,
+                &uploads,
+                &[],
+                Duration::from_secs(2),
+                || invalid("unexpected peer exit"),
+                || Ok(Some(Fence(1))),
+            )
+            .unwrap()
+        };
+        assert_eq!(fence, Some(Fence(1)));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), (Fence(1), 3));
+        ring.request_drain();
+        worker.join().unwrap();
+        assert!(ring.peer_exited());
+    }
+
+    #[test]
+    fn coordinate_step_aborts_before_local_submit_when_peer_validation_fails() {
+        const PEERS: usize = 3;
+        let ring = Arc::new(DispatchRing::new(512, 8));
+        let peer_launches = Arc::new(AtomicUsize::new(0));
+        let (err_tx, err_rx) = mpsc::channel::<Error>();
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let peer_ring = ring.clone();
+            let launches = peer_launches.clone();
+            let peer_err_tx = err_tx.clone();
+            workers.push(thread::spawn(move || {
+                let _guard = PeerExitGuard(peer_ring.clone());
+                let mut next_epoch = 1u64;
+                loop {
+                    match peer_ring.wait_next(next_epoch) {
+                        DispatchEvent::Step => {
+                            let fence = unsafe { peer_ring.slot(next_epoch).fence };
+                            // Simulate rank-local validation failure (e.g., partitioned Engram staging error)
+                            // on peer 1 during step 2 before signalling readiness.
+                            if peer_id == 1 && fence == Fence(2) {
+                                let _ = peer_err_tx.send(invalid("rank-1 engram staging error"));
+                                return;
+                            }
+                            peer_ring.mark_peer_ready(peer_id, next_epoch);
+                            match peer_ring.wait_decision(next_epoch, Duration::from_secs(5)).unwrap() {
+                                DecisionEvent::Commit => {
+                                    launches.fetch_add(1, Ordering::SeqCst);
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Cancel => {
+                                    peer_ring.mark_peer_cancelled(peer_id, next_epoch);
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Drain => return,
+                            }
+                        }
+                        DispatchEvent::Drain => return,
+                    }
+                }
+            }));
+        }
+        let data = 9u64.to_le_bytes();
+        let uploads = [Upload { buffer: "tokens", offset: 0, bytes: &data }];
+        let mut next_epoch = 1u64;
+        let mut local_launches = 0usize;
+
+        // Step 1 succeeds across all ranks.
+        let step1 = unsafe {
+            coordinate_step(
+                &ring,
+                PEERS,
+                &mut next_epoch,
+                Fence(1),
+                0,
+                false,
+                &uploads,
+                &[],
+                Duration::from_secs(5),
+                || invalid("unexpected peer exit"),
+                || {
+                    local_launches += 1;
+                    Ok(Some(Fence(1)))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(step1, Some(Fence(1)));
+        assert_eq!(local_launches, 1);
+
+        // Step 2 fails validation on peer 1; rank zero must NOT call local_submit and
+        // healthy peers must drain without launching step 2.
+        let step2 = unsafe {
+            coordinate_step(
+                &ring,
+                PEERS,
+                &mut next_epoch,
+                Fence(2),
+                0,
+                false,
+                &uploads,
+                &[],
+                Duration::from_secs(5),
+                || err_rx.try_recv().unwrap_or_else(|_| invalid("rank thread disconnected")),
+                || {
+                    local_launches += 1;
+                    Ok(Some(Fence(2)))
+                },
+            )
+        };
+        assert_eq!(step2.unwrap_err().to_string(), "rank-1 engram staging error");
+        assert_eq!(local_launches, 1, "rank zero must not launch when peer validation fails");
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            peer_launches.load(Ordering::SeqCst),
+            PEERS,
+            "healthy peers must not launch the aborted step"
+        );
+    }
+
+    #[test]
+    fn coordinate_step_cancels_cleanly_on_local_backpressure_without_poisoning() {
+        const PEERS: usize = 3;
+        let ring = Arc::new(DispatchRing::new(512, 8));
+        let mut receivers = Vec::with_capacity(PEERS);
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let (tx, rx) = mpsc::channel::<(Fence, usize)>();
+            let peer_ring = ring.clone();
+            workers.push(thread::spawn(move || {
+                let mut next_epoch = 1u64;
+                let mut cancels = 0usize;
+                loop {
+                    match peer_ring.wait_next(next_epoch) {
+                        DispatchEvent::Step => {
+                            let (fence, graph) = {
+                                let slot = unsafe { peer_ring.slot(next_epoch) };
+                                (slot.fence, slot.graph)
+                            };
+                            peer_ring.mark_peer_ready(peer_id, next_epoch);
+                            match peer_ring.wait_decision(next_epoch, Duration::from_secs(5)).unwrap() {
+                                DecisionEvent::Commit => {
+                                    tx.send((fence, graph)).unwrap();
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Cancel => {
+                                    cancels += 1;
+                                    peer_ring.mark_peer_cancelled(peer_id, next_epoch);
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Drain => break,
+                            }
+                        }
+                        DispatchEvent::Drain => break,
+                    }
+                }
+                cancels
+            }));
+            receivers.push(rx);
+        }
+        let data = 11u64.to_le_bytes();
+        let uploads = [Upload { buffer: "tokens", offset: 0, bytes: &data }];
+        let mut next_epoch = 1u64;
+
+        // Step 1 commits normally.
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring,
+                    PEERS,
+                    &mut next_epoch,
+                    Fence(1),
+                    2,
+                    false,
+                    &uploads,
+                    &[],
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    || Ok(Some(Fence(1))),
+                )
+                .unwrap()
+            },
+            Some(Fence(1))
+        );
+        for rx in &receivers {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), (Fence(1), 2));
+        }
+
+        // Next attempt hits documented Ok(None) backpressure from local.submit: must cancel
+        // peers cleanly without poisoning and without launching Fence(2).
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring,
+                    PEERS,
+                    &mut next_epoch,
+                    Fence(2),
+                    4,
+                    false,
+                    &uploads,
+                    &[],
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    || Ok(None),
+                )
+                .unwrap()
+            },
+            None
+        );
+        for rx in &receivers {
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+
+        // Retrying Fence(2) after backpressure clears succeeds across every rank.
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring,
+                    PEERS,
+                    &mut next_epoch,
+                    Fence(2),
+                    5,
+                    false,
+                    &uploads,
+                    &[],
+                    Duration::from_secs(5),
+                    || invalid("unexpected peer exit"),
+                    || Ok(Some(Fence(2))),
+                )
+                .unwrap()
+            },
+            Some(Fence(2))
+        );
+        for rx in &receivers {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), (Fence(2), 5));
+        }
+
+        ring.request_drain();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), 1);
         }
     }
 }

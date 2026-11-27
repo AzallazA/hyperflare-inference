@@ -117,7 +117,7 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [Vec<Option<u64>>; 7],
+    packed_round_durations: [Vec<Option<u64>>; crate::execution::BATCH_CAPACITIES.len()],
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -199,17 +199,18 @@ impl ActionCosts {
             if has_mtp && estimate.draft_source == Some(super::speculation::ProposalSource::Copy) {
                 continue;
             }
+            let Some(slot) = crate::execution::batch_capacity_index(key.batch) else { continue; };
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
-            for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
+            for duration in self.packed_round_durations[slot].iter_mut().take(maximum + 1).skip(1) {
                 *duration = min_measured_duration(*duration, nanos);
             }
         }
     }
 
     pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
-        if !batch.is_power_of_two() || batch > super::REQUEST_LANES { return None; }
-        self.packed_round_durations.get(batch.trailing_zeros() as usize)?.get(width).copied().flatten()
+        let index = crate::execution::batch_capacity_index(batch)?;
+        self.packed_round_durations.get(index)?.get(width).copied().flatten()
     }
 
     pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {

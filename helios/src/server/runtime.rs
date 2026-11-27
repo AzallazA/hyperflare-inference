@@ -1105,7 +1105,6 @@ impl<'a> Worker<'a> {
             .engram
             .as_ref()
             .and_then(|binding| ReadAhead::new(&binding.shared, self.config.limits.max_active));
-        let mut idle_polls = 0u32;
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
@@ -1151,21 +1150,15 @@ impl<'a> Worker<'a> {
                     }),
                 }
             });
-            if progress {
-                idle_polls = 0;
-            } else {
+            if !progress {
                 if executor.outstanding() > 0 {
-                    // A park is bounded; spin briefly before cooperative yield to cut kernel sched_yield overhead.
+                    // Skip the cooperative yield when park observed the wake word advance so
+                    // completion polling runs immediately without a sched_yield round-trip.
                     if !executor.park() {
                         std::hint::spin_loop();
-                    }
-                    idle_polls += 1;
-                    if idle_polls >= 64 {
-                        idle_polls = 0;
                         thread::yield_now();
                     }
                 } else {
-                    idle_polls = 0;
                     self.scheduler.idle()?;
                     let wait = self.idle_wait();
                     match self.receiver.recv_timeout(wait) {

@@ -77,6 +77,12 @@ fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort()
     let b8_shapes = [9usize, 11, 14, 18, 24, 31, 64];
     let mut graphs = super::tests::duration_graphs(8);
     graphs.retain(|g| !(g.kind == GraphKind::Speculative && g.token_capacity > 1));
+    for g in &mut graphs {
+        if g.kind == GraphKind::Speculative && g.token_capacity == 1 {
+            // Keep width-1 speculative slower than the packed speculative graphs under test.
+            g.estimated_duration_ns = 15 * MS;
+        }
+    }
     let mut allocations = Vec::new();
     for &p in &b4_shapes {
         allocations.push((4, 7, 8, p, crate::execution::PrefixAllocation::Gpu));
@@ -161,6 +167,12 @@ fn wider_speculative_batch_is_retained_when_tighter_batch_lacks_token_capacity()
     let mut s = engine(8, true);
     let mut graphs = super::tests::duration_graphs(8);
     graphs.retain(|g| !(g.kind == GraphKind::Speculative && g.token_capacity > 1));
+    for g in &mut graphs {
+        if g.kind == GraphKind::Speculative && g.token_capacity == 1 {
+            // Keep width-1 speculative slower than the packed speculative graphs under test.
+            g.estimated_duration_ns = 15 * MS;
+        }
+    }
     s.capabilities.speculative_allocations = vec![
         (4, 7, 8, 12, crate::execution::PrefixAllocation::Gpu),
         (8, 7, 8, 28, crate::execution::PrefixAllocation::Gpu),
@@ -1484,7 +1496,7 @@ fn speculative_cohorts_are_selected_by_expected_lane_value() {
                 .observe(speculation::ProposalSource::Mtp, 0, 7, if index >= 6 { 7 } else { 0 }, true, None);
         }
     }
-    for batch in [1, 2, 4, 8] {
+    for batch in [1, 2, 4, 6, 8] {
         for width in [1, 3, 8] {
             set_cost(&mut s, GraphKind::Speculative, batch, width, 200 * MS);
         }

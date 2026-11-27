@@ -779,8 +779,9 @@ impl RequestScheduler {
         let mut frontier = std::collections::BinaryHeap::new();
         let base_mtp_drafts = self.costs.max_mtp_draft_tokens();
         for shape in self.costs.packed_round_shapes() {
+            let Some(batch_idx) = crate::execution::batch_capacity_index(shape.batch) else { continue; };
             if shape.batch > self.limits.max_active.next_power_of_two()
-                || !self.speculative_catalog[shape.batch.ilog2() as usize].contains(&shape.width) { continue; }
+                || !self.speculative_catalog[batch_idx].contains(&shape.width) { continue; }
             if self.proposal_source == speculation::ProposalSource::Mtp
                 && shape.draft_source == Some(speculation::ProposalSource::Copy)
                 && shape.width > 1

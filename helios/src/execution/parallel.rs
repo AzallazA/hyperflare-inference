@@ -354,9 +354,8 @@ impl TensorParallelExecutor {
             if self.local.validate_submission(frame.graph, &uploads, &frame.cleared_pages, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
-            for peer in &mut self.peers {
-                peer.channel.send(COMMIT, &identity(frame.fence, frame.graph))?;
-            }
+            let payload = identity(frame.fence, frame.graph);
+            protocol::dispatch_commit(&mut self.peers, |peer| peer.channel.send(COMMIT, &payload))?;
             if self.local.submit(frame.graph, &uploads, &frame.cleared_pages, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero submission changed after coordinated validation"));
             }
@@ -649,11 +648,12 @@ pub unsafe fn serve_rank(
                     return Err(invalid("rank graph completion deadline expired"));
                 }
                 // A peer waiting only on its own running frame parks on it; a prepared frame waits
-                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
-                // the old loop's cooperative handoff after either.
+                // for rank zero's commit over the socket, which cannot end a park. Skip the yield
+                // when park observed the wake word advance so completion polling runs immediately.
                 if active {
-                    if prepared.is_none() { executor.park(); }
-                    std::thread::yield_now();
+                    if !(prepared.is_none() && executor.park()) {
+                        std::thread::yield_now();
+                    }
                 }
             }
         })();

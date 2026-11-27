@@ -38,8 +38,9 @@ pub use manifest::{
     GraphDescriptor, TuningGraphDescriptor, TunedBinding, GraphKind, PersistentWorkerControl,
     PersistentWorkerDescriptor, PersistentWorkerReader, PersistentWorkerSnapshot, PrefixAllocation,
     InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, DEFAULT_COMPLETION_TOKEN_CAPACITY,
-    COMPLETION_METADATA_FIELDS, resolve_completion_token_capacity, MAX_TOP_LOGPROBS,
-    MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, REQUEST_LANES, SamplingMode, WorkerState,
+    COMPLETION_METADATA_FIELDS, REQUIRED_BATCH_CAPACITIES, resolve_completion_token_capacity,
+    MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, REQUEST_LANES, SamplingMode,
+    WorkerState, batch_capacity_index,
 };
 
 /// Debug A/B (DeepSeek decode-corruption hunt, flare#193): `FLARE_SINGLE_SUBMISSION=1` keeps at most one

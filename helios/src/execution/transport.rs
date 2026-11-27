@@ -18,18 +18,25 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// `sched_yield` loop. On Linux aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
 /// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
 /// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
-/// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
-/// completion signal; the word can only end a park early, best effort (it relies on the GPU's
-/// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
-/// intentional wait per park; scheduling can add to it.
+/// monitor armed on that word. On x86_64, [`GraphExecutor::park`] uses runtime-detected WAITPKG
+/// (`UMONITOR`/`UMWAIT` in C0.1) when supported and falls back to a bounded `PAUSE` spin loop
+/// over the same mapped host word. The event query in [`GraphExecutor::poll`] stays the only
+/// completion signal; the word can only end a wait early, best effort.
 struct CompletionWake {
+    #[cfg_attr(
+        not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     word: PinnedHost,
     device: usize,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-mod host_wait {
-    use std::sync::OnceLock;
+pub(super) mod host_wait {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    };
 
     const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
 
@@ -37,6 +44,10 @@ mod host_wait {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
         *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT != 0)
+    }
+
+    pub(super) fn mode_label() -> &'static str {
+        "WFET"
     }
 
     pub(super) fn ticks() -> u64 {
@@ -76,13 +87,210 @@ mod host_wait {
             );
         }
     }
+
+    /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
+    /// Returns `true` if `word` changed, `false` on timeout or spurious wake without change.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory.
+    pub(super) unsafe fn wait_u32_change(word: *const u32, old: u32, limit_us: u64) -> bool {
+        let deadline = ticks() + frequency() * limit_us / 1_000_000;
+        // SAFETY: Caller guarantees `word` is live, aligned, and coherent; WFxT is checked by caller.
+        unsafe { wait_change(word, old, deadline) };
+        // SAFETY: Same live, aligned word.
+        unsafe { AtomicU32::from_ptr(word as *mut u32) }.load(Ordering::Acquire) != old
+    }
+
+    /// Wait up to `limit_us` microseconds for an `AtomicU64` to differ from `old`.
+    pub(in crate::execution) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
+        if !available() {
+            std::hint::spin_loop();
+            return word.load(Ordering::Acquire) != old;
+        }
+        let deadline = ticks() + frequency() * limit_us / 1_000_000;
+        let ptr = word.as_ptr() as *const u64;
+        // SAFETY: `word` is a live, 8-byte aligned AtomicU64 in coherent host memory and WFxT is available.
+        unsafe {
+            std::arch::asm!(
+                "sevl",
+                "wfe",
+                "ldxr {tmp}, [{word}]",
+                "eor {tmp}, {tmp}, {old}",
+                "cbnz {tmp}, 2f",
+                ".inst 0xd5031009", // wfet x9
+                "2:",
+                word = in(reg) ptr,
+                old = in(reg) old,
+                tmp = out(reg) _,
+                in("x9") deadline,
+                options(nostack),
+            );
+        }
+        word.load(Ordering::Acquire) != old
+    }
 }
 
-/// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
-/// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
-/// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+#[cfg(target_arch = "x86_64")]
+pub(super) mod host_wait {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    const WAITPKG_ECX_BIT: u32 = 1 << 5;
+    /// C0.1 state for UMWAIT: shallow power-saving state with sub-microsecond store wakeup.
+    const UMWAIT_C01: u32 = 1;
+    /// Iterations between monotonic clock checks inside the PAUSE spin loop.
+    const CLOCK_CHECK_STRIDE: u32 = 32;
+
+    pub(super) fn available() -> bool {
+        true
+    }
+
+    pub(super) fn waitpkg_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            // SAFETY: CPUID is always available on x86_64.
+            #[allow(unused_unsafe)]
+            let max_leaf = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+            if max_leaf < 7 {
+                return false;
+            }
+            // SAFETY: Leaf 7 is supported (`max_leaf >= 7`).
+            #[allow(unused_unsafe)]
+            let leaf7 = unsafe { core::arch::x86_64::__cpuid_count(7, 0) };
+            (leaf7.ecx & WAITPKG_ECX_BIT) != 0
+        })
+    }
+
+    pub(super) fn mode_label() -> &'static str {
+        if waitpkg_available() { "UMONITOR/UMWAIT" } else { "PAUSE spin" }
+    }
+
+    fn tsc_ticks_per_us() -> u64 {
+        static TICKS_PER_US: OnceLock<u64> = OnceLock::new();
+        *TICKS_PER_US.get_or_init(|| {
+            let start_instant = Instant::now();
+            // SAFETY: RDTSC is always available on x86_64.
+            let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            let target = Duration::from_micros(200);
+            while start_instant.elapsed() < target {
+                core::hint::spin_loop();
+            }
+            let elapsed_ns = start_instant.elapsed().as_nanos().max(1) as u64;
+            let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            let delta = end_tsc.saturating_sub(start_tsc);
+            ((delta as u128 * 1_000) / elapsed_ns as u128).max(1) as u64
+        })
+    }
+
+    macro_rules! define_umwait {
+        ($name:ident, $ty:ty, $mov:literal, $cmp:literal) => {
+            /// Arm UMONITOR on `word`, re-check its value against `old`, and execute UMWAIT
+            /// in C0.1 until a store touches the cache line or TSC reaches `deadline`.
+            ///
+            /// # Safety
+            /// `word` must point to a live, naturally aligned value and WAITPKG must be available.
+            unsafe fn $name(word: *const $ty, old: $ty, deadline: u64) {
+                let lo = deadline as u32;
+                let hi = (deadline >> 32) as u32;
+                unsafe {
+                    std::arch::asm!(
+                        ".byte 0xf3, 0x0f, 0xae, 0xf0", // umonitor rax
+                        $mov,
+                        $cmp,
+                        "jne 2f",
+                        "mov eax, {lo:e}",
+                        ".byte 0xf2, 0x0f, 0xae, 0xf1", // umwait ecx
+                        "2:",
+                        inout("rax") word => _,
+                        in("ecx") UMWAIT_C01,
+                        in("edx") hi,
+                        lo = in(reg) lo,
+                        old = in(reg) old,
+                        tmp = out(reg) _,
+                        options(nostack),
+                    );
+                }
+            }
+        };
+    }
+
+    define_umwait!(umwait_u32, u32, "mov {tmp:e}, dword ptr [rax]", "cmp {tmp:e}, {old:e}");
+    define_umwait!(umwait_u64, u64, "mov {tmp}, qword ptr [rax]", "cmp {tmp}, {old}");
+
+    fn wait_change<T: Copy + Eq>(
+        load: impl Fn() -> T,
+        old: T,
+        limit_us: u64,
+        umwait: impl FnOnce(u64),
+    ) -> bool {
+        if load() != old {
+            return true;
+        }
+        if waitpkg_available() {
+            // SAFETY: RDTSC is always available on x86_64; WAITPKG checked above.
+            let deadline = unsafe { core::arch::x86_64::_rdtsc() }
+                .wrapping_add(tsc_ticks_per_us().saturating_mul(limit_us));
+            umwait(deadline);
+            return load() != old;
+        }
+        let budget = Duration::from_micros(limit_us);
+        let started = Instant::now();
+        let mut iter = 0u32;
+        loop {
+            if load() != old {
+                return true;
+            }
+            core::hint::spin_loop();
+            iter = iter.wrapping_add(1);
+            if iter % CLOCK_CHECK_STRIDE == 0 && started.elapsed() >= budget {
+                return load() != old;
+            }
+        }
+    }
+
+    /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
+    /// Returns `true` if `word` changed, `false` on timeout.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory.
+    pub(super) unsafe fn wait_u32_change(word: *const u32, old: u32, limit_us: u64) -> bool {
+        // SAFETY: Caller guarantees `word` is live, 4-byte aligned, and valid for atomic reads.
+        let atomic = unsafe { AtomicU32::from_ptr(word as *mut u32) };
+        wait_change(
+            || atomic.load(Ordering::Acquire),
+            old,
+            limit_us,
+            |deadline| unsafe { umwait_u32(word, old, deadline) },
+        )
+    }
+
+    /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
+    /// Returns `true` if `word` changed, `false` on timeout.
+    pub(in crate::execution) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
+        wait_change(
+            || word.load(Ordering::Acquire),
+            old,
+            limit_us,
+            |deadline| unsafe { umwait_u64(word.as_ptr() as *const u64, old, deadline) },
+        )
+    }
+}
+
+/// Longest intentional wait per park on aarch64 WFET. The GPU's wake-word write may end it early;
+/// anything that cannot touch the word waits for the deadline, the WFE event stream, or a spurious
+/// wake, whichever comes first.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const PARK_LIMIT_US: u64 = 100;
+
+/// Longest intentional wait per park on x86_64 for both `UMONITOR`/`UMWAIT` (when WAITPKG is
+/// present) and the bounded `PAUSE` spin fallback.
+#[cfg(target_arch = "x86_64")]
+const PARK_LIMIT_US: u64 = 25;
 
 pub struct Upload<'a> {
     pub buffer: &'a str,
@@ -537,17 +745,17 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
         let wake = if host_wait::available() {
             let word = copy.mapped_host_buffer(64)?;
             let device = copy.mapped_address(&word)?;
             static ANNOUNCED: std::sync::Once = std::sync::Once::new();
-            ANNOUNCED.call_once(|| eprintln!("[flare] frame completion wait: WFET"));
+            ANNOUNCED.call_once(|| eprintln!("[flare] frame completion wait: {}", host_wait::mode_label()));
             Some(CompletionWake { word, device })
         } else {
             None
         };
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+        #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
         let wake = None;
         let engram = manifest
             .engram
@@ -700,11 +908,16 @@ impl GraphExecutor {
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
     }
-    /// Wait briefly for the oldest pending frame instead of yielding the CPU. Returns false,
-    /// without waiting, when no frame is pending, the wake word already reached the frame, or
-    /// this CPU has no WFxT; the caller then keeps its own polling step.
+    /// Wait briefly for the oldest pending frame's mapped wake word instead of yielding the CPU.
+    /// Returns `true` when the wake word already reached the oldest pending fence or changed
+    /// during the bounded wait (`PARK_LIMIT_US` microseconds), signaling the caller to re-poll
+    /// immediately without `thread::yield_now()`. Returns `false` when no frame is pending, the
+    /// wake word is unsupported, or the bounded wait timed out without observing a change; callers
+    /// should yield before parking again so long-running steps do not spin a CPU core continuously.
+    /// On x86_64 without hardware WAITPKG, each call executes a bounded `PAUSE` spin for
+    /// `PARK_LIMIT_US` microseconds before returning `false` so the caller yields.
     pub fn park(&self) -> bool {
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
         {
             let Some(resources) = self.resources.as_ref() else { return false };
             let Some(wake) = resources.wake.as_ref() else { return false };
@@ -722,14 +935,12 @@ impl GraphExecutor {
             let seen = unsafe { std::sync::atomic::AtomicU32::from_ptr(word as *mut u32) }
                 .load(std::sync::atomic::Ordering::Acquire);
             if (seen.wrapping_sub(target as u32) as i32) >= 0 {
-                return false;
+                return true;
             }
-            let deadline = host_wait::ticks() + host_wait::frequency() * PARK_LIMIT_US / 1_000_000;
             // SAFETY: As above; `available` gated the creation of `wake`.
-            unsafe { host_wait::wait_change(word, seen, deadline) };
-            true
+            unsafe { host_wait::wait_u32_change(word, seen, PARK_LIMIT_US) }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+        #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
         false
     }
 
@@ -1708,6 +1919,40 @@ mod input_copy_tests {
             Ok(())
         }).unwrap();
         batches.submit(8192, std::iter::empty(), |_, _, _| panic!("empty input must not enqueue")).unwrap();
+    }
+
+    #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
+    #[test]
+    fn host_wait_observes_immediate_cross_thread_and_bounded_timeout_transitions() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        };
+        use std::time::Duration;
+
+        let word32 = Arc::new(AtomicU32::new(7));
+        // Already changed: returns immediately.
+        assert!(unsafe { host_wait::wait_u32_change(word32.as_ptr() as *const u32, 6, 50) });
+        // Unchanged: times out cleanly within a bounded window.
+        let started = Instant::now();
+        assert!(!unsafe { host_wait::wait_u32_change(word32.as_ptr() as *const u32, 7, 25) });
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        // Cross-thread wake on u64 epoch word.
+        let word64 = Arc::new(AtomicU64::new(1));
+        assert!(host_wait::wait_u64_change(&word64, 0, 50));
+        assert!(!host_wait::wait_u64_change(&word64, 1, 10));
+        let producer = word64.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(200));
+            producer.store(2, Ordering::Release);
+        });
+        let wait_start = Instant::now();
+        while !host_wait::wait_u64_change(&word64, 1, 50) {
+            assert!(wait_start.elapsed() < Duration::from_secs(1), "u64 wake timed out");
+        }
+        assert_eq!(word64.load(Ordering::Acquire), 2);
+        writer.join().unwrap();
     }
 }
 
