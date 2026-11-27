@@ -5237,3 +5237,69 @@ fn history_drafts_is_request_scoped_by_default_and_gates_cross_request_fallback(
     let opt_in_plan = s.plan().unwrap();
     assert!(s.plan_requires_feedback(&opt_in_plan));
 }
+
+#[test]
+fn background_sam_attach_between_plan_and_commit_preserves_epoch() {
+    let mut s = RequestScheduler::new(
+        [0u8; 32],
+        SchedulerLimits {
+            max_active: 2,
+            request_slots: 2,
+            max_sequence_tokens: 16_384,
+            prefill_chunk_size: 4096,
+            pages: 512,
+            snapshots: 16,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 8,
+            vocabulary: 32_768,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.enable_history_drafts().unwrap();
+    s.enable_speculation(&[1, 6]).unwrap();
+    s.measured_graph_durations(&duration_graphs(2)).unwrap();
+    let long_prompt: Vec<u32> = (0..(sam::ASYNC_PROMPT_THRESHOLD + 512))
+        .map(|i| 100 + (i % 997) as u32)
+        .collect();
+    let h = s
+        .admit(RequestSpec {
+            prompt: long_prompt,
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 32,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+    assert!(s.request(h).unwrap().sam_pending());
+
+    // Plan the Init step BEFORE the background SAM arrives.
+    let plan = s.plan().unwrap();
+
+    // Wait for the off-thread SAM build to complete and drain it via advance_to(),
+    // mirroring runtime::submit() calling advance_to() between plan() and commit().
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s.request(h).unwrap().sam_pending() {
+        s.advance_to(1_000).unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background SAM failed to finish in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(s.request(h).unwrap().sam().is_some());
+
+    // Committing the pre-existing plan must NOT fail with "execution plan has stale request state".
+    s.commit(&plan, Fence(1)).unwrap();
+}

@@ -1242,7 +1242,14 @@ impl RequestScheduler {
             }
         }
         for (handle, mut sam) in ready {
-            if let Ok(request) = self.request_mut(handle)
+            // Attach directly without bumping `request.epoch`: `advance_to()` polls
+            // background SAMs between `plan()` and `commit()`, and attaching a SAM
+            // does not alter request phase, consumed tokens, pages, or state slots.
+            if let Some(request) = self
+                .slots
+                .get_mut(handle.slot as usize)
+                .and_then(|slot| slot.request.as_mut())
+                .filter(|request| request.handle == handle)
                 && request.sam_pending
             {
                 let buffered = std::mem::take(&mut request.sam_pending_tokens);
