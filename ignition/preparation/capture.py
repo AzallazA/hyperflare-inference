@@ -263,6 +263,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             warm.synchronize()
             stage.update(advance=1)
     stream.wait_stream(warm)
+    torch.cuda.empty_cache()
     ordered_names = _capture_order(names, compiled, coordinator)
     if progress is not None and compiled:
         progress(pool_request_report({name: compiled[name] for name in ordered_names if name in compiled}))
