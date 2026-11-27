@@ -47,6 +47,17 @@ pub(super) fn min_measured_duration(current: Option<u64>, nanos: u64) -> Option<
     })
 }
 
+pub(super) fn canonical_draft_source(
+    kind: GraphKind,
+    draft_source: Option<super::speculation::ProposalSource>,
+) -> Option<super::speculation::ProposalSource> {
+    if kind == GraphKind::Speculative {
+        Some(draft_source.unwrap_or(super::speculation::ProposalSource::Mtp))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Key {
     pub drafts: usize,
@@ -55,12 +66,20 @@ pub(super) struct Key {
     pub tokens: usize,
     pub prefill: usize,
     pub packed: usize,
+    pub draft_source: Option<super::speculation::ProposalSource>,
 }
 
 impl Key {
     pub fn from_step(step: &ScheduledStep) -> Self {
-        Self { drafts: step.draft_tokens, kind: step.kind, batch: step.batch_capacity, tokens: step.token_capacity,
-            prefill: step.prefill_capacity(), packed: step.packed_token_capacity }
+        Self {
+            drafts: step.draft_tokens,
+            kind: step.kind,
+            batch: step.batch_capacity,
+            tokens: step.token_capacity,
+            prefill: step.prefill_capacity(),
+            packed: step.packed_token_capacity,
+            draft_source: canonical_draft_source(step.kind, step.draft_source),
+        }
     }
 }
 
@@ -78,7 +97,6 @@ struct Estimate {
     replays: ReplayTimes,
     observed_at_ns: u64,
     last_attempt_ns: u64,
-    draft_source: Option<super::speculation::ProposalSource>,
 }
 
 #[derive(Default)]
@@ -117,7 +135,8 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [Vec<Option<u64>>; crate::execution::BATCH_CAPACITIES.len()],
+    /// Packed `(batch, width)` duration tables indexed by `ProposalSource as usize` (`Mtp`, `Copy`).
+    packed_round_durations: [[Vec<Option<u64>>; crate::execution::BATCH_CAPACITIES.len()]; 2],
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -129,14 +148,7 @@ impl ActionCosts {
 
     #[cfg(test)]
     pub fn set_measured(&mut self, step: &ScheduledStep, nanos: u64) {
-        let key = Key {
-            drafts: step.draft_tokens,
-            kind: step.kind,
-            batch: step.batch_capacity,
-            tokens: step.token_capacity,
-            prefill: step.prefill_capacity(),
-            packed: step.packed_token_capacity,
-        };
+        let key = Key::from_step(step);
         let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
         estimate.replays.observe(nanos, false);
@@ -155,6 +167,7 @@ impl ActionCosts {
                 tokens: graph.token_capacity,
                 prefill: graph.prefill_capacity,
                 packed: graph.packed_token_capacity,
+                draft_source: canonical_draft_source(graph.kind, graph.draft_source),
             };
             if index.insert(key, entries.len()).is_some() {
                 return Err("prepared graphs require unique shapes".into());
@@ -166,13 +179,14 @@ impl ActionCosts {
                     replays: ReplayTimes::default(),
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
-                    draft_source: graph.draft_source,
                 },
             ));
         }
         let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
         let mut costs = Self { entries, index,
-            packed_round_durations: std::array::from_fn(|_| vec![None; token_capacity + 1]),
+            packed_round_durations: std::array::from_fn(|_| {
+                std::array::from_fn(|_| vec![None; token_capacity + 1])
+            }),
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
         costs.refresh_packed_durations();
         Ok(costs)
@@ -188,56 +202,70 @@ impl ActionCosts {
     }
 
     fn refresh_packed_durations(&mut self) {
-        for row in &mut self.packed_round_durations { row.fill(None); }
-        let has_mtp = self.entries.iter().any(|(key, estimate)| {
-            key.kind == GraphKind::Speculative
-                && key.packed != 0
-                && estimate.draft_source != Some(super::speculation::ProposalSource::Copy)
-        });
+        for table in &mut self.packed_round_durations {
+            for row in table { row.fill(None); }
+        }
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
-            if has_mtp && estimate.draft_source == Some(super::speculation::ProposalSource::Copy) {
-                continue;
-            }
             let Some(slot) = crate::execution::batch_capacity_index(key.batch) else { continue; };
+            let source = key.draft_source.unwrap_or(super::speculation::ProposalSource::Mtp) as usize;
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
-            for duration in self.packed_round_durations[slot].iter_mut().take(maximum + 1).skip(1) {
+            for duration in self.packed_round_durations[source][slot]
+                .iter_mut()
+                .take(maximum + 1)
+                .skip(1)
+            {
                 *duration = min_measured_duration(*duration, nanos);
             }
         }
     }
 
-    pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
+    pub fn packed_round_duration_for(
+        &self,
+        source: super::speculation::ProposalSource,
+        batch: usize,
+        width: usize,
+    ) -> Option<u64> {
         let index = crate::execution::batch_capacity_index(batch)?;
-        self.packed_round_durations.get(index)?.get(width).copied().flatten()
+        self.packed_round_durations[source as usize]
+            .get(index)?
+            .get(width)
+            .copied()
+            .flatten()
+    }
+
+    pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
+        let mtp = self.packed_round_duration_for(super::speculation::ProposalSource::Mtp, batch, width);
+        let copy = self.packed_round_duration_for(super::speculation::ProposalSource::Copy, batch, width);
+        match (mtp, copy) {
+            (Some(m), _) if m > 0 => Some(m),
+            (_, Some(c)) if c > 0 => Some(c),
+            (Some(0), _) => Some(0),
+            (None, Some(0)) if !self.packed_round_durations[super::speculation::ProposalSource::Mtp as usize]
+                .iter()
+                .any(|row| row.iter().any(Option::is_some)) =>
+            {
+                Some(0)
+            }
+            _ => None,
+        }
     }
 
     pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
                 batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
-                nanos: estimate.nanos, draft_source: estimate.draft_source,
+                nanos: estimate.nanos, draft_source: key.draft_source,
             })
-    }
-
-    pub fn is_copy_only_step(&self, step: &ScheduledStep) -> bool {
-        step.kind == GraphKind::Speculative
-            && self
-                .index
-                .get(&Key::from_step(step))
-                .is_some_and(|&idx| {
-                    self.entries[idx].1.draft_source
-                        == Some(super::speculation::ProposalSource::Copy)
-                })
     }
 
     pub fn max_mtp_draft_tokens(&self) -> usize {
         self.entries
             .iter()
-            .filter(|(key, estimate)| {
+            .filter(|(key, _)| {
                 key.kind == GraphKind::Speculative
-                    && estimate.draft_source != Some(super::speculation::ProposalSource::Copy)
+                    && key.draft_source != Some(super::speculation::ProposalSource::Copy)
             })
             .map(|(key, _)| key.drafts)
             .max()
@@ -262,6 +290,7 @@ impl ActionCosts {
             tokens,
             prefill,
             packed: if kind == GraphKind::Speculative { batch * tokens } else { packed },
+            draft_source: canonical_draft_source(kind, None),
         })
         .map(|estimate| estimate.nanos)
     }
@@ -275,13 +304,29 @@ impl ActionCosts {
     }
 
     pub fn fresh_duration(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
-        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        let key = Key {
+            drafts: 0,
+            kind,
+            batch: 1,
+            tokens,
+            prefill: 0,
+            packed: 0,
+            draft_source: canonical_draft_source(kind, None),
+        };
         self.entry(key).filter(|estimate| estimate.fresh(self.now_ns, self.ttl_ns))
             .map(|estimate| estimate.nanos)
     }
 
     pub fn probe_duration(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
-        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        let key = Key {
+            drafts: 0,
+            kind,
+            batch: 1,
+            tokens,
+            prefill: 0,
+            packed: 0,
+            draft_source: canonical_draft_source(kind, None),
+        };
         self.entry(key)
             .filter(|estimate| {
                 !estimate.fresh(self.now_ns, self.ttl_ns)
@@ -292,7 +337,15 @@ impl ActionCosts {
     }
 
     pub fn record_probe(&mut self, kind: GraphKind, tokens: usize) {
-        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        let key = Key {
+            drafts: 0,
+            kind,
+            batch: 1,
+            tokens,
+            prefill: 0,
+            packed: 0,
+            draft_source: canonical_draft_source(kind, None),
+        };
         if let Some(&index) = self.index.get(&key) {
             // Zero denotes no attempt, so a probe at time zero is recorded as one.
             self.entries[index].1.last_attempt_ns = self.now_ns.max(1);
@@ -418,6 +471,7 @@ mod tests {
         };
         let step_for = |drafts, width, packed| ScheduledStep {
             draft_tokens: drafts,
+            draft_source: Some(super::super::speculation::ProposalSource::Mtp),
             kind: GraphKind::Speculative,
             batch_capacity: 16,
             token_capacity: width,
@@ -487,6 +541,7 @@ mod tests {
         };
         let step = ScheduledStep {
             draft_tokens: 0,
+            draft_source: None,
             kind: GraphKind::Prefill,
             batch_capacity: 1,
             token_capacity: 512,
@@ -512,5 +567,60 @@ mod tests {
         costs.observe(&step, ExecutionTiming { gpu_ns, ..Default::default() });
         costs.advance_to(20_000 + 2 * ttl, ttl);
         assert_eq!(costs.refresh_order(key), (false, 0));
+    }
+
+    #[test]
+    fn unmeasured_mtp_and_measured_copy_coexist_at_identical_shape_and_preserve_packed_duration() {
+        use super::super::speculation::ProposalSource;
+        let make = |name: &str, drafts, width, packed, source| GraphDescriptor {
+            name: name.into(),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            confidence_width: if source == ProposalSource::Mtp { drafts } else { 0 },
+            draft_tokens: drafts,
+            draft_source: Some(source),
+            handle: 1,
+            batch_capacity: 1,
+            token_capacity: width,
+            packed_token_capacity: packed,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+            tuned_bindings: vec![],
+        };
+        let step_for = |drafts, width, packed, source| ScheduledStep {
+            draft_tokens: drafts,
+            draft_source: Some(source),
+            kind: GraphKind::Speculative,
+            batch_capacity: 1,
+            token_capacity: width,
+            packed_token_capacity: packed,
+            mixed: None,
+            lanes: vec![],
+            requires_feedback: false,
+        };
+        let graphs = vec![
+            make("mtp-b1w8p8", 7, 8, 8, ProposalSource::Mtp),
+            make("copy-b1w8p8", 7, 8, 8, ProposalSource::Copy),
+            make("copy-b1w16p16", 15, 16, 16, ProposalSource::Copy),
+        ];
+        // Identical B/D/W/P shapes with distinct draft_source coexist in ActionCosts.
+        let mut costs = ActionCosts::prepared(&graphs, 16).unwrap();
+        assert_eq!(costs.len(), 3);
+        // Unmeasured MTP must not suppress a measured copy shape at the same or wider width.
+        costs.set_measured(&step_for(7, 8, 8, ProposalSource::Copy), 5_200_000);
+        costs.set_measured(&step_for(15, 16, 16, ProposalSource::Copy), 5_950_000);
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Mtp, 1, 8), Some(0));
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Copy, 1, 8), Some(5_200_000));
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Copy, 1, 16), Some(5_950_000));
+        assert_eq!(costs.packed_round_duration(1, 8), Some(5_200_000));
+        assert_eq!(costs.packed_round_duration(1, 16), Some(5_950_000));
+        // Once MTP is measured, combined lookup prefers the measured MTP duration for MTP-covered
+        // widths while retaining the copy measurement independently and for copy-only widths.
+        costs.set_measured(&step_for(7, 8, 8, ProposalSource::Mtp), 6_000_000);
+        assert_eq!(costs.get(&step_for(7, 8, 8, ProposalSource::Mtp)), Some(6_000_000));
+        assert_eq!(costs.get(&step_for(7, 8, 8, ProposalSource::Copy)), Some(5_200_000));
+        assert_eq!(costs.packed_round_duration(1, 8), Some(6_000_000));
+        assert_eq!(costs.packed_round_duration(1, 16), Some(5_950_000));
     }
 }

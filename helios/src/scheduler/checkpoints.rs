@@ -892,6 +892,7 @@ mod tests {
         scheduler.costs.set_measured(
             &ScheduledStep {
                 draft_tokens: 0,
+                draft_source: None,
                 kind,
                 batch_capacity: 1,
                 token_capacity: tokens,
@@ -1367,6 +1368,7 @@ mod tests {
         let decoder = scheduler.admit(super::super::tests::spec(128, 3)).unwrap();
         let step = ScheduledStep {
             draft_tokens: 0,
+            draft_source: None,
             kind: GraphKind::Mixed,
             batch_capacity: 2,
             token_capacity: 1,

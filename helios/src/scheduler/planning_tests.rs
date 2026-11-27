@@ -84,7 +84,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                 scheduler.proposal_source = source;
                 let round = ScheduledStep {
                     kind: GraphKind::Speculative, batch_capacity: active.next_power_of_two(),
-                    draft_tokens: 7, token_capacity: 8, packed_token_capacity: active.next_power_of_two() * 8,
+                    draft_tokens: 7, draft_source: Some(source), token_capacity: 8, packed_token_capacity: active.next_power_of_two() * 8,
                     mixed: None, requires_feedback: false,
                     lanes: scheduler.slots.iter().filter_map(|slot| slot.request.as_ref()).map(|request|
                         ScheduledLane { request: request.handle, start_position: request.consumed_tokens, tokens: 8 }).collect(),

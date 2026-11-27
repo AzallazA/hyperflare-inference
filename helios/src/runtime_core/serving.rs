@@ -55,12 +55,8 @@ impl NativeResources {
                     .iter()
                     .position(|name| *name == g.name)
                     .ok_or_else(|| invalid("execution references an unknown graph"))?;
-                let draft_source = match g.draft_source {
-                    0 => None,
-                    1 => Some(crate::scheduler::speculation::ProposalSource::Mtp),
-                    2 => Some(crate::scheduler::speculation::ProposalSource::Copy),
-                    _ => return Err(invalid("unknown graph draft source")),
-                };
+                let draft_source = crate::scheduler::speculation::ProposalSource::from_wire(g.draft_source)
+                    .map_err(|error| invalid(error.to_string()))?;
                 Ok(GraphDescriptor {
                     tuned_bindings: g.tuned_bindings.iter().map(|binding| TunedBinding {
                         buffer: binding.buffer.clone(), tuning_graph: binding.tuning_graph.clone(),

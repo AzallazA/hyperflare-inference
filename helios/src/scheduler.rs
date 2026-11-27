@@ -444,6 +444,7 @@ pub struct MixedStep {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScheduledStep {
     pub draft_tokens: usize,
+    pub draft_source: Option<speculation::ProposalSource>,
     pub kind: GraphKind,
     pub batch_capacity: usize,
     pub token_capacity: usize,
@@ -1384,7 +1385,8 @@ impl RequestScheduler {
     }
 
     pub fn is_copy_only_step(&self, step: &ScheduledStep) -> bool {
-        self.costs.is_copy_only_step(step)
+        step.kind == GraphKind::Speculative
+            && step.draft_source == Some(speculation::ProposalSource::Copy)
     }
 
     #[cfg(feature = "server")]
@@ -1458,11 +1460,15 @@ impl RequestScheduler {
         self.refresh.credit_ns
     }
 
+    /// Validates that no execution is in flight across an idle gap.
+    ///
+    /// Timing-refresh and acceptance-learning ledgers retain bounded earned credit
+    /// (`<= CREDIT_CAP_NS`) and negative debt across idle intervals because idle adds
+    /// neither credit nor ordinary duration.
     pub fn idle(&mut self) -> Result<()> {
         if !self.submissions.is_empty() {
             return Err("idle requires no submitted execution".into());
         }
-        self.refresh.idle();
         Ok(())
     }
 
@@ -2716,7 +2722,7 @@ impl RequestScheduler {
             self.estimated_round_lengths(mask, step.batch_capacity, step.draft_tokens, step.token_capacity, step.packed_token_capacity, false)
         });
         let copy_only_step = self.proposal_source == speculation::ProposalSource::Mtp
-            && self.costs.is_copy_only_step(step);
+            && self.is_copy_only_step(step);
         let expected_tokens = std::array::from_fn(|slot| step.lanes.iter().enumerate()
             .find(|(_, lane)| lane.request.slot as usize == slot).map_or(0.0, |(row, lane)| {
                 if step.lane_kind(row) == GraphKind::Speculative {
@@ -3012,7 +3018,7 @@ impl RequestScheduler {
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
         let copy_only_step = proposal_source == speculation::ProposalSource::Mtp
-            && self.costs.is_copy_only_step(&step);
+            && self.is_copy_only_step(&step);
         // One population update per round: this path for host estimates, `observe_packed_forecasts` for GPU confidence.
         let gpu_confidence = self.gpu_confidence();
         let host_population = proposal_source == speculation::ProposalSource::Mtp

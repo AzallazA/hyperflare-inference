@@ -102,7 +102,7 @@ class GraphSignature:
         if type(self.draft_source) is not int or self.draft_source not in (1, 2):
             raise ValueError("draft_source must be 1 (MTP) or 2 (COPY_DRAFT)")
         if self.draft_source == 2:
-            if not (self.kind == "speculative" or (self.kind == "mixed" and self.speculation_enabled is True)):
+            if self.kind != "speculative":
                 raise ValueError("copy draft source requires a speculative graph")
             if self.confidence_width != 0 or "speculative_prefix_limits" in self.inputs:
                 raise ValueError("copy-only speculative graphs cannot declare GPU confidence or prefix limits")

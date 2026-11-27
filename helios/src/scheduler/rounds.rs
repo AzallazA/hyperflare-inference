@@ -19,6 +19,13 @@ const SURPLUS_HISTORY_CAPACITY: usize = 256;
 const SURPLUS_MIN_SAMPLES: usize = 4;
 const SURPLUS_FACTOR_MAX: f64 = 2.0;
 
+/// Minimum extra copy tokens required beyond `base_mtp_drafts` before wide copy-verify
+/// graphs compete. Existing MTP graphs already verify `base_mtp_drafts` copy-overridden
+/// drafts at lower latency, so requiring at least three additional copy tokens (10+
+/// drafts when `base_mtp_drafts == 7`) prevents selecting wider verification for marginal
+/// one- or two-token extensions.
+const WIDE_COPY_MIN_EXTRA_DRAFTS: usize = 3;
+
 #[cfg(test)]
 thread_local! {
     /// Powered-curve evaluations on this thread, for tests that bound planning work.
@@ -499,21 +506,16 @@ impl RequestScheduler {
         lengths
     }
 
-    pub(super) fn host_prefix_ranking(&self, available: &[usize], batch: usize, drafts: usize, width: usize,
-        values: &[LaneValue; REQUEST_LANES], optimistic: bool) -> HostPrefixRanking {
-        let alpha = self.policy.alpha_for_batch(batch);
-        let mut probabilities = vec![vec![0.0; self.capabilities.completion_token_capacity - 1]; REQUEST_LANES];
+    fn build_host_prefix_ranking(
+        &self,
+        slots: &[usize],
+        limits: &[usize; REQUEST_LANES],
+        mut probabilities: Vec<Vec<f64>>,
+        values: &[LaneValue; REQUEST_LANES],
+    ) -> HostPrefixRanking {
         let mut scores = Vec::new();
-        for &slot in available {
-            let request = self.slots[slot].request.as_ref().unwrap();
-            let limit = self.speculative_tokens(request, width.min(drafts + 1));
-            let raw = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic);
-            probabilities[slot] = if alpha == 1.0 {
-                raw
-            } else {
-                raw.into_iter().map(|probability| probability.powf(alpha)).collect()
-            };
-            for position in 0..limit.saturating_sub(1) {
+        for &slot in slots {
+            for position in 0..limits[slot].saturating_sub(1) {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
             }
         }
@@ -524,7 +526,26 @@ impl RequestScheduler {
             ranks_by_slot[slot].push(rank);
             slots_by_rank.push(slot);
         }
+        probabilities.resize(REQUEST_LANES, Vec::new());
         HostPrefixRanking { probabilities, ranks_by_slot, slots_by_rank }
+    }
+
+    pub(super) fn host_prefix_ranking(&self, available: &[usize], batch: usize, drafts: usize, width: usize,
+        values: &[LaneValue; REQUEST_LANES], optimistic: bool) -> HostPrefixRanking {
+        let alpha = self.policy.alpha_for_batch(batch);
+        let mut probabilities = vec![Vec::new(); REQUEST_LANES];
+        let mut limits = [0usize; REQUEST_LANES];
+        for &slot in available {
+            let request = self.slots[slot].request.as_ref().unwrap();
+            limits[slot] = self.speculative_tokens(request, width.min(drafts + 1));
+            let raw = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic);
+            probabilities[slot] = if alpha == 1.0 {
+                raw
+            } else {
+                raw.into_iter().map(|probability| probability.powf(alpha)).collect()
+            };
+        }
+        self.build_host_prefix_ranking(available, &limits, probabilities, values)
     }
 
     pub(super) fn speculative_information(&self, request: &LiveRequest, depth: usize) -> f64 {
@@ -755,10 +776,111 @@ impl RequestScheduler {
         for &(slot, length, _) in &offers {
             if mask & (1 << slot) != 0 { host_lengths[slot] = length; }
         }
-        Some(Candidate { host_lengths: Some(host_lengths), draft_tokens: shape.drafts, kind: GraphKind::Speculative,
+        Some(Candidate { host_lengths: Some(host_lengths), draft_tokens: shape.drafts,
+            draft_source: shape.draft_source, kind: GraphKind::Speculative,
             mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
             prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: shape.nanos,
             expected, rate: ValueRate::new(shape.nanos, value, age), feedback: false })
+    }
+
+    fn select_host_allocated_candidate(
+        &self,
+        shape: &cost::PackedRoundShape,
+        slots: &[usize],
+        limits: &[usize; REQUEST_LANES],
+        ranking: &HostPrefixRanking,
+        values: &[LaneValue; REQUEST_LANES],
+        age: f64,
+        order: &mut Vec<(usize, f64)>,
+        frontier: &mut std::collections::BinaryHeap<usize>,
+    ) -> Option<Candidate> {
+        let nanos = shape.nanos;
+        let mut base = [0.0; REQUEST_LANES];
+        let mut full = [0.0; REQUEST_LANES];
+        for &slot in slots {
+            base[slot] = values[slot].decode(1.0, nanos as f64 / 1e6);
+            let take = limits[slot].saturating_sub(1).min(shape.tokens - 1);
+            let expected = 1.0 + ranking.probabilities[slot][..take].iter().sum::<f64>();
+            full[slot] = values[slot].decode(expected, nanos as f64 / 1e6);
+        }
+        let mut best: Option<(u64, f64, [usize; REQUEST_LANES])> = None;
+        for ordering in 0..3 {
+            order.clear();
+            order.extend(slots.iter().map(|&slot| {
+                (
+                    slot,
+                    match ordering {
+                        0 => full[slot],
+                        1 => base[slot],
+                        _ => full[slot] / limits[slot] as f64,
+                    },
+                )
+            }));
+            let rank = |a: &(usize, f64), b: &(usize, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+            let cohort = shape.batch.min(shape.tokens);
+            if (1..order.len()).contains(&cohort) {
+                order.select_nth_unstable_by(cohort - 1, rank);
+                order.truncate(cohort);
+            }
+            order.sort_unstable_by(rank);
+            frontier.clear();
+            let mut host_lengths = [0; REQUEST_LANES];
+            // A lane's value changes only when its host prefix length does.
+            let mut lane_terms = [(0, 0.0); REQUEST_LANES];
+            let mut mask = 0u64;
+            for (count, &(slot, _)) in order.iter().take(cohort).enumerate() {
+                mask |= 1 << slot;
+                ranking.extend_cohort(slot, &mut host_lengths, frontier, shape.tokens - count - 1);
+                let value: f64 = bits(mask)
+                    .map(|s| {
+                        if lane_terms[s].0 != host_lengths[s] {
+                            let expected = 1.0
+                                + ranking.probabilities[s][..host_lengths[s] - 1]
+                                    .iter()
+                                    .sum::<f64>();
+                            lane_terms[s] = (
+                                host_lengths[s],
+                                values[s].decode(expected, nanos as f64 / 1e6),
+                            );
+                        }
+                        lane_terms[s].1
+                    })
+                    .sum();
+                if best.is_none_or(|(old_mask, old_value, _)| {
+                    value > old_value
+                        || (value == old_value
+                            && (mask.count_ones(), std::cmp::Reverse(mask))
+                                > (old_mask.count_ones(), std::cmp::Reverse(old_mask)))
+                }) {
+                    best = Some((mask, value, host_lengths));
+                }
+            }
+        }
+        let (mask, value, host_lengths) = best?;
+        let expected = bits(mask)
+            .map(|slot| {
+                let tokens =
+                    1.0 + ranking.probabilities[slot][..host_lengths[slot] - 1].iter().sum::<f64>();
+                values[slot].decode(tokens, 0.0)
+            })
+            .sum();
+        Some(Candidate {
+            host_lengths: Some(host_lengths),
+            draft_tokens: shape.drafts,
+            draft_source: shape.draft_source,
+            kind: GraphKind::Speculative,
+            mask,
+            batch: shape.batch,
+            capacity: shape.width,
+            packed_token_capacity: shape.tokens,
+            prefill_capacity: 0,
+            prefill_slot: None,
+            work: 0,
+            duration_ns: nanos,
+            expected,
+            rate: ValueRate::new(nanos, value, age),
+            feedback: false,
+        })
     }
 
     pub(super) fn packed_round_candidates(&self, output: &mut Vec<Candidate>,
@@ -793,7 +915,9 @@ impl RequestScheduler {
                     continue;
                 }
                 let max_copy_drafts = shape.drafts.min(shape.width.saturating_sub(1));
-                let min_copy_len = base_mtp_drafts.saturating_add(3).min(max_copy_drafts);
+                let min_copy_len = base_mtp_drafts
+                    .saturating_add(WIDE_COPY_MIN_EXTRA_DRAFTS)
+                    .min(max_copy_drafts);
                 let mut copy_limits = [0usize; REQUEST_LANES];
                 let mut copy_available = Vec::new();
                 for &slot in &available {
@@ -818,124 +942,27 @@ impl RequestScheduler {
                 if copy_available.is_empty() {
                     continue;
                 }
-                let mut scores = Vec::new();
+                let mut probabilities = vec![Vec::new(); REQUEST_LANES];
                 for &slot in &copy_available {
                     let request = self.slots[slot].request.as_ref().unwrap();
                     let curve = copy_curves[slot]
                         .get_or_insert_with(|| self.wide_copy_curve(request, optimistic));
-                    for position in 0..copy_limits[slot].saturating_sub(1) {
-                        scores.push((curve[position] * values[slot].output_token, position, slot));
-                    }
+                    probabilities[slot] = curve.clone();
                 }
-                rank_prefixes(&mut scores);
-                let mut ranks_by_slot: [Vec<usize>; REQUEST_LANES] = std::array::from_fn(|_| Vec::new());
-                let mut slots_by_rank = Vec::with_capacity(scores.len());
-                for (rank, &(_, _, slot)) in scores.iter().enumerate() {
-                    ranks_by_slot[slot].push(rank);
-                    slots_by_rank.push(slot);
-                }
-                let nanos = shape.nanos;
-                let mut base = [0.0; REQUEST_LANES];
-                let mut full = [0.0; REQUEST_LANES];
-                for &slot in &copy_available {
-                    base[slot] = values[slot].decode(1.0, nanos as f64 / 1e6);
-                    let curve = copy_curves[slot].as_ref().unwrap();
-                    let take = copy_limits[slot].saturating_sub(1).min(shape.tokens - 1);
-                    let expected = 1.0 + curve[..take].iter().sum::<f64>();
-                    full[slot] = values[slot].decode(expected, nanos as f64 / 1e6);
-                }
-                let mut best: Option<(u64, f64, [usize; REQUEST_LANES])> = None;
-                for ordering in 0..3 {
-                    order.clear();
-                    order.extend(copy_available.iter().map(|&slot| {
-                        (
-                            slot,
-                            match ordering {
-                                0 => full[slot],
-                                1 => base[slot],
-                                _ => full[slot] / copy_limits[slot] as f64,
-                            },
-                        )
-                    }));
-                    let rank = |a: &(usize, f64), b: &(usize, f64)| {
-                        b.1.total_cmp(&a.1).then(a.0.cmp(&b.0))
-                    };
-                    let cohort = shape.batch.min(shape.tokens);
-                    if (1..order.len()).contains(&cohort) {
-                        order.select_nth_unstable_by(cohort - 1, rank);
-                        order.truncate(cohort);
-                    }
-                    order.sort_unstable_by(rank);
-                    frontier.clear();
-                    let mut host_lengths = [0; REQUEST_LANES];
-                    let mut lane_terms = [(0, 0.0); REQUEST_LANES];
-                    let mut mask = 0u64;
-                    for (count, &(slot, _)) in order.iter().take(cohort).enumerate() {
-                        mask |= 1 << slot;
-                        host_lengths[slot] = 1;
-                        for &r in &ranks_by_slot[slot] {
-                            frontier.push(r);
-                            host_lengths[slot] += 1;
-                        }
-                        let draft_budget = shape.tokens - count - 1;
-                        while frontier.len() > draft_budget {
-                            host_lengths[slots_by_rank[frontier.pop().unwrap()]] -= 1;
-                        }
-                        let value: f64 = bits(mask)
-                            .map(|s| {
-                                if lane_terms[s].0 != host_lengths[s] {
-                                    let curve = copy_curves[s].as_ref().unwrap();
-                                    let expected =
-                                        1.0 + curve[..host_lengths[s] - 1].iter().sum::<f64>();
-                                    lane_terms[s] = (
-                                        host_lengths[s],
-                                        values[s].decode(expected, nanos as f64 / 1e6),
-                                    );
-                                }
-                                lane_terms[s].1
-                            })
-                            .sum();
-                        if best.is_none_or(|(old_mask, old_value, _)| {
-                            value > old_value
-                                || (value == old_value
-                                    && (mask.count_ones(), std::cmp::Reverse(mask))
-                                        > (old_mask.count_ones(), std::cmp::Reverse(old_mask)))
-                        }) {
-                            best = Some((mask, value, host_lengths));
-                        }
-                    }
-                }
-                if let Some((mask, value, host_lengths)) = best {
-                    let expected = bits(mask)
-                        .map(|slot| {
-                            let curve = copy_curves[slot].as_ref().unwrap();
-                            let tokens = 1.0 + curve[..host_lengths[slot] - 1].iter().sum::<f64>();
-                            values[slot].decode(tokens, 0.0)
-                        })
-                        .sum();
-                    output.push(Candidate {
-                        host_lengths: Some(host_lengths),
-                        draft_tokens: shape.drafts,
-                        kind: GraphKind::Speculative,
-                        mask,
-                        batch: shape.batch,
-                        capacity: shape.width,
-                        packed_token_capacity: shape.tokens,
-                        prefill_capacity: 0,
-                        prefill_slot: None,
-                        work: 0,
-                        duration_ns: nanos,
-                        expected,
-                        rate: ValueRate::new(nanos, value, age),
-                        feedback: false,
-                    });
+                let ranking = self.build_host_prefix_ranking(
+                    &copy_available, &copy_limits, probabilities, values,
+                );
+                if let Some(candidate) = self.select_host_allocated_candidate(
+                    &shape, &copy_available, &copy_limits, &ranking, values, age, &mut order, &mut frontier,
+                ) {
+                    output.push(candidate);
                 }
                 continue;
             }
             let alpha = self.policy.alpha_for_batch(shape.batch);
             let alpha_bits = alpha.to_bits();
-            if self.speculative_fixed_width.is_some()
-                && !self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens) {
+            let gpu_alloc = self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens);
+            if self.speculative_fixed_width.is_some() && !gpu_alloc {
                 let prefixes = fixed_prefixes.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(|| {
                     available.iter().map(|&slot| {
                         let request = self.slots[slot].request.as_ref().unwrap();
@@ -954,15 +981,30 @@ impl RequestScheduler {
                 }
                 continue;
             }
+            let mut limits = [0; REQUEST_LANES];
+            for &slot in &available {
+                let request = self.slots[slot].request.as_ref().unwrap();
+                limits[slot] = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
+            }
+            if !gpu_alloc {
+                let ranking = host_rankings.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(|| {
+                    self.host_prefix_ranking(&available, shape.batch, shape.drafts, shape.width, values, optimistic)
+                });
+                if let Some(candidate) = self.select_host_allocated_candidate(
+                    &shape, &available, &limits, ranking, values, age, &mut order, &mut frontier,
+                ) {
+                    output.push(candidate);
+                }
+                continue;
+            }
             // Speculative positions ranked by marginal forecast tokens; shapes with equal
             // alpha, draft, and width bounds share the ranking.
-            let gpu_alloc = self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens);
             let depth_cap = shape.drafts.min(shape.width.saturating_sub(1));
             let forecast = forecasts.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(|| {
                 let mut scores = Vec::new();
                 for &slot in &available {
                     let request = self.slots[slot].request.as_ref().unwrap();
-                    let limit = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
+                    let limit = limits[slot];
                     let curve = powered_curves.entry((alpha_bits, slot)).or_insert_with(|| {
                         let raw = raw_curves[slot].get_or_insert_with(|| self.speculative_curve(request, optimistic));
                         if alpha == 1.0 {
@@ -994,26 +1036,17 @@ impl RequestScheduler {
                 (gains, slot_prices, ranks, surplus)
             });
             let (gains, slot_prices, ranks, surplus_table) = (&forecast.0, &forecast.1, &forecast.2, &forecast.3);
-            let host_ranking = if gpu_alloc {
-                None
-            } else {
-                Some(host_rankings.entry((alpha_bits, shape.drafts, shape.width)).or_insert_with(||
-                    self.host_prefix_ranking(&available, shape.batch, shape.drafts, shape.width, values, optimistic)))
-            };
             let nanos = shape.nanos;
             let mut base = [0.0; REQUEST_LANES];
             let mut base_zero = [0.0; REQUEST_LANES];
             let mut full = [0.0; REQUEST_LANES];
-            let mut limits = [0; REQUEST_LANES];
             for &slot in &available {
-                let request = self.slots[slot].request.as_ref().unwrap();
                 base[slot] = values[slot].decode(1.0, nanos as f64 / 1e6);
                 base_zero[slot] = values[slot].decode(1.0, 0.0);
                 full[slot] = base[slot] + ranks[slot].iter().take(shape.tokens - 1)
                     .map(|&rank| gains[rank]).sum::<f64>();
-                limits[slot] = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
             }
-            let mut best: Option<(u64, f64, f64, Option<[usize; REQUEST_LANES]>)> = None;
+            let mut best: Option<(u64, f64, f64)> = None;
             // Alternate bounded orderings expose long useful prefixes, delivery
             // fairness, and short tails. Every cohort is priced by its causal
             // prefix allocation and the full measured physical B/D/W/P round.
@@ -1030,72 +1063,51 @@ impl RequestScheduler {
                 }
                 order.sort_unstable_by(rank);
                 frontier.clear();
-                let mut host_lengths = [0; REQUEST_LANES];
-                // A lane's value changes only when its host prefix length does.
-                let mut lane_terms = [(0, 0.0); REQUEST_LANES];
                 let (mut mask, mut pending_value, mut pending_value_zero, mut draft_value, mut draft_cap, mut total_ceiling_drafts) =
                     (0u64, 0., 0., 0., 0., 0usize);
-                for (count, &(slot, _)) in order.iter().take(shape.batch.min(shape.tokens)).enumerate() {
+                for (count, &(slot, _)) in order.iter().take(cohort).enumerate() {
                     mask |= 1 << slot;
                     pending_value += base[slot];
                     pending_value_zero += base_zero[slot];
-                    let (value, value_zero) = if let Some(ranking) = &host_ranking {
-                        ranking.extend_cohort(slot, &mut host_lengths, &mut frontier, shape.tokens - count - 1);
-                        let total = bits(mask).map(|slot| {
-                            if lane_terms[slot].0 != host_lengths[slot] {
-                                let expected = 1.0 + ranking.probabilities[slot][..host_lengths[slot] - 1]
-                                    .iter().sum::<f64>();
-                                lane_terms[slot] = (host_lengths[slot], values[slot].decode(expected, nanos as f64 / 1e6));
-                            }
-                            lane_terms[slot].1
-                        }).sum();
-                        (total, 0.0)
+                    // The heap retains the best P-count speculative positions.
+                    // Its capacity decreases as pending rows enter; discarded
+                    // positions cannot re-enter at a subsequent cohort size.
+                    for &rank in &ranks[slot] {
+                        frontier.push(rank);
+                        draft_value += gains[rank];
+                        draft_cap += slot_prices[rank];
+                    }
+                    total_ceiling_drafts += ranks[slot].len();
+                    let lanes = count + 1;
+                    let draft_budget = shape.tokens - lanes;
+                    while frontier.len() > draft_budget {
+                        let evicted = frontier.pop().unwrap();
+                        draft_value -= gains[evicted];
+                        draft_cap -= slot_prices[evicted];
+                    }
+                    let effective_draft = if lanes >= 2 && draft_budget > 0 && draft_budget < total_ceiling_drafts {
+                        let surplus = surplus_table.as_ref().map_or(1.0, |t|
+                            t.factor(lanes, draft_budget, alpha));
+                        (draft_value * surplus).min(draft_cap)
                     } else {
-                        // The heap retains the best P-count speculative positions.
-                        // Its capacity decreases as pending rows enter; discarded
-                        // positions cannot re-enter at a subsequent cohort size.
-                        for &rank in &ranks[slot] {
-                            frontier.push(rank);
-                            draft_value += gains[rank];
-                            draft_cap += slot_prices[rank];
-                        }
-                        total_ceiling_drafts += ranks[slot].len();
-                        let lanes = count + 1;
-                        let draft_budget = shape.tokens - lanes;
-                        while frontier.len() > draft_budget {
-                            let evicted = frontier.pop().unwrap();
-                            draft_value -= gains[evicted];
-                            draft_cap -= slot_prices[evicted];
-                        }
-                        let effective_draft = if lanes >= 2 && draft_budget > 0 && draft_budget < total_ceiling_drafts {
-                            let surplus = surplus_table.as_ref().map_or(1.0, |t|
-                                t.factor(lanes, draft_budget, alpha));
-                            (draft_value * surplus).min(draft_cap)
-                        } else {
-                            draft_value
-                        };
-                        (pending_value + effective_draft, pending_value_zero + effective_draft)
+                        draft_value
                     };
-                    if best.is_none_or(|(old_mask, old_value, _, _)|
+                    let (value, value_zero) = (pending_value + effective_draft, pending_value_zero + effective_draft);
+                    if best.is_none_or(|(old_mask, old_value, _)|
                         value > old_value || (value == old_value &&
                             (mask.count_ones(), std::cmp::Reverse(mask)) >
                             (old_mask.count_ones(), std::cmp::Reverse(old_mask)))) {
-                        best = Some((mask, value, value_zero, host_ranking.as_ref().map(|_| host_lengths)));
+                        best = Some((mask, value, value_zero));
                     }
                 }
             }
-            if let Some((mask, value, mut expected, host_lengths)) = best {
-                if let (Some(ranking), Some(lengths)) = (&host_ranking, host_lengths) {
-                    expected = bits(mask).map(|slot| {
-                        let tokens = 1.0 + ranking.probabilities[slot][..lengths[slot] - 1].iter().sum::<f64>();
-                        values[slot].decode(tokens, 0.0)
-                    }).sum();
-                }
-                output.push(Candidate { host_lengths, draft_tokens: shape.drafts, kind: GraphKind::Speculative,
+            if let Some((mask, value, expected)) = best {
+                output.push(Candidate { host_lengths: None, draft_tokens: shape.drafts,
+                    draft_source: shape.draft_source, kind: GraphKind::Speculative,
                     mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
                     prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: nanos,
                     expected, rate: ValueRate::new(nanos, value, age), feedback: false,
-                    });
+                });
             }
         }
     }

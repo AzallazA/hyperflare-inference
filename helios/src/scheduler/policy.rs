@@ -219,6 +219,7 @@ impl RequestAccounting {
 #[derive(Clone, Copy)]
 pub(super) struct Candidate {
     pub draft_tokens: usize,
+    pub draft_source: Option<speculation::ProposalSource>,
     pub kind: GraphKind,
     pub mask: u64,
     pub batch: usize,
@@ -239,17 +240,20 @@ type LaneCurveCache = [Vec<(u64, Vec<f64>)>; REQUEST_LANES];
 
 impl Candidate {
     pub(super) fn cost_key(self) -> cost::Key {
-        cost::Key { drafts: self.draft_tokens,
+        cost::Key {
+            drafts: self.draft_tokens,
             kind: self.kind,
             batch: self.batch,
             tokens: self.capacity,
             prefill: self.prefill_capacity,
             packed: self.packed_token_capacity,
+            draft_source: cost::canonical_draft_source(self.kind, self.draft_source),
         }
     }
 }
 
 impl RequestScheduler {
+    #[cfg(test)]
     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
         self.dominates_padding_with(&smaller, &larger,
             || self.candidate_round_lengths(&smaller), || self.candidate_round_lengths(&larger))
@@ -276,7 +280,9 @@ impl RequestScheduler {
             candidate.prefill_capacity, rows(candidate), candidate.draft_tokens];
         let left = physical(smaller);
         let right = physical(larger);
-        if smaller.kind != larger.kind || smaller.mask != larger.mask
+        if smaller.kind != larger.kind
+            || smaller.draft_source != larger.draft_source
+            || smaller.mask != larger.mask
             || smaller.prefill_slot != larger.prefill_slot
             || left == right {
             return false;
@@ -349,7 +355,12 @@ impl RequestScheduler {
             let candidates = &*candidates;
             let group = |index: &usize| {
                 let candidate = &candidates[*index];
-                (candidate.kind as u8, candidate.mask, candidate.prefill_slot)
+                (
+                    candidate.kind as u8,
+                    candidate.draft_source.map(|source| source as u8),
+                    candidate.mask,
+                    candidate.prefill_slot,
+                )
             };
             let mut order: Vec<_> = (0..candidates.len()).collect();
             order.sort_unstable_by_key(group);
@@ -390,6 +401,7 @@ impl RequestScheduler {
                 // Only compute round lengths when a strictly tighter prepared batch candidate exists.
                 if !candidates.iter().any(|other| {
                     other.kind == GraphKind::Speculative
+                        && other.draft_source == candidate.draft_source
                         && other.batch >= lanes
                         && other.batch < candidate.batch
                         && other.capacity == candidate.capacity
@@ -400,6 +412,7 @@ impl RequestScheduler {
                 let needed = length(index).iter().sum::<usize>().min(candidate.packed_token_capacity);
                 dominated[index] = candidates.iter().any(|other| {
                     other.kind == GraphKind::Speculative
+                        && other.draft_source == candidate.draft_source
                         && other.batch >= lanes
                         && other.batch < candidate.batch
                         && other.capacity == candidate.capacity
@@ -1361,8 +1374,9 @@ impl RequestScheduler {
             .sum();
         let drafts = if kind == GraphKind::Speculative { capacity - 1 } else { 0 };
         let packed = if kind == GraphKind::Speculative { batch * capacity } else { 0 };
+        let draft_source = cost::canonical_draft_source(kind, None);
         let feedback = !self.costs.is_fresh(cost::Key { drafts,
-            kind, batch, tokens: capacity, prefill: 0, packed,
+            kind, batch, tokens: capacity, prefill: 0, packed, draft_source,
         })
             || !matches!(kind, GraphKind::Decode | GraphKind::Speculative)
             || bits(selected).any(|slot| {
@@ -1392,7 +1406,7 @@ impl RequestScheduler {
         } else {
             bits(selected).map(|slot| offers_zero[slot]).sum()
         };
-        output.push(Candidate { host_lengths: None, draft_tokens: drafts, packed_token_capacity: packed,
+        output.push(Candidate { host_lengths: None, draft_tokens: drafts, draft_source, packed_token_capacity: packed,
             kind,
             mask: selected,
             batch,
@@ -1612,7 +1626,7 @@ impl RequestScheduler {
                 if mask == 0 {
                     continue;
                 }
-                output.push(Candidate { host_lengths: None, draft_tokens: 0, packed_token_capacity: 0,
+                output.push(Candidate { host_lengths: None, draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
                     kind: GraphKind::Mixed,
                     mask,
                     batch,
@@ -2018,7 +2032,10 @@ impl RequestScheduler {
             estimated_duration_ns: candidate.duration_ns,
             selection_value_rate: candidate.rate.score,
             selection_log_scale: log_scale,
-            step: ScheduledStep { draft_tokens: candidate.draft_tokens, packed_token_capacity: candidate.packed_token_capacity,
+            step: ScheduledStep {
+                draft_tokens: candidate.draft_tokens,
+                draft_source: candidate.draft_source,
+                packed_token_capacity: candidate.packed_token_capacity,
                 kind: candidate.kind,
                 batch_capacity: candidate.batch,
                 token_capacity: candidate.capacity,

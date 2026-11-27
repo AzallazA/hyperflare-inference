@@ -59,7 +59,8 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
     let mut s = engine(4, true);
     let handles = (0..2).map(|id| add(&mut s, id, 64, 128)).collect::<Vec<_>>();
     ready(&mut s, &handles);
-    let candidate = Candidate { host_lengths: None, draft_tokens: 0, kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
+    let candidate = Candidate { host_lengths: None, draft_tokens: 0,
+        draft_source: Some(speculation::ProposalSource::Mtp), kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
         batch: 1, capacity: 1, packed_token_capacity: 1, prefill_capacity: 0, prefill_slot: None,
         work: 0, duration_ns: MS, expected: 1.0, rate: ValueRate::new(MS, 1.0, 0.0), feedback: true,
         };
@@ -1349,6 +1350,7 @@ fn interactive_engine(active: usize, speculative: bool) -> RequestScheduler {
 fn set_cost(s: &mut RequestScheduler, kind: GraphKind, batch: usize, capacity: usize, nanos: u64) {
     let step = ScheduledStep {
         draft_tokens: if kind == GraphKind::Speculative { capacity - 1 } else { 0 },
+        draft_source: (kind == GraphKind::Speculative).then_some(speculation::ProposalSource::Mtp),
         packed_token_capacity: if kind == GraphKind::Speculative { batch * capacity } else { 0 },
         kind,
         batch_capacity: batch,
@@ -2214,7 +2216,7 @@ fn mixed_cost_observations_and_expiry_are_specific_to_both_token_capacities() {
         true,
         &[(2, 1, 64, MS), (2, 8, 64, 2 * MS), (2, 8, 512, 3 * MS)],
     );
-    let make = |width, prefill| ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
+    let make = |width, prefill| ScheduledStep { draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
         kind: GraphKind::Mixed,
         batch_capacity: 2,
         token_capacity: width,
@@ -2542,9 +2544,9 @@ fn refresh_skips_infeasible_shapes_and_ranks_unattempted_tier_by_expected_value(
     let h = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[h]);
     let key = |width| cost::Key { drafts: width - 1, kind: GraphKind::Speculative, batch: 1,
-        tokens: width, prefill: 0, packed: width };
+        tokens: width, prefill: 0, packed: width, draft_source: Some(speculation::ProposalSource::Mtp) };
     let infeasible = cost::Key { drafts: 0, kind: GraphKind::Prefill, batch: 1,
-        tokens: 64, prefill: 0, packed: 0 };
+        tokens: 64, prefill: 0, packed: 0, draft_source: None };
     let base = s.now_ns;
     s.advance_to(base + MS).unwrap();
     for width in [2, 4] { set_cost(&mut s, GraphKind::Speculative, 1, width, 100 * MS); }
@@ -3697,7 +3699,7 @@ fn acceptance_probe_charges_one_round_preserves_timing_credit_and_carries_debt()
     state.complete(PlanOrigin::Ordinary, gpu_time(495 * MS));
     assert!(state.acceptance_ready());
     let timing_credit = state.credit_ns;
-    let round = ScheduledStep { draft_tokens: 7, kind: GraphKind::Speculative,
+    let round = ScheduledStep { draft_tokens: 7, draft_source: Some(speculation::ProposalSource::Mtp), kind: GraphKind::Speculative,
         batch_capacity: 1, token_capacity: 8, packed_token_capacity: 8,
         mixed: None, requires_feedback: true,
         lanes: vec![ScheduledLane { request: RequestHandle { slot: 0, generation: 1 }, start_position: 65, tokens: 8 }] };
@@ -3710,9 +3712,6 @@ fn acceptance_probe_charges_one_round_preserves_timing_credit_and_carries_debt()
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
     assert_eq!(state.credit_ns, timing_credit);
     assert!(!state.active());
-    state.idle();
-    assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
-    assert_eq!(state.credit_ns, timing_credit);
     state.abort();
     assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
     assert_eq!(state.credit_ns, 0.0);
@@ -6336,6 +6335,7 @@ fn refresh_start_still_calibrates_stale_smaller_prefill_shapes() {
         tokens: 8_192,
         prefill: 0,
         packed: 0,
+        draft_source: None,
     };
     assert_eq!(
         (probe.kind, probe.token_capacity, probe.origin),
@@ -6529,7 +6529,7 @@ fn power_cap_restore_recovers_largest_prefill_chunk_across_idle_requests() {
     let prefill_caps = [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192];
     let terminal_caps = [128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192];
     let mut s = large_prefill_engine(&prefill_caps, &terminal_caps);
-    let key = |kind, cap| cost::Key { drafts: 0, kind, batch: 1, tokens: cap, prefill: 0, packed: 0 };
+    let key = |kind, cap| cost::Key { drafts: 0, kind, batch: 1, tokens: cap, prefill: 0, packed: 0, draft_source: None };
     let fast_prefill_ns = |cap: usize| -> u64 {
         match cap {
             256 => 12 * MS,
@@ -6683,6 +6683,7 @@ fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
     acc_state.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
     let dummy_step = ScheduledStep {
         draft_tokens: 7,
+        draft_source: Some(speculation::ProposalSource::Mtp),
         kind: GraphKind::Speculative,
         batch_capacity: 1,
         token_capacity: 8,
@@ -6727,6 +6728,7 @@ fn attempted_stale_shapes_rotate_without_starvation_when_timing_is_invalid() {
         tokens: cap,
         prefill: 0,
         packed: 0,
+        draft_source: None,
     };
     s.advance_to(1_000 * MS).unwrap();
     for &cap in &caps {
@@ -6898,5 +6900,46 @@ fn cold_terminal_prefill_uses_terminal_catalog_for_natural_fit() {
             .iter()
             .any(|c| c.kind == GraphKind::TerminalPrefill && c.capacity == 256),
         "cold TerminalPrefill(256) must be discovered when 256 is the natural fit in terminal_prefill_catalog"
+    );
+}
+
+#[test]
+fn mixed_refresh_value_reuses_each_decoding_lanes_forecast() {
+    // A decoding lane's zero-duration refresh value uses the token forecast its
+    // duration-priced value already computed, so pricing both adds no curve evaluation.
+    let shapes = [(2, 3, 64, MS), (2, 8, 64, MS), (4, 3, 64, MS), (4, 8, 64, MS), (8, 8, 64, MS)];
+    let mut s = mixed_engine(8, true, &shapes);
+    let decoding = fixed_host_requests(&mut s, &[32, 32, 32, 32]);
+    let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    super::rounds::CURVE_EVALUATIONS.set(0);
+    s.mixed_candidates(&mut candidates, &values, age_price, false, None);
+    let evaluations = super::rounds::CURVE_EVALUATIONS.get();
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Mixed && c.expected > 0.0));
+    assert!(
+        evaluations <= shapes.len() * decoding.len(),
+        "{evaluations} curve evaluations for {} mixed shapes and {} decoding lanes",
+        shapes.len(),
+        decoding.len(),
+    );
+}
+
+#[test]
+fn decode_refresh_value_reuses_each_decoding_lanes_forecast() {
+    // Without speculative widths, add_candidate prices each decoding lane once per batch
+    // capacity; its zero-duration refresh value must reuse that forecast.
+    let mut s = engine(8, false);
+    let decoding = fixed_host_requests(&mut s, &[32, 32, 32, 32]);
+    let batches = crate::execution::BATCH_CAPACITIES.iter().take_while(|b| **b <= 8).count();
+    let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    super::rounds::CURVE_EVALUATIONS.set(0);
+    s.candidates(&mut candidates, &values, age_price);
+    let evaluations = super::rounds::CURVE_EVALUATIONS.get();
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Decode && c.expected > 0.0));
+    assert!(
+        evaluations <= batches * decoding.len(),
+        "{evaluations} curve evaluations for {batches} decode batch capacities and {} decoding lanes",
+        decoding.len(),
     );
 }

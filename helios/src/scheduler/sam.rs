@@ -19,6 +19,9 @@
 use std::sync::Arc;
 
 /// Default minimum context suffix length required to emit a copy proposal.
+/// Requiring six consecutive tokens avoids false-positive overrides on common short
+/// punctuation or keyword n-grams in non-repetitive prose while still matching quoted
+/// spans and code edits.
 pub const DEFAULT_MIN_MATCH_LEN: usize = 6;
 
 /// Maximum number of trailing prompt tokens indexed by default (128 Ki tokens).

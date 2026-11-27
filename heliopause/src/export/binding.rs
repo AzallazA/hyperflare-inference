@@ -198,9 +198,23 @@ pub(crate) fn execution(
                 return Err(super::invalid("speculative graph lacks explicit proposal depth"));
             }
             graph.insert("verify_tokens".into(), width.into());
-            if graph.get("draft_source").is_none_or(|v| v.is_null()) {
-                graph.insert("draft_source".into(), "MTP".into());
+            let draft_source = match graph.get("draft_source") {
+                None => "MTP",
+                Some(value) if value.is_null() => "MTP",
+                Some(value) => match value.as_u64() {
+                    Some(0 | 1) => "MTP",
+                    Some(2) => "COPY_DRAFT",
+                    _ => match value.as_str() {
+                        Some("MTP") => "MTP",
+                        Some("COPY_DRAFT") => "COPY_DRAFT",
+                        _ => return Err(super::invalid("unsupported graph draft_source")),
+                    },
+                },
+            };
+            if draft_source == "COPY_DRAFT" && kind != "speculative" {
+                return Err(super::invalid("copy draft source requires a speculative graph"));
             }
+            graph.insert("draft_source".into(), draft_source.into());
         }
 
     }
@@ -1638,6 +1652,41 @@ mod asset_tests {
 
         let copy_str = super::execution(&make(Some(serde_json::json!("COPY_DRAFT"))), &[]).unwrap();
         assert_eq!(copy_str.graphs[0].draft_source, super::super::wire::DraftSource::CopyDraft as i32);
+
+        let mtp_zero = super::execution(&make(Some(serde_json::json!(0))), &[]).unwrap();
+        assert_eq!(mtp_zero.graphs[0].draft_source, super::super::wire::DraftSource::Mtp as i32);
+
+        use prost::Message;
+        let decoded = super::super::wire::Execution::decode(copy_int.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.graphs[0].draft_source, super::super::wire::DraftSource::CopyDraft as i32);
+
+        for bad in [serde_json::json!(3), serde_json::json!(-1), serde_json::json!("UNKNOWN")] {
+            assert!(super::execution(&make(Some(bad)), &[]).is_err());
+        }
+
+        let mixed_copy = serde_json::json!({
+            "abi_version": 6,
+            "completion_token_capacity": 24,
+            "max_active": 4,
+            "input_frame_bytes": 64,
+            "buffers": [],
+            "graphs": [{
+                "name": "mixed-copy",
+                "kind": "mixed",
+                "sampling_mode": "general",
+                "batch_capacity": 4,
+                "token_capacity": 8,
+                "prefill_capacity": 64,
+                "draft_tokens": 7,
+                "speculation_enabled": true,
+                "draft_source": 2,
+                "input_bindings": [],
+                "tuned_bindings": [],
+            }],
+            "tuning_graphs": [],
+            "persistent_workers": [],
+        });
+        assert!(super::execution(&mixed_copy, &[]).is_err());
     }
 }
 

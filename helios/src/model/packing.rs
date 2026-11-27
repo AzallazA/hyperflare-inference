@@ -27,6 +27,7 @@ struct BoundInput {
 
 struct BoundGraph {
     drafts: usize,
+    draft_source: Option<crate::scheduler::speculation::ProposalSource>,
     semantics: GraphContract,
     inputs: Vec<BoundInput>,
     kind: GraphKind,
@@ -34,6 +35,21 @@ struct BoundGraph {
     tokens: usize,
     packed_tokens: usize,
     prefill: usize,
+}
+
+impl BoundGraph {
+    fn matches_step(&self, step: &crate::scheduler::ScheduledStep) -> bool {
+        self.kind == step.kind
+            && self.drafts == step.draft_tokens
+            && self.batch == step.batch_capacity
+            && self.tokens == step.token_capacity
+            && self.packed_tokens == step.packed_token_capacity
+            && self.prefill == step.prefill_capacity()
+            && (self.kind != GraphKind::Speculative
+                || step.draft_source.is_none()
+                || self.draft_source.unwrap_or(crate::scheduler::speculation::ProposalSource::Mtp)
+                    == step.draft_source.unwrap())
+    }
 }
 
 pub struct BoundContract {
@@ -253,6 +269,7 @@ impl Inputs {
                     inputs,
                     kind: graph.kind,
                     drafts: graph.draft_tokens,
+                    draft_source: graph.draft_source,
                     batch: graph.batch_capacity,
                     tokens: graph.token_capacity,
                     packed_tokens: graph.packed_token_capacity,
@@ -288,14 +305,7 @@ impl Inputs {
         self.contract
             .graphs
             .iter()
-            .find(|g| {
-                g.kind == step.kind
-                    && g.drafts == step.draft_tokens
-                    && g.batch == step.batch_capacity
-                    && g.tokens == step.token_capacity
-                    && g.packed_tokens == step.packed_token_capacity
-                    && g.prefill == step.prefill_capacity()
-            })
+            .find(|g| g.matches_step(step))
             .map(|g| &g.semantics)
             .ok_or_else(|| "completion has no prepared graph contract".into())
     }
@@ -379,14 +389,7 @@ impl Inputs {
             .contract
             .graphs
             .iter()
-            .find(|g| {
-                g.kind == frame.step.kind
-                    && g.drafts == frame.step.draft_tokens
-                    && g.batch == frame.step.batch_capacity
-                    && g.tokens == frame.step.token_capacity
-                    && g.packed_tokens == frame.step.packed_token_capacity
-                    && g.prefill == frame.step.prefill_capacity()
-            })
+            .find(|g| g.matches_step(frame.step))
             .ok_or("submission has no resolved packing plan")?;
         self.staging.clear();
         // Only retain cached bytes while this graph treats the same registered

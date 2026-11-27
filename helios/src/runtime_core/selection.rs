@@ -355,11 +355,11 @@ impl LoadOptions {
         if !widths.is_empty() && token_capacity == 0 {
             return Err(invalid("speculative token capacity must be positive"));
         }
-        let source = match config.get("speculative_proposal_source").and_then(Value::as_str).unwrap_or("mtp") {
-            "mtp" => 1,
-            "copy" => 2,
-            _ => return Err(invalid("unknown speculative proposal source")),
-        };
+        let source = crate::scheduler::speculation::ProposalSource::parse(
+            config.get("speculative_proposal_source").and_then(Value::as_str).unwrap_or("mtp"),
+        )
+        .map_err(|error| invalid(error.to_string()))?
+        .to_wire();
         let maximum = execution.graphs.iter().filter(|g| g.kind == "speculative" && g.draft_source == source)
             .filter_map(|g| g.draft_tokens).max().unwrap_or(0) as usize;
         let drafts = self.mtp_draft_tokens.unwrap_or(maximum);
@@ -518,14 +518,16 @@ impl LoadOptions {
             for graph in &execution.graphs {
                 if let Some(depth) = graph.draft_tokens {
                     let key = (graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
-                        graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone());
+                        graph.packed_token_capacity, graph.prefill_capacity, graph.draft_source,
+                        graph.sampling_mode.clone());
                     let selected = depths.entry(key).or_insert(depth);
                     *selected = (*selected).max(depth);
                 }
             }
             execution.graphs.retain(|graph| graph.draft_tokens.is_none_or(|depth|
                 depths[&(graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
-                    graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone())] == depth));
+                    graph.packed_token_capacity, graph.prefill_capacity, graph.draft_source,
+                    graph.sampling_mode.clone())] == depth));
             for batch in REQUIRED_BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
                 for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
                     if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == batch as u64

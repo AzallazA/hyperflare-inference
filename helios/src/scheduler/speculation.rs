@@ -11,16 +11,32 @@ use crate::{Result, execution::BATCH_CAPACITIES};
 /// Copy provenance uses the nonnegative bits of its signed 64-bit mask.
 pub const COPY_DRAFT_CAPACITY: usize = i64::BITS as usize - 1;
 
-/// Conservative per-step acceptance prior for uncalibrated wide copy-verify rounds.
+/// Geometric per-step acceptance prior for uncalibrated wide copy-verify rounds.
+/// At 0.88, expected output over 23 copy drafts is `1 + sum_{d=1..23} 0.88^d ~= 7.95`
+/// tokens (`6.72` over 15 drafts), allowing an uncalibrated wide copy graph to win its
+/// first long match against `W = 8` MTP so online calibration collects observations,
+/// while staying below 1.0 so shorter continuations do not over-select wider graphs.
 pub const WIDE_COPY_PRIOR_RATE: f64 = 0.88;
 
-/// Minimum suffix-automaton match length required before wide copy-verify graphs compete.
+/// Minimum suffix-automaton match length before wide copy-verify graphs compete.
+/// Matches `sam::DEFAULT_MIN_MATCH_LEN`: requiring six consecutive tokens filters
+/// incidental short-ngram collisions on non-repetitive text while triggering on quoted
+/// spans and code edits.
 pub const WIDE_COPY_MIN_MATCH_LEN: usize = 6;
 
+/// Prior sample weight anchoring `CopyCalibration::step_rate` at `WIDE_COPY_PRIOR_RATE`
+/// (matching `CALIBRATION_PRIOR_WEIGHT` in `rounds.rs`). Four pseudo-steps resist one
+/// isolated short-prefix mismatch while allowing a single full-width rejection (`7..=23`
+/// steps) to pull the posterior below MTP break-even within one to two rounds.
 const COPY_STEP_PRIOR_WEIGHT: f64 = 4.0;
+
+/// Shrinkage weight pulling per-depth copy survival toward `step_rate^(d + 1)`
+/// (matching `REQUEST_CALIBRATION_PRIOR_WEIGHT` and `PrefixEstimate::new`). Two
+/// pseudo-rounds regularize sparsely visited deep positions (`d >= 8`) while letting
+/// two to three direct observations at a depth dominate the geometric extrapolation.
 const COPY_DEPTH_SHRINK_WEIGHT: f64 = 2.0;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum ProposalSource {
     #[default]
     Mtp,
@@ -33,6 +49,22 @@ impl ProposalSource {
             "mtp" => Ok(Self::Mtp),
             "copy" => Ok(Self::Copy),
             _ => Err("speculative_proposal_source must be mtp or copy".into()),
+        }
+    }
+
+    pub fn from_wire(code: i32) -> Result<Option<Self>> {
+        match code {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Mtp)),
+            2 => Ok(Some(Self::Copy)),
+            _ => Err("unknown graph draft source".into()),
+        }
+    }
+
+    pub fn to_wire(self) -> i32 {
+        match self {
+            Self::Mtp => 1,
+            Self::Copy => 2,
         }
     }
 }

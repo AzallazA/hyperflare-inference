@@ -92,12 +92,6 @@ impl RefreshState {
         }
     }
 
-    /// Retains earned positive credit (capped at `CREDIT_CAP_NS`) and negative
-    /// debt across idle periods. Idle intervals add neither credit nor ordinary
-    /// duration, preserving `P <= 0.002 / 0.998 * O + D` for timing refresh and
-    /// `P <= 0.01 / 0.99 * O + D` for acceptance learning.
-    pub fn idle(&mut self) {}
-
     pub fn abort(&mut self) {
         self.active = false;
         self.credit_ns = self.credit_ns.min(0.0);

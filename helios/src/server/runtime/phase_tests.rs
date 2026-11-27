@@ -4049,6 +4049,163 @@ fn reasoning_budget_survives_preemption_and_checkpoint_recomputation() {
 }
 
 #[test]
+fn preempted_request_reindexes_generated_history_into_sam_on_readmission() {
+    // Unique 6-token motif [3, 1, 4, 0, 2, 1] preceded by 0 and followed by [4, 3, 0, 4, 1, 2, 3]
+    // is emitted before preemption, never present in the original prompt. After readmission,
+    // emitting [2, 3, 1, 4, 0, 2, 1] creates an exact 6-token suffix match (not an 8-gram in the
+    // shared ring), proving PromptOutputSAM re-indexed pre-preemption output and that later
+    // post-readmission output overrides it on recency.
+    const MOTIF: [u32; 14] = [0, 3, 1, 4, 0, 2, 1, 4, 3, 0, 4, 1, 2, 3];
+    const POST_QUERY: [u32; 7] = [2, 3, 1, 4, 0, 2, 1];
+    const POST_EDIT: [u32; 10] = [2, 2, 2, 4, 3, 1, 4, 0, 2, 1];
+    let data = |n| PromptData {
+        positions: (0..n).map(|p| [p as i64; 3]).collect(),
+        vision_token_indices: vec![-1; n],
+        ..Default::default()
+    };
+    for evict_checkpoint in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.history_drafts = true;
+        fixture.config.prepared_sequence_tokens = 4096;
+        fixture.config.limits.max_sequence_tokens = 4096;
+        fixture.config.limits.pages = 6;
+        fixture.config.limits.max_active = 2;
+        let page_tokens = crate::model::scheduler_capabilities(&fixture.config).page_tokens;
+        let budget = (page_tokens * 4) as u32;
+        let (sender, receiver) = mpsc::channel();
+        let (first, mut first_gen) = fixture.incoming_for(vec![0; 60], budget, data(60));
+        let (second, mut second_gen) = fixture.incoming_for(vec![2; 60], budget, data(60));
+        sender.send(vec![first, second]).unwrap();
+        let mut worker = fixture.worker_for(receiver);
+        let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+        }
+        worker.scheduler.measured_graph_durations(&graphs).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let mut sequence = 0u64;
+        let mut victim_generated = 0usize;
+        while worker.parked.is_empty() {
+            sequence += 1;
+            assert!(sequence < (page_tokens * 8) as u64, "no request was parked");
+            let step = worker.plan(0).unwrap().0.expect("page pressure must make progress");
+            worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+            let sample = match step.kind {
+                GraphKind::Decode | GraphKind::Resume => {
+                    let has_second = step.lanes.iter().any(|lane| {
+                        worker.scheduler.request(lane.request).unwrap().tokens()[0] == 2
+                    });
+                    if has_second {
+                        let tok = MOTIF.get(victim_generated).copied().unwrap_or(0);
+                        victim_generated += 1;
+                        Some(tok)
+                    } else {
+                        Some(1)
+                    }
+                }
+                GraphKind::Prefill => {
+                    let lane = &step.lanes[0];
+                    let live = worker.scheduler.request(lane.request).unwrap();
+                    if lane.start_position as usize + lane.tokens == live.prompt_tokens {
+                        if live.tokens()[0] == 2 {
+                            let tok = MOTIF[0];
+                            victim_generated += 1;
+                            Some(tok)
+                        } else {
+                            Some(1)
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let mut frame = completion(&worker, &step, sequence, sample);
+            frame.timing.gpu_ns[0] = Some(if step.kind == GraphKind::Snapshot { 10 } else { 1000 });
+            worker.complete(step.kind, frame).unwrap();
+            worker.publish().unwrap();
+            let _ = budget_events(&mut first_gen);
+            let _ = budget_events(&mut second_gen);
+        }
+        assert!(victim_generated >= MOTIF.len());
+        let running = worker.active.iter().flatten().map(|a| a.request).collect::<Vec<_>>();
+        worker.retire(&running).unwrap();
+        if evict_checkpoint {
+            let pressure = worker
+                .scheduler
+                .admit(RequestSpec {
+                    prompt: vec![4; page_tokens * 5],
+                    max_new_tokens: 1,
+                    growable_output: false,
+                    message_boundaries: vec![],
+                    conditioning: vec![],
+                    grammar_constrained: false,
+                    host_stops: false,
+                    prompt_logprobs: false,
+                    tools: false,
+                    reasoning_prompt: false,
+                })
+                .unwrap();
+            worker.scheduler.cancel(pressure).unwrap();
+        }
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let resumed = worker.active.iter().flatten().next().unwrap().request;
+        let history_len = worker.scheduler.request(resumed).unwrap().prompt_tokens;
+
+        // Drive post-readmission tokens matching MOTIF[1..7] = [3, 1, 4, 0, 2, 1] preceded by 2.
+        let feed = |worker: &mut Worker<'_>,
+                    sequence: &mut u64,
+                    first_gen: &mut Generation,
+                    second_gen: &mut Generation,
+                    tokens: &[u32]| {
+            let mut fed = 0usize;
+            while fed < tokens.len() {
+                *sequence += 1;
+                let step = worker.plan(0).unwrap().0.unwrap();
+                worker.reserve_and_pack(&step, Fence(*sequence)).unwrap();
+                let sample = match step.kind {
+                    GraphKind::Decode | GraphKind::Resume => {
+                        let tok = tokens[fed];
+                        fed += 1;
+                        Some(tok)
+                    }
+                    GraphKind::Prefill => {
+                        let lane = &step.lanes[0];
+                        if lane.start_position as usize + lane.tokens == history_len {
+                            let tok = tokens[fed];
+                            fed += 1;
+                            Some(tok)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let frame = completion(worker, &step, *sequence, sample);
+                worker.complete(step.kind, frame).unwrap();
+                worker.publish().unwrap();
+                let _ = budget_events(first_gen);
+                let _ = budget_events(second_gen);
+            }
+        };
+        feed(&mut worker, &mut sequence, &mut first_gen, &mut second_gen, &POST_QUERY);
+        let (proposal, count, match_len) =
+            worker.scheduler.request_history_proposal_with_match_len(resumed, 7);
+        assert_eq!(match_len, 6, "evict={evict_checkpoint}: SAM must match pre-preemption output");
+        assert_eq!(count, 7);
+        assert_eq!(&proposal[..7], &[4, 3, 0, 4, 1, 2, 3]);
+
+        // Post-readmission output edit overrides pre-preemption output on recency.
+        feed(&mut worker, &mut sequence, &mut first_gen, &mut second_gen, &POST_EDIT);
+        let (edited, edit_count, edit_match_len) =
+            worker.scheduler.request_history_proposal_with_match_len(resumed, 7);
+        assert_eq!(edit_match_len, 6, "evict={evict_checkpoint}: post-readmission output edit");
+        assert!(edit_count >= 3);
+        assert_eq!(&edited[..3], &[2, 2, 2]);
+    }
+}
+
+#[test]
 fn text_and_conditioned_admission_reserve_prompt_and_initial_output_pages() {
     let mut fixture = Fixture::new();
     fixture.config.prepared_sequence_tokens = 2048;

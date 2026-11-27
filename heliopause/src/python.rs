@@ -223,11 +223,9 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         let kind = GraphKind::try_from(field!(graph, "kind", String).as_str())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let draft_source = match graph.get_item("draft_source").ok()
-            .map(|value| value.extract::<u32>()).transpose()? {
-            Some(0) => None,
-            Some(1) => Some(helios_core::scheduler::speculation::ProposalSource::Mtp),
-            Some(2) => Some(helios_core::scheduler::speculation::ProposalSource::Copy),
-            Some(_) => return Err(PyValueError::new_err("unsupported graph draft_source")),
+            .map(|value| value.extract::<i32>()).transpose()? {
+            Some(code) => helios_core::scheduler::speculation::ProposalSource::from_wire(code)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
             None => (kind == GraphKind::Speculative)
                 .then_some(helios_core::scheduler::speculation::ProposalSource::Mtp),
         };

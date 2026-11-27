@@ -1172,7 +1172,8 @@ fn scheduler_width_one_round_has_no_proposal_work() {
     use crate::scheduler::{ScheduledLane, ScheduledStep, RequestHandle};
     let mut step = ScheduledStep {
         kind: GraphKind::Speculative, batch_capacity: 1, token_capacity: 1,
-        draft_tokens: 0, packed_token_capacity: 1, mixed: None, requires_feedback: false,
+        draft_tokens: 0, draft_source: Some(crate::scheduler::speculation::ProposalSource::Mtp),
+        packed_token_capacity: 1, mixed: None, requires_feedback: false,
         lanes: vec![ScheduledLane { request: RequestHandle { slot: 0, generation: 1 }, start_position: 64, tokens: 1 }],
     };
     step.validate_mixed().unwrap();

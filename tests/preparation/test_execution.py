@@ -369,3 +369,25 @@ def test_native_round_metadata_retains_full_proposal_depth(width, depth):
     assert (graph.token_capacity, graph.draft_tokens, graph.confidence_width) == (width, depth, depth)
     with pytest.raises(ValueError, match="draft depth"):
         GraphSignature("speculative", 4, width, draft_tokens=(1 << 31) - 1)
+
+
+def test_copy_draft_source_requires_speculative_graph_without_gpu_confidence(monkeypatch):
+    signature = GraphSignature("speculative", 1, 16, ("tokens",), draft_tokens=15, draft_source=2)
+    buffers = dict(_execution().buffers)
+    buffers["completion_records"] = _tensor("int64", (2, 4, 32))
+    execution = _execution(graphs={"copy": object()}, signatures={"copy": signature}, buffers=buffers)
+    spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11], spans))
+    graph, = execution.manifest()["graphs"]
+    assert (graph["draft_source"], graph["draft_tokens"], graph["verify_tokens"]) == (2, 15, 16)
+
+    with pytest.raises(ValueError, match="copy draft source requires a speculative graph"):
+        GraphSignature("mixed", 4, 8, ("prefill_row",), speculation_enabled=True, prefill_capacity=64, draft_source=2)
+    with pytest.raises(ValueError, match="copy draft source requires a speculative graph"):
+        GraphSignature("decode", 1, 1, ("tokens",), draft_source=2)
+    with pytest.raises(ValueError, match="GPU confidence or prefix limits"):
+        GraphSignature("speculative", 1, 16, ("speculative_prefix_limits",), draft_tokens=15, packed_token_capacity=16, draft_source=2)
+    with pytest.raises(ValueError, match="GPU confidence or prefix limits"):
+        GraphSignature("speculative", 1, 16, ("tokens",), draft_tokens=15, confidence_width=15, draft_source=2)
+    with pytest.raises(ValueError, match="draft_source"):
+        GraphSignature("speculative", 1, 8, ("tokens",), draft_source=3)

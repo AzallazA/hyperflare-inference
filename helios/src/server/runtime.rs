@@ -2215,7 +2215,7 @@ impl<'a> Worker<'a> {
         validate_sampling_admissions(step, &self.admissions)?;
         let fence = executor.next_fence()?;
         self.reserve_and_pack(step, fence)?;
-        let graph = crate::model::catalog::select_shape_with_drafts(
+        let graph = crate::model::catalog::select_shape_with_source(
             self.config,
             executor.manifest(),
             step.kind,
@@ -2224,6 +2224,7 @@ impl<'a> Worker<'a> {
             step.prefill_capacity(),
             step.packed_token_capacity,
             step.draft_tokens,
+            step.draft_source,
             SamplingMode::General,
         )?;
         // TP3 fork (DS41 tp3.index_row_split_min_context): a one-lane prefill chunk that starts at
@@ -2976,7 +2977,7 @@ mod tests {
             GraphKind::Resume,
             GraphKind::Speculative,
         ] {
-            let mut step = ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
+            let mut step = ScheduledStep { draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
                 kind,
                 batch_capacity: 4,
                 token_capacity: 1,
@@ -2998,7 +2999,7 @@ mod tests {
                 Error::Execution(ExecutionError::State(_))
             ));
         }
-        let mut step = ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
+        let mut step = ScheduledStep { draft_tokens: 0, draft_source: None, packed_token_capacity: 0,
             kind: GraphKind::Decode,
             batch_capacity: 1,
             token_capacity: 1,

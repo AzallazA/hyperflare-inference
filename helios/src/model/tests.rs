@@ -1525,7 +1525,7 @@ fn grammar_packing_fixture() -> (
             tokens: 3,
         });
     }
-    let step = crate::scheduler::ScheduledStep { draft_tokens: 0,
+    let step = crate::scheduler::ScheduledStep { draft_tokens: 0, draft_source: None,
         kind: GraphKind::Decode,
         batch_capacity: 8,
         token_capacity: 1,
@@ -2168,4 +2168,113 @@ fn wide_copy_verify_catalog_packs_23_sam_tokens_and_preserves_legacy_w8_cores() 
     assert_eq!(packed, expected);
     let copy_count = uploads.iter().find(|u| u.buffer == "copy_token_count").unwrap();
     assert_eq!(i32::from_le_bytes(copy_count.bytes[..4].try_into().unwrap()), 23);
+
+    // Complete the in-flight wide-copy step, cancel the first request, and verify that an ordinary
+    // W=8 MTP round with a shorter 7-token continuation also packs SAM copy drafts.
+    let live = scheduler.request(handle).unwrap();
+    let mut vec_rec = TokenVector {
+        emitted_count: 1,
+        verification_width: 24,
+        tokens: vec![-1; 24],
+        ..Default::default()
+    };
+    vec_rec.tokens[0] = 48;
+    let mut recs = vec![CompletionRecord::default(); 4];
+    recs[handle.slot as usize] = CompletionRecord {
+        generation: handle.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: live.consumed_tokens as i64 + 1,
+        generated_tokens: live.generated_tokens as i64 + 1,
+        token_id: 48,
+        status: 1,
+        vector: Some(vec_rec),
+        ..Default::default()
+    };
+    let mut timing = ExecutionTiming::default();
+    timing.gpu_ns[0] = Some(6_450_000);
+    scheduler.complete(Fence(fence), &recs, timing).unwrap();
+    fence += 1;
+    scheduler.cancel(handle).unwrap();
+    let mut short_prompt: Vec<u32> = (100..160).collect();
+    short_prompt[8..21].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    short_prompt[55..60].copy_from_slice(&[10, 11, 12, 13, 14]);
+    let short_h = scheduler
+        .admit(RequestSpec {
+            message_boundaries: vec![],
+            prompt: short_prompt.clone(),
+            conditioning: vec![],
+            // After prefill emits token 15, remaining budget is 8 (== base_mtp_drafts + 1),
+            // so wide copy-verify does not apply and W=8 MTP still packs the 7 SAM tokens.
+            max_new_tokens: 9,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+    admissions[short_h.slot as usize] = Some(Admission {
+        handle: short_h,
+        sampling: SamplingParameters::default(),
+        max_new_tokens: 9,
+        prompt: short_prompt.clone(),
+        data: PromptData {
+            positions: (0..short_prompt.len() as i64).map(|p| [p; 3]).collect(),
+            vision_token_indices: vec![-1; short_prompt.len()],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: true,
+        prompt_logprobs: false,
+    });
+    let mtp_plan = loop {
+        let plan = scheduler.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            break plan;
+        }
+        scheduler.commit(&plan, Fence(fence)).unwrap();
+        let live = scheduler.request(short_h).unwrap();
+        let is_prefill = plan.kind.is_prefill();
+        let mut vec_rec = TokenVector {
+            emitted_count: i64::from(is_prefill),
+            verification_width: 1,
+            tokens: vec![-1; 24],
+            ..Default::default()
+        };
+        if is_prefill {
+            vec_rec.tokens[0] = 15;
+        }
+        let mut recs = vec![CompletionRecord::default(); 4];
+        recs[short_h.slot as usize] = CompletionRecord {
+            generation: short_h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: if is_prefill { short_prompt.len() as i64 } else { live.consumed_tokens as i64 },
+            generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+            token_id: if is_prefill { 15 } else { -1 },
+            status: 1,
+            vector: Some(vec_rec),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        scheduler.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    };
+    assert_eq!((mtp_plan.batch_capacity, mtp_plan.token_capacity, mtp_plan.draft_tokens), (1, 8, 7));
+    assert!(!scheduler.is_copy_only_step(&mtp_plan));
+    scheduler.commit(&mtp_plan, Fence(fence)).unwrap();
+    pack_inputs(&mut inputs, &wide_cfg, &scheduler, &mtp_plan, &admissions).unwrap();
+    let uploads = inputs.uploads();
+    let mtp_copy_ids: Vec<i64> = uploads
+        .iter()
+        .find(|u| u.buffer == "copy_token_ids")
+        .unwrap()
+        .bytes
+        .chunks_exact(8)
+        .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let mtp_copy_count = uploads.iter().find(|u| u.buffer == "copy_token_count").unwrap();
+    assert_eq!(i32::from_le_bytes(mtp_copy_count.bytes[..4].try_into().unwrap()), 7);
+    assert_eq!(&mtp_copy_ids[..7], &[16, 17, 18, 19, 20, 21, 22]);
 }

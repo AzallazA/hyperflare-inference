@@ -127,7 +127,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
                 );
             }
         }
-        select_shape_with_drafts(
+        select_shape_with_source(
             config,
             manifest,
             graph.kind,
@@ -136,6 +136,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             graph.prefill_capacity,
             graph.packed_token_capacity,
             graph.draft_tokens,
+            graph.draft_source,
             graph.sampling_mode,
         )?;
     }
@@ -346,6 +347,14 @@ pub fn select_shape_with_drafts(
     config: &ModelConfig, manifest: &ExecutionManifest, kind: GraphKind,
     batch: usize, tokens: usize, prefill: usize, packed: usize, drafts: usize, mode: SamplingMode,
 ) -> Result<usize> {
+    select_shape_with_source(config, manifest, kind, batch, tokens, prefill, packed, drafts, None, mode)
+}
+
+pub fn select_shape_with_source(
+    config: &ModelConfig, manifest: &ExecutionManifest, kind: GraphKind,
+    batch: usize, tokens: usize, prefill: usize, packed: usize, drafts: usize,
+    draft_source: Option<speculation::ProposalSource>, mode: SamplingMode,
+) -> Result<usize> {
     let declared = batches(config).any(|capacity| capacity == batch)
         && match kind {
             GraphKind::Mixed => {
@@ -391,6 +400,10 @@ pub fn select_shape_with_drafts(
             && graph.packed_token_capacity == packed
             && graph.draft_tokens == drafts
             && graph.sampling_mode == mode
+            && (kind != GraphKind::Speculative
+                || draft_source.is_none()
+                || graph.draft_source.unwrap_or(speculation::ProposalSource::Mtp)
+                    == draft_source.unwrap())
     });
     let (index, _) = matches.next().ok_or_else(|| {
         format!("prepared model lacks {kind:?}/{mode:?} graph with batch {batch}, tokens {tokens}")

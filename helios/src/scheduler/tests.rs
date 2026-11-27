@@ -10,7 +10,7 @@ pub(super) fn measured_costs(graphs: &[crate::execution::GraphDescriptor]) -> co
     let mut costs = cost::ActionCosts::prepared(graphs, 16).unwrap();
     for graph in graphs {
         costs.observe(
-            &ScheduledStep { draft_tokens: graph.draft_tokens, packed_token_capacity: graph.packed_token_capacity,
+            &ScheduledStep { draft_tokens: graph.draft_tokens, draft_source: graph.draft_source, packed_token_capacity: graph.packed_token_capacity,
                 kind: graph.kind,
                 batch_capacity: graph.batch_capacity,
                 token_capacity: graph.token_capacity,
@@ -2444,7 +2444,7 @@ fn graph_duration_median_excludes_host_delay_and_queue_wait() {
 fn readiness_correction_changes_shape_cost_without_changing_service_time() {
     use crate::execution::{ExecutionTiming, ReadinessIntervals};
     let mut costs = cost::ActionCosts::prepared(&duration_graphs(1), 16).unwrap();
-    let step = ScheduledStep { draft_tokens: 0, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
+    let step = ScheduledStep { draft_tokens: 0, draft_source: None, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
         packed_token_capacity: 0, mixed: None, lanes: vec![], requires_feedback: false };
     let timestamps = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
     let mut gpu_ns = [None; 16];
@@ -4605,6 +4605,7 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
                     batch_capacity: batch,
                     token_capacity: 1,
                     draft_tokens: 0,
+                    draft_source: None,
                     packed_token_capacity: 0,
                     lanes: vec![],
                     mixed: None,
@@ -4618,6 +4619,7 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
                         batch_capacity: batch,
                         token_capacity: width,
                         draft_tokens: width - 1,
+                        draft_source: Some(speculation::ProposalSource::Mtp),
                         packed_token_capacity: batch * width,
                         lanes: vec![],
                         mixed: None,
