@@ -2729,7 +2729,7 @@ impl RequestScheduler {
                     let request = self.request(lane.request).unwrap();
                     let width = expected_lengths.as_ref().map_or(lane.tokens, |lengths| lengths[slot]);
                     if copy_only_step {
-                        self.expected_copy_tokens(request, width)
+                        self.expected_copy_tokens(request, step.batch_capacity, width)
                     } else {
                         self.expected_speculative_tokens(request, step.batch_capacity, width)
                     }

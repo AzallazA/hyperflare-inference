@@ -4120,6 +4120,25 @@ fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity(
 }
 
 #[test]
+fn wide_copy_curve_applies_per_batch_alpha_schedule() {
+    let mut sched = scheduler(8, 128, 16);
+    sched.policy.adaptive_verification_alpha = 1.0;
+    sched.policy.adaptive_verification_alpha_by_batch = vec![(1, 0.5), (4, 1.5), (usize::MAX, 2.5)];
+    let req = sched.admit(spec(4, 32)).unwrap();
+    let live = sched.request(req).unwrap();
+    let base = sched.wide_copy_curve(live, 1, false);
+    let mid = sched.wide_copy_curve(live, 4, false);
+    let high = sched.wide_copy_curve(live, 8, false);
+    assert!(!base.is_empty());
+    let prior0 = speculation::WIDE_COPY_PRIOR_RATE;
+    assert!((base[0] - prior0.powf(0.5)).abs() < 1e-12);
+    assert!((mid[0] - prior0.powf(1.5)).abs() < 1e-12);
+    assert!((high[0] - prior0.powf(2.5)).abs() < 1e-12);
+    assert!(sched.expected_copy_tokens(live, 1, 8) > sched.expected_copy_tokens(live, 4, 8));
+    assert!(sched.expected_copy_tokens(live, 4, 8) > sched.expected_copy_tokens(live, 8, 8));
+}
+
+#[test]
 fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwise() {
     use crate::execution::{ExecutionTiming, PrefixAllocation, TokenVector};
     use crate::scheduler::speculation::ProposalSource;

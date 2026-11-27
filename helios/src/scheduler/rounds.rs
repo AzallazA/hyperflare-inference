@@ -582,7 +582,7 @@ impl RequestScheduler {
         curve.into_iter().map(|p| p.powf(alpha)).collect()
     }
 
-    pub(super) fn wide_copy_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
+    pub(super) fn wide_copy_curve(&self, request: &LiveRequest, batch: usize, optimistic: bool) -> Vec<f64> {
         let curve = if let Some(calibration) = request.copy_calibration.as_ref() {
             calibration.curve(request.generated_tokens, optimistic)
         } else {
@@ -590,7 +590,7 @@ impl RequestScheduler {
                 .map(|depth| speculation::WIDE_COPY_PRIOR_RATE.powi(depth as i32 + 1))
                 .collect()
         };
-        let alpha = self.policy.adaptive_verification_alpha;
+        let alpha = self.policy.alpha_for_batch(batch);
         if alpha == 1.0 {
             return curve;
         }
@@ -600,8 +600,8 @@ impl RequestScheduler {
             .collect()
     }
 
-    pub(super) fn expected_copy_tokens(&self, request: &LiveRequest, width: usize) -> f64 {
-        forecast_tokens(&self.wide_copy_curve(request, false), width)
+    pub(super) fn expected_copy_tokens(&self, request: &LiveRequest, batch: usize, width: usize) -> f64 {
+        forecast_tokens(&self.wide_copy_curve(request, batch, false), width)
     }
 
     pub(super) fn speculative_duration(&self, request: &LiveRequest, batch: usize, width: usize) -> Option<u64> {
@@ -896,7 +896,7 @@ impl RequestScheduler {
         // distinct batch-schedule alpha value.
         let mut raw_curves: [Option<Vec<f64>>; REQUEST_LANES] = std::array::from_fn(|_| None);
         let mut powered_curves: HashMap<(u64, usize), Vec<f64>> = HashMap::new();
-        let mut copy_curves: [Option<Vec<f64>>; REQUEST_LANES] = std::array::from_fn(|_| None);
+        let mut copy_curves: HashMap<(u64, usize), Vec<f64>> = HashMap::new();
         let mut order = Vec::with_capacity(available.len());
         let mut frontier = std::collections::BinaryHeap::new();
         let base_mtp_drafts = self.costs.max_mtp_draft_tokens();
@@ -942,11 +942,13 @@ impl RequestScheduler {
                 if copy_available.is_empty() {
                     continue;
                 }
+                let copy_alpha_bits = self.policy.alpha_for_batch(shape.batch).to_bits();
                 let mut probabilities = vec![Vec::new(); REQUEST_LANES];
                 for &slot in &copy_available {
                     let request = self.slots[slot].request.as_ref().unwrap();
-                    let curve = copy_curves[slot]
-                        .get_or_insert_with(|| self.wide_copy_curve(request, optimistic));
+                    let curve = copy_curves
+                        .entry((copy_alpha_bits, slot))
+                        .or_insert_with(|| self.wide_copy_curve(request, shape.batch, optimistic));
                     probabilities[slot] = curve.clone();
                 }
                 let ranking = self.build_host_prefix_ranking(
