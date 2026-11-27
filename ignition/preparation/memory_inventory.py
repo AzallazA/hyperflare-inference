@@ -250,6 +250,7 @@ def collect_inventory(prepared, storage, core, *, external=()):
                 claims.append(Claim(start + live, start + size, "Allocator slack", "inactive blocks / alignment", priority=100))
     dynamic = {region.address: region for region in storage.dynamic_regions}
     persistent = tuple(getattr(storage, "persistent_regions", ()))
+    mixed = tuple(r for r in getattr(storage, "mixed_regions", ()) if not getattr(r, "closed", False))
     arena = getattr(storage, "_persistent_arena", None)
     if arena is not None:
         claims.extend(Claim(start, end, "Allocator slack", "persistent tensor alignment / mapping tail", priority=100)
@@ -275,6 +276,7 @@ def collect_inventory(prepared, storage, core, *, external=()):
         *((s["address"], s["address"] + s["total_size"]) for s in segments),
         *cache, *globals,
         *((region.address, region.address + region.nbytes) for region in persistent if region.nbytes),
+        *((region.address, region.address + region.device_bytes) for region in mixed if region.device_bytes),
     ])
     exported = merge_ranges([*fixed, *globals])
     core_padding = subtract_ranges(exported, physical)

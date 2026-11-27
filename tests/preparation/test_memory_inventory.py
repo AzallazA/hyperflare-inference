@@ -181,6 +181,46 @@ def test_inventory_separates_physical_cache_host_peers_and_core_alignment(monkey
         assert 'shared system memory' not in text
 
 
+def test_inventory_tracks_mixed_region_vram_prefixes(monkeypatch):
+    import flare_heliopause
+    import torch
+    from ignition.preparation import memory_inventory
+    from ignition.preparation.runtime_core import Allocation
+
+    monkeypatch.setattr(flare_heliopause, 'memory_inventory', lambda: dict(
+        device=0, total_bytes=10000, free_bytes=5000, mappings=[(100, 300)]))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, 'memory_snapshot', lambda *, include_traces: [])
+    monkeypatch.setattr(torch.cuda, 'memory_allocated', lambda device: 300)
+    monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda device: 300)
+    monkeypatch.setattr(memory_inventory, 'owner_claims', lambda prepared: [
+        Claim(2000, 5000, '', 'experts.hot', 'moe.py:10', tensor=True)])
+    prepared = SimpleNamespace(export_zero_ranges=(), buffers={}, graphs={'decode': None})
+    storage = SimpleNamespace(
+        rank=0, device=0, numeric_storage=SimpleNamespace(ranges=lambda: [(2000, 5000)]),
+        graph_pool=SimpleNamespace(id=(1, 1)), dynamic_regions=[],
+        mixed_regions=[
+            SimpleNamespace(address=2000, extent=4000, device_bytes=3000, closed=False),
+            SimpleNamespace(address=8000, extent=2000, device_bytes=1000, closed=True),
+            SimpleNamespace(address=12000, extent=2000, device_bytes=0, closed=False),
+        ],
+        peer_storage=None, host_regions=[],
+    )
+    core = SimpleNamespace(
+        allocations=[Allocation('fixed', 100, 300), Allocation('mixed-0-3000', 2000, 4000)],
+        module_globals=[],
+        export_counts={'kernels': 1, 'modules': 1, 'cubin_bytes': 3},
+    )
+    report = collect_inventory(prepared, storage, core)
+    # Physical VRAM tracks native mapping (300) + open mixed region VRAM prefix (3000);
+    # closed and zero-device-byte mixed regions are excluded.
+    assert report['tracked_physical_bytes'] == 3300
+    assert report['device_unattributed_bytes'] == 5000 - 3300
+    # Only the host-backed tail [5000, 6000) remains outside physical VRAM, not the 3000 B VRAM prefix.
+    assert report['core_padding_bytes'] == 1000
+    assert sum(row['nbytes'] for row in report['entries']) == 3300
+
+
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned CUDA device')
 def test_cuda_inventory_tracks_shared_scratch_and_bounded_cache():
     import subprocess
