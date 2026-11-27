@@ -113,7 +113,7 @@ class DeviceRequestState:
         def zeros(shape, dtype=torch.int64):
             return torch.zeros(shape, dtype=dtype, device=device)
         if capacity not in BATCH_CAPACITIES:
-            raise ValueError("request capacity must be a power of two through 64")
+            raise ValueError(f"request capacity must be in {BATCH_CAPACITIES}")
         consumed = zeros(capacity) if consumed_tokens is None else consumed_tokens
         actual_device = torch.empty(0, device=device).device
         _check_tensor(consumed, (capacity,), torch.int64, actual_device, "consumed_tokens", contiguous=False)
@@ -211,7 +211,7 @@ class AdmissionBuffers:
         if type(steering) is not bool:
             raise TypeError("steering must be a boolean")
         if capacity not in BATCH_CAPACITIES:
-            raise ValueError("admission capacity must be a power of two through 64")
+            raise ValueError(f"admission capacity must be in {BATCH_CAPACITIES}")
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
         parameter_count = 7 if steering else 6

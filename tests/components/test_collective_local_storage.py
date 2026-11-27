@@ -10,9 +10,10 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
-    ConcurrentAllGather, ConcurrentGatherShards, ConcurrentReduceScatter,
-    PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather,
-    PreparedGatherShards, PreparedReduceScatter,
+    ConcurrentAllGather, ConcurrentAllReduce,
+    ConcurrentGatherShards, ConcurrentReduceScatter,
+    PreparedAllGather, PreparedAllReduce,
+    PreparedChunkedAllGather, PreparedGatherShards, PreparedReduceScatter,
 )
 
 
