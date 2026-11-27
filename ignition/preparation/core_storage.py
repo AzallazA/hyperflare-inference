@@ -625,10 +625,17 @@ class ScratchPool:
 
     def materialize(self):
         """Restore the scratch pool's physical storage at its original addresses."""
+        if not self.unbacked:
+            return
+        import torch
+
         while self.unbacked:
             address, size = self.unbacked[-1]
             DeviceRegion(self.storage.cuda, address, size, self.storage.device)
             self.unbacked.pop()
+        # DeviceRegion zeros via cuMemsetD8_v2 (async w.r.t. host on device memory);
+        # drain before any non-blocking stream access or retire() cuMemUnmap.
+        torch.cuda.synchronize(self.storage.device)
 
 
 class MixedRegion:
