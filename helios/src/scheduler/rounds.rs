@@ -19,6 +19,12 @@ const SURPLUS_HISTORY_CAPACITY: usize = 256;
 const SURPLUS_MIN_SAMPLES: usize = 4;
 const SURPLUS_FACTOR_MAX: f64 = 2.0;
 
+#[cfg(test)]
+thread_local! {
+    /// Powered-curve evaluations on this thread, for tests that bound planning work.
+    pub(super) static CURVE_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy)]
 struct DepthCalibration {
     realized: f64,
@@ -475,7 +481,10 @@ impl RequestScheduler {
             let request = self.slots[slot].request.as_ref().unwrap();
             if gpu { self.speculative_curve(request, optimistic) }
             else { request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .into_iter().map(|probability| probability.powf(alpha) * values[slot].output_token).collect() }
+                .into_iter().map(|probability| {
+                    let p = if alpha == 1.0 { probability } else { probability.powf(alpha) };
+                    p * values[slot].output_token
+                }).collect() }
         });
         let mut positions = Vec::new();
         for slot in bits(mask) {
@@ -498,8 +507,12 @@ impl RequestScheduler {
         for &slot in available {
             let request = self.slots[slot].request.as_ref().unwrap();
             let limit = self.speculative_tokens(request, width.min(drafts + 1));
-            probabilities[slot] = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .into_iter().map(|probability| probability.powf(alpha)).collect();
+            let raw = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic);
+            probabilities[slot] = if alpha == 1.0 {
+                raw
+            } else {
+                raw.into_iter().map(|probability| probability.powf(alpha)).collect()
+            };
             for position in 0..limit.saturating_sub(1) {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
             }
@@ -536,9 +549,16 @@ impl RequestScheduler {
     }
 
     /// Prefix survival raised to the adaptive verification exponent for `batch`.
+    /// An exponent of one returns the survival curve unchanged without a `powf` per depth.
     pub(super) fn powered_curve(&self, request: &LiveRequest, batch: usize, optimistic: bool) -> Vec<f64> {
+        #[cfg(test)]
+        CURVE_EVALUATIONS.set(CURVE_EVALUATIONS.get() + 1);
+        let curve = self.speculative_curve(request, optimistic);
         let alpha = self.policy.alpha_for_batch(batch);
-        self.speculative_curve(request, optimistic).into_iter().map(|p| p.powf(alpha)).collect()
+        if alpha == 1.0 {
+            return curve;
+        }
+        curve.into_iter().map(|p| p.powf(alpha)).collect()
     }
 
     pub(super) fn wide_copy_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
@@ -549,9 +569,13 @@ impl RequestScheduler {
                 .map(|depth| speculation::WIDE_COPY_PRIOR_RATE.powi(depth as i32 + 1))
                 .collect()
         };
+        let alpha = self.policy.adaptive_verification_alpha;
+        if alpha == 1.0 {
+            return curve;
+        }
         curve
             .into_iter()
-            .map(|p| p.powf(self.policy.adaptive_verification_alpha))
+            .map(|p| p.powf(alpha))
             .collect()
     }
 
@@ -940,7 +964,11 @@ impl RequestScheduler {
                     let limit = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
                     let curve = powered_curves.entry((alpha_bits, slot)).or_insert_with(|| {
                         let raw = raw_curves[slot].get_or_insert_with(|| self.speculative_curve(request, optimistic));
-                        raw.iter().map(|&p| p.powf(alpha)).collect()
+                        if alpha == 1.0 {
+                            raw.clone()
+                        } else {
+                            raw.iter().map(|&p| p.powf(alpha)).collect()
+                        }
                     });
                     let mut before = 1.0;
                     for position in 0..limit.saturating_sub(1) {

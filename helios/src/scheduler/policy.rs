@@ -234,6 +234,9 @@ pub(super) struct Candidate {
     pub host_lengths: Option<[usize; REQUEST_LANES]>,
 }
 
+/// Per-lane cache of `(alpha_bits, powered_curve)` for one planning pass.
+type LaneCurveCache = [Vec<(u64, Vec<f64>)>; REQUEST_LANES];
+
 impl Candidate {
     pub(super) fn cost_key(self) -> cost::Key {
         cost::Key { drafts: self.draft_tokens,
@@ -368,16 +371,32 @@ impl RequestScheduler {
                 if dominated[index]
                     || candidate.kind != GraphKind::Speculative
                     || candidate.packed_token_capacity == 0
-                    || !self.gpu_prefix_allocation(
-                        candidate.batch,
-                        candidate.draft_tokens,
-                        candidate.capacity,
-                        candidate.packed_token_capacity,
-                    )
                 {
                     continue;
                 }
                 let lanes = candidate.mask.count_ones() as usize;
+                // A full batch (batch <= lanes) cannot be dominated by any strictly smaller batch.
+                if candidate.batch <= lanes {
+                    continue;
+                }
+                if !self.gpu_prefix_allocation(
+                    candidate.batch,
+                    candidate.draft_tokens,
+                    candidate.capacity,
+                    candidate.packed_token_capacity,
+                ) {
+                    continue;
+                }
+                // Only compute round lengths when a strictly tighter prepared batch candidate exists.
+                if !candidates.iter().any(|other| {
+                    other.kind == GraphKind::Speculative
+                        && other.batch >= lanes
+                        && other.batch < candidate.batch
+                        && other.capacity == candidate.capacity
+                        && other.draft_tokens == candidate.draft_tokens
+                }) {
+                    continue;
+                }
                 let needed = length(index).iter().sum::<usize>().min(candidate.packed_token_capacity);
                 dominated[index] = candidates.iter().any(|other| {
                     other.kind == GraphKind::Speculative
@@ -841,15 +860,27 @@ impl RequestScheduler {
         duration_ns: u64,
         value: LaneValue,
     ) -> f64 {
+        self.prerequisite_value_pair(r, kind, duration_ns, value).0
+    }
+
+    /// Evaluates `(prerequisite_value_at_duration, prerequisite_value_at_zero)` with a
+    /// single `next_progress` scan so refresh-expected scoring avoids repeating the scan.
+    fn prerequisite_value_pair(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        duration_ns: u64,
+        value: LaneValue,
+    ) -> (f64, f64) {
         if terminal_cleanup(r) {
             let ms = duration_ns as f64 / 1e6;
-            return value.finish(ms, ms);
+            return (value.finish(ms, ms), value.finish(0.0, 0.0));
         }
         let Some((mut following, work)) = self.next_progress(r, value) else {
-            return 0.0;
+            return (0.0, 0.0);
         };
         if duration_ns == 0 || following == 0 {
-            return work;
+            return (work, work);
         }
         let next_window = r.following_conditioned_window();
         if next_window.is_some() {
@@ -860,7 +891,7 @@ impl RequestScheduler {
                 .min()
                 .unwrap_or(0);
             if restore == 0 {
-                return work;
+                return (work, work);
             }
             following = following.saturating_add(restore);
         }
@@ -877,11 +908,14 @@ impl RequestScheduler {
                 .min()
                 .unwrap_or(0);
             if cost == 0 {
-                return work;
+                return (work, work);
             }
             following = following.saturating_add(cost);
         }
-        work * duration_ns as f64 / duration_ns.saturating_add(following) as f64
+        (
+            work * duration_ns as f64 / duration_ns.saturating_add(following) as f64,
+            work,
+        )
     }
 
     fn following_kind(&self, r: &LiveRequest, kind: GraphKind) -> Option<GraphKind> {
@@ -916,6 +950,7 @@ impl RequestScheduler {
         first_offers: &[(usize, f64)],
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
+        curves: &mut LaneCurveCache,
     ) -> Option<(u64, ValueRate)> {
         if !matches!(
             kind,
@@ -1021,7 +1056,7 @@ impl RequestScheduler {
                                 || (ns == 0
                                     && self.natural_fit_prefill_capacity(
                                         request,
-                                        self.prefill_catalog(request.prefill_kind()),
+                                        self.prefill_catalog(following),
                                         cut,
                                     ) != Some(extent))))
                     {
@@ -1030,7 +1065,15 @@ impl RequestScheduler {
                 }
                 let offer = (
                     slot,
-                    self.lane_value(request, role, batch, extent, horizon, values[slot]),
+                    self.cached_lane_value(
+                        request,
+                        role,
+                        batch,
+                        extent,
+                        horizon,
+                        values[slot],
+                        &mut curves[slot],
+                    ),
                 );
                 if mixed && role == GraphKind::Prefill {
                     let best = &mut prompts[usize::from(promoted)];
@@ -1148,6 +1191,87 @@ impl RequestScheduler {
         )
     }
 
+    fn cached_powered_curve<'a>(
+        &self,
+        r: &LiveRequest,
+        batch: usize,
+        cache: &'a mut Vec<(u64, Vec<f64>)>,
+    ) -> &'a [f64] {
+        let alpha_bits = self.policy.alpha_for_batch(batch).to_bits();
+        if let Some(pos) = cache.iter().position(|(bits, _)| *bits == alpha_bits) {
+            return &cache[pos].1;
+        }
+        cache.push((alpha_bits, self.powered_curve(r, batch, false)));
+        &cache.last().unwrap().1
+    }
+
+    /// `lane_value` with the request's powered curve evaluated at most once per
+    /// `(lane, alpha)` in `curve`. One-token lanes commit 1 token without building a curve.
+    fn cached_lane_value(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        batch: usize,
+        capacity: usize,
+        duration_ns: u64,
+        value: LaneValue,
+        curve: &mut Vec<(u64, Vec<f64>)>,
+    ) -> f64 {
+        if !matches!(kind, GraphKind::Decode | GraphKind::Speculative) {
+            return self.lane_value(r, kind, batch, capacity, duration_ns, value);
+        }
+        let tokens = self.lane_tokens(r, kind, capacity);
+        let expected = if tokens <= 1 {
+            f64::from(tokens != 0)
+        } else {
+            let powered = self.cached_powered_curve(r, batch, curve);
+            super::rounds::forecast_tokens(powered, tokens)
+        };
+        value.decode(expected, duration_ns as f64 / 1e6)
+    }
+
+    /// Evaluates `(lane_value(duration_ns), lane_value(0))` in one pass, avoiding duplicate
+    /// powered-curve builds and duplicate prerequisite `next_progress` scans.
+    fn cached_lane_value_pair(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        batch: usize,
+        capacity: usize,
+        duration_ns: u64,
+        value: LaneValue,
+        curve: &mut Vec<(u64, Vec<f64>)>,
+    ) -> (f64, f64) {
+        match kind {
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => {
+                let tokens = self.prefill_work(r, capacity);
+                let v = value.prefill(
+                    tokens,
+                    r.consumed_tokens + tokens as u64 == r.prompt_tokens as u64,
+                );
+                (v, v)
+            }
+            GraphKind::Decode | GraphKind::Speculative => {
+                let tokens = self.lane_tokens(r, kind, capacity);
+                let expected = if tokens <= 1 {
+                    f64::from(tokens != 0)
+                } else {
+                    let powered = self.cached_powered_curve(r, batch, curve);
+                    super::rounds::forecast_tokens(powered, tokens)
+                };
+                (
+                    value.decode(expected, duration_ns as f64 / 1e6),
+                    value.decode(expected, 0.0),
+                )
+            }
+            GraphKind::Resume => (
+                value.decode(1.0, duration_ns as f64 / 1e6),
+                value.decode(1.0, 0.0),
+            ),
+            _ => self.prerequisite_value_pair(r, kind, duration_ns, value),
+        }
+    }
+
     fn lane_value_for_tokens(
         &self,
         r: &LiveRequest,
@@ -1180,20 +1304,18 @@ impl RequestScheduler {
         mask: u64,
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
+        curves: &mut LaneCurveCache,
     ) {
         let Some(duration_ns) = self.costs.duration(kind, batch, capacity) else {
             return;
         };
         let mut offers = [(0usize, 0.0); REQUEST_LANES];
+        let mut offers_zero = [0.0f64; REQUEST_LANES];
         let mut count = 0;
         for slot in bits(mask) {
             let r = self.slots[slot].request.as_ref().unwrap();
             if kind.is_prefill() {
-                let catalog = if kind == GraphKind::ScoredPrefill {
-                    &self.scored_prefill_catalog
-                } else {
-                    &self.prefill_catalog
-                };
+                let catalog = self.prefill_catalog(kind);
                 let cut = self.estimated_checkpoint_cut(r);
                 let work = self.prefill_work_through(r, capacity, cut);
                 let resolved = self.resolve_prefill_kind(r, capacity, work, cut);
@@ -1213,10 +1335,17 @@ impl RequestScheduler {
             if kind == GraphKind::Vision && capacity < r.vision_patches[0] {
                 continue;
             }
-            offers[count] = (
-                slot,
-                self.lane_value(r, kind, batch, capacity, duration_ns, values[slot]),
+            let (val, val_zero) = self.cached_lane_value_pair(
+                r,
+                kind,
+                batch,
+                capacity,
+                duration_ns,
+                values[slot],
+                &mut curves[slot],
             );
+            offers[count] = (slot, val);
+            offers_zero[slot] = val_zero;
             count += 1;
         }
         if count == 0 {
@@ -1253,23 +1382,13 @@ impl RequestScheduler {
                 &offers[..count],
                 values,
                 age_price,
+                curves,
             )
             .unwrap_or_else(|| (selected, ValueRate::new(duration_ns, expected, age_price)));
         let expected = if duration_ns == 0 || kind.is_prefill() {
             expected
         } else {
-            bits(selected)
-                .map(|slot| {
-                    self.lane_value(
-                        self.slots[slot].request.as_ref().unwrap(),
-                        kind,
-                        batch,
-                        capacity,
-                        0,
-                        values[slot],
-                    )
-                })
-                .sum()
+            bits(selected).map(|slot| offers_zero[slot]).sum()
         };
         output.push(Candidate { host_lengths: None, draft_tokens: drafts, packed_token_capacity: packed,
             kind,
@@ -1303,7 +1422,9 @@ impl RequestScheduler {
         age_price: f64,
     ) {
         output.clear();
-        self.mixed_candidates(output, values, age_price, false, None);
+        // Continuation, mixed, and direct pricing for every shape share one curve cache per lane.
+        let mut curves: LaneCurveCache = std::array::from_fn(|_| Vec::new());
+        self.mixed_candidates_with_curves(output, values, age_price, false, None, &mut curves);
         self.packed_round_candidates(output, values, age_price, false);
         for kind in [
             GraphKind::Prefill,
@@ -1338,11 +1459,11 @@ impl RequestScheduler {
             }
             if kind.is_prefill() {
                 for &capacity in self.prefill_catalog(kind) {
-                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
+                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price, &mut curves);
                 }
             } else if kind == GraphKind::Vision {
                 for &capacity in &self.capabilities.vision.patch_capacities {
-                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
+                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price, &mut curves);
                 }
             } else {
                 for batch in crate::execution::BATCH_CAPACITIES
@@ -1352,11 +1473,11 @@ impl RequestScheduler {
                     if kind == GraphKind::Speculative {
                         for &capacity in &self.speculative_catalog[batch.ilog2() as usize] {
                             self.add_candidate(
-                                output, kind, batch, capacity, mask, values, age_price,
+                                output, kind, batch, capacity, mask, values, age_price, &mut curves,
                             );
                         }
                     } else {
-                        self.add_candidate(output, kind, batch, 1, mask, values, age_price);
+                        self.add_candidate(output, kind, batch, 1, mask, values, age_price, &mut curves);
                     }
                 }
             }
@@ -1371,6 +1492,19 @@ impl RequestScheduler {
         optimistic: bool,
         prompt_slot: Option<usize>,
     ) {
+        let mut curves: LaneCurveCache = std::array::from_fn(|_| Vec::new());
+        self.mixed_candidates_with_curves(output, values, age_price, optimistic, prompt_slot, &mut curves);
+    }
+
+    fn mixed_candidates_with_curves(
+        &self,
+        output: &mut Vec<Candidate>,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+        optimistic: bool,
+        prompt_slot: Option<usize>,
+        curves: &mut LaneCurveCache,
+    ) {
         let decode = if self.speculative_widths.is_empty() {
             GraphKind::Decode
         } else {
@@ -1384,6 +1518,7 @@ impl RequestScheduler {
                 continue;
             };
             let mut decoders = [(0usize, 0.0); REQUEST_LANES];
+            let mut decoders_zero = [0.0f64; REQUEST_LANES];
             let mut count = 0;
             let mut prompt: Option<(usize, f64)> = None;
             for (slot, entry) in self.slots.iter().enumerate() {
@@ -1416,11 +1551,25 @@ impl RequestScheduler {
                         }
                     }
                     Some(kind) if kind == decode => {
-                        decoders[count] = (
-                            slot,
-                            if optimistic { values[slot].decode(self.optimistic_tokens(r, self.speculative_tokens(r, width)), duration_ns as f64 / 1e6) }
-                            else { self.lane_value(r, decode, batch, width, duration_ns, values[slot]) },
-                        );
+                        let (val, val_zero) = if optimistic {
+                            let tokens = self.optimistic_tokens(r, self.speculative_tokens(r, width));
+                            (
+                                values[slot].decode(tokens, duration_ns as f64 / 1e6),
+                                values[slot].decode(tokens, 0.0),
+                            )
+                        } else {
+                            self.cached_lane_value_pair(
+                                r,
+                                decode,
+                                batch,
+                                width,
+                                duration_ns,
+                                values[slot],
+                                &mut curves[slot],
+                            )
+                        };
+                        decoders[count] = (slot, val);
+                        decoders_zero[slot] = val_zero;
                         count += 1;
                     }
                     _ => {}
@@ -1449,14 +1598,7 @@ impl RequestScheduler {
                 let mut refresh_expected = decoders[..count]
                     .iter()
                     .filter(|(s, _)| mask & (1 << s) != 0)
-                    .map(|&(slot, _)| {
-                        let r = self.slots[slot].request.as_ref().unwrap();
-                        if optimistic {
-                            values[slot].decode(self.optimistic_tokens(r, self.speculative_tokens(r, width)), 0.0)
-                        } else {
-                            self.lane_value(r, decode, batch, width, 0, values[slot])
-                        }
-                    })
+                    .map(|&(slot, _)| decoders_zero[slot])
                     .sum::<f64>();
                 if let Some((slot, value)) = prompt {
                     mask |= 1 << slot;
@@ -1605,19 +1747,20 @@ impl RequestScheduler {
     ) {
         let slot = r.handle.slot as usize;
         let Some(kind) = self.request_kind(r) else { return };
+        let mut curves: LaneCurveCache = std::array::from_fn(|_| Vec::new());
         if kind.is_prefill() {
-            self.mixed_candidates(output, values, age_price, false, Some(slot));
+            self.mixed_candidates_with_curves(output, values, age_price, false, Some(slot), &mut curves);
             for &capacity in self.prefill_catalog(kind) {
-                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price, &mut curves);
             }
             if kind == GraphKind::Prefill {
                 for &capacity in &self.terminal_prefill_catalog {
-                    self.add_candidate(output, GraphKind::TerminalPrefill, 1, capacity, 1 << slot, values, age_price);
+                    self.add_candidate(output, GraphKind::TerminalPrefill, 1, capacity, 1 << slot, values, age_price, &mut curves);
                 }
             }
         } else if kind == GraphKind::Vision {
             for &capacity in &self.capabilities.vision.patch_capacities {
-                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price, &mut curves);
             }
         } else {
             let mask = self
@@ -1635,7 +1778,7 @@ impl RequestScheduler {
                 .into_iter()
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
             {
-                self.add_candidate(output, kind, batch, 1, mask, values, age_price);
+                self.add_candidate(output, kind, batch, 1, mask, values, age_price, &mut curves);
             }
         }
     }
@@ -1801,8 +1944,14 @@ impl RequestScheduler {
             let decode = if self.speculative_widths.is_empty() { GraphKind::Decode } else { GraphKind::Speculative };
             for slot in bits(candidate.mask & !(1 << slot)) {
                 let r = self.slots[slot].request.as_ref().unwrap();
-                expected += self.lane_value(r, decode, candidate.batch, candidate.capacity, duration_ns, values[slot]);
-                refresh_expected += self.lane_value(r, decode, candidate.batch, candidate.capacity, 0, values[slot]);
+                let tokens = self.lane_tokens(r, decode, candidate.capacity);
+                let pred = if tokens <= 1 {
+                    f64::from(tokens != 0)
+                } else {
+                    self.expected_speculative_tokens(r, candidate.batch, tokens)
+                };
+                expected += values[slot].decode(pred, duration_ns as f64 / 1e6);
+                refresh_expected += values[slot].decode(pred, 0.0);
             }
         }
         candidate.expected = refresh_expected;
@@ -1915,16 +2064,17 @@ impl RequestScheduler {
             })
             .fold(0, |a, b| a | b);
         let mut candidates = Vec::new();
+        let mut curves: LaneCurveCache = std::array::from_fn(|_| Vec::new());
         if kind.is_prefill() {
             for &capacity in self.prefill_catalog(kind) {
-                self.add_candidate(&mut candidates, kind, 1, capacity, mask, &values, age_price);
+                self.add_candidate(&mut candidates, kind, 1, capacity, mask, &values, age_price, &mut curves);
             }
         } else {
             for batch in crate::execution::BATCH_CAPACITIES
                 .into_iter()
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
             {
-                self.add_candidate(&mut candidates, kind, batch, 1, mask, &values, age_price);
+                self.add_candidate(&mut candidates, kind, batch, 1, mask, &values, age_price, &mut curves);
             }
         }
         let candidate = *candidates

@@ -6765,3 +6765,126 @@ fn attempted_stale_shapes_rotate_without_starvation_when_timing_is_invalid() {
     // Once all feasible stale shapes are in Tier 1, oldest-attempt rotates back to 8192.
     invalid_probe(&mut s, 8192);
 }
+
+#[test]
+fn waiting_init_prices_each_decoding_lane_curve_once_per_candidate_pass() {
+    // Issue #547: An Init candidate prices its continuation over every Init batch capacity
+    // and every following shape, including each speculative (batch, width) cell. The decoding
+    // lanes' forecast curves do not change within the pass, so the Init candidate may add at
+    // most one curve evaluation per decoding lane.
+    let mut s = engine(8, true);
+    let decoding = fixed_host_requests(&mut s, &[32, 32, 32, 32]);
+    let pass = |s: &RequestScheduler| {
+        let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+        let mut candidates = Vec::new();
+        super::rounds::CURVE_EVALUATIONS.set(0);
+        s.candidates(&mut candidates, &values, age_price);
+        (super::rounds::CURVE_EVALUATIONS.get(), candidates)
+    };
+    let (without_init, _) = pass(&s);
+    let waiting = add(&mut s, 9, 64, 128);
+    assert_eq!(s.request(waiting).unwrap().phase, RequestPhase::Initialize);
+    let (with_init, candidates) = pass(&s);
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Init));
+    assert!(with_init > without_init, "the Init continuation must price the decoding lanes");
+    assert!(
+        with_init - without_init <= decoding.len(),
+        "a waiting Init added {} curve evaluations for {} decoding lanes",
+        with_init - without_init,
+        decoding.len(),
+    );
+}
+
+#[test]
+fn mixed_candidates_price_each_decoding_lane_curve_once_per_call() {
+    // Issue #547: Every mixed shape prices the same decoding lanes, whose forecast curves do
+    // not change while the shapes compete.
+    let mut s = mixed_engine(
+        8,
+        true,
+        &[(2, 3, 64, MS), (2, 8, 64, MS), (4, 3, 64, MS), (4, 8, 64, MS), (8, 8, 64, MS)],
+    );
+    let decoding = fixed_host_requests(&mut s, &[32, 32, 32, 32]);
+    let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    super::rounds::CURVE_EVALUATIONS.set(0);
+    s.mixed_candidates(&mut candidates, &values, age_price, false, None);
+    let evaluations = super::rounds::CURVE_EVALUATIONS.get();
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Mixed));
+    assert!(evaluations > 0, "mixed shapes must price the decoding lanes");
+    assert!(
+        evaluations <= decoding.len(),
+        "mixed candidates made {evaluations} curve evaluations for {} decoding lanes",
+        decoding.len(),
+    );
+}
+
+#[test]
+fn decode_only_candidate_pass_builds_no_forecast_curve() {
+    // Issue #547: Without speculative widths each decoding lane commits one token per step,
+    // so its lane value needs no forecast curve.
+    let mut s = engine(8, false);
+    let decoding = fixed_host_requests(&mut s, &[32, 32, 32, 32]);
+    let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    super::rounds::CURVE_EVALUATIONS.set(0);
+    s.candidates(&mut candidates, &values, age_price);
+    let evaluations = super::rounds::CURVE_EVALUATIONS.get();
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Decode
+        && c.mask.count_ones() as usize == decoding.len()));
+    assert_eq!(evaluations, 0, "decode-only candidates built {evaluations} forecast curves");
+}
+
+#[test]
+fn cold_terminal_prefill_uses_terminal_catalog_for_natural_fit() {
+    // #538 follow-up: When terminal_prefill_catalog is a subset of prefill_catalog, cold
+    // TerminalPrefill discovery must compute natural-fit capacity over terminal_prefill_catalog
+    // rather than prefill_catalog.
+    let mut s = super::tests::scheduler(1, 128, 16);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.terminal_prefill_graphs(&[256, 512]).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    for cap in [256usize, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: 0,
+            draft_source: None,
+            packed_token_capacity: 0,
+            name: format!("terminal_prefill{cap}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            handle: 1,
+            batch_capacity: 1,
+            token_capacity: cap,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+        });
+    }
+    s.graph_durations(&graphs).unwrap();
+    // Measure Prefill(128) while TerminalPrefill(256) stays cold (duration_ns == 0).
+    set_cost(&mut s, GraphKind::Prefill, 1, 128, 100_000);
+    set_cost(&mut s, GraphKind::Init, 1, 1, 10_000);
+
+    let handle = add(&mut s, 1, 100, 16);
+    let init = s.plan().unwrap();
+    assert_eq!(init.kind, GraphKind::Init);
+    s.commit(&init, Fence(1)).unwrap();
+    s.advance_to(MS).unwrap();
+    complete_timed(&mut s, &init, Fence(1), 0, false, gpu_time(10_000));
+    assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Prefill);
+
+    // 100 tokens: in prefill_catalog the smallest fit is 128, whereas in terminal_prefill_catalog
+    // the smallest fit is 256. Cold TerminalPrefill(256) must be offered as a candidate rather
+    // than rejected by prefill_catalog's 128.
+    let (values, age_price, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    s.candidates(&mut candidates, &values, age_price);
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.kind == GraphKind::TerminalPrefill && c.capacity == 256),
+        "cold TerminalPrefill(256) must be discovered when 256 is the natural fit in terminal_prefill_catalog"
+    );
+}

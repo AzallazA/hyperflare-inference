@@ -275,8 +275,8 @@ and clips work to that candidate's capacity. Refresh and discovery plans
 retain their capacities and clip work to fit. Atomic image spans, feature windows,
 and prompt length also restrict logical work. A graph with 64 useful prompt tokens
 earns 64 prompt units and at most one output token, regardless of physical capacity.
-Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
-oldest-request filter, or per-chunk prefill lateness cost.
+Candidate scoring has no smallest-fitting-shape filter among measured graphs,
+duration ceiling, forced oldest-request filter, or per-chunk prefill lateness cost.
 
 When a prepared model registers `TERMINAL_PREFILL` graphs for a subset of
 aligned prefill capacities, Helios infers the tail-protection window as the
@@ -292,8 +292,9 @@ suppresses checkpoint and early-retirement snapshot capture so incomplete
 continuation state is never published. Checkpoint cut budgeting prices
 non-terminal and terminal chunks using their separate measured durations with
 sibling fallback when only one operation is measured, skipping unmeasured
-larger capacities that consume no additional tokens and unmeasured non-target
-capacities on terminal-prefill catalogs.
+larger capacities that consume no additional tokens and unmeasured capacities
+other than the step's target capacity, which pure prefill dispatch never
+discovers. An unmeasured target capacity leaves the price unknown.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a
