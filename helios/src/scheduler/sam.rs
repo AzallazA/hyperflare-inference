@@ -31,6 +31,11 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 131_072;
 /// spanning the prompt/output boundary are indexed directly.
 pub const DEFAULT_BOUNDARY_OVERLAP: usize = 512;
 
+/// Prompts at or below this length build their `PromptOutputSAM` inline at admission;
+/// longer prompts offload construction to [`BackgroundSamBuilder`] so CPU build time
+/// overlaps GPU prefill with zero TTFT overhead.
+pub const ASYNC_PROMPT_THRESHOLD: usize = 2048;
+
 const NONE: u32 = u32::MAX;
 const ROOT: u32 = 0;
 const INLINE_EDGES: usize = 4;
@@ -1026,11 +1031,9 @@ impl PromptOutputSAM {
         }
     }
 
-    /// Proposes up to `max_draft_len` continuation tokens for the current sequence
-    /// `indexed_prompt ++ output` in O(match_len_extension + draft_len) sub-microsecond time.
-    pub fn propose(&self, max_draft_len: usize) -> Option<MatchProposal> {
+    fn best_match(&self) -> Option<(usize, usize)> {
         let total = self.total_len();
-        if max_draft_len == 0 || total < 2 || total < self.config.min_match_len {
+        if total < 2 || total < self.config.min_match_len {
             return None;
         }
 
@@ -1062,7 +1065,41 @@ impl PromptOutputSAM {
             (match_len >= self.config.min_match_len).then_some((match_len, endpos))
         });
 
-        self.build_proposal(prompt_candidate, output_candidate, max_draft_len)
+        match (prompt_candidate, output_candidate) {
+            (Some(p), Some(o)) => Some(if o >= p { o } else { p }),
+            (Some(p), None) => Some(p),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        }
+    }
+
+    /// Zero-allocation query returning `(valid_continuation_len, match_len)` for tokens
+    /// strictly below `vocabulary`.
+    pub fn match_stats(&self, max_draft_len: usize, vocabulary: usize) -> Option<(usize, usize)> {
+        if max_draft_len == 0 {
+            return None;
+        }
+        let (match_len, endpos) = self.best_match()?;
+        let total = self.total_len();
+        if endpos + 1 >= total {
+            return None;
+        }
+        let count = max_draft_len.min(total - 1 - endpos);
+        let mut valid_len = 0;
+        while valid_len < count && (self.token_at(endpos + 1 + valid_len) as usize) < vocabulary {
+            valid_len += 1;
+        }
+        (valid_len > 0).then_some((valid_len, match_len))
+    }
+
+    /// Proposes up to `max_draft_len` continuation tokens for the current sequence
+    /// `indexed_prompt ++ output` in O(match_len_extension + draft_len) sub-microsecond time.
+    pub fn propose(&self, max_draft_len: usize) -> Option<MatchProposal> {
+        if max_draft_len == 0 {
+            return None;
+        }
+        let best = self.best_match()?;
+        self.build_proposal(Some(best), None, max_draft_len)
     }
 
     /// Proposes up to `max_draft_len` continuation tokens for an arbitrary query `context`
@@ -1224,6 +1261,68 @@ impl PromptOutputSAM {
             endpos,
             source,
         })
+    }
+}
+
+/// Persistent off-thread builder for long-prompt `PromptOutputSAM` instances so
+/// automaton construction overlaps GPU prefill without blocking the scheduler loop.
+pub(crate) struct BackgroundSamBuilder {
+    tx: Option<std::sync::mpsc::Sender<(super::RequestHandle, Vec<u32>)>>,
+    rx: std::sync::mpsc::Receiver<(super::RequestHandle, PromptOutputSAM)>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundSamBuilder {
+    pub(crate) fn spawn() -> Option<Self> {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<(super::RequestHandle, Vec<u32>)>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(super::RequestHandle, PromptOutputSAM)>();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::Builder::new()
+            .name("helios-sam-builder".into())
+            .spawn(move || {
+                while let Ok((handle, prompt_tail)) = job_rx.recv() {
+                    if worker_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let sam = PromptOutputSAM::new(&prompt_tail);
+                    if worker_shutdown.load(std::sync::atomic::Ordering::Acquire)
+                        || res_tx.send((handle, sam)).is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            tx: Some(job_tx),
+            rx: res_rx,
+            shutdown,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn enqueue(&self, handle: super::RequestHandle, prompt: &[u32]) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        let start = prompt.len().saturating_sub(DEFAULT_MAX_PROMPT_TOKENS);
+        tx.send((handle, prompt[start..].to_vec())).is_ok()
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<(super::RequestHandle, PromptOutputSAM)> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for BackgroundSamBuilder {
+    fn drop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Release);
+        drop(self.tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 

@@ -401,10 +401,19 @@ impl Inputs {
         {
             for (row, lane) in frame.step.lanes.iter().enumerate() {
                 let live = frame.scheduler.request(lane.request)?;
-                if frame.step.lane_kind(row) == GraphKind::Speculative && live.copy_allowed() {
+                let max_drafts = lane.tokens.saturating_sub(1);
+                if frame.step.lane_kind(row) == GraphKind::Speculative
+                    && live.copy_allowed()
+                    && max_drafts > 0
+                    && frame
+                        .scheduler
+                        .request_copy_match_stats(lane.request, max_drafts)
+                        .0
+                        > 0
+                {
                     history_proposals[row] = Some(frame.scheduler.request_history_proposal(
                         lane.request,
-                        lane.tokens.saturating_sub(1),
+                        max_drafts,
                     ));
                 }
             }

@@ -1793,10 +1793,11 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
 fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion() {
     use crate::model::contract::{GraphOperation, InputIndexing, ValueSource};
     use crate::scheduler::speculation::ProposalSource;
-    for (source, output_limit, expected_copies) in [
-        (ProposalSource::Copy, 16, 2),
-        (ProposalSource::Mtp, 16, 2),
-        (ProposalSource::Mtp, 3, 1),
+    for (source, cross_request, output_limit, expected_copies) in [
+        (ProposalSource::Copy, false, 16, 2),
+        (ProposalSource::Mtp, false, 16, 0),
+        (ProposalSource::Mtp, true, 16, 2),
+        (ProposalSource::Mtp, true, 3, 1),
     ] {
         let mut fixture = Fixture::new();
         fixture.config.speculative_widths = vec![1, 8];
@@ -1832,6 +1833,7 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         worker.scheduler.enable_speculation(&[1, 8]).unwrap();
         worker.scheduler.fixed_speculative_width(Some(8)).unwrap();
         worker.scheduler.proposal_source(source).unwrap();
+        worker.scheduler.set_history_cross_request(cross_request);
         let (incoming, _first_output) = fixture.incoming(vec![0, 1, 2, 3], 6);
         sender.send(vec![incoming]).unwrap();
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -1886,19 +1888,27 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 .chunks_exact(8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .collect::<Vec<_>>(),
-            if expected_copies == 1 {
-                [4, -1, -1, -1, -1, -1, -1]
-            } else {
-                [4, 2, -1, -1, -1, -1, -1]
+            match expected_copies {
+                0 => [-1, -1, -1, -1, -1, -1, -1],
+                1 => [4, -1, -1, -1, -1, -1, -1],
+                _ => [4, 2, -1, -1, -1, -1, -1],
             }
         );
         assert_eq!(
             i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()),
-            live.consumed_tokens as i64
+            if expected_copies == 0 && source == ProposalSource::Mtp {
+                -1
+            } else {
+                live.consumed_tokens as i64
+            }
         );
         assert_eq!(
             i64::from_le_bytes(bytes("copy_generation").try_into().unwrap()),
-            live.handle.generation as i64
+            if expected_copies == 0 && source == ProposalSource::Mtp {
+                0
+            } else {
+                live.handle.generation as i64
+            }
         );
     }
 }

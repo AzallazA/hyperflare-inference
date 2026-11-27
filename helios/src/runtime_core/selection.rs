@@ -596,7 +596,18 @@ impl LoadOptions {
         let retained_widths: Vec<_> = if !enabled {
             Vec::new()
         } else if retain_wide_copy {
+            let live_widths: BTreeSet<usize> = cores
+                .first()
+                .and_then(|core| core.execution.as_ref())
+                .into_iter()
+                .flat_map(|execution| execution.graphs.iter())
+                .filter(|graph| graph.kind == "speculative")
+                .map(|graph| graph.token_capacity as usize)
+                .collect();
             widths
+                .into_iter()
+                .filter(|width| *width == 1 || live_widths.contains(width))
+                .collect()
         } else {
             widths
                 .into_iter()
@@ -2131,20 +2142,48 @@ mod tests {
             .iter()
             .any(|g| g.name == "copy-speculative1x24"));
 
-        // With history_drafts = false: prunes wide copy graphs and narrows speculative_widths.
-        let mut without_history = [make_core()];
-        let mut without_cfg = cfg();
-        LoadOptions { history_drafts: Some(false), ..Default::default() }
-            .select(&mut without_history, &mut without_cfg)
-            .unwrap();
-        assert_eq!(without_cfg["speculative_widths"], serde_json::json!([1, 6]));
-        assert!(!without_history[0]
+        // With history_drafts = false (and default None): prunes wide copy graphs and narrows speculative_widths.
+        for opt in [Some(false), None] {
+            let mut without_history = [make_core()];
+            let mut without_cfg = cfg();
+            LoadOptions { history_drafts: opt, ..Default::default() }
+                .select(&mut without_history, &mut without_cfg)
+                .unwrap();
+            assert_eq!(without_cfg["speculative_widths"], serde_json::json!([1, 6]));
+            assert!(!without_history[0]
+                .execution
+                .as_ref()
+                .unwrap()
+                .graphs
+                .iter()
+                .any(|g| g.draft_source == 2));
+        }
+
+        // Tighter verification token budget prunes wide copy graphs above budget without leaving dangling widths.
+        let mut budgeted = [make_core()];
+        let mut budgeted_cfg = cfg();
+        LoadOptions {
+            history_drafts: Some(true),
+            mtp_max_verification_token_budget: Some(16),
+            ..Default::default()
+        }
+        .select(&mut budgeted, &mut budgeted_cfg)
+        .unwrap();
+        assert_eq!(budgeted_cfg["speculative_widths"], serde_json::json!([1, 6, 16]));
+        assert!(budgeted[0]
             .execution
             .as_ref()
             .unwrap()
             .graphs
             .iter()
-            .any(|g| g.draft_source == 2));
+            .any(|g| g.name == "copy-speculative1x16"));
+        assert!(!budgeted[0]
+            .execution
+            .as_ref()
+            .unwrap()
+            .graphs
+            .iter()
+            .any(|g| g.name == "copy-speculative1x24" || g.name == "copy-speculative2x16"));
 
         // --mtp-draft-tokens still validates against the MTP maximum (5), not wide copy depth (23).
         let mut capped_cfg = cfg();

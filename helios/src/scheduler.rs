@@ -39,6 +39,24 @@ use crate::execution::{CompletionRecord, GraphKind, REQUEST_LANES};
 use flare_selene::{InboundTicket, PublishedCheckpoint};
 use crate::{Result, Shutdown};
 
+/// Opt-in environment switch (`FLARE_HISTORY_CROSS_REQUEST=1`) allowing `--history-drafts`
+/// under learned speculation (`ProposalSource::Mtp`) to fall back to the shared cross-request
+/// `DecodedHistory` ring when a request's per-request `PromptOutputSAM` misses.
+/// Disabled by default (`0`) so `--history-drafts` is strictly request-scoped (`PromptOutputSAM`
+/// only, `min_match_len >= 6`), avoiding cross-request and 4-gram false hits against learned drafts.
+pub(crate) const HISTORY_CROSS_REQUEST_ENV: &str = "FLARE_HISTORY_CROSS_REQUEST";
+
+fn parse_history_cross_request(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn cross_request_history_from_env() -> bool {
+    parse_history_cross_request(std::env::var(HISTORY_CROSS_REQUEST_ENV).ok().as_deref())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct RequestHandle {
     pub slot: u32,
@@ -274,6 +292,8 @@ pub struct LiveRequest {
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     sam: Option<sam::PromptOutputSAM>,
+    sam_pending: bool,
+    sam_pending_tokens: Vec<u32>,
     copy_calibration: Option<speculation::CopyCalibration>,
     growable_output: bool,
     tools: bool,
@@ -396,6 +416,9 @@ impl LiveRequest {
     }
     pub fn sam(&self) -> Option<&sam::PromptOutputSAM> {
         self.sam.as_ref()
+    }
+    pub fn sam_pending(&self) -> bool {
+        self.sam_pending
     }
     pub fn pages(&self) -> impl Iterator<Item = PageId> + '_ {
         self.shared_pages.iter().chain(&self.private_pages).copied()
@@ -691,6 +714,8 @@ pub struct RequestScheduler {
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     decoded_history: Option<decoded_history::DecodedHistory>,
+    history_cross_request: bool,
+    sam_builder: Option<sam::BackgroundSamBuilder>,
     forecasts: rounds::Forecasts,
     costs: cost::ActionCosts,
     refresh: refresh::RefreshState,
@@ -792,6 +817,8 @@ impl RequestScheduler {
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
             decoded_history: None,
+            history_cross_request: false,
+            sam_builder: None,
             forecasts,
             costs: cost::ActionCosts::default(),
             refresh: refresh::RefreshState::default(),
@@ -1186,7 +1213,50 @@ impl RequestScheduler {
             return Err("decoded history must be enabled before admission".into());
         }
         self.decoded_history.get_or_insert_with(decoded_history::DecodedHistory::new);
+        self.history_cross_request = cross_request_history_from_env();
+        if self.sam_builder.is_none() {
+            self.sam_builder = sam::BackgroundSamBuilder::spawn();
+        }
         Ok(())
+    }
+
+    /// Explicitly toggles cross-request `DecodedHistory` fallback for `--history-drafts`
+    /// under learned speculation (defaults to `FLARE_HISTORY_CROSS_REQUEST`, i.e., `false`).
+    pub fn set_history_cross_request(&mut self, enabled: bool) {
+        self.history_cross_request = enabled;
+    }
+
+    fn uses_cross_request_history(&self) -> bool {
+        self.proposal_source == speculation::ProposalSource::Copy || self.history_cross_request
+    }
+
+    /// Non-blockingly drains completed off-thread `PromptOutputSAM` builds, attaching them
+    /// to live matching requests (replaying any tokens committed while building) and dropping
+    /// stale results for finished or cancelled requests.
+    pub fn poll_background_sams(&mut self) -> usize {
+        let mut attached = 0usize;
+        let mut ready = Vec::new();
+        if let Some(builder) = self.sam_builder.as_ref() {
+            while let Some(item) = builder.try_recv() {
+                ready.push(item);
+            }
+        }
+        for (handle, mut sam) in ready {
+            if let Ok(request) = self.request_mut(handle)
+                && request.sam_pending
+            {
+                let buffered = std::mem::take(&mut request.sam_pending_tokens);
+                if !buffered.is_empty() {
+                    sam.push_slice(&buffered);
+                }
+                request.sam = Some(sam);
+                request.sam_pending = false;
+                attached += 1;
+            }
+            // Otherwise the request finished/cancelled (or the slot moved to a newer
+            // generation); drop `sam` immediately with zero leak.
+        }
+        attached
     }
 
     pub fn history_proposal(&self, context: &[u32], maximum: usize) -> (Vec<i64>, usize) {
@@ -1195,8 +1265,9 @@ impl RequestScheduler {
     }
 
     /// Returns copy draft proposals for a live request by querying its per-request
-    /// prompt+output suffix automaton first, falling back to the shared decoded-history
-    /// ring when the shared ring has a strictly longer match or the per-request SAM misses.
+    /// prompt+output suffix automaton (`PromptOutputSAM`). Cross-request `DecodedHistory`
+    /// fallback is disabled by default under learned speculation and only consulted when
+    /// opted in via `FLARE_HISTORY_CROSS_REQUEST=1` (or `ProposalSource::Copy`).
     pub fn request_history_proposal(
         &self,
         handle: RequestHandle,
@@ -1235,9 +1306,13 @@ impl RequestScheduler {
             (!proposal.tokens.is_empty()).then_some(proposal)
         });
         let shared = self
-            .decoded_history
-            .as_ref()
-            .map(|history| history.lookup_with_match_len(request.tokens(), maximum));
+            .uses_cross_request_history()
+            .then(|| {
+                self.decoded_history
+                    .as_ref()
+                    .map(|history| history.lookup_with_match_len(request.tokens(), maximum))
+            })
+            .flatten();
         match (sam_proposal, shared) {
             (Some(sam), Some((shared_tokens, shared_count, shared_match_len)))
                 if shared_count > 0 && shared_match_len > sam.match_len =>
@@ -1256,8 +1331,7 @@ impl RequestScheduler {
         }
     }
 
-    /// Returns `(available_copy_tokens, match_len)` for a live request without building
-    /// a padded upload vector.
+    /// Returns `(available_copy_tokens, match_len)` for a live request without allocating.
     pub(crate) fn request_copy_match_stats(
         &self,
         handle: RequestHandle,
@@ -1273,23 +1347,23 @@ impl RequestScheduler {
             return (0, 0);
         };
         let vocabulary = self.capabilities.vocabulary;
-        let sam_stats = request.sam.as_ref().and_then(|sam| {
-            let proposal = sam.propose(maximum)?;
-            let valid_len = proposal
-                .tokens
-                .iter()
-                .position(|&token| (token as usize) >= vocabulary)
-                .unwrap_or(proposal.tokens.len());
-            (valid_len > 0).then_some((valid_len, proposal.match_len))
-        });
-        let shared = self
-            .decoded_history
+        let sam_stats = request
+            .sam
             .as_ref()
-            .map(|history| {
-                let (_, count, match_len) = history.lookup_with_match_len(request.tokens(), maximum);
-                (count, match_len)
+            .and_then(|sam| sam.match_stats(maximum, vocabulary));
+        let shared = self
+            .uses_cross_request_history()
+            .then(|| {
+                self.decoded_history
+                    .as_ref()
+                    .map(|history| {
+                        let (_, count, match_len) =
+                            history.lookup_with_match_len(request.tokens(), maximum);
+                        (count, match_len)
+                    })
+                    .filter(|&(count, _)| count > 0)
             })
-            .filter(|&(count, _)| count > 0);
+            .flatten();
         match (sam_stats, shared) {
             (Some((_sam_len, sam_match)), Some((shared_len, shared_match)))
                 if shared_match > sam_match =>
@@ -1323,6 +1397,7 @@ impl RequestScheduler {
     /// Records host-forced output without changing device completion counters.
     #[cfg(feature = "server")]
     pub(crate) fn record_decoded_token(&mut self, handle: RequestHandle, token: u32) -> Result<()> {
+        self.poll_background_sams();
         let mut sequence = self.request(handle)?.decoded_sequence;
         if let Some(history) = &mut self.decoded_history {
             history.append(&mut sequence, token);
@@ -1330,6 +1405,10 @@ impl RequestScheduler {
             request.decoded_sequence = sequence;
             if let Some(sam) = &mut request.sam {
                 sam.push_token(token);
+            } else if request.sam_pending
+                && request.sam_pending_tokens.len() < sam::DEFAULT_MAX_OUTPUT_TOKENS
+            {
+                request.sam_pending_tokens.push(token);
             }
         }
         Ok(())
@@ -1385,10 +1464,14 @@ impl RequestScheduler {
             plan.packed_token_capacity, plan.prefill_capacity());
         plan.requires_feedback || !matches!(plan.kind, GraphKind::Decode | GraphKind::Speculative)
             || self.capabilities.completion_inputs.iter().any(|(key, inputs)| *key == geometry && !inputs.is_empty())
-            || plan.lanes.iter().any(|lane| self.request(lane.request).is_ok_and(|request|
+            || self.is_copy_only_step(plan)
+            || plan.lanes.iter().enumerate().any(|(row, lane)| self.request(lane.request).is_ok_and(|request|
                 request.grammar_constrained || request.host_stops
                     || self.proposal_source == speculation::ProposalSource::Copy
-                    || self.decoded_history.is_some()))
+                    || (self.decoded_history.is_some()
+                        && plan.lane_kind(row) == GraphKind::Speculative
+                        && lane.tokens > 1
+                        && self.request_copy_match_stats(lane.request, lane.tokens - 1).0 > 0)))
             || !self.costs.is_fresh(cost::Key::from_step(plan))
             || plan.origin.is_probe()
     }
@@ -1950,11 +2033,23 @@ impl RequestScheduler {
         checkpoints.clear_reservations();
         let demand_epoch = checkpoints.demand_epoch;
         if let Some(id) = lookup.checkpoint { self.cache.touch(id, demand_epoch)?; }
+        self.poll_background_sams();
         let message_boundaries = spec.message_boundaries;
-        let sam = self
-            .decoded_history
-            .is_some()
-            .then(|| sam::PromptOutputSAM::new(&spec.prompt));
+        let mut sam = None;
+        let mut sam_pending = false;
+        if self.decoded_history.is_some() {
+            if spec.prompt.len() > sam::ASYNC_PROMPT_THRESHOLD {
+                if let Some(builder) = self.sam_builder.as_ref()
+                    && builder.enqueue(handle, &spec.prompt)
+                {
+                    sam_pending = true;
+                } else {
+                    sam = Some(sam::PromptOutputSAM::new(&spec.prompt));
+                }
+            } else {
+                sam = Some(sam::PromptOutputSAM::new(&spec.prompt));
+            }
+        }
         let copy_calibration = self
             .decoded_history
             .is_some()
@@ -1991,6 +2086,8 @@ impl RequestScheduler {
             copy_proposal: None,
             decoded_sequence: Default::default(),
             sam,
+            sam_pending,
+            sam_pending_tokens: Vec::new(),
             copy_calibration,
             history,
             tokens: spec.prompt,
@@ -3124,14 +3221,21 @@ impl RequestScheduler {
                 request.scheduled_consumed = request.consumed_tokens.saturating_add(pending);
             }
         }
+        self.poll_background_sams();
         if let Some(history) = &mut self.decoded_history {
             for event in &generated {
                 let slot = event.request.slot as usize;
-                if records[slot].status != 3 {
-                    let request = self.slots[slot].request.as_mut().unwrap();
+                if records[slot].status != 3
+                    && let Some(request) = self.slots[slot].request.as_mut()
+                    && request.handle == event.request
+                {
                     history.append(&mut request.decoded_sequence, event.token);
                     if let Some(sam) = &mut request.sam {
                         sam.push_token(event.token);
+                    } else if request.sam_pending
+                        && request.sam_pending_tokens.len() < sam::DEFAULT_MAX_OUTPUT_TOKENS
+                    {
+                        request.sam_pending_tokens.push(event.token);
                     }
                 }
             }
@@ -3442,6 +3546,7 @@ impl RequestScheduler {
         });
         self.advance_retirement(self.completed)?;
         self.refill_reservations()?;
+        self.poll_background_sams();
         Ok(result.map(PublishResult::id).or(request.prefix))
     }
 }

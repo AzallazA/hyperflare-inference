@@ -4660,3 +4660,580 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
         assert_eq!(step.lanes.len(), concurrency);
     }
 }
+
+#[test]
+fn history_drafts_preserves_pipelining_without_copy_match_and_syncs_on_copy_match() {
+    use crate::execution::{ExecutionTiming, PrefixAllocation, TokenVector};
+    use crate::scheduler::speculation::ProposalSource;
+
+    let limits = SchedulerLimits {
+        max_active: 4,
+        request_slots: 4,
+        max_sequence_tokens: 4096,
+        prefill_chunk_size: 512,
+        pages: 128,
+        snapshots: 16,
+    };
+    let mut capabilities = scheduler(4, 128, 16).capabilities.clone();
+    capabilities.completion_token_capacity = 16;
+    capabilities.vocabulary = 1024;
+    capabilities.speculative_allocations = vec![
+        (1, 0, 1, 1, PrefixAllocation::Host),
+        (2, 0, 1, 2, PrefixAllocation::Host),
+        (4, 0, 1, 4, PrefixAllocation::Host),
+        (1, 5, 6, 6, PrefixAllocation::Gpu),
+        (2, 5, 6, 12, PrefixAllocation::Gpu),
+        (4, 5, 6, 24, PrefixAllocation::Gpu),
+        (1, 15, 16, 16, PrefixAllocation::Host),
+        (2, 15, 16, 32, PrefixAllocation::Host),
+        (4, 15, 16, 64, PrefixAllocation::Host),
+    ];
+
+    let mut graphs = duration_graphs(4);
+    graphs.retain(|g| g.kind != GraphKind::Speculative);
+    for batch in [1usize, 2, 4] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: 0,
+            draft_source: Some(ProposalSource::Mtp),
+            packed_token_capacity: batch,
+            name: format!("speculative{batch}x1"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: 1,
+            prefill_capacity: 0,
+            estimated_duration_ns: 5_000_000,
+            input_bindings: vec![],
+        });
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 5,
+            draft_tokens: 5,
+            draft_source: Some(ProposalSource::Mtp),
+            packed_token_capacity: batch * 6,
+            name: format!("packed-speculative{batch}x6"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: 6,
+            prefill_capacity: 0,
+            estimated_duration_ns: 6_000_000 + (batch as u64 - 1) * 1_000_000,
+            input_bindings: vec![],
+        });
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: 15,
+            draft_source: Some(ProposalSource::Copy),
+            packed_token_capacity: batch * 16,
+            name: format!("copy-speculative{batch}x16"),
+            kind: GraphKind::Speculative,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: 16,
+            prefill_capacity: 0,
+            estimated_duration_ns: 5_900_000 + (batch as u64 - 1) * 1_100_000,
+            input_bindings: vec![],
+        });
+    }
+
+    let mut sched = RequestScheduler::new([0; 32], limits, capabilities).unwrap();
+    sched.enable_speculation(&[1, 6, 16]).unwrap();
+    sched
+        .speculative_graphs(&[(1, 1), (1, 6), (1, 16), (2, 1), (2, 6), (2, 16), (4, 1), (4, 6), (4, 16)])
+        .unwrap();
+    sched.enable_history_drafts().unwrap();
+    sched.measured_graph_durations(&graphs).unwrap();
+
+    // Prompt has non-matching prefix [900..908] followed by copiable span [20..50] at the end,
+    // so after emitting through `42` only 7 continuation tokens [43..50] remain (< min_copy_len = 8).
+    let mut prompt: Vec<u32> = (900..908).collect();
+    prompt.extend(20..50);
+    let h = sched
+        .admit(RequestSpec {
+            prompt: prompt.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 256,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+
+    // Advance Init -> Prefill (emits `20`, no >=6 match yet) -> Decode.
+    let mut fence = 1u64;
+    for _ in 0..4 {
+        let plan = sched.plan().unwrap();
+        if plan.kind == GraphKind::Speculative {
+            break;
+        }
+        sched.commit(&plan, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 4];
+        let live = sched.request(h).unwrap();
+        let is_prefill = plan.kind.is_prefill();
+        let mut vec_rec = TokenVector {
+            emitted_count: i64::from(is_prefill),
+            verification_width: 1,
+            tokens: vec![-1; 16],
+            ..Default::default()
+        };
+        if is_prefill {
+            vec_rec.tokens[0] = 20;
+        }
+        recs[h.slot as usize] = CompletionRecord {
+            generation: h.generation as i64,
+            submission_sequence: fence as i64,
+            consumed_tokens: if is_prefill { prompt.len() as i64 } else { live.consumed_tokens as i64 },
+            generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+            token_id: if is_prefill { 20 } else { -1 },
+            status: 1,
+            vector: Some(vec_rec),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(1_000_000);
+        sched.complete(Fence(fence), &recs, timing).unwrap();
+        fence += 1;
+    }
+
+    // 1. With --history-drafts on and NO active copy match: plan_requires_feedback is false
+    //    and in_flight = 2 pipelining works seamlessly!
+    let step1 = sched.plan().unwrap();
+    assert_eq!((step1.kind, step1.token_capacity, step1.draft_tokens), (GraphKind::Speculative, 6, 5));
+    assert!(!sched.is_copy_only_step(&step1));
+    assert!(!sched.plan_requires_feedback(&step1), "non-copy MTP step must keep in_flight=2");
+    let fence1 = Fence(fence);
+    sched.commit(&step1, fence1).unwrap();
+    fence += 1;
+
+    let step2 = sched.plan().expect("second speculative step must pipeline while step1 is in flight");
+    assert_eq!((step2.kind, step2.token_capacity, step2.draft_tokens), (GraphKind::Speculative, 6, 5));
+    assert!(!sched.plan_requires_feedback(&step2));
+    let fence2 = Fence(fence);
+    sched.commit(&step2, fence2).unwrap();
+    fence += 1;
+    assert_eq!(sched.submissions.len(), 2, "must sustain in_flight=2 without copy matches");
+
+    // 2. Complete step1 emitting [21..=25] -> SAM now matches [20..=25] (match_len=6, 24 continuations).
+    //    While step2 is still in flight, planning drains instead of queueing stale copy proposals.
+    let complete_mtp = |sched: &mut RequestScheduler, f: Fence, emitted: &[i64]| {
+        let mut recs = vec![CompletionRecord::default(); 4];
+        let mut tokens_buf = vec![-1i64; 16];
+        tokens_buf[..emitted.len()].copy_from_slice(emitted);
+        let live = sched.request(h).unwrap();
+        recs[h.slot as usize] = CompletionRecord {
+            generation: h.generation as i64,
+            submission_sequence: f.0 as i64,
+            consumed_tokens: live.consumed_tokens as i64 + emitted.len() as i64,
+            generated_tokens: live.generated_tokens as i64 + emitted.len() as i64,
+            token_id: *emitted.last().unwrap(),
+            status: 1,
+            vector: Some(TokenVector {
+                emitted_count: emitted.len() as i64,
+                offered_drafts: 5,
+                accepted_drafts: (emitted.len() - 1) as i64,
+                copy_offered_mask: 0,
+                model_reserved: -1,
+                draft_cache_consumed: 0,
+                verification_width: 6,
+                tokens: tokens_buf,
+            }),
+            ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(6_000_000);
+        let conf = vec![vec![0.75f32; 15]; 1];
+        sched.complete_packed_round(f, &recs, timing, &conf).unwrap();
+    };
+    complete_mtp(&mut sched, fence1, &[21, 22, 23, 24, 25]);
+    assert_eq!(sched.submissions.len(), 1);
+    assert!(
+        sched.plan().is_none(),
+        "entering a copy streak must drain the in-flight pipelined step before dispatching"
+    );
+
+    // Complete step2 emitting [26]: queue is now empty and SAM matches [20..=26] with 23 continuations.
+    complete_mtp(&mut sched, fence2, &[26]);
+
+    // 3. Scheduler selects wide copy-verify W=16 (draft_source=Copy) with plan_requires_feedback == true!
+    let wide_plan = sched.plan().unwrap();
+    assert_eq!(
+        (wide_plan.batch_capacity, wide_plan.token_capacity, wide_plan.draft_tokens),
+        (1, 16, 15)
+    );
+    assert!(sched.is_copy_only_step(&wide_plan));
+    assert!(sched.plan_requires_feedback(&wide_plan), "wide copy-verify must require feedback");
+    let wide_fence = Fence(fence);
+    sched.commit(&wide_plan, wide_fence).unwrap();
+    fence += 1;
+    assert!(sched.plan().is_none(), "in-flight wide copy step must hold feedback barrier");
+
+    // Complete W=16 emitting 16 tokens ending in [500..=505, 506, 500..=505], which has a
+    // 6-token SAM match with only 7 continuation tokens left (< min_copy_len = 8), so the next
+    // step stays on MTP W=6 while still supplying 5 copy tokens!
+    let emitted_wide: Vec<i64> = vec![
+        27, 28, 29, 500, 501, 502, 503, 504, 505, 506, 500, 501, 502, 503, 504, 505,
+    ];
+    let mut recs = vec![CompletionRecord::default(); 4];
+    let mut tokens_buf = vec![-1i64; 16];
+    tokens_buf[..emitted_wide.len()].copy_from_slice(&emitted_wide);
+    let live = sched.request(h).unwrap();
+    recs[h.slot as usize] = CompletionRecord {
+        generation: h.generation as i64,
+        submission_sequence: wide_fence.0 as i64,
+        consumed_tokens: live.consumed_tokens as i64 + emitted_wide.len() as i64,
+        generated_tokens: live.generated_tokens as i64 + emitted_wide.len() as i64,
+        token_id: *emitted_wide.last().unwrap(),
+        status: 1,
+        vector: Some(TokenVector {
+            emitted_count: emitted_wide.len() as i64,
+            offered_drafts: 15,
+            accepted_drafts: 15,
+            copy_offered_mask: (1i64 << 15) - 1,
+            model_reserved: -1,
+            draft_cache_consumed: 0,
+            verification_width: 16,
+            tokens: tokens_buf,
+        }),
+        ..Default::default()
+    };
+    let mut wide_timing = ExecutionTiming::default();
+    wide_timing.gpu_ns[0] = Some(5_900_000);
+    sched.complete_with_survival(wide_fence, &recs, wide_timing, None).unwrap();
+
+    // 4. Short copy match (7 continuations < min_copy_len=8): selects MTP W=6,
+    //    but STILL sets plan_requires_feedback == true because lane proposes 5 copy tokens!
+    let short_copy_plan = sched.plan().unwrap();
+    assert_eq!((short_copy_plan.token_capacity, short_copy_plan.draft_tokens), (6, 5));
+    assert!(!sched.is_copy_only_step(&short_copy_plan));
+    assert_eq!(sched.request_copy_match_stats(h, 5).0, 5);
+    assert!(
+        sched.plan_requires_feedback(&short_copy_plan),
+        "MTP step with active copy override must require feedback"
+    );
+    let short_fence = Fence(fence);
+    sched.commit(&short_copy_plan, short_fence).unwrap();
+    fence += 1;
+
+    // 5. Diverge from the prompt (`[43, 888]`): copy streak ends -> plan_requires_feedback returns false
+    //    and in_flight = 2 pipelining immediately resumes!
+    complete_mtp(&mut sched, short_fence, &[43, 888]);
+    assert_eq!(sched.request_copy_match_stats(h, 5), (0, 0));
+    let resumed1 = sched.plan().unwrap();
+    assert!(!sched.plan_requires_feedback(&resumed1));
+    sched.commit(&resumed1, Fence(fence)).unwrap();
+    fence += 1;
+    let resumed2 = sched.plan().expect("pipelining must resume immediately after copy streak ends");
+    assert!(!sched.plan_requires_feedback(&resumed2));
+    sched.commit(&resumed2, Fence(fence)).unwrap();
+    assert_eq!(sched.submissions.len(), 2);
+}
+
+#[test]
+fn background_sam_builds_off_thread_replays_committed_tokens_and_drops_cancelled_stale_results() {
+    let mut s = RequestScheduler::new(
+        [0; 32],
+        SchedulerLimits {
+            max_active: 2,
+            request_slots: 2,
+            max_sequence_tokens: 16_384,
+            prefill_chunk_size: 4096,
+            pages: 512,
+            snapshots: 16,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 8,
+            vocabulary: 32_768,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.enable_history_drafts().unwrap();
+    s.enable_speculation(&[1, 8]).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+
+    // Long prompt (> ASYNC_PROMPT_THRESHOLD = 2048) with a copiable span [100..120] and
+    // tail [100, 101, 102, 103, 104] so committing `105` yields a 6-token match -> [106..120].
+    let prompt_len = sam::ASYNC_PROMPT_THRESHOLD + 2048;
+    let mut long_prompt: Vec<u32> = (10_000..10_000 + prompt_len as u32).collect();
+    let span: Vec<u32> = (100..120).collect();
+    long_prompt[200..220].copy_from_slice(&span);
+    long_prompt[prompt_len - 5..prompt_len].copy_from_slice(&[100, 101, 102, 103, 104]);
+
+    let h = s
+        .admit(RequestSpec {
+            prompt: long_prompt.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 64,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+
+    // Admission must NOT block building SAM synchronously for prompts > 2048 tokens.
+    assert!(s.request(h).unwrap().sam_pending());
+    assert!(s.request(h).unwrap().sam().is_none());
+
+    // Simulate tokens committed before the background SAM finishes (direct buffer path).
+    {
+        let req = s.request_mut(h).unwrap();
+        req.sam_pending_tokens.push(105);
+        req.tokens.push(105);
+        req.generated_tokens = 1;
+        req.consumed_tokens = prompt_len as u64;
+        req.scheduled_consumed = prompt_len as u64;
+        req.phase = RequestPhase::Decode;
+    }
+
+    // Poll non-blockingly via advance_to() until the background worker attaches the SAM.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut now_ns = 1_000_000u64;
+    while s.request(h).unwrap().sam_pending() {
+        assert!(std::time::Instant::now() < deadline, "background SAM build timed out");
+        s.advance_to(now_ns).unwrap();
+        now_ns += 1_000_000;
+        if s.request(h).unwrap().sam_pending() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    // Replayed token `105` must be indexed so SAM proposes [106..=112] immediately!
+    let live = s.request(h).unwrap();
+    assert!(!live.sam_pending());
+    assert_eq!(live.sam().unwrap().output_len(), 1);
+    assert!(live.sam_pending_tokens.is_empty());
+    let (ids, count, match_len) = s.request_history_proposal_with_match_len(h, 7);
+    assert_eq!(match_len, 6);
+    assert_eq!(count, 7);
+    assert_eq!(ids, vec![106, 107, 108, 109, 110, 111, 112]);
+
+    // Early cancellation: admit a second long prompt, cancel it immediately, reuse the slot
+    // with a short prompt (sync SAM), then drain background results and verify stale SAM is dropped.
+    let cancelled = s
+        .admit(RequestSpec {
+            prompt: long_prompt,
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 32,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+    assert!(s.request(cancelled).unwrap().sam_pending());
+    s.cancel(cancelled).unwrap();
+
+    let reused = s
+        .admit(RequestSpec {
+            prompt: (500..564).collect(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 32,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        })
+        .unwrap();
+    assert_eq!(reused.slot, cancelled.slot);
+    assert_ne!(reused.generation, cancelled.generation);
+    assert!(!s.request(reused).unwrap().sam_pending());
+    assert_eq!(s.request(reused).unwrap().sam().unwrap().prompt_len(), 64);
+
+    // Wait briefly for the cancelled job to finish on the worker, then drain and ensure
+    // the stale SAM was cleanly dropped without overwriting `reused`.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(s.poll_background_sams(), 0);
+    assert_eq!(s.request(reused).unwrap().sam().unwrap().prompt_len(), 64);
+}
+
+#[test]
+fn history_drafts_is_request_scoped_by_default_and_gates_cross_request_fallback() {
+    assert!(!parse_history_cross_request(None));
+    assert!(!parse_history_cross_request(Some("")));
+    assert!(!parse_history_cross_request(Some("0")));
+    assert!(!parse_history_cross_request(Some("false")));
+    assert!(parse_history_cross_request(Some("1")));
+    assert!(parse_history_cross_request(Some("true")));
+    assert!(parse_history_cross_request(Some("yes")));
+    assert!(parse_history_cross_request(Some("on")));
+
+    let mut s = scheduler(2, 64, 4);
+    s.enable_history_drafts().unwrap();
+    s.set_history_cross_request(false);
+    s.enable_speculation(&[1, 8]).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+    s.measured_graph_durations(&duration_graphs(2)).unwrap();
+
+    // Request A emits [10..=17, 200, 201, 202] (populating shared DecodedHistory 4-gram & 8-gram).
+    let mut spec_a = spec(64, 32);
+    spec_a.prompt = (300..364).collect();
+    let a = s.admit(spec_a).unwrap();
+
+    // Request B has an unrelated prompt and will emit [10..=17] once -> matches A's 8-gram
+    // in DecodedHistory, but has ZERO earlier occurrences in B's own prompt/output!
+    let mut spec_b = spec(64, 32);
+    spec_b.prompt = (600..664).collect();
+    let b = s.admit(spec_b).unwrap();
+
+    // Advance A and B to Decode (A emits `10`, B emits `777`).
+    let mut fence = 1u64;
+    while s.request(a).unwrap().phase != RequestPhase::Decode
+        || s.request(b).unwrap().phase != RequestPhase::Decode
+    {
+        let step = s.plan().unwrap();
+        s.commit(&step, Fence(fence)).unwrap();
+        let mut recs = vec![CompletionRecord::default(); 2];
+        for lane in &step.lanes {
+            let req = s.request(lane.request).unwrap();
+            let consumed = if step.kind.is_prefill() {
+                lane.start_position + lane.tokens as u64
+            } else {
+                req.consumed_tokens
+            };
+            let samples = step.kind.is_prefill() && consumed == req.prompt_tokens as u64;
+            let tok = if lane.request == a { 10 } else { 777 };
+            recs[lane.request.slot as usize] = CompletionRecord {
+                generation: lane.request.generation as i64,
+                submission_sequence: fence as i64,
+                consumed_tokens: consumed as i64,
+                generated_tokens: if samples { 1 } else { req.generated_tokens as i64 },
+                token_id: if samples { tok } else { -1 },
+                status: 1,
+                ..Default::default()
+            };
+        }
+        s.complete(Fence(fence), &recs, Default::default()).unwrap();
+        fence += 1;
+    }
+
+    // Complete one speculative round where A emits [11..=17, 200] and B emits [778].
+    let step = s.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Speculative);
+    assert!(!s.plan_requires_feedback(&step), "no copy match yet -> pipelining preserved");
+    s.commit(&step, Fence(fence)).unwrap();
+    let mut comp = vec![CompletionRecord::default(); 2];
+    comp[a.slot as usize] = CompletionRecord {
+        generation: a.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: 72,
+        generated_tokens: 9,
+        token_id: 200,
+        status: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 8,
+            offered_drafts: 7,
+            accepted_drafts: 7,
+            verification_width: 8,
+            tokens: vec![11, 12, 13, 14, 15, 16, 17, 200],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    comp[b.slot as usize] = CompletionRecord {
+        generation: b.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: 65,
+        generated_tokens: 2,
+        token_id: 778,
+        status: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 1,
+            offered_drafts: 7,
+            accepted_drafts: 0,
+            verification_width: 8,
+            tokens: vec![778, -1, -1, -1, -1, -1, -1, -1],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    s.complete(Fence(fence), &comp, Default::default()).unwrap();
+    fence += 1;
+
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(fence)).unwrap();
+    let mut comp2 = vec![CompletionRecord::default(); 2];
+    comp2[a.slot as usize] = CompletionRecord {
+        generation: a.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: 78,
+        generated_tokens: 15,
+        token_id: 17,
+        status: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 6,
+            offered_drafts: 7,
+            accepted_drafts: 5,
+            verification_width: 8,
+            tokens: vec![201, 202, 14, 15, 16, 17, -1, -1],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    comp2[b.slot as usize] = CompletionRecord {
+        generation: b.generation as i64,
+        submission_sequence: fence as i64,
+        consumed_tokens: 73,
+        generated_tokens: 10,
+        token_id: 17,
+        status: 1,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 8,
+            offered_drafts: 7,
+            accepted_drafts: 7,
+            verification_width: 8,
+            tokens: vec![10, 11, 12, 13, 14, 15, 16, 17],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    s.complete(Fence(fence), &comp2, Default::default()).unwrap();
+
+    // Shared ring holds [10..=17] -> [200, 201, 202] AND 4-gram [14..=17] -> [200, 201, 202].
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13, 14, 15, 16, 17], 7).1, 7);
+    assert_eq!(s.history_proposal(&[14, 15, 16, 17], 7).1, 7);
+
+    // By default (request-scoped ONLY):
+    // - Request B sees ZERO cross-request leakage from A!
+    assert_eq!(s.request_history_proposal(b, 7).1, 0);
+    assert_eq!(s.request_copy_match_stats(b, 7), (0, 0));
+    // - Request A sees ZERO 4-gram false hit on [14, 15, 16, 17] (below SAM min_match_len = 6)!
+    assert_eq!(s.request_history_proposal(a, 7).1, 0);
+    assert_eq!(s.request_copy_match_stats(a, 7), (0, 0));
+    // - Next speculative plan for [A, B] requires NO feedback sync (`in_flight = 2` preserved!).
+    let next_plan = s.plan().unwrap();
+    assert!(!s.plan_requires_feedback(&next_plan));
+
+    // When cross-request opt-in is explicitly enabled, B receives A's continuation.
+    s.set_history_cross_request(true);
+    let (ids_b, count_b, match_len_b) = s.request_history_proposal_with_match_len(b, 7);
+    assert_eq!(match_len_b, 8);
+    assert_eq!(count_b, 7);
+    assert_eq!(&ids_b[..3], &[200, 201, 202]);
+    let opt_in_plan = s.plan().unwrap();
+    assert!(s.plan_requires_feedback(&opt_in_plan));
+}
