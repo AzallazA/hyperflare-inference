@@ -281,6 +281,30 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
+                // On AMD Zen 4 (CPUID 0x80000001 ECX bit 29), arm MONITORX/MWAITX on the mailbox
+                // flag so the reader wakes in < 1 us on the coherent write without memory-bus/IF
+                // spin contention or falling into NAP_MAX=250 us sleep. Bounded timer guarantees
+                // prompt observation of cancellation on a separate cacheline.
+                #[cfg(target_arch = "x86_64")]
+                if engram_mwaitx_enabled() {
+                    while ready.load(Ordering::Acquire) != sequence {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err("n-gram request cancelled".into());
+                        }
+                        let seen = ready.load(Ordering::Acquire);
+                        if seen == sequence {
+                            break;
+                        }
+                        let _ = crate::execution::host_wait::wait_u64_mwaitx(
+                            ready,
+                            seen,
+                            ENGRAM_MWAITX_LIMIT_US,
+                        );
+                    }
+                    return Ok(
+                        unsafe { std::slice::from_raw_parts(address as *const i64, rows) }.to_vec(),
+                    );
+                }
                 // The graph publishes these ids part-way through the step that
                 // consumes them, so this wait spins only while they may still be in
                 // flight and gives the core up once they are not. Optional
@@ -324,6 +348,39 @@ fn engram_spin_us() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0)
     })
+}
+
+/// Bounded MWAITX timer for Engram mailbox waits: keeps cancellation latency <= 100 us while
+/// letting coherent GPU/host writes to the flag cacheline wake the reader in < 1 us.
+#[cfg(target_arch = "x86_64")]
+const ENGRAM_MWAITX_LIMIT_US: u64 = 100;
+
+fn parse_engram_mwaitx_env(value: Option<&str>, has_mwaitx: bool) -> bool {
+    if !has_mwaitx {
+        return false;
+    }
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "false" | "off" | "no") => false,
+        _ => true,
+    }
+}
+
+fn engram_mwaitx_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let env_val = std::env::var("FLARE_ENGRAM_MWAITX").ok();
+            parse_engram_mwaitx_env(
+                env_val.as_deref(),
+                crate::execution::host_wait::mwaitx_available(),
+            )
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 const STAGING_FRAMES: usize = 2;
 /// Rounds a waiting gather spins before it starts napping, enough to catch ids
@@ -596,6 +653,17 @@ impl Shared {
             return Err("invalid embedding delivery geometry".into());
         }
         let stream = Stream::open(context, device)?;
+        static ANNOUNCED_WAIT: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED_WAIT.call_once(|| {
+            eprintln!(
+                "[flare] engram request wait: {}",
+                if engram_mwaitx_enabled() {
+                    "MWAITX"
+                } else {
+                    "spin+nap"
+                }
+            );
+        });
         let mut layers = Vec::new();
         let mut read_ahead = false;
         let mut next_pin_cpu = pin_cpu_base;
@@ -1133,6 +1201,42 @@ mod tests {
             thread::sleep(AFTER_SPIN);
             cancelled.store(true, Ordering::Release);
             assert!(worker.join().unwrap().is_err());
+        });
+    }
+
+    #[test]
+    fn engram_mwaitx_env_gating_and_fast_wake() {
+        assert!(!parse_engram_mwaitx_env(None, false));
+        assert!(!parse_engram_mwaitx_env(Some("1"), false));
+        assert!(parse_engram_mwaitx_env(None, true));
+        assert!(parse_engram_mwaitx_env(Some("1"), true));
+        assert!(!parse_engram_mwaitx_env(Some("0"), true));
+        assert!(!parse_engram_mwaitx_env(Some("off"), true));
+
+        if !engram_mwaitx_enabled() {
+            return;
+        }
+        #[repr(align(64))]
+        struct AlignedFlag(AtomicU64);
+        let ids = [17i64, 31, 47];
+        let flag = AlignedFlag(AtomicU64::new(0));
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = device_request(&flag.0, &ids).read(&cancelled);
+                (Instant::now(), result)
+            });
+            // Wait well past any initial spin window so reader is parked in MWAITX.
+            thread::sleep(AFTER_SPIN);
+            let written_at = Instant::now();
+            flag.0.store(7, Ordering::Release);
+            let (woke_at, result) = worker.join().unwrap();
+            assert_eq!(result.unwrap(), ids);
+            let wake_latency = woke_at.saturating_duration_since(written_at);
+            assert!(
+                wake_latency < Duration::from_millis(5),
+                "Engram MWAITX reader wake latency unexpectedly slow: {wake_latency:?}"
+            );
         });
     }
 

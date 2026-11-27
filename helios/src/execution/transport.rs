@@ -19,9 +19,11 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
 /// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
 /// monitor armed on that word. On x86_64, [`GraphExecutor::park`] uses runtime-detected WAITPKG
-/// (`UMONITOR`/`UMWAIT` in C0.1) when supported and falls back to a bounded `PAUSE` spin loop
-/// over the same mapped host word. The event query in [`GraphExecutor::poll`] stays the only
-/// completion signal; the word can only end a wait early, best effort.
+/// (`UMONITOR`/`UMWAIT` in C0.1) or AMD `MONITORX`/`MWAITX` (CPUID `0x80000001` ECX bit 29, C0
+/// with bounded timer) when supported, and falls back to a bounded `PAUSE` spin loop over the same
+/// mapped host word (overridable via `FLARE_HOST_WAIT=pause|mwaitx|auto`). The event query in
+/// [`GraphExecutor::poll`] stays the only completion signal; the word can only end a wait early,
+/// best effort.
 struct CompletionWake {
     #[cfg_attr(
         not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")),
@@ -32,7 +34,7 @@ struct CompletionWake {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-pub(super) mod host_wait {
+pub(crate) mod host_wait {
     use std::sync::{
         OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -102,7 +104,7 @@ pub(super) mod host_wait {
     }
 
     /// Wait up to `limit_us` microseconds for an `AtomicU64` to differ from `old`.
-    pub(in crate::execution) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
+    pub(crate) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
         if !available() {
             std::hint::spin_loop();
             return word.load(Ordering::Acquire) != old;
@@ -131,7 +133,7 @@ pub(super) mod host_wait {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(super) mod host_wait {
+pub(crate) mod host_wait {
     use std::{
         sync::{
             OnceLock,
@@ -141,10 +143,25 @@ pub(super) mod host_wait {
     };
 
     const WAITPKG_ECX_BIT: u32 = 1 << 5;
+    /// AMD CPUID extended leaf `0x80000001` ECX bit 29: `MONITORX`/`MWAITX` support.
+    const MWAITX_EXT_ECX_BIT: u32 = 1 << 29;
     /// C0.1 state for UMWAIT: shallow power-saving state with sub-microsecond store wakeup.
     const UMWAIT_C01: u32 = 1;
+    /// C0 hint for AMD MWAITX (`EAX[7:4] = 0xF`): disables deeper C-states for sub-microsecond
+    /// wakeup on a coherent cacheline write while eliminating memory-bus/IF spin traffic.
+    const MWAITX_HINT_C0: u32 = 0xf0;
+    /// AMD MWAITX ECX extension bit 1: enable bounded timer using `EBX` TSC cycles (bit 0 MUST
+    /// remain 0 in ring 3 to avoid `#GP`).
+    const MWAITX_TIMER_ENABLE: u32 = 1 << 1;
     /// Iterations between monotonic clock checks inside the PAUSE spin loop.
     const CLOCK_CHECK_STRIDE: u32 = 32;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum WaitMode {
+        Waitpkg,
+        Mwaitx,
+        Pause,
+    }
 
     pub(super) fn available() -> bool {
         true
@@ -166,8 +183,61 @@ pub(super) mod host_wait {
         })
     }
 
+    pub(crate) fn mwaitx_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            // SAFETY: CPUID is always available on x86_64.
+            #[allow(unused_unsafe)]
+            let max_ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+            if max_ext < 0x8000_0001 {
+                return false;
+            }
+            // SAFETY: Extended leaf 0x8000_0001 is supported (`max_ext >= 0x8000_0001`).
+            #[allow(unused_unsafe)]
+            let ext1 = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+            (ext1.ecx & MWAITX_EXT_ECX_BIT) != 0
+        })
+    }
+
+    pub(super) fn parse_wait_mode(
+        override_val: Option<&str>,
+        has_waitpkg: bool,
+        has_mwaitx: bool,
+    ) -> WaitMode {
+        match override_val
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pause") => WaitMode::Pause,
+            Some("mwaitx") if has_mwaitx => WaitMode::Mwaitx,
+            Some("waitpkg") if has_waitpkg => WaitMode::Waitpkg,
+            Some("mwaitx") | Some("waitpkg") => WaitMode::Pause,
+            _ => {
+                if has_waitpkg {
+                    WaitMode::Waitpkg
+                } else if has_mwaitx {
+                    WaitMode::Mwaitx
+                } else {
+                    WaitMode::Pause
+                }
+            }
+        }
+    }
+
+    fn active_mode() -> WaitMode {
+        static MODE: OnceLock<WaitMode> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let env_val = std::env::var("FLARE_HOST_WAIT").ok();
+            parse_wait_mode(env_val.as_deref(), waitpkg_available(), mwaitx_available())
+        })
+    }
+
     pub(super) fn mode_label() -> &'static str {
-        if waitpkg_available() { "UMONITOR/UMWAIT" } else { "PAUSE spin" }
+        match active_mode() {
+            WaitMode::Waitpkg => "UMONITOR/UMWAIT",
+            WaitMode::Mwaitx => "MWAITX",
+            WaitMode::Pause => "PAUSE spin",
+        }
     }
 
     fn tsc_ticks_per_us() -> u64 {
@@ -185,6 +255,12 @@ pub(super) mod host_wait {
             let delta = end_tsc.saturating_sub(start_tsc);
             ((delta as u128 * 1_000) / elapsed_ns as u128).max(1) as u64
         })
+    }
+
+    fn mwaitx_cycles(limit_us: u64) -> u32 {
+        tsc_ticks_per_us()
+            .saturating_mul(limit_us)
+            .clamp(1, u32::MAX as u64) as u32
     }
 
     macro_rules! define_umwait {
@@ -219,24 +295,76 @@ pub(super) mod host_wait {
         };
     }
 
+    macro_rules! define_mwaitx {
+        ($name:ident, $ty:ty, $mov:literal, $cmp:literal) => {
+            /// Arm AMD MONITORX on `word`, re-check its value against `old`, and execute ring-3
+            /// MWAITX in C0 with its hardware timer (`ebx` cycles, `ecx = 2`) until a store
+            /// invalidates the cache line or the timer expires.
+            ///
+            /// # Safety
+            /// `word` must point to a live, naturally aligned value and `mwaitx_available()` must
+            /// be true.
+            pub(super) unsafe fn $name(word: *const $ty, old: $ty, cycles: u32) {
+                let cycles = cycles.max(1);
+                unsafe {
+                    std::arch::asm!(
+                        "xor ecx, ecx",
+                        "xor edx, edx",
+                        ".byte 0x0f, 0x01, 0xfa", // monitorx (rax=addr, ecx=0, edx=0)
+                        $mov,
+                        $cmp,
+                        "jne 2f",
+                        "mov {saved}, rbx",
+                        "mov ebx, {cycles:e}",
+                        "mov eax, {hint}",
+                        "mov ecx, {ext}",
+                        ".byte 0x0f, 0x01, 0xfb", // mwaitx (eax=hint, ebx=cycles, ecx=timer)
+                        "mov rbx, {saved}",
+                        "2:",
+                        inout("rax") word => _,
+                        out("rcx") _,
+                        out("rdx") _,
+                        old = in(reg) old,
+                        cycles = in(reg) cycles,
+                        hint = const MWAITX_HINT_C0,
+                        ext = const MWAITX_TIMER_ENABLE,
+                        tmp = out(reg) _,
+                        saved = out(reg) _,
+                        options(nostack),
+                    );
+                }
+            }
+        };
+    }
+
     define_umwait!(umwait_u32, u32, "mov {tmp:e}, dword ptr [rax]", "cmp {tmp:e}, {old:e}");
     define_umwait!(umwait_u64, u64, "mov {tmp}, qword ptr [rax]", "cmp {tmp}, {old}");
+    define_mwaitx!(mwaitx_u32, u32, "mov {tmp:e}, dword ptr [rax]", "cmp {tmp:e}, {old:e}");
+    define_mwaitx!(mwaitx_u64, u64, "mov {tmp}, qword ptr [rax]", "cmp {tmp}, {old}");
 
     fn wait_change<T: Copy + Eq>(
         load: impl Fn() -> T,
         old: T,
         limit_us: u64,
         umwait: impl FnOnce(u64),
+        mwaitx: impl FnOnce(u32),
     ) -> bool {
         if load() != old {
             return true;
         }
-        if waitpkg_available() {
-            // SAFETY: RDTSC is always available on x86_64; WAITPKG checked above.
-            let deadline = unsafe { core::arch::x86_64::_rdtsc() }
-                .wrapping_add(tsc_ticks_per_us().saturating_mul(limit_us));
-            umwait(deadline);
-            return load() != old;
+        match active_mode() {
+            WaitMode::Waitpkg => {
+                // SAFETY: RDTSC is always available on x86_64; WAITPKG checked via active_mode.
+                let deadline = unsafe { core::arch::x86_64::_rdtsc() }
+                    .wrapping_add(tsc_ticks_per_us().saturating_mul(limit_us));
+                umwait(deadline);
+                return load() != old;
+            }
+            WaitMode::Mwaitx => {
+                mwaitx(mwaitx_cycles(limit_us));
+                return load() != old;
+            }
+            WaitMode::Pause => {}
         }
         let budget = Duration::from_micros(limit_us);
         let started = Instant::now();
@@ -266,18 +394,35 @@ pub(super) mod host_wait {
             old,
             limit_us,
             |deadline| unsafe { umwait_u32(word, old, deadline) },
+            |cycles| unsafe { mwaitx_u32(word, old, cycles) },
         )
     }
 
     /// Wait up to `limit_us` microseconds for `word` to differ from `old`.
     /// Returns `true` if `word` changed, `false` on timeout.
-    pub(in crate::execution) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
+    pub(crate) fn wait_u64_change(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
         wait_change(
             || word.load(Ordering::Acquire),
             old,
             limit_us,
             |deadline| unsafe { umwait_u64(word.as_ptr() as *const u64, old, deadline) },
+            |cycles| unsafe { mwaitx_u64(word.as_ptr() as *const u64, old, cycles) },
         )
+    }
+
+    /// Direct AMD `MONITORX`/`MWAITX` wait on an `AtomicU64` with a bounded timer (`limit_us`).
+    /// Independent of `FLARE_HOST_WAIT` so callers with their own opt-in flag (e.g. Engram) can
+    /// gate MWAITX separately. Returns `true` if `word` changed.
+    pub(crate) fn wait_u64_mwaitx(word: &AtomicU64, old: u64, limit_us: u64) -> bool {
+        if word.load(Ordering::Acquire) != old {
+            return true;
+        }
+        if !mwaitx_available() {
+            return false;
+        }
+        // SAFETY: `word` is a live, 8-byte aligned AtomicU64 and `mwaitx_available()` was checked.
+        unsafe { mwaitx_u64(word.as_ptr() as *const u64, old, mwaitx_cycles(limit_us)) };
+        word.load(Ordering::Acquire) != old
     }
 }
 
@@ -1953,6 +2098,125 @@ mod input_copy_tests {
         }
         assert_eq!(word64.load(Ordering::Acquire), 2);
         writer.join().unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn host_wait_mode_resolution_respects_env_overrides() {
+        use host_wait::{WaitMode, parse_wait_mode};
+        assert_eq!(parse_wait_mode(None, true, true), WaitMode::Waitpkg);
+        assert_eq!(parse_wait_mode(None, false, true), WaitMode::Mwaitx);
+        assert_eq!(parse_wait_mode(None, false, false), WaitMode::Pause);
+        assert_eq!(parse_wait_mode(Some("auto"), false, true), WaitMode::Mwaitx);
+        assert_eq!(parse_wait_mode(Some("pause"), true, true), WaitMode::Pause);
+        assert_eq!(parse_wait_mode(Some("mwaitx"), true, true), WaitMode::Mwaitx);
+        assert_eq!(parse_wait_mode(Some("mwaitx"), false, false), WaitMode::Pause);
+        assert_eq!(parse_wait_mode(Some("waitpkg"), false, true), WaitMode::Pause);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mwaitx_hardware_immediate_wake_and_bounded_timer_timeout() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        };
+        use std::time::Duration;
+
+        if !host_wait::mwaitx_available() {
+            return;
+        }
+        if !host_wait::waitpkg_available() && std::env::var_os("FLARE_HOST_WAIT").is_none() {
+            assert_eq!(host_wait::mode_label(), "MWAITX");
+        }
+
+        // (a) Bounded timer timeout wakeup on unchanged u64 & u32 cachelines (no SIGILL, no hang).
+        #[repr(align(64))]
+        struct AlignedU64(AtomicU64);
+        #[repr(align(64))]
+        struct AlignedU32(AtomicU32);
+
+        let idle64 = AlignedU64(AtomicU64::new(42));
+        let mut timer_samples_u64 = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let start = Instant::now();
+            assert!(!host_wait::wait_u64_mwaitx(&idle64.0, 42, 400));
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "MWAITX u64 timer exceeded bound: {elapsed:?}"
+            );
+            timer_samples_u64.push(elapsed);
+        }
+        let max_timer_u64 = *timer_samples_u64.iter().max().unwrap();
+        assert!(
+            max_timer_u64 >= Duration::from_micros(50),
+            "MWAITX u64 timer did not actually park in hardware: {timer_samples_u64:?}"
+        );
+
+        let idle32 = AlignedU32(AtomicU32::new(99));
+        let start32 = Instant::now();
+        unsafe { host_wait::mwaitx_u32(idle32.0.as_ptr() as *const u32, 99, 2_000_000) };
+        let elapsed_u32 = start32.elapsed();
+        assert!(
+            elapsed_u32 < Duration::from_millis(50),
+            "MWAITX u32 timer exceeded bound: {elapsed_u32:?}"
+        );
+        assert_eq!(idle32.0.load(Ordering::Acquire), 99);
+
+        // (b) Immediate cross-thread cacheline-write wakeup well before a 20 ms MWAITX timer.
+        let word64 = Arc::new(AlignedU64(AtomicU64::new(0)));
+        let mut wake_latencies_ns = Vec::with_capacity(8);
+        for trial in 1u64..=8 {
+            let prev = trial - 1;
+            let barrier = Arc::new(Barrier::new(2));
+            let w = word64.clone();
+            let b = barrier.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                b.wait();
+                std::thread::sleep(Duration::from_micros(300));
+                let written_at = Instant::now();
+                w.0.store(trial, Ordering::Release);
+                tx.send(written_at).unwrap();
+            });
+            barrier.wait();
+            let mut changed = false;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !changed {
+                changed = host_wait::wait_u64_mwaitx(&word64.0, prev, 20_000);
+                assert!(Instant::now() < deadline, "MWAITX u64 wake timed out on trial {trial}");
+            }
+            let woke_at = Instant::now();
+            let written_at = rx.recv().unwrap();
+            writer.join().unwrap();
+            assert_eq!(word64.0.load(Ordering::Acquire), trial);
+            let latency = woke_at.saturating_duration_since(written_at);
+            assert!(
+                latency < Duration::from_millis(5),
+                "MWAITX u64 wake latency too slow (did timer expire instead?): {latency:?}"
+            );
+            wake_latencies_ns.push(latency.as_nanos());
+        }
+        wake_latencies_ns.sort_unstable();
+        let median_ns = wake_latencies_ns[wake_latencies_ns.len() / 2];
+        eprintln!(
+            "[mwaitx_test] u64 wake latencies ns={wake_latencies_ns:?} median={median_ns}ns timer_u64_max={max_timer_u64:?} timer_u32={elapsed_u32:?}"
+        );
+
+        // Cross-thread u32 wake via wait_u32_change (which uses MWAITX on Zen 4).
+        let word32 = Arc::new(AlignedU32(AtomicU32::new(10)));
+        let w32 = word32.clone();
+        let writer32 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(300));
+            w32.0.store(11, Ordering::Release);
+        });
+        let start = Instant::now();
+        while !unsafe { host_wait::wait_u32_change(word32.0.as_ptr() as *const u32, 10, 20_000) } {
+            assert!(start.elapsed() < Duration::from_secs(1), "MWAITX u32 wake timed out");
+        }
+        assert_eq!(word32.0.load(Ordering::Acquire), 11);
+        writer32.join().unwrap();
     }
 }
 
