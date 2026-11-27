@@ -198,7 +198,9 @@ pub(crate) fn execution(
                 return Err(super::invalid("speculative graph lacks explicit proposal depth"));
             }
             graph.insert("verify_tokens".into(), width.into());
-            graph.insert("draft_source".into(), "MTP".into());
+            if graph.get("draft_source").is_none_or(|v| v.is_null()) {
+                graph.insert("draft_source".into(), "MTP".into());
+            }
         }
 
     }
@@ -1589,6 +1591,53 @@ mod asset_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn execution_preserves_explicit_draft_source_and_defaults_missing_to_mtp() {
+        let make = |draft_source: Option<serde_json::Value>| {
+            let mut graph = serde_json::json!({
+                "name": "spec1x16",
+                "kind": "speculative",
+                "sampling_mode": "general",
+                "batch_capacity": 1,
+                "token_capacity": 16,
+                "packed_token_capacity": 16,
+                "draft_tokens": 15,
+                "confidence_width": 0,
+                "speculation_enabled": true,
+                "input_bindings": [],
+                "tuned_bindings": [],
+            });
+            if let Some(source) = draft_source {
+                graph.as_object_mut().unwrap().insert("draft_source".into(), source);
+            }
+            serde_json::json!({
+                "abi_version": 6,
+                "completion_token_capacity": 24,
+                "max_active": 1,
+                "input_frame_bytes": 64,
+                "buffers": [],
+                "graphs": [graph],
+                "tuning_graphs": [],
+                "persistent_workers": [],
+            })
+        };
+
+        let absent = super::execution(&make(None), &[]).unwrap();
+        assert_eq!(absent.graphs[0].draft_source, super::super::wire::DraftSource::Mtp as i32);
+
+        let null_source = super::execution(&make(Some(serde_json::Value::Null)), &[]).unwrap();
+        assert_eq!(null_source.graphs[0].draft_source, super::super::wire::DraftSource::Mtp as i32);
+
+        let mtp_int = super::execution(&make(Some(serde_json::json!(1))), &[]).unwrap();
+        assert_eq!(mtp_int.graphs[0].draft_source, super::super::wire::DraftSource::Mtp as i32);
+
+        let copy_int = super::execution(&make(Some(serde_json::json!(2))), &[]).unwrap();
+        assert_eq!(copy_int.graphs[0].draft_source, super::super::wire::DraftSource::CopyDraft as i32);
+
+        let copy_str = super::execution(&make(Some(serde_json::json!("COPY_DRAFT"))), &[]).unwrap();
+        assert_eq!(copy_str.graphs[0].draft_source, super::super::wire::DraftSource::CopyDraft as i32);
     }
 }
 
