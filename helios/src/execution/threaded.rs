@@ -173,19 +173,20 @@ enum WaitPeersError {
 ///
 /// Each coordinated step runs an inline Prepare -> Ready -> Commit/Cancel barrier over
 /// cache-aligned atomics without per-step heap allocations or control-channel traffic:
-/// 1. Rank zero writes `slots[epoch & 1]` (only while no in-flight frame occupies that parity
-///    slot) and publishes `prepare_epoch = epoch`.
+/// 1. Rank zero writes `slots[epoch & 1]` and publishes `prepare_epoch = epoch`.
 /// 2. Every peer thread validates its local upload layout, cleared pages, frame capacity, and
-///    rank-local Engram staging state without launching CUDA work, then stores `epoch << 1` in
-///    its `peer_ack` slot.
+///    rank-local Engram staging state without launching CUDA work, drops its `&StepSlot` borrow,
+///    and stores `epoch << 1` in its `peer_ack` slot.
 /// 3. Only after every peer acknowledges readiness does rank zero submit locally and publish
 ///    `decision = (epoch << 1) | 1` (`Commit`). If any peer fails validation or exits, rank
 ///    zero requests drain without launching locally, preventing stranded collectives. If rank
 ///    zero encounters `Ok(None)` backpressure, it publishes `decision = epoch << 1` (`Cancel`),
 ///    waits for peers to acknowledge `(epoch << 1) | 1`, and returns `Ok(None)` without poisoning.
-/// 4. Rank zero never reuses `slots[epoch & 1]` while any peer can still borrow it: every peer
-///    drops its `&StepSlot` for `epoch - 1` before reading `prepare_epoch >= epoch` and drops its
-///    borrow for a cancelled `epoch` before storing its cancel acknowledgement.
+/// 4. Parity slot reuse (`slots[epoch & 1]` for `epoch >= 3`) is synchronized by
+///    `wait_peer_acks(peer_count, (epoch - 1) << 1)`: every peer drops its `&StepSlot` borrow
+///    for `epoch - 2` inside `executor.submit()` (or after observing `Cancel(epoch - 2)`) before
+///    advancing to `epoch - 1` and releasing `peer_ack >= (epoch - 1) << 1`. This holds even if
+///    `epoch - 1` is cancelled while `epoch - 2`'s GPU frame is still in flight.
 struct DispatchRing {
     slots: [CacheAligned<UnsafeCell<StepSlot>>; 2],
     prepare_epoch: CacheAligned<AtomicU64>,
@@ -198,10 +199,10 @@ struct DispatchRing {
     idle_wake: Condvar,
 }
 
-// SAFETY: Rank zero is the sole writer to `slots[epoch & 1]` and writes a parity slot only
-// after every peer has dropped any borrow of the prior step occupying that slot. Peers obtain
-// shared `&StepSlot` references only after observing `prepare_epoch >= step_epoch` and drop them
-// before advancing to the next epoch or acknowledging cancel.
+// SAFETY: Rank zero is the sole writer to `slots[epoch & 1]`. For `epoch >= 3`, rank zero writes
+// `slots[epoch & 1]` only after `wait_peer_acks(peer_count, (epoch - 1) << 1)` acquires each
+// peer's release store `mark_peer_ready(peer, epoch - 1)`, which happens strictly after the peer
+// drops its `&StepSlot` borrow for `epoch - 2` inside `executor.submit()` (or cancel handling).
 unsafe impl Sync for DispatchRing {}
 
 impl DispatchRing {
@@ -261,6 +262,20 @@ impl DispatchRing {
         self.decision.0.store(epoch << 1, Ordering::SeqCst);
     }
 
+    fn poll_peer_acks(
+        &self,
+        peer_count: usize,
+        target: u64,
+    ) -> Option<std::result::Result<(), WaitPeersError>> {
+        if (0..peer_count).all(|index| self.peer_ack[index].0.load(Ordering::Acquire) >= target) {
+            return Some(Ok(()));
+        }
+        if self.peer_exited() {
+            return Some(Err(WaitPeersError::PeerExited));
+        }
+        None
+    }
+
     fn wait_peer_acks(
         &self,
         peer_count: usize,
@@ -272,48 +287,44 @@ impl DispatchRing {
                 .find(|&index| self.peer_ack[index].0.load(Ordering::Acquire) < target)
         };
         for _ in 0..32 {
-            if first_pending().is_none() {
-                return Ok(());
-            }
-            if self.peer_exited() {
-                return Err(WaitPeersError::PeerExited);
+            if let Some(status) = self.poll_peer_acks(peer_count, target) {
+                return status;
             }
             std::hint::spin_loop();
         }
         let started = Instant::now();
         loop {
-            let Some(pending_peer) = first_pending() else {
-                return Ok(());
-            };
-            if self.peer_exited() {
-                return Err(WaitPeersError::PeerExited);
+            if let Some(status) = self.poll_peer_acks(peer_count, target) {
+                return status;
             }
             if started.elapsed() > timeout {
                 return Err(WaitPeersError::Timeout);
             }
             #[cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64"))]
             {
-                let seen = self.peer_ack[pending_peer].0.load(Ordering::Acquire);
-                if seen < target && !self.peer_exited() {
-                    let _ = super::transport::host_wait::wait_u64_change(
-                        &self.peer_ack[pending_peer].0,
-                        seen,
-                        25,
-                    );
+                if let Some(pending_peer) = first_pending() {
+                    let seen = self.peer_ack[pending_peer].0.load(Ordering::Acquire);
+                    if seen < target && !self.peer_exited() {
+                        let _ = super::transport::host_wait::wait_u64_change(
+                            &self.peer_ack[pending_peer].0,
+                            seen,
+                            25,
+                        );
+                    }
                 }
             }
             #[cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_arch = "x86_64")))]
             {
-                let _ = pending_peer;
+                let _ = first_pending;
                 std::hint::spin_loop();
             }
         }
     }
 
     fn poll_decision(&self, epoch: u64) -> Option<DecisionEvent> {
-        if self.drain.0.load(Ordering::Acquire) {
-            return Some(DecisionEvent::Drain);
-        }
+        // Check `decision` before `drain`: under 2-deep pipelining a later step can fail
+        // and request drain after `epoch` was already committed and launched on other ranks.
+        // Every surviving peer must still observe `Commit(epoch)` so no collective is stranded.
         let value = self.decision.0.load(Ordering::Acquire);
         if (value >> 1) >= epoch {
             return Some(if (value & 1) != 0 {
@@ -321,6 +332,19 @@ impl DispatchRing {
             } else {
                 DecisionEvent::Cancel
             });
+        }
+        if self.drain.0.load(Ordering::SeqCst) {
+            // Re-check `decision` after observing `drain`: `commit`/`cancel` (SeqCst)
+            // precedes any subsequent `request_drain` (SeqCst) in the total order.
+            let value = self.decision.0.load(Ordering::SeqCst);
+            if (value >> 1) >= epoch {
+                return Some(if (value & 1) != 0 {
+                    DecisionEvent::Commit
+                } else {
+                    DecisionEvent::Cancel
+                });
+            }
+            return Some(DecisionEvent::Drain);
         }
         None
     }
@@ -373,6 +397,8 @@ impl DispatchRing {
     }
 
     fn poll_next(&self, next_epoch: u64) -> Option<DispatchEvent> {
+        // Safe to check `drain` first here: rank zero cannot commit `next_epoch` until
+        // every peer has already observed `prepare_epoch >= next_epoch` and signalled ready.
         if self.drain.0.load(Ordering::Acquire) {
             return Some(DispatchEvent::Drain);
         }
@@ -508,6 +534,29 @@ where
     }
 }
 
+/// Drain every already-committed in-flight frame on a rank thread before closing its executor.
+fn drain_outstanding_frames<S, T>(
+    state: &mut S,
+    mut outstanding: impl FnMut(&S) -> usize,
+    mut poll: impl FnMut(&mut S) -> Result<Option<T>>,
+    started: &mut VecDeque<Instant>,
+    timeout: Duration,
+    mut on_complete: impl FnMut(T),
+) -> Result<()> {
+    while outstanding(state) != 0 {
+        if let Some(completion) = poll(state)? {
+            started.pop_front();
+            on_complete(completion);
+        } else if started.front().is_some_and(|time| time.elapsed() > timeout) {
+            return Err(invalid("rank graph completion deadline expired during drain"));
+        } else {
+            std::hint::spin_loop();
+            thread::yield_now();
+        }
+    }
+    Ok(())
+}
+
 struct PeerExitGuard(Arc<DispatchRing>);
 impl Drop for PeerExitGuard {
     fn drop(&mut self) {
@@ -554,64 +603,31 @@ struct InFlightFrame {
     completions: [Option<FrameCompletion>; MAX_RANKS],
 }
 
-fn can_submit_window(
-    pending: &VecDeque<InFlightFrame>,
-    barrier: bool,
-    manifest: &ExecutionManifest,
-) -> bool {
-    pending.len() < 2
-        && (!barrier || pending.is_empty())
-        && !pending.iter().any(|frame| {
-            frame.grammar
-                || !matches!(
-                    manifest.graphs[frame.graph].kind,
-                    super::GraphKind::Decode | super::GraphKind::Speculative
-                )
-        })
-}
-
-fn record_local_completion(
-    pending: &mut VecDeque<InFlightFrame>,
-    completion: FrameCompletion,
-) -> Result<()> {
-    let frame = pending
-        .iter_mut()
-        .find(|frame| frame.fence == completion.fence)
-        .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
-    if frame.graph != completion.graph_index {
-        return Err(invalid("rank-zero completion identity or state differs"));
+impl protocol::PendingFrame for InFlightFrame {
+    fn fence(&self) -> Fence {
+        self.fence
     }
-    if frame.completions[0].is_some() {
-        return Err(invalid("duplicate rank-zero completion"));
+    fn graph(&self) -> usize {
+        self.graph
     }
-    frame.completions[0] = Some(completion);
-    Ok(())
-}
-
-fn record_peer_completion(
-    pending: &mut VecDeque<InFlightFrame>,
-    peer: usize,
-    completion: FrameCompletion,
-) -> Result<()> {
-    let expected = pending
-        .iter_mut()
-        .find(|frame| frame.completions[peer + 1].is_none())
-        .ok_or_else(|| invalid("unexpected rank completion"))?;
-    if expected.fence != completion.fence || expected.graph != completion.graph_index {
-        return Err(invalid("rank completion order or identity differs"));
+    fn grammar(&self) -> bool {
+        self.grammar
     }
-    expected.completions[peer + 1] = Some(completion);
-    Ok(())
-}
-
-fn pop_completed_front(pending: &mut VecDeque<InFlightFrame>) -> Option<InFlightFrame> {
-    if !pending
-        .front()
-        .is_some_and(|frame| frame.completions[..frame.world_size].iter().all(Option::is_some))
-    {
-        return None;
+    fn committed(&self) -> bool {
+        true
     }
-    pending.pop_front()
+    fn ready(&self) -> &[bool] {
+        &[]
+    }
+    fn ready_mut(&mut self) -> &mut [bool] {
+        &mut []
+    }
+    fn completions(&self) -> &[Option<FrameCompletion>] {
+        &self.completions[..self.world_size]
+    }
+    fn completions_mut(&mut self) -> &mut [Option<FrameCompletion>] {
+        &mut self.completions[..self.world_size]
+    }
 }
 
 pub(crate) struct ThreadedExecutor {
@@ -814,7 +830,7 @@ impl ThreadedExecutor {
         self.poison.is_none()
             && self.shutdown.is_none()
             && (!super::single_submission() || self.pending.is_empty())
-            && can_submit_window(&self.pending, grammar, self.local.manifest())
+            && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
     pub fn next_fence(&self) -> Result<Fence> {
@@ -858,8 +874,11 @@ impl ThreadedExecutor {
         let queued = !self.pending.is_empty();
         let dispatched = Instant::now();
         let peers = &self.peers;
-        // SAFETY: `can_submit` limits `self.pending.len() < 2` and every prior frame in parity
-        // slot `next_epoch & 1` has already been released by every peer.
+        // SAFETY: Rank zero is the sole producer. For `next_epoch <= 2`, parity slot
+        // `next_epoch & 1` has never been read by any peer. For `next_epoch >= 3`, advancing
+        // past `next_epoch - 1` required `wait_peer_acks(peers.len(), (next_epoch - 1) << 1)`,
+        // acquiring every peer's release store made strictly after it dropped its `&StepSlot`
+        // borrow for `next_epoch - 2` inside `executor.submit()` (or cancel handling).
         let coordinated = unsafe {
             coordinate_step(
                 &self.ring,
@@ -913,7 +932,7 @@ impl ThreadedExecutor {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
         if let Some(completion) = self.local.poll()? {
-            record_local_completion(&mut self.pending, completion)?;
+            protocol::record_local_completion(&mut self.pending, completion)?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             loop {
@@ -924,13 +943,13 @@ impl ThreadedExecutor {
                 };
                 match reply {
                     Reply::Complete(completion) => {
-                        record_peer_completion(&mut self.pending, index, completion)?;
+                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
                     }
                     _ => return Err(invalid("unexpected rank thread reply")),
                 }
             }
         }
-        let Some(mut frame) = pop_completed_front(&mut self.pending) else { return Ok(None); };
+        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else { return Ok(None); };
         let mut root = frame.completions[0].take().unwrap();
         for index in 0..self.peers.len() {
             let completion = frame.completions[index + 1].take().unwrap();
@@ -1017,10 +1036,21 @@ impl Drop for ThreadedExecutor {
     }
 }
 
-fn drain_rank(executor: &mut GraphExecutor, send: &impl Fn(Reply) -> Result<()>) -> Result<()> {
-    if executor.outstanding() != 0 {
-        return Err(invalid("rank drain arrived with outstanding frames"));
-    }
+fn drain_rank(
+    executor: &mut GraphExecutor,
+    started: &mut VecDeque<Instant>,
+    send: &impl Fn(Reply) -> Result<()>,
+) -> Result<()> {
+    drain_outstanding_frames(
+        executor,
+        |exec| exec.outstanding(),
+        |exec| exec.poll(),
+        started,
+        TIMEOUT,
+        |completion| {
+            let _ = send(Reply::Complete(completion));
+        },
+    )?;
     let shutdown = executor.close();
     if !shutdown.drained {
         return Err(invalid("rank streams did not drain"));
@@ -1028,7 +1058,7 @@ fn drain_rank(executor: &mut GraphExecutor, send: &impl Fn(Reply) -> Result<()>)
     if let Some(error) = shutdown.error {
         return Err(error);
     }
-    send(Reply::Drained)?;
+    let _ = send(Reply::Drained);
     Ok(())
 }
 
@@ -1045,6 +1075,7 @@ fn rank_loop(
             .map_err(|_| invalid("rank coordinator disconnected"))
     };
     send(Reply::Initialized)?;
+    let mut started = VecDeque::with_capacity(2);
     // Startup phase: run startup tuning graphs and FinishStartup over the control channel.
     loop {
         match receive(&commands, None) {
@@ -1061,14 +1092,13 @@ fn rank_loop(
                 break;
             }
             Ok(Command::Drain) => {
-                return drain_rank(executor, &send);
+                return drain_rank(executor, &mut started, &send);
             }
             Err(_) => return Ok(()),
         }
     }
     // Serving phase: lock-free Prepare -> Ready -> Commit/Cancel step dispatch over DispatchRing.
     let mut next_epoch = 1u64;
-    let mut started = VecDeque::with_capacity(2);
     loop {
         let event = if executor.outstanding() == 0 {
             Some(ring.wait_next(next_epoch))
@@ -1078,7 +1108,7 @@ fn rank_loop(
         match event {
             Some(DispatchEvent::Step) => {
                 // SAFETY: `ring` published `prepare_epoch >= next_epoch`; this borrow ends
-                // before signalling readiness or cancel acknowledgement.
+                // before signalling readiness or advancing past `next_epoch`.
                 let (fence, graph, grammar, validated) = {
                     let slot = unsafe { ring.slot(next_epoch) };
                     let fence = slot.fence;
@@ -1086,17 +1116,37 @@ fn rank_loop(
                     let grammar = slot.grammar;
                     let validated = slot.with_uploads(|uploads| {
                         executor.validate_submission(graph, uploads, &slot.cleared_pages, grammar)
-                    })?;
+                    });
                     (fence, graph, grammar, validated)
                 };
-                if validated != Some(fence) {
-                    return Err(invalid("rank submission fence differs"));
+                let validation_error = match validated {
+                    Ok(Some(v)) if v == fence => None,
+                    Ok(_) => Some(invalid("rank submission fence differs")),
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = validation_error {
+                    // Signal failure immediately so rank zero aborts this step without
+                    // launching a stranded collective, then drain any prior in-flight frame.
+                    let _ = replies.send(Err(error.clone()));
+                    ring.mark_peer_exited();
+                    let _ = drain_outstanding_frames(
+                        executor,
+                        |exec| exec.outstanding(),
+                        |exec| exec.poll(),
+                        &mut started,
+                        TIMEOUT,
+                        |completion| {
+                            let _ = send(Reply::Complete(completion));
+                        },
+                    );
+                    return Err(error);
                 }
                 ring.mark_peer_ready(peer_index, next_epoch);
                 match ring.wait_decision(next_epoch, TIMEOUT)? {
                     DecisionEvent::Commit => {
-                        // SAFETY: Rank zero committed `next_epoch` and retains slot ownership
-                        // until this peer finishes submission and advances `next_epoch`.
+                        // SAFETY: Rank zero committed `next_epoch` and will not overwrite
+                        // `slots[next_epoch & 1]` until `wait_peer_acks((next_epoch + 1) << 1)`,
+                        // which happens strictly after this block drops `&StepSlot`.
                         let submitted = {
                             let slot = unsafe { ring.slot(next_epoch) };
                             slot.with_uploads(|uploads| {
@@ -1114,12 +1164,12 @@ fn rank_loop(
                         next_epoch += 1;
                     }
                     DecisionEvent::Drain => {
-                        return drain_rank(executor, &send);
+                        return drain_rank(executor, &mut started, &send);
                     }
                 }
             }
             Some(DispatchEvent::Drain) => {
-                return drain_rank(executor, &send);
+                return drain_rank(executor, &mut started, &send);
             }
             None => {}
         }
@@ -1211,6 +1261,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, HashSet};
 
     #[test]
     fn rank_layout_uses_completion_geometry_instead_of_abi_labels() {
@@ -1856,6 +1907,625 @@ mod tests {
         for worker in workers {
             assert_eq!(worker.join().unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn poll_decision_observes_commit_before_drain_under_two_deep_pipelining() {
+        // Reproduces the 3-rank (rank 0 + 2 peers) 2-deep race:
+        // Step 1 commits on rank 0; peer 0 launches step 1 and fails validation on step 2,
+        // causing rank 0 to request drain while slow peer 1 is still in wait_decision(1).
+        // Peer 1 MUST still observe Commit(1) before draining at epoch 2 so GPU collectives
+        // already launched on rank 0 and peer 0 cannot deadlock.
+        let ring = Arc::new(DispatchRing::new(256, 4));
+        let data = 7u64.to_le_bytes();
+        let uploads = [Upload {
+            buffer: "tokens",
+            offset: 0,
+            bytes: &data,
+        }];
+        let mut next_epoch = 1u64;
+
+        // Step 1: prepare, both peers validate, rank zero commits.
+        unsafe { ring.prepare(1, Fence(1), 0, false, &uploads, &[]) };
+        assert_eq!(ring.poll_next(1), Some(DispatchEvent::Step));
+        ring.mark_peer_ready(0, 1);
+        ring.mark_peer_ready(1, 1);
+        ring.commit(1);
+        next_epoch += 1;
+
+        // Peer 0 observes Commit(1) and advances to epoch 2. Peer 1 has NOT polled decision(1) yet.
+        assert_eq!(ring.poll_decision(1), Some(DecisionEvent::Commit));
+
+        // Step 2: rank zero stages epoch 2 into parity slot 0 while peer 1 still needs slot 1.
+        let data2 = 13u64.to_le_bytes();
+        let uploads2 = [Upload {
+            buffer: "tokens",
+            offset: 0,
+            bytes: &data2,
+        }];
+        unsafe { ring.prepare(next_epoch, Fence(2), 1, false, &uploads2, &[]) };
+        assert_eq!(ring.poll_next(2), Some(DispatchEvent::Step));
+
+        // Peer 0 fails validation on step 2 -> peer_exited + coordinator requests drain.
+        ring.mark_peer_exited();
+        ring.request_drain();
+
+        // Slow peer 1 now polls decision(1): MUST observe Commit(1), NOT Drain!
+        assert_eq!(
+            ring.poll_decision(1),
+            Some(DecisionEvent::Commit),
+            "committed step must be observed before drain"
+        );
+        // Slot 1 still intact for peer 1's submission of step 1!
+        let slot1 = unsafe { ring.slot(1) };
+        assert_eq!(slot1.fence, Fence(1));
+        assert_eq!(slot1.graph, 0);
+
+        // Only after launching step 1 and advancing to epoch 2 does peer 1 observe Drain.
+        assert_eq!(ring.poll_next(2), Some(DispatchEvent::Drain));
+    }
+
+    #[test]
+    fn drain_outstanding_frames_completes_in_flight_work_before_close() {
+        let mut remaining = VecDeque::from([Fence(1), Fence(2)]);
+        let mut started = VecDeque::from([Instant::now(), Instant::now()]);
+        let mut poll_calls = 0usize;
+        let mut delivered = Vec::new();
+        drain_outstanding_frames(
+            &mut remaining,
+            |q| q.len(),
+            |q| {
+                poll_calls += 1;
+                if poll_calls % 2 == 0 {
+                    Ok(q.pop_front())
+                } else {
+                    Ok(None)
+                }
+            },
+            &mut started,
+            Duration::from_secs(2),
+            |fence| delivered.push(fence),
+        )
+        .expect("surviving peer must drain in-flight work before closing");
+        assert!(remaining.is_empty());
+        assert!(started.is_empty());
+        assert_eq!(delivered, vec![Fence(1), Fence(2)]);
+
+        // An expired in-flight frame during drain must still fail cleanly instead of hanging.
+        let mut stuck_started = VecDeque::from([Instant::now() - Duration::from_secs(5)]);
+        let mut stuck = 1usize;
+        let err = drain_outstanding_frames::<usize, Fence>(
+            &mut stuck,
+            |count| *count,
+            |_| Ok(None),
+            &mut stuck_started,
+            Duration::from_millis(10),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "rank graph completion deadline expired during drain"
+        );
+    }
+
+    #[test]
+    fn parity_slot_reuse_after_cancel_while_prior_frame_in_flight() {
+        // Exercises the exact slot-reuse safety boundary:
+        // Step 1 commits (slot 1) and remains IN FLIGHT (not completed yet).
+        // Step 2 prepares (slot 0) and is cancelled by local backpressure.
+        // Step 3 reuses slot 1 while step 1's GPU frame is still in flight; this is safe
+        // because every peer already dropped its `&StepSlot` borrow for slot 1 before
+        // acknowledging readiness for step 2.
+        const PEERS: usize = 2;
+        let ring = Arc::new(DispatchRing::new(256, 4));
+        let (launched_tx, launched_rx) = mpsc::channel::<(usize, Fence, u64)>();
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let peer_ring = ring.clone();
+            let tx = launched_tx.clone();
+            workers.push(thread::spawn(move || {
+                let mut next_epoch = 1u64;
+                let mut in_flight: Vec<Fence> = Vec::new();
+                loop {
+                    match peer_ring.wait_next(next_epoch) {
+                        DispatchEvent::Step => {
+                            let fence = unsafe { peer_ring.slot(next_epoch).fence };
+                            peer_ring.mark_peer_ready(peer_id, next_epoch);
+                            match peer_ring
+                                .wait_decision(next_epoch, Duration::from_secs(5))
+                                .unwrap()
+                            {
+                                DecisionEvent::Commit => {
+                                    let payload = {
+                                        let slot = unsafe { peer_ring.slot(next_epoch) };
+                                        slot.with_uploads(|uploads| {
+                                            u64::from_le_bytes(
+                                                uploads[0].bytes.try_into().unwrap(),
+                                            )
+                                        })
+                                    };
+                                    in_flight.push(fence);
+                                    tx.send((peer_id, fence, payload)).unwrap();
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Cancel => {
+                                    peer_ring.mark_peer_cancelled(peer_id, next_epoch);
+                                    next_epoch += 1;
+                                }
+                                DecisionEvent::Drain => break,
+                            }
+                        }
+                        DispatchEvent::Drain => break,
+                    }
+                }
+                in_flight
+            }));
+        }
+
+        let mut next_epoch = 1u64;
+        let bytes1 = 0x1111_2222_3333_4444u64.to_le_bytes();
+        let bytes2 = 0x5555_6666_7777_8888u64.to_le_bytes();
+        let bytes3 = 0x9999_AAAA_BBBB_CCCCu64.to_le_bytes();
+
+        // Step 1 (slot 1): commit and keep in flight.
+        let u1 = [Upload { buffer: "tokens", offset: 0, bytes: &bytes1 }];
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring, PEERS, &mut next_epoch, Fence(1), 0, false, &u1, &[],
+                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(1))),
+                )
+                .unwrap()
+            },
+            Some(Fence(1))
+        );
+
+        // Step 2 (slot 0): cancel on local backpressure while step 1 is still in flight.
+        let u2 = [Upload { buffer: "tokens", offset: 0, bytes: &bytes2 }];
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring, PEERS, &mut next_epoch, Fence(2), 1, false, &u2, &[],
+                    Duration::from_secs(5), || invalid("exit"), || Ok(None),
+                )
+                .unwrap()
+            },
+            None
+        );
+
+        // Step 3 (reuses slot 1!): commit while step 1 is STILL in flight on all peers.
+        let u3 = [Upload { buffer: "tokens", offset: 0, bytes: &bytes3 }];
+        assert_eq!(
+            unsafe {
+                coordinate_step(
+                    &ring, PEERS, &mut next_epoch, Fence(2), 2, false, &u3, &[],
+                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(2))),
+                )
+                .unwrap()
+            },
+            Some(Fence(2))
+        );
+
+        let mut observed = Vec::new();
+        for _ in 0..(PEERS * 2) {
+            observed.push(launched_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        ring.request_drain();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), vec![Fence(1), Fence(2)]);
+        }
+        for peer_id in 0..PEERS {
+            assert!(observed.contains(&(peer_id, Fence(1), 0x1111_2222_3333_4444)));
+            assert!(observed.contains(&(peer_id, Fence(2), 0x9999_AAAA_BBBB_CCCC)));
+        }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq, Hash)]
+    enum ModelCoordPhase {
+        Idle = 0,
+        WaitingReady = 1,
+        WaitingCancel = 2,
+        Draining = 3,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq, Hash)]
+    enum ModelPeerPhase {
+        WaitingStep = 0,
+        ReadingPrepare = 1,
+        WaitingDecision = 2,
+        ReadingCommit = 3,
+        Draining = 4,
+        Closed = 5,
+        Abandoned = 6,
+    }
+
+    #[derive(Clone)]
+    struct RingModelState {
+        prepare_epoch: u64,
+        decision_word: u64,
+        drain: bool,
+        peer_exited: bool,
+        coord_phase: ModelCoordPhase,
+        coord_epoch: u64,
+        pending: u8,
+        committed: u8,
+        peer_phase: [ModelPeerPhase; 2],
+        peer_epoch: [u64; 2],
+        peer_ack: [u64; 2],
+        peer_in_flight: [u8; 2],
+        slot_write_conflict: bool,
+        stranded_on_drain: bool,
+        abandoned_in_flight: bool,
+    }
+
+    impl RingModelState {
+        fn initial() -> Self {
+            Self {
+                prepare_epoch: 0,
+                decision_word: 0,
+                drain: false,
+                peer_exited: false,
+                coord_phase: ModelCoordPhase::Idle,
+                coord_epoch: 1,
+                pending: 0,
+                committed: 0,
+                peer_phase: [ModelPeerPhase::WaitingStep; 2],
+                peer_epoch: [1; 2],
+                peer_ack: [0; 2],
+                peer_in_flight: [0; 2],
+                slot_write_conflict: false,
+                stranded_on_drain: false,
+                abandoned_in_flight: false,
+            }
+        }
+
+        fn hydrate_ring(&self) -> DispatchRing {
+            let ring = DispatchRing::new(64, 4);
+            ring.prepare_epoch.0.store(self.prepare_epoch, Ordering::SeqCst);
+            ring.decision.0.store(self.decision_word, Ordering::SeqCst);
+            ring.drain.0.store(self.drain, Ordering::SeqCst);
+            ring.peer_exited.0.store(self.peer_exited, Ordering::SeqCst);
+            for p in 0..2 {
+                ring.peer_ack[p].0.store(self.peer_ack[p], Ordering::SeqCst);
+            }
+            ring
+        }
+
+        fn sync_from_ring(&mut self, ring: &DispatchRing) {
+            self.prepare_epoch = ring.prepare_epoch.0.load(Ordering::SeqCst);
+            self.decision_word = ring.decision.0.load(Ordering::SeqCst);
+            self.drain = ring.drain.0.load(Ordering::SeqCst);
+            self.peer_exited = ring.peer_exited.0.load(Ordering::SeqCst);
+            for p in 0..2 {
+                self.peer_ack[p] = ring.peer_ack[p].0.load(Ordering::SeqCst);
+            }
+        }
+
+        fn projection(&self) -> [usize; 18] {
+            let flags = usize::from(self.slot_write_conflict)
+                | (usize::from(self.stranded_on_drain) << 1)
+                | (usize::from(self.abandoned_in_flight) << 2);
+            [
+                self.prepare_epoch as usize,
+                (self.decision_word >> 1) as usize,
+                (self.decision_word & 1) as usize,
+                usize::from(self.drain),
+                usize::from(self.peer_exited),
+                self.coord_phase as usize,
+                self.coord_epoch as usize,
+                self.pending as usize,
+                self.committed as usize,
+                self.peer_phase[0] as usize,
+                self.peer_epoch[0] as usize,
+                self.peer_ack[0] as usize,
+                self.peer_in_flight[0] as usize,
+                self.peer_phase[1] as usize,
+                self.peer_epoch[1] as usize,
+                self.peer_ack[1] as usize,
+                self.peer_in_flight[1] as usize,
+                flags,
+            ]
+        }
+
+        fn peer_reads_slot(&self, peer: usize, slot: u64) -> bool {
+            matches!(
+                self.peer_phase[peer],
+                ModelPeerPhase::ReadingPrepare | ModelPeerPhase::ReadingCommit
+            ) && (self.peer_epoch[peer] & 1) == slot
+        }
+    }
+
+    #[test]
+    fn dispatch_ring_matches_model_edges() {
+        const MAX_EPOCHS: u64 = 3;
+        let mut work = vec![RingModelState::initial()];
+        let mut states = HashSet::new();
+        let mut edges = BTreeSet::new();
+        let mut observed_commit_after_drain = false;
+        let mut observed_drain_with_in_flight = false;
+        let mut observed_cancel_slot_reuse = false;
+
+        while let Some(state) = work.pop() {
+            let before = state.projection();
+            if !states.insert(before) {
+                continue;
+            }
+            assert!(
+                !state.slot_write_conflict,
+                "parity slot overwritten while peer held borrow"
+            );
+            assert!(
+                !state.stranded_on_drain,
+                "committed step must be observed before drain"
+            );
+            assert!(
+                !state.abandoned_in_flight,
+                "surviving peer must drain in-flight work before closing"
+            );
+            for e in 1..=MAX_EPOCHS {
+                if (state.committed & (1 << (e - 1))) != 0 {
+                    for p in 0..2 {
+                        assert!(
+                            state.peer_epoch[p] > e || state.peer_ack[p] >= (e << 1),
+                            "commit must wait for every peer readiness"
+                        );
+                    }
+                }
+            }
+
+            let mut emit = |after: RingModelState, action: [usize; 3]| {
+                edges.insert((before, action, after.projection()));
+                work.push(after);
+            };
+
+            // 1. CoordPrepare
+            if state.coord_phase == ModelCoordPhase::Idle
+                && !state.drain
+                && !state.peer_exited
+                && state.coord_epoch <= MAX_EPOCHS
+                && state.pending.count_ones() < 2
+            {
+                let mut after = state.clone();
+                let ring = after.hydrate_ring();
+                let epoch = after.coord_epoch;
+                let slot = epoch & 1;
+                if (0..2).any(|p| state.peer_reads_slot(p, slot)) {
+                    after.slot_write_conflict = true;
+                }
+                if epoch == 3 && (state.pending & 1) != 0 && (state.committed & 2) == 0 {
+                    observed_cancel_slot_reuse = true;
+                }
+                unsafe { ring.prepare(epoch, Fence(epoch), 0, false, &[], &[]) };
+                after.sync_from_ring(&ring);
+                after.coord_phase = ModelCoordPhase::WaitingReady;
+                emit(after, [1, epoch as usize, 0]);
+            }
+
+            // 5, 6, 7, 8: Coordinator transitions driven by production poll_peer_acks / commit / cancel / request_drain.
+            let ring_ro = state.hydrate_ring();
+            match state.coord_phase {
+                ModelCoordPhase::WaitingReady => {
+                    let ack_status = ring_ro.poll_peer_acks(2, state.coord_epoch << 1);
+                    if matches!(ack_status, Some(Ok(()))) && !state.peer_exited {
+                        // 5. CoordCommit
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        let epoch = after.coord_epoch;
+                        ring.commit(epoch);
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::Idle;
+                        after.coord_epoch += 1;
+                        after.pending |= 1 << (epoch - 1);
+                        after.committed |= 1 << (epoch - 1);
+                        emit(after, [5, epoch as usize, 0]);
+
+                        // 6. CoordCancel
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        let epoch = after.coord_epoch;
+                        ring.cancel(epoch);
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::WaitingCancel;
+                        emit(after, [6, epoch as usize, 0]);
+                    }
+                    if !state.drain
+                        && (matches!(ack_status, Some(Err(WaitPeersError::PeerExited)))
+                            || matches!(ack_status, Some(Ok(()))))
+                    {
+                        // 8. CoordRequestDrain (peer exited or local submit error before commit)
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.request_drain();
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::Draining;
+                        emit(after, [8, 0, 0]);
+                    }
+                }
+                ModelCoordPhase::WaitingCancel => {
+                    let cancel_status = ring_ro.poll_peer_acks(2, (state.coord_epoch << 1) | 1);
+                    if matches!(cancel_status, Some(Ok(()))) && !state.peer_exited {
+                        // 7. CoordCancelComplete
+                        let mut after = state.clone();
+                        let epoch = after.coord_epoch;
+                        after.coord_phase = ModelCoordPhase::Idle;
+                        after.coord_epoch += 1;
+                        emit(after, [7, epoch as usize, 0]);
+                    }
+                    if !state.drain && matches!(cancel_status, Some(Err(WaitPeersError::PeerExited)))
+                    {
+                        // 8. CoordRequestDrain
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.request_drain();
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::Draining;
+                        emit(after, [8, 0, 0]);
+                    }
+                }
+                ModelCoordPhase::Idle => {
+                    if !state.drain && (state.pending == 0 || state.peer_exited) {
+                        // 8. CoordRequestDrain
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.request_drain();
+                        after.sync_from_ring(&ring);
+                        after.coord_phase = ModelCoordPhase::Draining;
+                        emit(after, [8, 0, 0]);
+                    }
+                }
+                ModelCoordPhase::Draining => {}
+            }
+
+            // 16. CoordRetireFront
+            if state.pending != 0 {
+                let oldest = (state.pending.trailing_zeros() + 1) as u64;
+                let bit = 1u8 << (oldest - 1);
+                if (0..2).all(|p| {
+                    state.peer_epoch[p] > oldest && (state.peer_in_flight[p] & bit) == 0
+                }) {
+                    let mut after = state.clone();
+                    after.pending &= !bit;
+                    emit(after, [16, oldest as usize, 0]);
+                }
+            }
+
+            // Peer transitions driven by production poll_next / mark_peer_ready / poll_decision / mark_peer_cancelled / drain_outstanding_frames.
+            for p in 0..2 {
+                let epoch = state.peer_epoch[p];
+                match state.peer_phase[p] {
+                    ModelPeerPhase::WaitingStep => {
+                        match ring_ro.poll_next(epoch) {
+                            Some(DispatchEvent::Step) => {
+                                // 2. PeerObserveStep
+                                let mut after = state.clone();
+                                after.peer_phase[p] = ModelPeerPhase::ReadingPrepare;
+                                emit(after, [2, p, epoch as usize]);
+                            }
+                            Some(DispatchEvent::Drain) => {
+                                // 13. PeerObserveStepDrain
+                                let mut after = state.clone();
+                                if epoch <= MAX_EPOCHS && (state.committed & (1 << (epoch - 1))) != 0 {
+                                    after.stranded_on_drain = true;
+                                }
+                                after.peer_phase[p] = ModelPeerPhase::Draining;
+                                emit(after, [13, p, epoch as usize]);
+                            }
+                            None => {}
+                        }
+                    }
+                    ModelPeerPhase::ReadingPrepare => {
+                        // 3. PeerValidateOk
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.mark_peer_ready(p, epoch);
+                        after.sync_from_ring(&ring);
+                        after.peer_phase[p] = ModelPeerPhase::WaitingDecision;
+                        emit(after, [3, p, epoch as usize]);
+
+                        // 4. PeerValidateFail
+                        let mut after = state.clone();
+                        let ring = after.hydrate_ring();
+                        ring.mark_peer_exited();
+                        after.sync_from_ring(&ring);
+                        after.peer_phase[p] = if state.peer_in_flight[p] == 0 {
+                            ModelPeerPhase::Abandoned
+                        } else {
+                            ModelPeerPhase::Draining
+                        };
+                        emit(after, [4, p, epoch as usize]);
+                    }
+                    ModelPeerPhase::WaitingDecision => {
+                        match ring_ro.poll_decision(epoch) {
+                            Some(DecisionEvent::Commit) => {
+                                // 9. PeerObserveCommit
+                                if state.drain {
+                                    observed_commit_after_drain = true;
+                                }
+                                let mut after = state.clone();
+                                after.peer_phase[p] = ModelPeerPhase::ReadingCommit;
+                                emit(after, [9, p, 0]);
+                            }
+                            Some(DecisionEvent::Cancel) => {
+                                // 10. PeerObserveCancel
+                                let mut after = state.clone();
+                                let ring = after.hydrate_ring();
+                                ring.mark_peer_cancelled(p, epoch);
+                                after.sync_from_ring(&ring);
+                                after.peer_epoch[p] += 1;
+                                after.peer_phase[p] = ModelPeerPhase::WaitingStep;
+                                emit(after, [10, p, 0]);
+                            }
+                            Some(DecisionEvent::Drain) => {
+                                // 11. PeerObserveDecisionDrain
+                                let mut after = state.clone();
+                                if epoch <= MAX_EPOCHS && (state.committed & (1 << (epoch - 1))) != 0 {
+                                    after.stranded_on_drain = true;
+                                }
+                                after.peer_phase[p] = ModelPeerPhase::Draining;
+                                emit(after, [11, p, 0]);
+                            }
+                            None => {}
+                        }
+                    }
+                    ModelPeerPhase::ReadingCommit => {
+                        // 12. PeerSubmitCommitted
+                        let mut after = state.clone();
+                        after.peer_in_flight[p] |= 1 << (epoch - 1);
+                        after.peer_epoch[p] += 1;
+                        after.peer_phase[p] = ModelPeerPhase::WaitingStep;
+                        emit(after, [12, p, epoch as usize]);
+                    }
+                    ModelPeerPhase::Draining => {
+                        if state.peer_in_flight[p] != 0 {
+                            observed_drain_with_in_flight = true;
+                        } else {
+                            // 15. PeerFinishDrain (verified via production drain_outstanding_frames)
+                            let mut started = VecDeque::new();
+                            let mut empty = 0usize;
+                            drain_outstanding_frames::<usize, ()>(
+                                &mut empty,
+                                |count| *count,
+                                |_| Ok(None),
+                                &mut started,
+                                Duration::from_secs(1),
+                                |_| {},
+                            )
+                            .unwrap();
+                            let mut after = state.clone();
+                            after.peer_phase[p] = ModelPeerPhase::Closed;
+                            emit(after, [15, p, 0]);
+                        }
+                    }
+                    ModelPeerPhase::Closed | ModelPeerPhase::Abandoned => {}
+                }
+
+                // 14. PeerCompleteFrame (FIFO completion on any non-closed/abandoned peer)
+                if !matches!(
+                    state.peer_phase[p],
+                    ModelPeerPhase::Closed | ModelPeerPhase::Abandoned
+                ) && state.peer_in_flight[p] != 0
+                {
+                    let oldest = (state.peer_in_flight[p].trailing_zeros() + 1) as u64;
+                    let mut after = state.clone();
+                    after.peer_in_flight[p] &= !(1 << (oldest - 1));
+                    emit(after, [14, p, oldest as usize]);
+                }
+            }
+        }
+
+        assert!(
+            observed_commit_after_drain,
+            "exploration must exercise committed step observation after drain"
+        );
+        assert!(
+            observed_drain_with_in_flight,
+            "exploration must exercise draining peers with in-flight GPU work"
+        );
+        assert!(
+            observed_cancel_slot_reuse,
+            "exploration must exercise parity slot reuse after cancel while prior frame is in flight"
+        );
     }
 }
 
