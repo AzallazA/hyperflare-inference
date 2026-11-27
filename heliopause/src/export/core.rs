@@ -1957,6 +1957,8 @@ fn rank_plan(
 
     let mut resources = Vec::new();
     let mut modules = Vec::new();
+    let mut cubins_by_sha256: std::collections::HashMap<[u8; 32], Vec<(u32, PathBuf)>> =
+        std::collections::HashMap::new();
     for (index, module) in bundle.modules.iter().enumerate() {
         let span = bundle
             .resources
@@ -1968,11 +1970,37 @@ fn rank_plan(
             staging,
             &format!("rank{rank_index}-cubin-{index}.plain"),
         )?;
-        resources.push(payload_export::PublishResource {
-            kind: pwire::ExecutableKind::Cubin,
-            path,
-            nbytes: span.nbytes,
-        });
+        let cubin_bytes = fs::read(&path)?;
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&cubin_bytes).into()
+        };
+        let cubin_index = if let Some(existing) = cubins_by_sha256
+            .get(&digest)
+            .and_then(|candidates| {
+                candidates.iter().find_map(|(idx, prev_path)| {
+                    fs::read(prev_path)
+                        .ok()
+                        .filter(|prev| prev.as_slice() == cubin_bytes.as_slice())
+                        .map(|_| *idx)
+                })
+            })
+        {
+            let _ = fs::remove_file(&path);
+            existing
+        } else {
+            let resource_index = resources.len() as u32;
+            resources.push(payload_export::PublishResource {
+                kind: pwire::ExecutableKind::Cubin,
+                path: path.clone(),
+                nbytes: span.nbytes,
+            });
+            cubins_by_sha256
+                .entry(digest)
+                .or_default()
+                .push((resource_index, path));
+            resource_index
+        };
         let mut globals = Vec::new();
         for (global_index, global) in module.globals.iter().enumerate() {
             let span = bundle
@@ -2002,7 +2030,7 @@ fn rank_plan(
         }
         modules.push(pwire::Module {
             name: module.name.clone(),
-            cubin: index as u32,
+            cubin: cubin_index,
             globals,
         });
     }
@@ -5156,6 +5184,96 @@ mod payload_export_tests {
         // core identity differs.
         assert_eq!(first_payloads, second_payloads);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rank_plan_deduplicates_identical_cubin_resources_while_preserving_modules_and_globals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rank = staged_rank(dir.path());
+        // Add a second module with identical cubin bytes, plus distinct global payloads for both,
+        // and a third module with different cubin bytes.
+        let cubin_dup = b"cubin-bytes".to_vec();
+        let cubin_other = b"other-cubin".to_vec();
+        let global0 = b"g0-bytes".to_vec();
+        let global1 = b"g1-bytes".to_vec();
+        std::fs::write(dir.path().join("cubin-dup.bin"), &cubin_dup).unwrap();
+        std::fs::write(dir.path().join("cubin-other.bin"), &cubin_other).unwrap();
+        std::fs::write(dir.path().join("global-0.bin"), &global0).unwrap();
+        std::fs::write(dir.path().join("global-1.bin"), &global1).unwrap();
+
+        let bundle = &mut rank.index.ranks[0];
+        bundle.modules[0].globals.push(wire::Global {
+            symbol: "state".into(),
+            file: "global-0.bin".into(),
+            nbytes: global0.len() as u64,
+            relocations: vec![],
+        });
+        bundle.modules.push(wire::Module {
+            name: "kernel-dup".into(),
+            file: "cubin-dup.bin".into(),
+            globals: vec![wire::Global {
+                symbol: "state".into(),
+                file: "global-1.bin".into(),
+                nbytes: global1.len() as u64,
+                relocations: vec![],
+            }],
+        });
+        bundle.modules.push(wire::Module {
+            name: "kernel-other".into(),
+            file: "cubin-other.bin".into(),
+            globals: vec![],
+        });
+        for (name, offset, len) in [
+            ("cubin-dup.bin", 12288u64, cubin_dup.len() as u64),
+            ("cubin-other.bin", 16384, cubin_other.len() as u64),
+            ("global-0.bin", 20480, global0.len() as u64),
+            ("global-1.bin", 24576, global1.len() as u64),
+        ] {
+            bundle.resources.insert(
+                name.into(),
+                wire::Span {
+                    offset,
+                    nbytes: len,
+                    filename: String::new(),
+                },
+            );
+            rank.payload.push(FilePart {
+                offset,
+                source: FileSource {
+                    path: dir.path().join(name),
+                    offset: 0,
+                    nbytes: len,
+                },
+            });
+        }
+
+        let staging = dir.path().join("stage");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut leases = LeaseMap::new();
+        let plan = super::rank_plan(
+            &rank,
+            0,
+            1,
+            &[],
+            &staging,
+            "gb202-tp1",
+            None,
+            &mut leases,
+        )
+        .unwrap();
+        // 3 modules, but only 2 unique cubin resources + 1 graph resource = 3 resources total.
+        assert_eq!(plan.body.modules.len(), 3);
+        assert_eq!(plan.body.modules[0].cubin, 0);
+        assert_eq!(plan.body.modules[1].cubin, 0);
+        assert_eq!(plan.body.modules[2].cubin, 1);
+        assert_eq!(plan.body.graphs[0].resource, 2);
+        assert_eq!(plan.resources.len(), 3);
+        assert_eq!(plan.body.modules[0].globals.len(), 1);
+        assert_eq!(plan.body.modules[1].globals.len(), 1);
+        assert_ne!(
+            plan.body.modules[0].globals[0].contents.as_ref().unwrap().slice.as_ref().unwrap().offset,
+            plan.body.modules[1].globals[0].contents.as_ref().unwrap().slice.as_ref().unwrap().offset,
+        );
     }
 }
 

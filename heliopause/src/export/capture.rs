@@ -2812,6 +2812,96 @@ fn file_source(path: PathBuf) -> ExportResult<FileSource> {
     })
 }
 
+type FunctionSignature = (Vec<u64>, Vec<(i32, i32)>);
+
+struct CanonicalStatelessModule {
+    name: String,
+    cubin: Vec<u8>,
+    symbols: HashMap<String, FunctionSignature>,
+}
+
+/// Deduplicate stateless (`globals.is_empty()`), kernel-referenced CUmodules whose
+/// debug-stripped cubins are byte-identical (SHA-256 + exact byte equality) and whose
+/// referenced functions agree on `(parameter_sizes, attributes)` for every shared symbol.
+/// Rewrites duplicate functions' `module` references to the canonical module name so Helios
+/// loads a single `CUmodule` handle instead of thousands of duplicate driver modules.
+#[derive(Default)]
+struct StatelessModuleDeduplicator {
+    by_sha256: HashMap<[u8; 32], Vec<CanonicalStatelessModule>>,
+    deduped_modules: usize,
+    deduped_bytes: u64,
+}
+
+impl StatelessModuleDeduplicator {
+    fn function_signature(function: &wire::Function) -> FunctionSignature {
+        let mut attrs: Vec<(i32, i32)> = function
+            .attributes
+            .iter()
+            .map(|attr| (attr.id, attr.value))
+            .collect();
+        attrs.sort_unstable();
+        (function.parameter_sizes.clone(), attrs)
+    }
+
+    fn try_deduplicate(
+        &mut self,
+        name: &str,
+        exported: &[u8],
+        functions: &mut [wire::Function],
+    ) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        let mut incoming: HashMap<String, FunctionSignature> = HashMap::new();
+        for function in functions.iter().filter(|f| f.module == name) {
+            let sig = Self::function_signature(function);
+            if let Some(existing) = incoming.get(&function.symbol) {
+                if existing != &sig {
+                    return None;
+                }
+            } else {
+                incoming.insert(function.symbol.clone(), sig);
+            }
+        }
+        // Standalone modules (e.g. CodecLayout.gpu_module) have no captured functions and are
+        // looked up by exact module name; never collapse or rename them.
+        if incoming.is_empty() {
+            return None;
+        }
+        let digest: [u8; 32] = Sha256::digest(exported).into();
+        let bucket = self.by_sha256.entry(digest).or_default();
+        for canonical in bucket.iter_mut() {
+            if canonical.cubin.as_slice() != exported {
+                continue;
+            }
+            let compatible = incoming.iter().all(|(symbol, sig)| {
+                canonical
+                    .symbols
+                    .get(symbol)
+                    .is_none_or(|existing| existing == sig)
+            });
+            if compatible {
+                for (symbol, sig) in incoming {
+                    canonical.symbols.entry(symbol).or_insert(sig);
+                }
+                for function in functions.iter_mut() {
+                    if function.module == name {
+                        function.module = canonical.name.clone();
+                    }
+                }
+                self.deduped_modules += 1;
+                self.deduped_bytes += exported.len() as u64;
+                return Some(canonical.name.clone());
+            }
+        }
+        bucket.push(CanonicalStatelessModule {
+            name: name.to_owned(),
+            cubin: exported.to_vec(),
+            symbols: incoming,
+        });
+        None
+    }
+}
+
 pub(crate) fn capture_rank(
     request: &CaptureRequest,
     recorder: Option<&Recorder>,
@@ -3236,19 +3326,21 @@ pub(crate) fn capture_rank(
     let module_phase = progress.phase("Capture compiled modules and globals", None);
     let mut module_bytes = 0u64;
     let mut downloader = Downloader::new(&cuda)?;
+    let mut module_dedup = StatelessModuleDeduplicator::default();
     for (index, (name, image)) in modules.into_iter().enumerate() {
         let file = format!("module-{index}.cubin");
         let exported = cubin::strip_debug(&image)?;
-        module_bytes += exported.len() as u64;
-        module_phase.advance_bytes(exported.len() as u64);
-        fs::write(stage.path.join(&file), exported)?;
+        let global_symbols = cubin::global_symbols(&image)?;
         let mut globals = Vec::new();
         let Some(kernel) = kernels.iter().find(|k| k.module == name) else {
-            if !cubin::global_symbols(&image)?.is_empty() {
+            if !global_symbols.is_empty() {
                 return Err(invalid(format!(
                     "standalone module {name} declares globals without a captured kernel"
                 )));
             }
+            module_bytes += exported.len() as u64;
+            module_phase.advance_bytes(exported.len() as u64);
+            fs::write(stage.path.join(&file), &exported)?;
             output.index.ranks[0].modules.push(wire::Module {
                 name,
                 file: file.clone(),
@@ -3257,6 +3349,16 @@ pub(crate) fn capture_rank(
             other_resources.push((file.clone(), file_source(stage.path.join(file))?));
             continue;
         };
+        if global_symbols.is_empty()
+            && module_dedup
+                .try_deduplicate(&name, &exported, &mut output.index.ranks[0].functions)
+                .is_some()
+        {
+            continue;
+        }
+        module_bytes += exported.len() as u64;
+        module_phase.advance_bytes(exported.len() as u64);
+        fs::write(stage.path.join(&file), &exported)?;
         let mut module = std::ptr::null_mut();
         cu!(
             &cuda,
@@ -3265,7 +3367,7 @@ pub(crate) fn capture_rank(
             &mut module,
             kernel.function as Handle
         )?;
-        for symbol in cubin::global_symbols(&image)? {
+        for symbol in global_symbols {
             let symbol_c = std::ffi::CString::new(symbol.clone())?;
             let (mut address, mut size) = (0u64, 0usize);
             cu!(
@@ -3335,7 +3437,9 @@ pub(crate) fn capture_rank(
         other_resources.push((file.clone(), file_source(stage.path.join(file))?));
     }
     module_phase.finish(format!(
-        "{module_bytes} bytes, {} global bytes downloaded",
+        "{module_bytes} bytes, {} duplicate modules deduplicated ({} bytes saved), {} global bytes downloaded",
+        module_dedup.deduped_modules,
+        module_dedup.deduped_bytes,
         downloader.downloaded
     ));
     let storage_phase = progress.phase(
@@ -5077,5 +5181,61 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stateless_module_dedup_merges_identical_cubins_and_preserves_conflicts_and_standalones() {
+        let func = |module: &str, symbol: &str, params: &[u64], attrs: &[(i32, i32)]| wire::Function {
+            module: module.into(),
+            symbol: symbol.into(),
+            parameter_sizes: params.to_vec(),
+            attributes: attrs
+                .iter()
+                .map(|&(id, value)| wire::FunctionAttribute { id, value })
+                .collect(),
+        };
+        let mut functions = vec![
+            func("module-0", "kern_a", &[8, 4], &[(8, 65536), (9, 50)]),
+            // Identical cubin, same symbol & attributes (in different order) -> merges into module-0.
+            func("module-1", "kern_a", &[8, 4], &[(9, 50), (8, 65536)]),
+            // Identical cubin, distinct symbol -> merges into module-0.
+            func("module-2", "kern_b", &[8], &[(8, 0)]),
+            // Identical cubin, same symbol kern_a with DIFFERENT dynamic smem attribute -> must stay distinct!
+            func("module-3", "kern_a", &[8, 4], &[(8, 131072), (9, 50)]),
+            // Matches module-3's attribute set -> merges into module-3!
+            func("module-4", "kern_a", &[8, 4], &[(8, 131072), (9, 50)]),
+            // Different cubin bytes -> must stay distinct.
+            func("module-5", "kern_a", &[8, 4], &[(8, 65536), (9, 50)]),
+        ];
+        let cubin_a = b"\x7fELF-cubin-A-payload";
+        let cubin_b = b"\x7fELF-cubin-B-payload";
+        let mut dedup = StatelessModuleDeduplicator::default();
+
+        // Standalone module (no functions) is never collapsed even if cubin matches.
+        assert_eq!(dedup.try_deduplicate("kv_codec_gpu", cubin_a, &mut functions), None);
+        assert_eq!(dedup.try_deduplicate("module-0", cubin_a, &mut functions), None);
+        assert_eq!(
+            dedup.try_deduplicate("module-1", cubin_a, &mut functions),
+            Some("module-0".into())
+        );
+        assert_eq!(
+            dedup.try_deduplicate("module-2", cubin_a, &mut functions),
+            Some("module-0".into())
+        );
+        assert_eq!(dedup.try_deduplicate("module-3", cubin_a, &mut functions), None);
+        assert_eq!(
+            dedup.try_deduplicate("module-4", cubin_a, &mut functions),
+            Some("module-3".into())
+        );
+        assert_eq!(dedup.try_deduplicate("module-5", cubin_b, &mut functions), None);
+
+        assert_eq!(functions[0].module, "module-0");
+        assert_eq!(functions[1].module, "module-0");
+        assert_eq!(functions[2].module, "module-0");
+        assert_eq!(functions[3].module, "module-3");
+        assert_eq!(functions[4].module, "module-3");
+        assert_eq!(functions[5].module, "module-5");
+        assert_eq!(dedup.deduped_modules, 3);
+        assert_eq!(dedup.deduped_bytes, (3 * cubin_a.len()) as u64);
     }
 }
