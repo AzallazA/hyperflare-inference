@@ -587,7 +587,7 @@ impl Staged {
                 .ok_or_else(|| invalid("embedding tables lack a consuming graph"))
         }).collect::<Result<Vec<_>>>()?;
         let staging_bytes = engram.iter().zip(&engram_tokens).try_fold(0u64,
-            |total, ((index, _), tokens)| total.checked_add(crate::engram::staging_bytes(index, *tokens)?)
+            |total, ((index, ranks), tokens)| total.checked_add(crate::engram::staging_bytes(index, *tokens, ranks.len())?)
                 .ok_or_else(|| invalid("embedding staging exceeds the memory budget")))?;
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
@@ -983,7 +983,18 @@ impl NativeModel {
                 {
                     let first = ranks[0];
                     let pin_cpu_base = next_engram_cpu;
-                    next_engram_cpu += table_storage[position].len();
+                    next_engram_cpu += index
+                        .tables
+                        .iter()
+                        .zip(&table_storage[position])
+                        .map(|(table, storage)| {
+                            if table.per_rank && *storage == crate::engram::Storage::Ram {
+                                ranks.len()
+                            } else {
+                                1
+                            }
+                        })
+                        .sum::<usize>();
                     let shared = crate::engram::Shared::new(
                         index,
                         &direct_files,

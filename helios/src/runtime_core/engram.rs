@@ -224,7 +224,9 @@ pub(super) fn decode<F: super::payload::Files>(
             })
         };
         let planes = [plane(weights, row_bytes)?, plane(scales, scale_bytes)?];
-        let compact_heads = (gpu && !table.shards.is_empty() && world > 1 && heads % world == 0)
+        // Compact rank-local head staging works for both partitioned and shared host tables
+        // whenever the GPU writes per-rank row IDs to its own mapped mailbox.
+        let compact_heads = (gpu && world > 1 && heads % world == 0)
             .then_some(heads / world);
         let mut staged_heads: Option<usize> = None;
         for core in cores {
@@ -334,9 +336,11 @@ pub(super) fn decode<F: super::payload::Files>(
                 }
             }
         }
+        let staged_heads = staged_heads.unwrap_or(heads);
         tables.push(Table {
             planes,
-            heads: staged_heads.unwrap_or(heads),
+            heads: staged_heads,
+            per_rank: staged_heads < heads,
             weights: table.weight_buffer,
             scales: table.scale_buffer,
             hashes: table.hash_buffer,
@@ -690,12 +694,14 @@ mod tests {
         let (legacy_catalog, legacy_core) = decode_fixture(4, 24, true, true);
         let legacy = decode(legacy_catalog, &archive, &[legacy_core], 0, 4).unwrap();
         assert_eq!(legacy.tables[0].heads, 24);
-        let legacy_staging = crate::engram::staging_bytes(&legacy, 16384).unwrap();
+        assert!(!legacy.tables[0].per_rank);
+        let legacy_staging = crate::engram::staging_bytes(&legacy, 16384, 1).unwrap();
 
         let (compact_catalog, compact_core) = decode_fixture(4, 6, true, true);
         let compact = decode(compact_catalog, &archive, &[compact_core], 0, 4).unwrap();
         assert_eq!(compact.tables[0].heads, 6);
-        let compact_staging = crate::engram::staging_bytes(&compact, 16384).unwrap();
+        assert!(compact.tables[0].per_rank);
+        let compact_staging = crate::engram::staging_bytes(&compact, 16384, 1).unwrap();
         // 4x fewer staged payload bytes per frame (103.8 MiB -> 25.95 MiB at 16K tokens).
         assert_eq!(
             legacy_staging - 2 * 4,
@@ -710,15 +716,56 @@ mod tests {
             );
         }
 
-        // Unpartitioned and host-hashed tables still require all 24 canonical heads.
-        let (unpart_catalog, unpart_core) = decode_fixture(4, 6, false, true);
-        assert!(decode(unpart_catalog, &archive, &[unpart_core], 0, 4).is_err());
+        // Host-hashed tables still require all 24 canonical heads.
         let (host_catalog, host_core) = decode_fixture(4, 6, false, false);
         assert!(decode(host_catalog, &archive, &[host_core], 0, 1).is_err());
+        let (host_tp3_catalog, host_tp3_core) = decode_fixture(3, 8, false, false);
+        assert!(decode(host_tp3_catalog, &archive, &[host_tp3_core], 0, 3).is_err());
 
         // Sibling ranks passed together cannot disagree on staged head width.
         let (mixed_catalog, compact_rank) = decode_fixture(4, 6, true, true);
         let (_, legacy_rank) = decode_fixture(4, 24, true, true);
         assert!(decode(mixed_catalog, &archive, &[compact_rank, legacy_rank], 0, 4).is_err());
+    }
+
+    #[test]
+    fn shared_gpu_tp3_tables_accept_both_legacy_24_and_compact_8_head_staging() {
+        let archive = MemoryArchive::new();
+        // Backward compatibility: Wave 9D / Wave 10 shared TP3 packages keep 24 heads & per_rank=false.
+        let (legacy_catalog, legacy_core) = decode_fixture(3, 24, false, true);
+        let legacy = decode(legacy_catalog, &archive, &[legacy_core], 0, 3).unwrap();
+        assert_eq!(legacy.tables[0].heads, 24);
+        assert!(!legacy.tables[0].per_rank);
+
+        // Wave 11A compact shared TP3 package: 8 heads per rank & per_rank=true, sharing one host table.
+        let (compact_catalog, compact_core) = decode_fixture(3, 8, false, true);
+        let mut decoded = Vec::new();
+        for rank in 0..3 {
+            let index = decode(compact_catalog.clone(), &archive, std::slice::from_ref(&compact_core), rank, 3).unwrap();
+            assert_eq!(index.tables[0].heads, 8);
+            assert!(index.tables[0].per_rank);
+            decoded.push(index);
+        }
+        // All 3 ranks produce equal Index values so model.rs keeps 1x shared backing table in host RAM.
+        assert_eq!(decoded[0], decoded[1]);
+        assert_eq!(decoded[1], decoded[2]);
+
+        let legacy_staging = crate::engram::staging_bytes(&legacy, 16384, 3).unwrap();
+        let compact_staging = crate::engram::staging_bytes(&decoded[0], 16384, 3).unwrap();
+        // Total pinned staging across 3 per-rank lanes matches 1x legacy 24-head payload (only 2 extra u32 flags/frame).
+        assert_eq!(compact_staging - 3 * 2 * 4, legacy_staging - 2 * 4);
+
+        for bad_heads in [0, 4, 6, 9, 12, 23, 25] {
+            let (bad_catalog, bad_core) = decode_fixture(3, bad_heads, false, true);
+            assert!(
+                decode(bad_catalog, &archive, &[bad_core], 0, 3).is_err(),
+                "expected rejection for TP3 shared bad_heads={bad_heads}"
+            );
+        }
+
+        // Sibling ranks on a shared table cannot disagree on compact vs legacy head width.
+        let (mixed_catalog, compact_rank) = decode_fixture(3, 8, false, true);
+        let (_, legacy_rank) = decode_fixture(3, 24, false, true);
+        assert!(decode(mixed_catalog, &archive, &[compact_rank, legacy_rank], 0, 3).is_err());
     }
 }

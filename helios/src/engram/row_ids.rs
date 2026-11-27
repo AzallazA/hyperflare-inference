@@ -40,7 +40,7 @@ impl RowHash {
         self.orders.iter().copied().max().unwrap_or(2).max(2) as usize - 1
     }
 
-    fn heads(&self) -> usize {
+    pub(super) fn heads(&self) -> usize {
         self.primes.len()
     }
 

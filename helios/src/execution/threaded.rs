@@ -785,6 +785,7 @@ mod tests {
                                     row_bytes,
                                 }),
                                 heads: 24,
+                                per_rank: false,
                                 weights: "weights".into(),
                                 scales: "scales".into(),
                                 hashes: "hashes".into(),
@@ -891,7 +892,7 @@ mod tests {
                             file: rank, offset: rank as u64 * 4096,
                             nbytes: (100 + rank) * row_bytes, row_bytes,
                         }),
-                        heads: 24, weights: "weights".into(), scales: "scales".into(),
+                        heads: 24, per_rank: false, weights: "weights".into(), scales: "scales".into(),
                         hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()), hash: None,
                     }] }, if partitioned { 1 } else { 4 })
                 }).collect();

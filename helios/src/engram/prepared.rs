@@ -118,6 +118,7 @@ impl PreparedTables {
             tables.push(Table {
                 planes: [planes[0], planes[1]],
                 heads: source.heads,
+                per_rank: false,
                 weights: source.weights.clone(),
                 scales: source.scales.clone(),
                 hashes: source.hashes.clone(),

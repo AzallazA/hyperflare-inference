@@ -1394,9 +1394,20 @@ impl Reader {
         self.gather_threads = threads.max(1);
         self
     }
-    /// A reader over already-loaded resident planes (prepared tables); prefill-sized gathers
-    /// fan out with the same default cap the package loader configures.
-    #[cfg(unix)]
+    /// Configured CPU gather fan-out cap for this reader.
+    pub(super) fn gather_threads(&self) -> usize {
+        self.gather_threads
+    }
+    /// Shared immutable RAM planes when this reader is RAM-resident.
+    pub(super) fn ram_planes(&self) -> Option<&[Arc<Resident>; 2]> {
+        match &self.data {
+            Data::Ram(planes) => Some(planes),
+            Data::Disk(_) | Data::Cached(_) => None,
+        }
+    }
+    /// A reader over already-loaded resident planes (prepared tables or per-rank
+    /// compact views of a shared RAM table); prefill-sized gathers fan out with
+    /// the same default cap the package loader configures.
     pub(super) fn resident(data: [Arc<Resident>; 2], stats: Arc<Stats>) -> Self {
         Self {
             data: Data::Ram(data),

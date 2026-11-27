@@ -271,7 +271,7 @@ pub(super) fn run_reader(
     hash: &RowHash,
     reader: &mut reader::Reader,
     planes: &[Plane; 2],
-    buffers: &[Staging; STAGING_FRAMES],
+    buffers: &[Arc<[Staging; STAGING_FRAMES]>],
     row_bytes: usize,
     stop: &AtomicBool,
     stats: &Stats,
@@ -282,7 +282,8 @@ pub(super) fn run_reader(
         match next_work(&receiver, advisory, &mut held, stop) {
             Work::Gather(job) => {
                 let sequence = job.sequence;
-                serve(reader, planes, buffers, row_bytes, stop, job);
+                let lane = job.lane;
+                serve(reader, planes, &buffers[lane], row_bytes, stop, job);
                 advisory.served(sequence);
             }
             Work::Warm(window) => {
@@ -294,8 +295,10 @@ pub(super) fn run_reader(
                     // then reports only its cancellation.
                     stats.read_ahead_errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!("Engram read-ahead failed; failing the table: {error}");
-                    for frame in buffers {
-                        frame.error.lock().unwrap().get_or_insert_with(|| error.clone());
+                    for lane_buffers in buffers {
+                        for frame in lane_buffers.iter() {
+                            frame.error.lock().unwrap().get_or_insert_with(|| error.clone());
+                        }
                     }
                     stop.store(true, Ordering::Release);
                 }
@@ -335,7 +338,8 @@ impl Shared {
         };
         let disk_tables = self.layers.iter().filter(|layer| layer.advisory.is_some()).count().max(1);
         let capacity = self.stats.capacity_rows.load(Ordering::Relaxed) as usize / disk_tables;
-        (capacity / 4).min(SLOTS * BATCH_ROWS) / entry.heads.max(1)
+        let predicted_heads = entry.hash.as_ref().map_or(entry.heads, |hash| hash.heads()).max(1);
+        (capacity / 4).min(SLOTS * BATCH_ROWS) / predicted_heads
     }
 
     /// Record, for every table that reads ahead, that step `sequence` launches the prompt of
@@ -379,7 +383,7 @@ impl Shared {
             return first;
         }
         let end = end.min(tokens.len());
-        let heads = self.index.tables[table].heads.max(1);
+        let heads = hash.heads().max(1);
         let step = (BATCH_ROWS / heads).max(1);
         let mut position = first;
         {
@@ -460,6 +464,7 @@ mod tests {
 
     fn device_job(flag: &AtomicU64, sequence: u64) -> Job {
         Job {
+            lane: 0,
             frame: 0,
             generation: 1,
             sequence,
@@ -508,7 +513,7 @@ mod tests {
         assert!(advisory.queue.lock().unwrap().is_empty());
         cancelled.store(false, Ordering::Release);
         sender
-            .send(Job { frame: 1, generation: 2, sequence: 7, requests: Requests::Host(vec![1]) })
+            .send(Job { lane: 0, frame: 1, generation: 2, sequence: 7, requests: Requests::Host(vec![1]) })
             .unwrap();
         push(&advisory, window(0, 1, 4, 5, &tokens));
         assert!(matches!(next_work(&receiver, &advisory, &mut held, &cancelled), Work::Gather(_)));
@@ -542,7 +547,7 @@ mod tests {
         unpark();
         assert_eq!(wait(), "warm");
         sender
-            .send(Job { frame: 0, generation: 1, sequence: 1, requests: Requests::Host(vec![]) })
+            .send(Job { lane: 0, frame: 0, generation: 1, sequence: 1, requests: Requests::Host(vec![]) })
             .unwrap();
         unpark();
         assert_eq!(wait(), "gather");
