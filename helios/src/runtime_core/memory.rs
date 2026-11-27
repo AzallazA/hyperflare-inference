@@ -1123,13 +1123,17 @@ impl NativeModel {
         }
         summary.push_str(&format!(" · {pages} KV pages · {} shared snapshot slots", rows - execution));
         progress.phase("Plan cache", None).finish(summary);
+        let compression = options.prefix_cache.compression;
+        let codec_layout = (compression != crate::offload::KvCompression::Off)
+            .then(|| contract.cache.codec_layout.as_ref())
+            .flatten();
         unsafe {
             self.allocate_cache_capacity(
                 cores,
                 progress,
                 &contract,
                 codec_layout,
-                cfg.compression,
+                compression,
                 rows,
                 pages,
                 execution,
