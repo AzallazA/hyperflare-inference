@@ -89,9 +89,13 @@ def test_engram_inputs_allocate_validation_and_shapes(monkeypatch):
         assert compact.scales.shape == (128 * heads, 8)
         assert compact.hashes.shape == (128, heads)
 
-    for bad in (0, -1, 25, 6.0, True):
-        with pytest.raises(ValueError, match="1 and 24 staged heads"):
+    for bad in (0, -1, 5, 25, 6.0, True):
+        with pytest.raises(ValueError, match="must divide 24"):
             EngramInputs.allocate(8, "cpu", timings=timings, heads=bad)
+
+    for heads, world in ((12, 4), (6, 1), (8, 4)):
+        with pytest.raises(ValueError, match="invalid for world size"):
+            EngramInputs.allocate(8, "cpu", timings=timings, heads=heads, world=world)
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4, 6, 8])
@@ -231,6 +235,17 @@ def test_prepared_engram_requests_validation_errors(monkeypatch):
             head_indices=(0, 4, 8, 12, 16, 20),
         )
 
+    rows = geometry.num_embeddings[0]
+    _, tp4_mapping, _ = _partition_mapping(geometry.offsets[0], rows, 0, 4)
+    # TP4 owns 6 heads; staging 12 heads must be rejected at preparation (matching Helios decode).
+    with pytest.raises(ValueError, match="invalid for world size 4"):
+        PreparedEngramRequests(
+            _make_inputs(tokens, 12), token_ids, starts, history, counts,
+            torch.zeros(tokens * 12 + 1, dtype=torch.int64), sequence,
+            layer=1, token_map=token_map, geometry=geometry, session=None, name="tp4_wrong_heads",
+            row_mapping=tp4_mapping, head_indices=tuple(range(12)),
+        )
+
 
 def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
     geometry = b12x_engram.build_geometry(layer_ids=(1,), base_table_size=101, compressed_vocab_size=32)
@@ -266,7 +281,6 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
         layer=1, token_map=token_map, geometry=geometry, session=None, name="compact_lookup",
     ).functional(session=None)
     assert compact_lookup.plan is None
-    assert compact_lookup.heads == 6
     assert compact_lookup.table_rows == rows
 
     # Wrong output width must raise immediately.
@@ -274,6 +288,14 @@ def test_prepared_engram_lookup_dispatch_validation_and_fx_tracing(monkeypatch):
         PreparedEngramLookup(
             compact_inputs, torch.empty((tokens, 6144), dtype=torch.bfloat16), count,
             layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_out",
+        )
+
+    # Mismatched world size on runtime must raise immediately.
+    with pytest.raises(ValueError, match="invalid for world size 4"):
+        PreparedEngramLookup(
+            _make_inputs(tokens, 12), torch.empty((tokens, 12 * 256), dtype=torch.bfloat16), count,
+            layer=1, token_map=token_map, geometry=geometry, session=None, name="bad_world",
+            runtime=SimpleNamespace(world_size=4),
         )
 
     # Legacy 24-head path still uses b12x plan and flare::staged_engram.
