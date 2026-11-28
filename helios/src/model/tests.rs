@@ -2054,6 +2054,9 @@ fn wide_copy_verify_catalog_packs_23_sam_tokens_and_preserves_legacy_w8_cores() 
         .contract
         .graphs
         .retain(|g| retained_names.contains(&g.graph));
+    // Post-selection config keeps only primary MTP widths [1, 8] in speculative_widths
+    // while wide copy-only graphs (1x16, 1x24, 2x16, 4x16) remain in the manifest.
+    wide_cfg.speculative_widths = vec![1, 8];
 
     catalog::validate(&wide_cfg, &wide_manifest).unwrap();
     let mut inputs = Inputs::new(&wide_cfg, &wide_manifest).unwrap();
@@ -2062,14 +2065,8 @@ fn wide_copy_verify_catalog_packs_23_sam_tokens_and_preserves_legacy_w8_cores() 
     let capabilities = scheduler_capabilities_with_manifest(&wide_cfg, &wide_manifest).unwrap();
     let mut scheduler = RequestScheduler::new(wide_cfg.identity, wide_cfg.limits, capabilities).unwrap();
     scheduler.enable_speculation(&wide_cfg.speculative_widths).unwrap();
-    scheduler
-        .speculative_graphs(&[
-            (1, 1), (1, 8), (1, 16), (1, 24),
-            (2, 1), (2, 8), (2, 16),
-            (4, 1), (4, 8), (4, 16),
-        ])
-        .unwrap();
     scheduler.enable_history_drafts().unwrap();
+    scheduler.shape_catalogs(&wide_manifest.graphs).unwrap();
     // Set realistic speculative graph durations so W=24 Copy (6.45ms) beats W=8 MTP (6.0ms) and W=1 (5.5ms) on a 23-token SAM match.
     for g in &mut wide_manifest.graphs {
         if g.kind == GraphKind::Speculative {

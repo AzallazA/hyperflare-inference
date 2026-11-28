@@ -508,11 +508,11 @@ impl LoadOptions {
                     && (graph.kind != "decode" || !enabled)
                     && (!(graph.kind == "speculative" || graph.kind == "mixed" && enabled)
                         || enabled
-                            && widths.contains(&(graph.token_capacity as usize))
-                            && (copy_wide
-                                || (graph.draft_source == source
+                            && (copy_wide && graph.token_capacity as usize <= completion_token_capacity
+                                || widths.contains(&(graph.token_capacity as usize))
+                                    && graph.draft_source == source
                                     && graph.draft_tokens.is_some_and(|depth| depth <= drafts as u32)
-                                    && (graph.token_capacity == 1 || fixed.is_none_or(|width| graph.token_capacity == width as u64)))))
+                                    && (graph.token_capacity == 1 || fixed.is_none_or(|width| graph.token_capacity == width as u64))))
                     && (graph.kind != "speculative" || graph.token_capacity == 1
                         || graph.packed_token_capacity <= selected_token_capacity
                             && (copy_wide || self.mtp_verification_token_budget.is_none_or(|budget|
@@ -603,21 +603,11 @@ impl LoadOptions {
                 .flatten();
             prune_kernels(core, keep_codec_module)?;
         }
+        // Keep copy-only widths out of `speculative_widths` so MTP service-rate normalization,
+        // delivery reference intervals, and lookahead never price requests against unrealizable
+        // copy-only graphs. Retained wide copy graphs remain available in `execution.graphs`.
         let retained_widths: Vec<_> = if !enabled {
             Vec::new()
-        } else if retain_wide_copy {
-            let live_widths: BTreeSet<usize> = cores
-                .first()
-                .and_then(|core| core.execution.as_ref())
-                .into_iter()
-                .flat_map(|execution| execution.graphs.iter())
-                .filter(|graph| graph.kind == "speculative")
-                .map(|graph| graph.token_capacity as usize)
-                .collect();
-            widths
-                .into_iter()
-                .filter(|width| *width == 1 || live_widths.contains(width))
-                .collect()
         } else {
             widths
                 .into_iter()
@@ -2146,13 +2136,14 @@ mod tests {
             "speculative_proposal_source": "mtp",
         });
 
-        // With history_drafts = true: retains both MTP graphs and wide copy graphs.
+        // With history_drafts = true: retains both MTP graphs and wide copy graphs, while keeping
+        // copy-only widths (16, 24) out of `speculative_widths` so MTP normalization is isolated.
         let mut with_history = [make_core()];
         let mut with_cfg = cfg();
         LoadOptions { history_drafts: Some(true), ..Default::default() }
             .select(&mut with_history, &mut with_cfg)
             .unwrap();
-        assert_eq!(with_cfg["speculative_widths"], serde_json::json!([1, 6, 16, 24]));
+        assert_eq!(with_cfg["speculative_widths"], serde_json::json!([1, 6]));
         assert!(with_history[0]
             .execution
             .as_ref()
@@ -2161,7 +2152,7 @@ mod tests {
             .iter()
             .any(|g| g.name == "copy-speculative1x24"));
 
-        // With history_drafts = false (and default None): prunes wide copy graphs and narrows speculative_widths.
+        // With history_drafts = false (and default None): prunes wide copy graphs and keeps MTP widths.
         for opt in [Some(false), None] {
             let mut without_history = [make_core()];
             let mut without_cfg = cfg();
@@ -2178,7 +2169,7 @@ mod tests {
                 .any(|g| g.draft_source == 2));
         }
 
-        // Tighter verification token budget prunes wide copy graphs above budget without leaving dangling widths.
+        // Tighter verification token budget prunes wide copy graphs above budget while keeping MTP widths.
         let mut budgeted = [make_core()];
         let mut budgeted_cfg = cfg();
         LoadOptions {
@@ -2188,7 +2179,7 @@ mod tests {
         }
         .select(&mut budgeted, &mut budgeted_cfg)
         .unwrap();
-        assert_eq!(budgeted_cfg["speculative_widths"], serde_json::json!([1, 6, 16]));
+        assert_eq!(budgeted_cfg["speculative_widths"], serde_json::json!([1, 6]));
         assert!(budgeted[0]
             .execution
             .as_ref()

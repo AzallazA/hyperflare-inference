@@ -902,6 +902,10 @@ impl RequestScheduler {
         )?;
         self.speculative_graphs(
             &of(GraphKind::Speculative)
+                .filter(|g| {
+                    g.draft_source.unwrap_or(speculation::ProposalSource::Mtp)
+                        == self.proposal_source
+                })
                 .map(|g| (g.batch_capacity, g.token_capacity))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -1658,10 +1662,24 @@ impl RequestScheduler {
             .saturating_sub(request.private_pages.len())
     }
 
+    /// Maximum verification width any scheduled speculative round may run, including wide
+    /// copy-verify graphs kept outside the primary MTP `speculative_widths` catalog.
+    fn max_verification_width(&self) -> usize {
+        let primary = self.speculative_widths.last().copied().unwrap_or(1);
+        if self.proposal_source == speculation::ProposalSource::Mtp
+            && self.decoded_history.is_some()
+            && self.speculative_fixed_width.is_none()
+        {
+            primary.max(self.costs.max_copy_width())
+        } else {
+            primary
+        }
+    }
+
     /// Tokens a decoding request may consume before its next completion: two rounds
     /// at the widest verification, as two submissions may be in flight.
     fn decode_horizon(&self) -> u64 {
-        2 * self.speculative_widths.last().copied().unwrap_or(1) as u64
+        2 * self.max_verification_width() as u64
     }
 
     /// Whether a request's reservation covers its next decode rounds; reservations of
@@ -1803,7 +1821,7 @@ impl RequestScheduler {
 
     /// Tokens a request may consume, including the widest speculative verification.
     fn execution_limit(&self, prompt_tokens: usize, max_new_tokens: u32) -> usize {
-        let extra = self.speculative_widths.last().copied().unwrap_or(1) - 1;
+        let extra = self.max_verification_width() - 1;
         (prompt_tokens + max_new_tokens as usize)
             .saturating_add(extra)
             .min(self.limits.max_sequence_tokens)
@@ -2671,7 +2689,10 @@ impl RequestScheduler {
         self.refresh.validate(origin)?;
         if origin == PlanOrigin::AcceptanceStart
             && (self.speculative_fixed_width.is_some() || step.token_capacity <= 1
-                || !matches!(step.kind, GraphKind::Speculative | GraphKind::Mixed)) {
+                || !matches!(step.kind, GraphKind::Speculative | GraphKind::Mixed)
+                || (self.proposal_source == speculation::ProposalSource::Mtp
+                    && self.is_copy_only_step(step)))
+        {
             return Err("acceptance learning requires an adaptive speculative choice".into());
         }
         if let PlanOrigin::RefreshStart(target) = origin {
@@ -3225,7 +3246,9 @@ impl RequestScheduler {
         for (depth, value) in population {
             self.forecasts.observe_population(depth, value as f32);
         }
-        if let Some(confidence) = confidence {
+        if let Some(confidence) = confidence
+            && !copy_only_step
+        {
             self.observe_packed_forecasts(&step, records, confidence, &calibration);
         }
         for lane in &step.lanes {

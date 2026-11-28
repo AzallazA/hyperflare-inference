@@ -378,7 +378,14 @@ pub fn select_shape_with_source(
                 batch == 1 && config.contract.vision.patch_capacities.contains(&tokens)
             }
             GraphKind::Speculative => {
-                config.speculative_widths.contains(&tokens)
+                let copy_only_wide = draft_source == Some(speculation::ProposalSource::Copy)
+                    && config.speculative_proposal_source == speculation::ProposalSource::Mtp
+                    && !config.speculative_widths.is_empty()
+                    && config.history_drafts
+                    && config.speculative_fixed_width.is_none()
+                    && tokens > 1
+                    && tokens <= config.completion_token_capacity;
+                (config.speculative_widths.contains(&tokens) || copy_only_wide)
                     && drafts < config.completion_token_capacity
                     && packed >= batch && packed <= batch.saturating_mul(tokens)
                     && (tokens == 1 || packed <= config.speculative_token_capacity)

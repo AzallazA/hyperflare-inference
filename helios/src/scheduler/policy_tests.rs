@@ -69,10 +69,11 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
 }
 
 #[test]
-fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort() {
-    // Reproduces disjoint ragged token budgets across batch buckets (e.g., B=4 P=[5,8,13,20,32]
-    // vs wider padded B=8 P=[9,11,14,18,24,31,64]): a 4-request cohort must stay on tight B=4
-    // even if a wider padded batch reports a faster duration at an intermediate P=11.
+fn padding_pruning_enforces_strict_pareto_dominance_and_same_cohort() {
+    // Strict physical Pareto dominance requires every physical dimension of the smaller
+    // shape (batch, width, prefill, packed rows, drafts) to be <= the larger shape for the
+    // exact same request cohort (`mask`). A tighter batch with more packed rows (B=4, P=13
+    // vs B=8, P=11) is NOT Pareto-dominant and must not prune a faster B=8, P=11 shape.
     let mut s = engine(8, true);
     let b4_shapes = [5usize, 8, 13, 20, 32];
     let b8_shapes = [9usize, 11, 14, 18, 24, 31, 64];
@@ -80,7 +81,6 @@ fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort()
     graphs.retain(|g| !(g.kind == GraphKind::Speculative && g.token_capacity > 1));
     for g in &mut graphs {
         if g.kind == GraphKind::Speculative && g.token_capacity == 1 {
-            // Keep width-1 speculative slower than the packed speculative graphs under test.
             g.estimated_duration_ns = 15 * MS;
         }
     }
@@ -119,11 +119,29 @@ fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort()
             batch_capacity: 8,
             token_capacity: 8,
             prefill_capacity: 0,
-            // Deliberately faster than B=4 to prove pruning blocks padded batch leakage.
             estimated_duration_ns: if p == 11 { 7 * MS } else { 10 * MS },
             input_bindings: vec![],
         });
     }
+    // Also add an exact Pareto pair at P=32 where B=4, P=32 physically dominates B=8, P=32
+    // and B=8, P=64 because all 4 requests' ceilings (4 * 8 = 32) fit within P=32.
+    allocations.push((8, 7, 8, 32, crate::execution::PrefixAllocation::Gpu));
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 7,
+        draft_tokens: 7,
+        draft_source: None,
+        packed_token_capacity: 32,
+        name: "packed-speculative8x8-drafts7-tokens32".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        handle: 1,
+        batch_capacity: 8,
+        token_capacity: 8,
+        prefill_capacity: 0,
+        estimated_duration_ns: 6 * MS,
+        input_bindings: vec![],
+    });
     s.capabilities.speculative_allocations = allocations;
     s.measured_graph_durations(&graphs).unwrap();
     s.enable_speculation(&[1, 8]).unwrap();
@@ -134,33 +152,62 @@ fn tight_batch_prunes_wider_padded_ragged_speculative_shapes_for_active_cohort()
     let (values, age, _) = s.lane_values(s.window_remaining().unwrap());
     let mut candidates = Vec::new();
     s.candidates(&mut candidates, &values, age);
-    assert!(
-        candidates.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.packed_token_capacity == 11),
-        "setup must expose padded B=8 P=11 candidate before pruning"
-    );
     let count = s.prune_padding(&mut candidates);
     let retained = &candidates[..count];
+    // Non-Pareto B=8, P=11 (11 < 13) must survive against slower B=4, P=13.
     assert!(
-        retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 4 && c.packed_token_capacity == 13),
-        "tight B=4 ragged shapes must survive pruning"
+        retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.packed_token_capacity == 11),
+        "non-Pareto faster B=8 P=11 must NOT be pruned by B=4 P=13"
     );
+    // Strict physical Pareto dominance: B=4, P=32 dominates B=8, P=32 and B=8, P=64 for C=4.
     assert!(
-        !retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.capacity == 8),
-        "wider padded B=8 must be pruned for C=4 when tight B=4 covers full target token capacity"
+        !retained.iter().any(|c| c.kind == GraphKind::Speculative && c.batch == 8 && c.packed_token_capacity >= 32),
+        "strictly Pareto-dominated B=8 P>=32 must be pruned by B=4 P=32 for C=4"
     );
-
     let plan = s.plan().unwrap();
     assert_eq!(plan.kind, GraphKind::Speculative);
-    assert_eq!(plan.batch_capacity, 4, "C=4 must select tight B=4, never padded B=8");
-    assert_eq!(plan.lanes.len(), 4);
+    assert_eq!((plan.batch_capacity, plan.packed_token_capacity), (8, 11));
 
-    // Negative check: when C=6 exceeds B=4, B=8 is no longer padded relative to B=4 and is selected.
-    let more = (4..6).map(|id| add(&mut s, id, 64, 4096)).collect::<Vec<_>>();
-    ready(&mut s, &more);
-    let plan6 = s.plan().unwrap();
-    assert_eq!(plan6.kind, GraphKind::Speculative);
-    assert_eq!(plan6.batch_capacity, 8, "C=6 exceeds B=4 and must be allowed to select B=8");
-    assert_eq!(plan6.lanes.len(), 6);
+    // Distinct request cohorts (`mask`) must never prune one another even when B=4 <= B=8.
+    let mask_a = (1u64 << handles[0].slot) | (1u64 << handles[1].slot);
+    let mask_b = (1u64 << handles[2].slot) | (1u64 << handles[3].slot);
+    let mut cross_cohort = vec![
+        Candidate {
+            host_lengths: None,
+            draft_tokens: 7,
+            draft_source: Some(speculation::ProposalSource::Mtp),
+            kind: GraphKind::Speculative,
+            mask: mask_a,
+            batch: 4,
+            capacity: 8,
+            packed_token_capacity: 32,
+            prefill_capacity: 0,
+            prefill_slot: None,
+            work: 0,
+            duration_ns: 11 * MS,
+            expected: 2.0,
+            rate: ValueRate::new(11 * MS, 2.0, 0.0),
+            feedback: false,
+        },
+        Candidate {
+            host_lengths: None,
+            draft_tokens: 7,
+            draft_source: Some(speculation::ProposalSource::Mtp),
+            kind: GraphKind::Speculative,
+            mask: mask_b,
+            batch: 8,
+            capacity: 8,
+            packed_token_capacity: 32,
+            prefill_capacity: 0,
+            prefill_slot: None,
+            work: 0,
+            duration_ns: 9 * MS,
+            expected: 2.0,
+            rate: ValueRate::new(9 * MS, 2.0, 0.0),
+            feedback: false,
+        },
+    ];
+    assert_eq!(s.prune_padding(&mut cross_cohort), 2, "different mask cohorts must never prune each other");
 }
 
 #[test]
@@ -2561,16 +2608,18 @@ fn refresh_skips_infeasible_shapes_and_ranks_unattempted_tier_by_expected_value(
     }
     set_cost(&mut s, GraphKind::Speculative, 1, 8, MS / 10);
     assert_eq!(s.plan().unwrap().token_capacity, 8);
-    assert_eq!(s.costs.refresh_order(infeasible), (false, 0));
-    assert_eq!(s.costs.refresh_order(key(2)), (false, 0));
-    assert_eq!(s.costs.refresh_order(key(1)), (false, 0));
+    assert!(s.costs.refresh_order(infeasible) < base + MS);
+    assert_eq!(s.costs.refresh_order(key(2)), base + MS);
+    assert_eq!(s.costs.refresh_order(key(4)), base + MS);
+    assert_eq!(s.costs.refresh_order(key(1)), base + 2 * MS);
     s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    // Equal-timestamp stale keys (key(2), key(4) at base + MS) tie-break by expected value.
     assert_eq!(s.plan().unwrap().origin, PlanOrigin::RefreshStart(key(4)));
     s.costs.record_attempt(key(4));
-    assert_eq!(s.costs.refresh_order(key(4)), (true, s.now_ns));
+    assert_eq!(s.costs.refresh_order(key(4)), s.now_ns);
     assert_eq!(s.plan().unwrap().origin, PlanOrigin::RefreshStart(key(2)));
     s.costs.record_attempt(key(2));
-    assert_eq!(s.costs.refresh_order(key(2)), (true, s.now_ns));
+    assert_eq!(s.costs.refresh_order(key(2)), s.now_ns);
     assert_eq!(s.plan().unwrap().origin, PlanOrigin::RefreshStart(key(1)));
 }
 
@@ -2600,14 +2649,15 @@ fn refresh_commit_rechecks_credit_and_freezes_physical_cost_context() {
     timing.wall_ns = 12 * MS;
     s.advance_to(s.now_ns + timing.wall_ns).unwrap();
     complete_timed(&mut s, &first, fence, 0, false, timing);
-    assert_eq!(s.refresh_credit_ns(), -7_000_000.0);
+    // Negative debt is capped at -CREDIT_CAP_NS (-5 ms).
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
     assert!(!s.refresh.active());
     let order = s.costs.refresh_order(key);
     let pending = s.request(b).unwrap().pending;
     assert!(s.commit(&saved, Fence(fence.0 + 1)).is_err());
     assert_eq!(s.costs.refresh_order(key), order);
     assert_eq!(s.request(b).unwrap().pending, pending);
-    assert_eq!(s.refresh_credit_ns(), -7_000_000.0);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
     assert_eq!(s.submitted, fence);
 }
 
@@ -2631,12 +2681,13 @@ fn invalid_refresh_timing_pays_isolated_wall_time_once_without_refreshing_cost()
     assert!(s.submitted_step(fence).is_ok());
     s.advance_to(s.now_ns + timing.wall_ns).unwrap();
     s.complete(fence, &records, ExecutionTiming { queued: false, ..timing }).unwrap();
-    assert_eq!(s.refresh_credit_ns(), -95_000_000.0);
+    // Negative debt is capped at -CREDIT_CAP_NS (-5 ms) so a single slow probe cannot freeze refresh.
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
     assert_eq!(s.costs.observation(key), before);
     assert!(s.complete(fence, &records, timing).is_err());
-    assert_eq!(s.refresh_credit_ns(), -95_000_000.0);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
     s.idle().unwrap();
-    assert_eq!(s.refresh_credit_ns(), -95_000_000.0);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
 }
 
 #[test]
@@ -2771,13 +2822,11 @@ fn refresh_funding_requires_earned_credit_and_accounts_for_repeated_attempts_and
     let second = measured_step(&mut s, 20 * MS, 0);
     assert_eq!(second.origin, PlanOrigin::RefreshStart(key));
     refresh_ns += 20 * MS;
-    assert_eq!(s.refresh_credit_ns(), -15_000_000.0);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
     assert!(!s.refresh.active());
     assert!(refresh_ns as f64 <= ordinary_ns as f64 * 0.002 / 0.998 + (20 * MS) as f64);
-    assert!((s.refresh_credit_ns()
-        - (ordinary_ns as f64 * 0.002 / 0.998 - refresh_ns as f64)).abs() < 1e-6);
     s.idle().unwrap();
-    assert_eq!(s.refresh_credit_ns(), -15_000_000.0);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
 }
 
 #[test]
@@ -2795,18 +2844,28 @@ fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
     assert_eq!(s.plan().unwrap().token_capacity, 1);
     let mut ordinary_ns = 0;
     let mut probe_ns = 0;
+    let mut probe_count = 0usize;
     let mut recovered = false;
     for _ in 0..1800 {
         let plan = s.plan().unwrap();
         let duration = plan.estimated_duration_ns();
-        if plan.origin.is_acceptance() { probe_ns += duration; }
-        else { ordinary_ns += duration; }
+        if plan.origin.is_acceptance() {
+            probe_ns += duration;
+            probe_count += 1;
+        } else {
+            ordinary_ns += duration;
+        }
         let accepted = if s.request(handle).unwrap().generated_tokens < generated + 512 { 0 } else { 7 };
         if accepted == 7 && plan.origin == PlanOrigin::Ordinary && plan.token_capacity >= 6 {
             recovered = true;
         }
         step(&mut s, accepted);
-        assert!(probe_ns as f64 <= ordinary_ns as f64 * 0.01 / 0.99 + 17.0 * MS as f64 + 1.0);
+        // With negative debt floored at -CREDIT_CAP_NS, each probe consumes at most 2 * CREDIT_CAP_NS
+        // (10 ms) of credit, bounding probe frequency to ordinary_ns * 0.01 / 0.99 / (2 * CREDIT_CAP_NS).
+        assert!(
+            (probe_count.saturating_sub(1) as f64) * 2.0 * refresh::CREDIT_CAP_NS
+                <= ordinary_ns as f64 * 0.01 / 0.99 + 1.0
+        );
         if recovered { break; }
     }
     assert!(recovered, "an improved request must escape width one");
@@ -6599,17 +6658,13 @@ fn power_cap_restore_recovers_largest_prefill_chunk_across_idle_requests() {
     s.refresh.credit_ns = 0.0;
     s.idle().unwrap();
 
-    // Serve sequential 64,000-token prompts (< 2,495 ms each) separated by idle gaps.
-    // Request 2 earns ~2.58 ms (retained across idle); Request 3 reaches the 5.0 ms cap on its
-    // terminal chunk (retained across idle); Request 4's first prefill chunk fires Probe #1 on
-    // Prefill(8192) rather than an older smaller shape such as Prefill(256).
-    let mut ordinary_ns = 0u64;
-    let mut refresh_ns = 0u64;
-    let mut last_refresh_ns = 0u64;
-    let mut first_refresh: Option<cost::Key> = None;
+    // Serve sequential 64,000-token prompts separated by idle gaps.
+    // Age-primary refresh order refreshes the oldest stale shapes first (no starvation) while
+    // capped -5 ms debt ensures every stale shape, including Prefill(8192), recovers promptly.
+    let mut refreshed_targets = Vec::new();
     let mut ordinary_8192_after_recovery = 0usize;
 
-    for req_id in 2u32..=5 {
+    for req_id in 2u32..=80 {
         let handle = add(&mut s, req_id, 64_000, 1);
         while s.request(handle).is_ok() {
             let plan = s.plan().unwrap();
@@ -6620,8 +6675,7 @@ fn power_cap_restore_recovers_largest_prefill_chunk_across_idle_requests() {
             };
             match plan.origin {
                 PlanOrigin::Ordinary => {
-                    ordinary_ns += duration;
-                    if first_refresh.is_some()
+                    if refreshed_targets.contains(&key(GraphKind::Prefill, 8192))
                         && plan.kind == GraphKind::Prefill
                         && plan.token_capacity == 8192
                     {
@@ -6629,11 +6683,7 @@ fn power_cap_restore_recovers_largest_prefill_chunk_across_idle_requests() {
                     }
                 }
                 PlanOrigin::RefreshStart(target) => {
-                    if first_refresh.is_none() {
-                        first_refresh = Some(target);
-                    }
-                    refresh_ns += duration;
-                    last_refresh_ns = duration;
+                    refreshed_targets.push(target);
                 }
                 _ => {}
             }
@@ -6646,21 +6696,26 @@ fn power_cap_restore_recovers_largest_prefill_chunk_across_idle_requests() {
         if req_id == 2 {
             // Request 2 (< 2.495 s) earned partial positive credit that survives idle.
             assert!(s.refresh_credit_ns() > 0.0 && s.refresh_credit_ns() < refresh::CREDIT_CAP_NS);
-            assert!(first_refresh.is_none());
+            assert!(refreshed_targets.is_empty());
         } else if req_id == 3 {
             // Request 3 completes at full 5.0 ms credit, retained across idle for Request 4.
             assert_eq!(s.refresh_credit_ns(), refresh::CREDIT_CAP_NS);
-            assert!(first_refresh.is_none());
+            assert!(refreshed_targets.is_empty());
+        }
+        if ordinary_8192_after_recovery >= 12 {
+            break;
         }
     }
 
-    assert_eq!(first_refresh, Some(key(GraphKind::Prefill, 8192)));
+    // Oldest stale shapes (256/512/1024 at t=1s, tie-broken by expected value -> 1024 first)
+    // refresh before newer stale shapes, and capped debt lets Prefill(8192) recover too.
+    assert_eq!(refreshed_targets.first().copied(), Some(key(GraphKind::Prefill, 1024)));
+    assert!(refreshed_targets.contains(&key(GraphKind::Prefill, 8192)));
     assert!(ordinary_8192_after_recovery >= 12);
-    assert!(refresh_ns as f64 <= ordinary_ns as f64 * 0.002 / 0.998 + last_refresh_ns as f64);
 }
 
 #[test]
-fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
+fn timing_refresh_excludes_readiness_wait_and_caps_negative_debt() {
     use crate::execution::ReadinessIntervals;
     let timestamps = [1_000u64, 1_000 + 255 * MS, 1_000 + 255 * MS + 100]
         .into_iter()
@@ -6678,7 +6733,7 @@ fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
     assert!((state.credit_ns - (145 * MS) as f64 * 0.002 / 0.998).abs() < 1e-6);
     assert!((state.acceptance_credit_ns - (400 * MS) as f64 * 0.01 / 0.99).abs() < 1e-6);
 
-    // AcceptanceStart charges raw physical time (400 ms), including readiness wait.
+    // AcceptanceStart caps negative debt at -CREDIT_CAP_NS (-5 ms) even on a 400 ms spike.
     let mut acc_state = refresh::RefreshState::default();
     acc_state.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
     let dummy_step = ScheduledStep {
@@ -6698,9 +6753,9 @@ fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
     };
     acc_state.commit(PlanOrigin::AcceptanceStart, Fence(1), &dummy_step);
     acc_state.complete(PlanOrigin::AcceptanceStart, timing);
-    assert_eq!(acc_state.acceptance_credit_ns, -395.0 * MS as f64);
+    assert_eq!(acc_state.acceptance_credit_ns, -refresh::CREDIT_CAP_NS);
 
-    // RefreshStart excludes measured readiness wait: ActionCosts records 145 ms and debt is -140 ms.
+    // RefreshStart excludes measured readiness wait: ActionCosts records 145 ms and debt caps at -5 ms.
     let mut s = engine(1, false);
     let h = add(&mut s, 1, 512, 4);
     ready(&mut s, &[h]);
@@ -6714,7 +6769,7 @@ fn timing_refresh_excludes_readiness_wait_from_episode_debt() {
     s.advance_to(s.now_ns + timing.wall_ns).unwrap();
     complete_timed(&mut s, &plan, fence, 0, false, timing);
     assert_eq!(s.costs.duration_key(key), Some(145 * MS));
-    assert_eq!(s.refresh_credit_ns(), -140.0 * MS as f64);
+    assert_eq!(s.refresh_credit_ns(), -refresh::CREDIT_CAP_NS);
 }
 
 #[test]
@@ -6767,16 +6822,16 @@ fn attempted_stale_shapes_rotate_without_starvation_when_timing_is_invalid() {
             ExecutionTiming { wall_ns: 10 * MS, queued: false, ..Default::default() },
         );
         assert!(!s.costs.is_fresh(target));
-        assert_eq!(s.costs.refresh_order(target), (true, commit_ns));
+        assert_eq!(s.costs.refresh_order(target), commit_ns);
         commit_ns
     };
 
-    // Tier 0 drains largest-expected-value first: 8192 -> 7168 -> 5120.
+    // Equal timestamps tie-break by expected value: 8192 -> 7168 -> 5120.
     let t1 = invalid_probe(&mut s, 8192);
     let t2 = invalid_probe(&mut s, 7168);
     let t3 = invalid_probe(&mut s, 5120);
     assert!(t1 < t2 && t2 < t3);
-    // Once all feasible stale shapes are in Tier 1, oldest-attempt rotates back to 8192.
+    // Once all feasible stale shapes have been attempted, oldest-attempt rotates back to 8192.
     invalid_probe(&mut s, 8192);
 }
 
@@ -6941,5 +6996,300 @@ fn decode_refresh_value_reuses_each_decoding_lanes_forecast() {
         evaluations <= batches * decoding.len(),
         "{evaluations} curve evaluations for {batches} decode batch capacities and {} decoding lanes",
         decoding.len(),
+    );
+}
+
+#[test]
+fn age_primary_refresh_order_prevents_large_prefill_from_starving_smaller_stale_shape() {
+    // Bug 1 regression: an older stale smaller prefill (512) must be refreshed ahead of a
+    // newer stale larger prefill (8192) even across repeated expiry cycles.
+    let caps = [512, 4096, 8192];
+    let mut s = large_prefill_engine(&caps, &caps);
+    let key = |cap| cost::Key {
+        drafts: 0,
+        kind: GraphKind::Prefill,
+        batch: 1,
+        tokens: cap,
+        prefill: 0,
+        packed: 0,
+        draft_source: None,
+    };
+    let ttl = s.policy.estimate_ttl_ns;
+    s.advance_to(1_000 * MS).unwrap();
+    for &cap in &caps {
+        set_cost(&mut s, GraphKind::Prefill, 1, cap, 200 * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, cap, 250 * MS);
+    }
+    // Refresh 8192 later so 512 is strictly older when both become stale.
+    s.advance_to(10_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 8192, 220 * MS);
+    // Expire both 512 (observed at 1s) and 8192 (observed at 10s); keep 4096 fresh as Ordinary winner.
+    s.advance_to(10_000 * MS + ttl + 1_000 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 80 * MS);
+
+    let h = add(&mut s, 1, 65_536, 1);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    s.advance_to(s.now_ns + MS).unwrap();
+    complete_timed(&mut s, &init, fence, 0, false, gpu_time(MS));
+    assert_eq!(s.request(h).unwrap().phase, RequestPhase::Prefill);
+
+    assert!(s.costs.refresh_order(key(512)) < s.costs.refresh_order(key(8192)));
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let probe = s.plan().unwrap();
+    assert_eq!(
+        probe.origin,
+        PlanOrigin::RefreshStart(key(512)),
+        "older stale Prefill(512) must not be starved by newer stale Prefill(8192)"
+    );
+}
+
+#[test]
+fn copy_only_wide_graphs_stay_isolated_from_mtp_normalization_refresh_and_acceptance_probes() {
+    // Bugs 3 & 4 regression:
+    // - Wide copy-only shapes (1x16) stay outside `speculative_widths` / `speculative_catalog`
+    //   and never contaminate `service_rates`, `delivery_reference_intervals`, or `next_progress`.
+    // - `acceptance_probe` never spends MTP acceptance credit on `draft_source == Some(Copy)`.
+    // - `ActionCosts::stale_keys()` excludes Copy shapes so stale 1x16 never wins `RefreshStart`.
+    // - Wide copy-verify (1x16) STILL activates on a verbatim SAM copy match.
+    use crate::execution::{PrefixAllocation, TokenVector};
+    use crate::scheduler::speculation::ProposalSource;
+
+    let build_engine = |with_wide_copy: bool| {
+        let limits = SchedulerLimits {
+            max_active: 4,
+            request_slots: 4,
+            max_sequence_tokens: 4096,
+            prefill_chunk_size: 512,
+            pages: 128,
+            snapshots: 16,
+        };
+        let mut capabilities = super::tests::scheduler(4, 128, 16).capabilities.clone();
+        capabilities.completion_token_capacity = 16;
+        capabilities.vocabulary = 1024;
+        capabilities.speculative_allocations = vec![
+            (1, 0, 1, 1, PrefixAllocation::Host),
+            (2, 0, 1, 2, PrefixAllocation::Host),
+            (4, 0, 1, 4, PrefixAllocation::Host),
+            (1, 7, 8, 8, PrefixAllocation::Gpu),
+            (2, 7, 8, 16, PrefixAllocation::Gpu),
+            (4, 7, 8, 32, PrefixAllocation::Gpu),
+        ];
+        let mut graphs = super::tests::duration_graphs(4);
+        graphs.retain(|g| g.kind != GraphKind::Speculative);
+        for batch in [1usize, 2, 4] {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                draft_tokens: 0,
+                draft_source: Some(ProposalSource::Mtp),
+                packed_token_capacity: batch,
+                name: format!("speculative{batch}x1"),
+                kind: GraphKind::Speculative,
+                sampling_mode: SamplingMode::General,
+                handle: 1,
+                batch_capacity: batch,
+                token_capacity: 1,
+                prefill_capacity: 0,
+                estimated_duration_ns: 5_000_000,
+                input_bindings: vec![],
+            });
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 7,
+                draft_tokens: 7,
+                draft_source: Some(ProposalSource::Mtp),
+                packed_token_capacity: batch * 8,
+                name: format!("packed-speculative{batch}x8"),
+                kind: GraphKind::Speculative,
+                sampling_mode: SamplingMode::General,
+                handle: 1,
+                batch_capacity: batch,
+                token_capacity: 8,
+                prefill_capacity: 0,
+                estimated_duration_ns: 12_000_000 + (batch as u64 - 1) * 1_000_000,
+                input_bindings: vec![],
+            });
+        }
+        if with_wide_copy {
+            capabilities.speculative_allocations.push((1, 15, 16, 16, PrefixAllocation::Host));
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                draft_tokens: 15,
+                draft_source: Some(ProposalSource::Copy),
+                packed_token_capacity: 16,
+                name: "copy-speculative1x16".into(),
+                kind: GraphKind::Speculative,
+                sampling_mode: SamplingMode::General,
+                handle: 1,
+                batch_capacity: 1,
+                token_capacity: 16,
+                prefill_capacity: 0,
+                // Deliberately very fast (2 ms) to expose any accidental contamination.
+                estimated_duration_ns: 2_000_000,
+                input_bindings: vec![],
+            });
+        }
+        let mut s = RequestScheduler::new([0; 32], limits, capabilities).unwrap();
+        s.enable_speculation(&[1, 8]).unwrap();
+        s.speculative_graphs(&[(1, 1), (1, 8), (2, 1), (2, 8), (4, 1), (4, 8)]).unwrap();
+        s.enable_history_drafts().unwrap();
+        s.measured_graph_durations(&graphs).unwrap();
+        s
+    };
+
+    let mut plain = build_engine(false);
+    let mut hybrid = build_engine(true);
+    let advance_to_decode = |s: &mut RequestScheduler, prompt: Vec<u32>, first_tok: i64| -> RequestHandle {
+        let h = s.admit(RequestSpec {
+            prompt: prompt.clone(),
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 256,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+            tools: false,
+            reasoning_prompt: false,
+        }).unwrap();
+        for _ in 0..4 {
+            let plan = s.plan().unwrap();
+            if plan.kind == GraphKind::Speculative {
+                break;
+            }
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&plan, fence).unwrap();
+            let mut recs = vec![CompletionRecord::default(); 4];
+            let live = s.request(h).unwrap();
+            let is_prefill = plan.kind.is_prefill();
+            let mut vec_rec = TokenVector {
+                emitted_count: i64::from(is_prefill),
+                verification_width: 1,
+                tokens: vec![-1; 16],
+                ..Default::default()
+            };
+            if is_prefill {
+                vec_rec.tokens[0] = first_tok;
+            }
+            recs[h.slot as usize] = CompletionRecord {
+                generation: h.generation as i64,
+                submission_sequence: fence.0 as i64,
+                consumed_tokens: if is_prefill { prompt.len() as i64 } else { live.consumed_tokens as i64 },
+                generated_tokens: live.generated_tokens as i64 + i64::from(is_prefill),
+                token_id: if is_prefill { first_tok } else { -1 },
+                status: 1,
+                vector: Some(vec_rec),
+                ..Default::default()
+            };
+            s.advance_to(s.now_ns + MS).unwrap();
+            s.complete(fence, &recs, gpu_time(MS)).unwrap();
+        }
+        h
+    };
+
+    // 1. Request with NO copy match: service_rates and delivery_reference_intervals must match bit-for-bit.
+    let non_copy_prompt: Vec<u32> = (100..164).collect();
+    let h_plain = advance_to_decode(&mut plain, non_copy_prompt.clone(), 500);
+    let h_hybrid = advance_to_decode(&mut hybrid, non_copy_prompt, 500);
+    let plain_rates = plain.service_rates(plain.request(h_plain).unwrap());
+    let hybrid_rates = hybrid.service_rates(hybrid.request(h_hybrid).unwrap());
+    assert_eq!(hybrid_rates, plain_rates, "copy-only 1x16 must not contaminate MTP service_rates");
+    let mut delivery_in = [None; REQUEST_LANES];
+    delivery_in[h_plain.slot as usize] = plain_rates.1;
+    assert_eq!(
+        hybrid.delivery_reference_intervals(&delivery_in),
+        plain.delivery_reference_intervals(&delivery_in),
+        "copy-only 1x16 must not contaminate delivery_reference_intervals"
+    );
+
+    // 2. Request WITH a verbatim SAM match (prompt has [20..52] then suffix [20..26] + emitted 27):
+    //    - Ordinary plan selects 1x16 copy-only!
+    //    - Even when copy-only 1x16 is stale, stale_keys() excludes it so RefreshStart never targets Copy.
+    //    - When MTP is forced to W=1 and acceptance_probe runs, AcceptanceStart NEVER picks Copy 1x16.
+    hybrid.cancel(h_hybrid).unwrap();
+    let mut copy_prompt: Vec<u32> = (20..52).collect();
+    copy_prompt.extend(20..27); // ends with [20..26]; emitting 27 gives match_len=8 >= 6 and 24+ continuation tokens
+    let h_copy = advance_to_decode(&mut hybrid, copy_prompt, 27);
+    let ordinary = hybrid.plan().unwrap();
+    assert_eq!(ordinary.origin, PlanOrigin::Ordinary);
+    assert_eq!((ordinary.batch_capacity, ordinary.token_capacity), (1, 16));
+    assert!(hybrid.is_copy_only_step(&ordinary), "1x16 wide copy-verify must still activate on verbatim copy match");
+
+    // When MTP is forced to W=1 (depressed confidence) and copy calibration is depressed so
+    // W=1 wins Ordinary, acceptance_probe with optimistic=true must ONLY probe MTP (W=8),
+    // NEVER spending MTP acceptance credit on the Copy 1x16 graph.
+    let copy_step = ScheduledStep {
+        draft_tokens: 15,
+        draft_source: Some(ProposalSource::Copy),
+        kind: GraphKind::Speculative,
+        batch_capacity: 1,
+        token_capacity: 16,
+        packed_token_capacity: 16,
+        mixed: None,
+        lanes: vec![],
+        requires_feedback: true,
+    };
+    let mtp_w1 = ScheduledStep {
+        draft_tokens: 0,
+        draft_source: Some(ProposalSource::Mtp),
+        kind: GraphKind::Speculative,
+        batch_capacity: 1,
+        token_capacity: 1,
+        packed_token_capacity: 1,
+        mixed: None,
+        lanes: vec![],
+        requires_feedback: false,
+    };
+    let mtp_w8 = ScheduledStep {
+        draft_tokens: 7,
+        draft_source: Some(ProposalSource::Mtp),
+        kind: GraphKind::Speculative,
+        batch_capacity: 1,
+        token_capacity: 8,
+        packed_token_capacity: 8,
+        mixed: None,
+        lanes: vec![],
+        requires_feedback: false,
+    };
+    hybrid.costs.set_measured(&copy_step, 7_000_000);
+    hybrid.costs.set_measured(&mtp_w1, 5_000_000);
+    hybrid.costs.set_measured(&mtp_w8, 12_000_000);
+    // Depress copy calibration so 1x16 loses Ordinary to W=1, while optimistic copy UCB would
+    // easily beat W=1 (16 tokens in 7 ms) if copy shapes leaked into acceptance_probe.
+    for _ in 0..32 {
+        hybrid.request_mut(h_copy).unwrap().copy_calibration.as_mut().unwrap()
+            .observe_prefix(1, 15, 0, true, None);
+    }
+    // Also depress MTP forecast so W=1 wins Ordinary.
+    let generated = hybrid.request(h_copy).unwrap().generated_tokens;
+    for _ in 0..32 {
+        hybrid.request_mut(h_copy).unwrap().acceptance.observe(ProposalSource::Mtp, generated, 7, 0, true, None);
+    }
+    hybrid.forecasts.population.fill(0.05);
+    hybrid.refresh.credit_ns = 0.0;
+    hybrid.refresh.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+    let probe = hybrid.plan().unwrap();
+    assert_eq!(probe.origin, PlanOrigin::AcceptanceStart);
+    assert!(
+        !hybrid.is_copy_only_step(&probe),
+        "AcceptanceStart must never spend MTP acceptance credit on a Copy graph"
+    );
+    assert_eq!(probe.token_capacity, 8);
+    // Defense-in-depth: commit() also rejects PlanOrigin::AcceptanceStart on a copy-only step.
+    let mut forged_copy_probe = ordinary.clone();
+    forged_copy_probe.origin = PlanOrigin::AcceptanceStart;
+    assert!(
+        hybrid.commit(&forged_copy_probe, Fence(hybrid.submitted.0 + 1)).is_err(),
+        "commit must reject AcceptanceStart on a copy-only step"
+    );
+
+    // Stale Copy 1x16 must NOT appear in stale_keys() or compete in RefreshStart.
+    hybrid.advance_to(hybrid.now_ns + hybrid.policy.estimate_ttl_ns + MS).unwrap();
+    assert!(
+        hybrid.costs.stale_keys().all(|k| k.draft_source != Some(ProposalSource::Copy)),
+        "ActionCosts::stale_keys() must exclude Copy-source shapes"
     );
 }

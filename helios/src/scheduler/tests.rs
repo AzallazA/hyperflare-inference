@@ -4229,9 +4229,9 @@ fn wide_copy_verify_selects_w24_on_long_sam_match_and_falls_back_to_mtp_otherwis
     }
 
     let mut sched = RequestScheduler::new([0; 32], limits, capabilities).unwrap();
-    sched.enable_speculation(&[1, 8, 16, 24]).unwrap();
+    sched.enable_speculation(&[1, 8]).unwrap();
     sched
-        .speculative_graphs(&[(1, 1), (1, 8), (1, 16), (1, 24), (2, 1), (2, 8), (2, 16), (4, 1), (4, 8), (4, 16)])
+        .speculative_graphs(&[(1, 1), (1, 8), (2, 1), (2, 8), (4, 1), (4, 8)])
         .unwrap();
     sched.enable_history_drafts().unwrap();
     sched.measured_graph_durations(&graphs).unwrap();
@@ -4764,9 +4764,9 @@ fn history_drafts_preserves_pipelining_without_copy_match_and_syncs_on_copy_matc
     }
 
     let mut sched = RequestScheduler::new([0; 32], limits, capabilities).unwrap();
-    sched.enable_speculation(&[1, 6, 16]).unwrap();
+    sched.enable_speculation(&[1, 6]).unwrap();
     sched
-        .speculative_graphs(&[(1, 1), (1, 6), (1, 16), (2, 1), (2, 6), (2, 16), (4, 1), (4, 6), (4, 16)])
+        .speculative_graphs(&[(1, 1), (1, 6), (2, 1), (2, 6), (4, 1), (4, 6)])
         .unwrap();
     sched.enable_history_drafts().unwrap();
     sched.measured_graph_durations(&graphs).unwrap();

@@ -235,23 +235,6 @@ impl ActionCosts {
             .flatten()
     }
 
-    pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
-        let mtp = self.packed_round_duration_for(super::speculation::ProposalSource::Mtp, batch, width);
-        let copy = self.packed_round_duration_for(super::speculation::ProposalSource::Copy, batch, width);
-        match (mtp, copy) {
-            (Some(m), _) if m > 0 => Some(m),
-            (_, Some(c)) if c > 0 => Some(c),
-            (Some(0), _) => Some(0),
-            (None, Some(0)) if !self.packed_round_durations[super::speculation::ProposalSource::Mtp as usize]
-                .iter()
-                .any(|row| row.iter().any(Option::is_some)) =>
-            {
-                Some(0)
-            }
-            _ => None,
-        }
-    }
-
     pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
@@ -268,6 +251,18 @@ impl ActionCosts {
                     && key.draft_source != Some(super::speculation::ProposalSource::Copy)
             })
             .map(|(key, _)| key.drafts)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn max_copy_width(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(key, _)| {
+                key.kind == GraphKind::Speculative
+                    && key.draft_source == Some(super::speculation::ProposalSource::Copy)
+            })
+            .map(|(key, _)| key.tokens)
             .max()
             .unwrap_or(0)
     }
@@ -353,19 +348,19 @@ impl ActionCosts {
     }
 
     pub fn stale_keys(&self) -> impl Iterator<Item = Key> + '_ {
-        self.entries.iter().filter(|(_, estimate)| estimate.nanos != 0
-            && !estimate.fresh(self.now_ns, self.ttl_ns)).map(|(key, _)| *key)
+        self.entries
+            .iter()
+            .filter(|(key, estimate)| {
+                key.draft_source != Some(super::speculation::ProposalSource::Copy)
+                    && estimate.nanos != 0
+                    && !estimate.fresh(self.now_ns, self.ttl_ns)
+            })
+            .map(|(key, _)| *key)
     }
 
-    pub fn refresh_order(&self, key: Key) -> (bool, u64) {
-        self.entry(key).map_or((false, 0), |estimate| {
-            let stale_at = estimate.observed_at_ns.saturating_add(self.ttl_ns);
-            if estimate.last_attempt_ns >= stale_at {
-                (true, estimate.last_attempt_ns)
-            } else {
-                (false, 0)
-            }
-        })
+    pub fn refresh_order(&self, key: Key) -> u64 {
+        self.entry(key)
+            .map_or(0, |estimate| estimate.observed_at_ns.max(estimate.last_attempt_ns))
     }
 
     pub fn record_attempt(&mut self, key: Key) {
@@ -485,25 +480,25 @@ mod tests {
             make("b16w6p39", 5, 6, 39),
         ];
         let mut costs = ActionCosts::prepared(&graphs, 8).unwrap();
-        assert_eq!(costs.packed_round_duration(16, 4), Some(0));
+        assert_eq!(costs.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 4), Some(0));
         // Measured first entry must not be zeroed by trailing unmeasured sibling.
         costs.set_measured(&step_for(3, 4, 64), 24_000_000);
-        assert_eq!(costs.packed_round_duration(16, 4), Some(24_000_000));
-        assert_eq!(costs.packed_round_duration(16, 6), Some(0));
+        assert_eq!(costs.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 4), Some(24_000_000));
+        assert_eq!(costs.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 6), Some(0));
         // Measuring a faster second sibling replaces the positive minimum.
         costs.set_measured(&step_for(5, 6, 39), 18_000_000);
-        assert_eq!(costs.packed_round_duration(16, 4), Some(18_000_000));
-        assert_eq!(costs.packed_round_duration(16, 6), Some(18_000_000));
+        assert_eq!(costs.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 4), Some(18_000_000));
+        assert_eq!(costs.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 6), Some(18_000_000));
 
         // Reverse order: unmeasured first entry must not block a measured sibling.
         let mut reversed = ActionCosts::prepared(&graphs, 8).unwrap();
         reversed.set_measured(&step_for(5, 6, 39), 18_000_000);
-        assert_eq!(reversed.packed_round_duration(16, 4), Some(18_000_000));
-        assert_eq!(reversed.packed_round_duration(16, 6), Some(18_000_000));
+        assert_eq!(reversed.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 4), Some(18_000_000));
+        assert_eq!(reversed.packed_round_duration_for(super::super::speculation::ProposalSource::Mtp, 16, 6), Some(18_000_000));
     }
 
     #[test]
-    fn compute_refresh_duration_excludes_readiness_wait_and_refresh_order_partitions_tiers() {
+    fn compute_refresh_duration_excludes_readiness_wait_and_refresh_order_tracks_age() {
         use crate::execution::{ExecutionTiming, ReadinessIntervals, SamplingMode};
         let timestamps = [1_000u64, 256_000, 256_100]
             .into_iter()
@@ -556,21 +551,21 @@ mod tests {
         costs.advance_to(10_000, ttl);
         costs.record_attempt(key);
         costs.observe(&step, ExecutionTiming { gpu_ns, ..Default::default() });
-        // Becoming stale without a stale-period attempt places the key in Tier 0.
+        // Primary refresh order is age: observed_at_ns.max(last_attempt_ns).
         costs.advance_to(10_000 + ttl, ttl);
-        assert_eq!(costs.refresh_order(key), (false, 0));
-        // An attempt while stale that yields no valid observation moves it to Tier 1.
+        assert_eq!(costs.refresh_order(key), 10_000);
+        // An attempt while stale that yields no valid observation advances last_attempt_ns.
         costs.record_attempt(key);
-        assert_eq!(costs.refresh_order(key), (true, 10_000 + ttl));
-        // A later valid observation restores freshness; the next staleness returns to Tier 0.
+        assert_eq!(costs.refresh_order(key), 10_000 + ttl);
+        // A later valid observation updates observed_at_ns.
         costs.advance_to(20_000 + ttl, ttl);
         costs.observe(&step, ExecutionTiming { gpu_ns, ..Default::default() });
         costs.advance_to(20_000 + 2 * ttl, ttl);
-        assert_eq!(costs.refresh_order(key), (false, 0));
+        assert_eq!(costs.refresh_order(key), 20_000 + ttl);
     }
 
     #[test]
-    fn unmeasured_mtp_and_measured_copy_coexist_at_identical_shape_and_preserve_packed_duration() {
+    fn unmeasured_mtp_and_measured_copy_coexist_at_identical_shape_and_stay_isolated() {
         use super::super::speculation::ProposalSource;
         let make = |name: &str, drafts, width, packed, source| GraphDescriptor {
             name: name.into(),
@@ -607,20 +602,23 @@ mod tests {
         // Identical B/D/W/P shapes with distinct draft_source coexist in ActionCosts.
         let mut costs = ActionCosts::prepared(&graphs, 16).unwrap();
         assert_eq!(costs.len(), 3);
-        // Unmeasured MTP must not suppress a measured copy shape at the same or wider width.
+        let ttl = 30_000_000_000;
+        costs.advance_to(1_000, ttl);
+        // Copy measurements stay isolated from MTP packed duration queries.
         costs.set_measured(&step_for(7, 8, 8, ProposalSource::Copy), 5_200_000);
         costs.set_measured(&step_for(15, 16, 16, ProposalSource::Copy), 5_950_000);
         assert_eq!(costs.packed_round_duration_for(ProposalSource::Mtp, 1, 8), Some(0));
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Mtp, 1, 16), None);
         assert_eq!(costs.packed_round_duration_for(ProposalSource::Copy, 1, 8), Some(5_200_000));
         assert_eq!(costs.packed_round_duration_for(ProposalSource::Copy, 1, 16), Some(5_950_000));
-        assert_eq!(costs.packed_round_duration(1, 8), Some(5_200_000));
-        assert_eq!(costs.packed_round_duration(1, 16), Some(5_950_000));
-        // Once MTP is measured, combined lookup prefers the measured MTP duration for MTP-covered
-        // widths while retaining the copy measurement independently and for copy-only widths.
+        // Measuring MTP leaves Copy unaffected, and stale_keys() excludes Copy entries.
         costs.set_measured(&step_for(7, 8, 8, ProposalSource::Mtp), 6_000_000);
         assert_eq!(costs.get(&step_for(7, 8, 8, ProposalSource::Mtp)), Some(6_000_000));
         assert_eq!(costs.get(&step_for(7, 8, 8, ProposalSource::Copy)), Some(5_200_000));
-        assert_eq!(costs.packed_round_duration(1, 8), Some(6_000_000));
-        assert_eq!(costs.packed_round_duration(1, 16), Some(5_950_000));
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Mtp, 1, 8), Some(6_000_000));
+        assert_eq!(costs.packed_round_duration_for(ProposalSource::Mtp, 1, 16), None);
+        costs.advance_to(1_000 + ttl, ttl);
+        let stale: Vec<_> = costs.stale_keys().collect();
+        assert_eq!(stale, vec![super::Key::from_step(&step_for(7, 8, 8, ProposalSource::Mtp))]);
     }
 }

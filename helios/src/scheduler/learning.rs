@@ -38,7 +38,12 @@ impl RequestScheduler {
         };
         let ordinary_widths = widths(ordinary, false);
         candidates[..count].iter().copied()
-            .filter(|candidate| candidate.rate.duration_ns != 0 && candidate.rate.compare(ordinary.rate).is_gt())
+            .filter(|candidate| {
+                candidate.rate.duration_ns != 0
+                    && candidate.rate.compare(ordinary.rate).is_gt()
+                    && !(self.proposal_source == speculation::ProposalSource::Mtp
+                        && candidate.draft_source == Some(speculation::ProposalSource::Copy))
+            })
             .map(|candidate| (candidate, widths(candidate, true)))
             .filter(|(candidate, widths)| bits(candidate.mask).any(|slot| {
                 let request = self.slots[slot].request.as_ref().unwrap();

@@ -82,10 +82,11 @@ impl RefreshState {
             _ => {
                 if origin.is_acceptance() {
                     let duration = cost::observed_duration_ns(timing).unwrap_or(timing.wall_ns);
-                    self.acceptance_credit_ns -= duration as f64;
+                    self.acceptance_credit_ns =
+                        (-CREDIT_CAP_NS).max(self.acceptance_credit_ns - duration as f64);
                 } else {
                     let duration = cost::timing_refresh_duration_ns(timing);
-                    self.credit_ns -= duration as f64;
+                    self.credit_ns = (-CREDIT_CAP_NS).max(self.credit_ns - duration as f64);
                 }
                 self.active = false;
             }

@@ -606,11 +606,12 @@ impl RequestScheduler {
 
     pub(super) fn speculative_duration(&self, request: &LiveRequest, batch: usize, width: usize) -> Option<u64> {
         if self.speculative_fixed_width.is_none() {
-            // The full B x W graph is among the rounds this table minimizes over.
-            return self.costs.packed_round_duration(batch, width);
+            // The full B x W graph is already included in the packed round aggregate for this source.
+            return self.costs.packed_round_duration_for(self.proposal_source, batch, width);
         }
         let length = self.speculative_tokens(request, width);
         self.costs.packed_round_shapes().filter(|shape| shape.batch == batch && shape.width == width
+            && shape.draft_source.unwrap_or(speculation::ProposalSource::Mtp) == self.proposal_source
             && shape.drafts + 1 >= length && shape.tokens >= length)
             .fold(None, |best, shape| cost::min_measured_duration(best, shape.nanos))
     }
@@ -901,14 +902,14 @@ impl RequestScheduler {
         let mut frontier = std::collections::BinaryHeap::new();
         let base_mtp_drafts = self.costs.max_mtp_draft_tokens();
         for shape in self.costs.packed_round_shapes() {
-            let Some(batch_idx) = crate::execution::batch_capacity_index(shape.batch) else { continue; };
-            if shape.batch > self.limits.max_active.next_power_of_two()
-                || !self.speculative_catalog[batch_idx].contains(&shape.width) { continue; }
+            if shape.batch > self.limits.max_active.next_power_of_two() { continue; }
             if self.proposal_source == speculation::ProposalSource::Mtp
                 && shape.draft_source == Some(speculation::ProposalSource::Copy)
-                && shape.width > 1
             {
-                if self.decoded_history.is_none()
+                if optimistic
+                    || shape.width <= 1
+                    || shape.width > self.capabilities.completion_token_capacity
+                    || self.decoded_history.is_none()
                     || self.speculative_fixed_width.is_some()
                     || shape.drafts <= base_mtp_drafts
                 {
@@ -961,6 +962,8 @@ impl RequestScheduler {
                 }
                 continue;
             }
+            let Some(batch_idx) = crate::execution::batch_capacity_index(shape.batch) else { continue; };
+            if !self.speculative_catalog[batch_idx].contains(&shape.width) { continue; }
             let alpha = self.policy.alpha_for_batch(shape.batch);
             let alpha_bits = alpha.to_bits();
             let gpu_alloc = self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens);
