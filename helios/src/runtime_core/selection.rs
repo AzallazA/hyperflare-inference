@@ -30,6 +30,8 @@ pub struct LoadOptions {
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
     /// When absent, enabled for disk tables on discrete GPUs.
     pub embedding_table_resident_scales: Option<bool>,
+    /// Disable advisory host row-cache warming from graph-published lookahead mailboxes.
+    pub no_embedding_table_prefetch: bool,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
@@ -281,6 +283,10 @@ impl LoadOptions {
     /// Resident scale planes apply to disk tables only; `has_disk_tables` is the resolved layout's.
     pub(super) fn embedding_resident_scales(&self, has_disk_tables: bool, integrated: bool) -> bool {
         has_disk_tables && self.embedding_table_resident_scales.unwrap_or(!integrated)
+    }
+
+    pub(super) fn embedding_prefetch(&self, has_disk_tables: bool, cache_bytes: u64) -> bool {
+        cache_bytes != 0 && has_disk_tables && !self.no_embedding_table_prefetch
     }
 
     pub(super) fn embedding_cache_bytes(&self, has_disk_tables: bool, integrated: bool) -> u64 {

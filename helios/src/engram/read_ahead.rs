@@ -473,6 +473,7 @@ mod tests {
                 flag: flag as *const AtomicU64 as usize,
                 sequence,
                 rows: 0,
+                advisory: None,
             },
         }
     }

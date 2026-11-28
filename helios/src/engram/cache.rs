@@ -8,12 +8,13 @@
 use crate::Result;
 
 const WAYS: usize = 4;
-/// TP3 fork (perf/engram-readahead, from c2606aae): marks a row read ahead of its first use.
+/// Marks a row read ahead / advisory-prefetched before its first use.
 /// A pinned row was admitted without the frequency test and no insertion may evict it until
 /// a gather uses it or its pin goes stale. The bit lives in the recency stamp, which the clock
-/// never reaches, so an entry stays two words. Only `insert_ahead` and `pin` set it, so with
-/// read-ahead off no entry carries it and every decision below is the previous one.
+/// never reaches, so an entry stays two words. Only `insert_ahead`, `pin`, `insert_advisory`,
+/// and `pin_if_present` set it, so with read-ahead/prefetch off no entry carries it.
 const PINNED: u64 = 1 << 63;
+const CLOCK_MASK: u64 = !PINNED;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -165,31 +166,48 @@ impl RowCache {
         first..first + WAYS
     }
 
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1) & CLOCK_MASK;
+        self.clock
+    }
+
+    fn is_pinned(&self, entry: Entry) -> bool {
+        entry.id >= 0
+            && (entry.accessed & PINNED) != 0
+            && self.clock.saturating_sub(entry.accessed & CLOCK_MASK) < self.entries.len() as u64
+    }
+
     pub fn get(&mut self, id: i64) -> Option<&[u8]> {
         self.frequency.observe(id);
         let slot = self.set(id).find(|&slot| self.entries[slot].id == id)?;
-        self.clock = self.clock.saturating_add(1);
-        self.entries[slot].accessed = self.clock;
+        let now = self.tick();
+        // Consuming a row clears any advisory pin so normal frequency/recency rules manage it.
+        self.entries[slot].accessed = now;
         Some(&self.payload[slot * self.row_bytes..(slot + 1) * self.row_bytes])
     }
 
     /// Whether `id` is resident, pinning it for an upcoming use if so. A prediction is not a
     /// use: the frequency estimate is left to the gather that consumes the row.
     pub fn pin(&mut self, id: i64) -> bool {
+        self.pin_if_present(id)
+    }
+
+    /// Protect an already-resident row against eviction until consumed or one cache turnover passes.
+    pub fn pin_if_present(&mut self, id: i64) -> bool {
         let Some(slot) = self.set(id).find(|&slot| self.entries[slot].id == id) else {
             return false;
         };
-        self.clock = self.clock.saturating_add(1);
-        self.entries[slot].accessed = self.clock | PINNED;
+        let now = self.tick();
+        self.entries[slot].accessed = now | PINNED;
         true
     }
 
     pub fn insert(&mut self, id: i64, weights: &[u8], scales: &[u8]) -> Insertion {
         debug_assert!(id >= 0);
         debug_assert_eq!(weights.len() + scales.len(), self.row_bytes);
-        self.clock = self.clock.saturating_add(1);
-        match self.admit(id, self.clock) {
-            Some(slot) => self.place(slot, id, self.clock, weights, scales),
+        let now = self.tick();
+        match self.admit(id, now) {
+            Some(slot) => self.place(slot, id, now, weights, scales),
             None => Insertion::REFUSED,
         }
     }
@@ -199,11 +217,23 @@ impl RowCache {
     pub fn insert_ahead(&mut self, id: i64, weights: &[u8], scales: &[u8]) -> Insertion {
         debug_assert!(id >= 0);
         debug_assert_eq!(weights.len() + scales.len(), self.row_bytes);
-        self.clock = self.clock.saturating_add(1);
+        let now = self.tick();
         match self.victim(id) {
-            Some(slot) => self.place(slot, id, self.clock | PINNED, weights, scales),
+            Some(slot) => self.place(slot, id, now | PINNED, weights, scales),
             None => Insertion::REFUSED,
         }
+    }
+
+    /// Admit an advisory-prefetched row without requiring prior frequency, pinning it until
+    /// consumed or aged out. Declines admission if every way in the target set is already pinned.
+    pub fn insert_advisory(&mut self, id: i64, weights: &[u8], scales: &[u8]) -> Insertion {
+        debug_assert!(id >= 0);
+        debug_assert_eq!(weights.len() + scales.len(), self.row_bytes);
+        let Some(slot) = self.victim(id) else {
+            return Insertion::REFUSED;
+        };
+        let now = self.tick();
+        self.place(slot, id, now | PINNED, weights, scales)
     }
 
     fn place(&mut self, slot: usize, id: i64, accessed: u64, weights: &[u8], scales: &[u8]) -> Insertion {
@@ -217,12 +247,6 @@ impl RowCache {
         }
     }
 
-    /// A read-ahead row stays protected for one turnover of the cache's operations; a row
-    /// predicted but never requested (a cancelled request) then ages back into an ordinary entry.
-    fn protected(&self, entry: Entry) -> bool {
-        entry.pinned() && self.clock.saturating_sub(entry.stamp()) < self.entries.len() as u64
-    }
-
     /// The slot `id` would occupy: its own, an empty way, or the way with the lowest usage and
     /// then the oldest use among those not protected. Without pinned entries this is the
     /// previous choice exactly (stamp == accessed, nothing protected).
@@ -232,7 +256,7 @@ impl RowCache {
             .find(|&slot| self.entries[slot].id == id)
             .or_else(|| set.clone().find(|&slot| self.entries[slot].id == -1))
             .or_else(|| {
-                set.filter(|&slot| !self.protected(self.entries[slot]))
+                set.filter(|&slot| !self.is_pinned(self.entries[slot]))
                     .min_by_key(|&slot| {
                         let entry = self.entries[slot];
                         (self.frequency.estimate(entry.id), entry.stamp())
@@ -463,4 +487,72 @@ mod tests {
         assert!(inserts > 10_000 && refusals > 100, "{inserts} inserts, {refusals} refusals");
     }
 
+    #[test]
+    fn advisory_insert_admits_into_full_cache_pins_until_consumed_and_ages_out() {
+        let mut cache = RowCache::new(16384, 1000, 2048).unwrap();
+        let payload = [7u8; 2048];
+        let warm_payload = [42u8; 2048];
+        assert_eq!(cache.capacity(), 4);
+        // Fill all four ways with hot entries so normal frequency admission rejects cold rows.
+        for id in 0..4 {
+            cache.get(id);
+            cache.insert(id, &payload, &[]);
+        }
+        for _ in 0..10 {
+            for id in 0..4 {
+                assert!(cache.get(id).is_some());
+            }
+        }
+        // Advisory insert admits row 100 despite zero prior frequency and protects it from
+        // immediate non-advisory eviction.
+        let ins = cache.insert_advisory(100, &warm_payload, &[]);
+        assert!(ins.evicted);
+        assert!(cache.pin_if_present(100));
+        // Consuming row 100 returns its exact bytes and clears the pin.
+        assert_eq!(cache.get(100), Some(&warm_payload[..]));
+        // An unconsumed advisory pin ages out once one full cache turnover of ticks passes.
+        // Row 101 evicts row 100 (whose pin cleared on get above), while hot row 1 stays resident.
+        let ins101 = cache.insert_advisory(101, &warm_payload, &[]);
+        assert!(ins101.evicted);
+        assert!(cache.get(100).is_none());
+        for _ in 0..cache.capacity() {
+            assert!(cache.get(1).is_some());
+        }
+        let slot = cache.set(101).find(|&s| cache.entries[s].id == 101).unwrap();
+        assert!(!cache.is_pinned(cache.entries[slot]));
+    }
+
+    #[test]
+    fn advisory_insert_does_not_evict_unconsumed_pinned_rows_when_set_is_full() {
+        // Use a multi-set cache (capacity > WAYS) so pins do not age out after WAYS insertions.
+        let mut cache = RowCache::new(65536, 1000, 2048).unwrap();
+        assert!(cache.capacity() >= WAYS * 4);
+        let same_set: Vec<i64> = (0i64..1000)
+            .filter(|&id| cache.set(id).start == 0)
+            .take(WAYS + 2)
+            .collect();
+        assert_eq!(same_set.len(), WAYS + 2);
+        let payloads: [[u8; 2048]; 6] = std::array::from_fn(|i| [(i + 1) as u8; 2048]);
+        for i in 0..WAYS {
+            let ins = cache.insert_advisory(same_set[i], &payloads[i], &[]);
+            assert!(ins.added && !ins.evicted);
+        }
+        // All four ways in set 0 are pinned: a fifth advisory insert into set 0 must not evict them.
+        let overflow = cache.insert_advisory(same_set[WAYS], &payloads[WAYS], &[]);
+        assert!(!overflow.added && !overflow.evicted);
+        // A regular insert into the same set is also blocked while every way holds an unconsumed pin.
+        let blocked = cache.insert(same_set[WAYS + 1], &payloads[WAYS + 1], &[]);
+        assert!(!blocked.added && !blocked.evicted);
+        // Consuming row 0 returns its exact bytes and clears its pin so normal admission resumes.
+        assert_eq!(cache.get(same_set[0]), Some(&payloads[0][..]));
+        for i in 1..WAYS {
+            let id = same_set[i];
+            let slot = cache.set(id).find(|&s| cache.entries[s].id == id).unwrap();
+            assert!(cache.is_pinned(cache.entries[slot]));
+        }
+        cache.get(same_set[WAYS + 1]);
+        let admitted = cache.insert(same_set[WAYS + 1], &payloads[WAYS + 1], &[]);
+        assert!(admitted.evicted);
+        assert_eq!(cache.get(same_set[WAYS + 1]), Some(&payloads[WAYS + 1][..]));
+    }
 }
