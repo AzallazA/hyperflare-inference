@@ -109,9 +109,9 @@ struct Read {
     fragments: std::ops::Range<usize>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 struct Aligned(usize, usize);
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl Aligned {
     fn new(nbytes: usize) -> Result<Self> {
         Ok(Self(
@@ -119,6 +119,7 @@ impl Aligned {
             nbytes,
         ))
     }
+    #[cfg(windows)]
     fn at(&self, slot: usize) -> *mut u8 {
         (self.0 + slot * CHUNK) as *mut u8
     }
@@ -511,7 +512,7 @@ impl Resident {
         unsafe { std::slice::from_raw_parts((address + self.skip) as *const u8, self.nbytes) }
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl Drop for Aligned {
     fn drop(&mut self) {
         unsafe { crate::os::free_aligned(self.0, self.1) };
