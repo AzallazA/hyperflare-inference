@@ -13,8 +13,11 @@ MODEL = Path(__file__).resolve().parent
 ROOT = MODEL.parent.parent
 TEST = "scheduler::lifecycle_tests::scheduler_matches_lifecycle_model"
 RANK_TEST = "execution::threaded::protocol_tests::rank_coordinator_matches_model"
+DISPATCH_RING_TEST = "execution::threaded::tests::dispatch_ring_matches_model_edges"
+DISPATCH_RING_SUITE = "execution::threaded::tests::"
 CHECKS = [("Lifecycle", TEST, "LIFECYCLE_EDGE ", 14),
           ("RankProtocol", RANK_TEST, "RANK_EDGE ", 15),
+          ("DispatchRing", DISPATCH_RING_TEST, "DISPATCH_RING_EDGE ", 18),
           ("OffloadTransfer", "offload::transfer::lifecycle_tests::offload_transfers_match_model",
            "OFFLOAD_EDGE ", 16),
           ("CacheOwnership", "cache::lifecycle_tests::bounded_cache_ownership_matches_tla",
@@ -172,6 +175,37 @@ def main():
                  "0 \\in Head(before.queue).done", "RemovalRequiresEveryRank"),
                 ("RankDispatch", "!.failed = TRUE]", "!.failed = TRUE, !.released = TRUE]",
                  "FailureRetainsOwnership"),
+                ("DispatchRing",
+                 "    IF s.decisionEpoch >= e THEN (IF s.decisionCommit THEN \"Commit\" ELSE \"Cancel\")\n"
+                 "    ELSE IF s.drain THEN \"Drain\"",
+                 "    IF s.drain THEN \"Drain\"\n"
+                 "    ELSE IF s.decisionEpoch >= e THEN (IF s.decisionCommit THEN \"Commit\" ELSE \"Cancel\")",
+                 "NoStrandedCollective"),
+                ("DispatchRing",
+                 "PeerFinishDrain(before, after, p) ==\n"
+                 "    /\\ before.peerPhase[p] = \"Draining\"\n"
+                 "    /\\ before.peerInFlight[p] = {}",
+                 "PeerFinishDrain(before, after, p) ==\n"
+                 "    /\\ before.peerPhase[p] = \"Draining\"",
+                 "NoAbandonedInFlightWork"),
+                ("DispatchRing",
+                 "CoordCommit(before, after) ==\n"
+                 "    /\\ before.coordPhase = \"WaitingReady\"\n"
+                 "    /\\ ~before.peerExited\n"
+                 "    /\\ \\A p \\in Peers : before.peerAck[p] >= 2 * before.coordEpoch",
+                 "CoordCommit(before, after) ==\n"
+                 "    /\\ before.coordPhase = \"WaitingReady\"\n"
+                 "    /\\ ~before.peerExited\n"
+                 "    /\\ \\E p \\in Peers : before.peerAck[p] >= 2 * before.coordEpoch",
+                 "CommitRequiresEveryPeer"),
+                ("DispatchRing",
+                 "        !.decisionEpoch = before.coordEpoch,\n"
+                 "        !.decisionCommit = TRUE,\n"
+                 "        !.coordPhase = \"LaunchingLocal\",",
+                 "        !.decisionEpoch = before.decisionEpoch,\n"
+                 "        !.decisionCommit = before.decisionCommit,\n"
+                 "        !.coordPhase = \"LaunchingLocal\",",
+                 "CommitBeforeLocalLaunch"),
                 ("CacheOwnership", "!.nodes[child][6] = Max(U(before, child), Max(U(before, n), R(before, n)))]",
                  "!.nodes[child][6] = U(before, child)]", "InheritedLastUse"),
                 ("Speculation", "Advance(st, ceiling) == Min(ceiling, Geometry(st)[7])",
@@ -202,16 +236,68 @@ def main():
                 ("ignored dispatch failure", "send(peer)?;",
                  "let _ = send(peer);",
                  "partial commit dispatch must report disconnected peer"),
+                ("parallel local submit before peer commit",
+                 "    dispatch_commit(peers, send)?;\n    local_submit()",
+                 "    local_submit()?;\n    dispatch_commit(peers, send)",
+                 "parallel commit must be dispatched to every peer before local CUDA submission"),
             ])
-            check_mutations(cargo, ROOT / "helios/src/cache.rs", CHECKS[3][1], [
+            check_mutations(cargo, ROOT / "helios/src/execution/threaded.rs", DISPATCH_RING_SUITE, [
+                ("drain before commit decision",
+                 "        let value = self.decision.0.load(Ordering::Acquire);\n"
+                 "        if (value >> 1) >= epoch {\n"
+                 "            return Some(if (value & 1) != 0 {\n"
+                 "                DecisionEvent::Commit\n"
+                 "            } else {\n"
+                 "                DecisionEvent::Cancel\n"
+                 "            });\n"
+                 "        }\n"
+                 "        if self.drain.0.load(Ordering::SeqCst) {",
+                 "        if self.drain.0.load(Ordering::SeqCst) {\n"
+                 "            return Some(DecisionEvent::Drain);\n"
+                 "        }\n"
+                 "        let value = self.decision.0.load(Ordering::Acquire);\n"
+                 "        if (value >> 1) >= epoch {\n"
+                 "            return Some(if (value & 1) != 0 {\n"
+                 "                DecisionEvent::Commit\n"
+                 "            } else {\n"
+                 "                DecisionEvent::Cancel\n"
+                 "            });\n"
+                 "        }\n"
+                 "        if false {",
+                 "committed step must be observed before drain"),
+                ("abandon in-flight work on drain",
+                 "    while outstanding(state) != 0 {",
+                 "    if outstanding(state) != 0 {\n"
+                 "        return Err(invalid(\"rank drain arrived with outstanding frames\"));\n"
+                 "    }\n"
+                 "    while false {",
+                 "surviving peer must drain in-flight work before closing"),
+                ("partial dispatch-ring readiness",
+                 "if (0..peer_count).all(|index| self.peer_ack[index].0.load(Ordering::Acquire) >= target) {",
+                 "if (0..peer_count).any(|index| self.peer_ack[index].0.load(Ordering::Acquire) >= target) {",
+                 "commit must wait for every peer readiness"),
+                ("local submit before peer commit",
+                 "            ring.commit(epoch);\n"
+                 "            *next_epoch += 1;\n"
+                 "            match local_submit(local) {\n"
+                 "                Ok(Some(submitted)) if submitted == fence => Ok(Some(fence)),",
+                 "            match local_submit(local) {\n"
+                 "                Ok(Some(submitted)) if submitted == fence => {\n"
+                 "                    ring.commit(epoch);\n"
+                 "                    *next_epoch += 1;\n"
+                 "                    Ok(Some(fence))\n"
+                 "                }",
+                 "peer commit must be published before local CUDA submission"),
+            ])
+            check_mutations(cargo, ROOT / "helios/src/cache.rs", CHECKS[4][1], [
                 ("lost inherited fence", "child.last_use = child.last_use.max(node.last_use).max(node.ready_after);",
                  "child.last_use = child.last_use;", "compaction lost inherited last-use fence"),
             ])
-            check_mutations(cargo, ROOT / "helios/src/offload/transfer.rs", CHECKS[2][1], [
+            check_mutations(cargo, ROOT / "helios/src/offload/transfer.rs", CHECKS[3][1], [
                 ("premature transfer aggregation", "if pending.remaining > 0 {", "if pending.remaining > 1 {",
                  "accepted rank replies must retain pending ownership until the final reply"),
             ])
-            check_mutations(cargo, ROOT / "helios/src/server/runtime.rs", CHECKS[5][1], [
+            check_mutations(cargo, ROOT / "helios/src/server/runtime.rs", CHECKS[6][1], [
                 ("unread response admission", "_capacity: Some(capacity.clone()),\n                admission: admitted,",
                  "_capacity: None,\n                admission: admitted,",
                  "retained output lost its admission reservation"),
@@ -223,7 +309,7 @@ def main():
                 ("undersized response queue", "async_mpsc::channel(event_capacity);",
                  "async_mpsc::channel(2);", "response queue must cover its complete output allowance"),
             ])
-            check_mutations(cargo, ROOT / "helios/src/scheduler.rs", CHECKS[4][1], [
+            check_mutations(cargo, ROOT / "helios/src/scheduler.rs", CHECKS[5][1], [
                 ("physical pending capacity", "lane.tokens.min(self.packed_token_capacity)", "lane.tokens",
                  "pending speculative advance must use physical capacity"),
                 ("full lane reservation", "let pages = self.pages_through(request, through);",

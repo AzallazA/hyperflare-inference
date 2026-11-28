@@ -84,16 +84,25 @@ grammar state, and upload set. Rank zero validates the submission locally,
 writes it into parity slot `epoch & 1`, and publishes `prepare_epoch` (waking
 idle peers parked on the ring's condition variable). Each peer observes
 `prepare_epoch`, validates its upload layout, frame capacity, and any rank-local
-Engram staging state without launching CUDA work, and writes its cache-aligned
-readiness word. Only after every peer acknowledges readiness does rank zero
-submit locally and publish a `Commit` decision (or `Cancel` if rank zero
-encounters backpressure, leaving the executor unpoisoned, or `Drain` on peer or
-local error so no rank launches a stranded collective). Peers observe `Commit`,
-issue their local CUDA submission, and return `Reply::Complete` over their reply
-channels. The coordinator retires the fence only when all ranks agree on request
-epochs, consumed-token counts, and status, and never reuses parity slot
-`epoch & 1` until every rank completes the prior step in that slot (or
-acknowledges a cancel). Rank zero delivers sampled output.
+Engram staging state without launching CUDA work, drops its slot borrow, and
+writes its cache-aligned readiness word. Only after every peer acknowledges
+readiness and rank zero re-validates locally does rank zero publish a `Commit`
+decision before calling `local.submit()`, so every rank enters multi-GPU
+collectives concurrently without rank zero blocking inside `cuGraphLaunch`
+while peers wait for `Commit`. If rank zero encounters pre-commit backpressure,
+it publishes `Cancel` and leaves the executor unpoisoned; on peer failure,
+pre-commit local error, or post-commit local submission error, it publishes
+`Drain`.
+Peers check `decision` for their current epoch before observing `drain`, so a
+step already committed on other ranks still launches on every surviving peer
+even when a pipelined next step fails and requests drain. On `Drain`, each peer
+drains any already-committed in-flight GPU frames through `executor.poll()`
+before closing its executor. Parity slot `epoch & 1` is reused for `epoch >= 3`
+only after `wait_peer_acks((epoch - 1) << 1)` acquires every peer's readiness
+store for `epoch - 1`, which happens strictly after every peer drops its slot
+borrow for `epoch - 2` inside `executor.submit()` (or cancel handling). The
+coordinator retires the fence only when all ranks agree on request epochs,
+consumed-token counts, and status, and rank zero delivers sampled output.
 
 At most two coordinated steps are outstanding. A second step is admitted only
 when both are ordinary decode or complete speculative steps without grammar

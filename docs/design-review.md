@@ -158,6 +158,98 @@ before committing; a design acknowledgment cannot authorize them.
     Follow
     [contact on PRs and issues](../AGENTS.md#contact-on-prs-and-issues).
 
+## Testing hierarchy
+
+Software verification progresses through three layers, each establishing a
+distinct property. Every layer affected by a change is mandatory, and passing a
+lower layer never substitutes for a higher layer's requirement. Select the
+required checks from the properties at risk, following
+[verification guidance](verification.md). Hardware execution, core
+compatibility, and serving benchmarks remain governed by principles 12 and 13.
+
+1. **Crate unit and contract tests (CPU).** Run `cargo test --locked --release`
+   on every affected Rust crate (`eos`, `selene`, `selene-manager`, `helios`
+   with `--features runtime-core,server`, `flare`, `flare-cli`, and
+   `heliopause`, matching
+   [the native-serving workflow](../.github/workflows/native-serving.yml)) and
+   `pytest` on affected Python suites (`tests/cli`, `tests/preparation`, and
+   component and scheduler tests). `cargo check` does not substitute for
+   `cargo test`. Tests must exercise the actual production entry points,
+   validate rejection without partial mutation, and avoid mocks or source-text
+   checks that bypass runtime behavior. Changes to cross-rank dispatch or
+   transport coordination (`helios/src/execution/{threaded,parallel,roce}*`)
+   require a multi-thread CPU test with a blocking cross-rank barrier coupling
+   rank-zero local submission with peer commit handlers, proving that peer
+   `Commit` publication precedes rank-zero local CUDA launch even when local
+   submission blocks waiting for peer ranks.
+2. **Scheduling simulator and mathematical references.** Changes to graph
+   selection, service pricing, timing estimation, refresh or exploration
+   budgets, or cohort algorithms must be evaluated against the Python simulator
+   and reference solvers in `scripts/scheduling_sim/`
+   ([scheduling theory](scheduling-theory.md),
+   [scheduling utility](scheduling-utility.md), and
+   [the scheduling oracle](scheduling-oracle.md)). Changes to timing
+   estimation or funded refresh require running the screening and 64-seed
+   validation catalog in `scripts/scheduling_sim/learning.py` (stationary
+   workloads, idle transients, poisoned observations, missing timings, and
+   recovery fixtures). Do not diverge Helios from the simulator's qualified
+   policy without updating and validating the rule across that catalog.
+   Simulator results do not establish native runtime behavior or GPU
+   performance.
+3. **Formal lifecycle conformance, sequential proofs, and mutation testing.**
+   Follow [Helios lifecycle verification](../verification/helios-lifecycle/README.md):
+   - Run the TLA+ models and Rust trace-conformance suite
+     (`python3 verification/helios-lifecycle/check.py`) whenever changing
+     admission, fences, generations, cancellation, speculation accounting,
+     cache compaction, snapshot aliases, response buffering or ownership,
+     offload aggregation, readiness, or rank coordination. Observed-edge
+     conformance harnesses and mutation guards must execute the production
+     coordinator entry points (such as `coordinate_step` and
+     `commit_and_launch`), not only hand-written replays of low-level atomic or
+     channel primitives, and must model rank-zero local CUDA launch as a
+     distinct phase after peer commit publication.
+   - Run the Kani sequential proofs
+     (`cargo kani --manifest-path helios/Cargo.toml --lib`) whenever changing
+     completion-vector validation, prepared completion contracts, state-view
+     extent arithmetic, or sequential validators whose safety must hold over
+     an input domain.
+   - Run mutation testing (`check.py --mutations` or `cargo-mutants`) when
+     adding or changing safety guards to verify that the checks detect
+     plausible implementation faults.
+   Formal checks do not establish CUDA ordering, kernel arithmetic, or thread
+   interleavings outside their modeled domain.
+
+**Mandatory enforcement and non-substitution:**
+
+- **Never touch covered code without running and updating its simulator and
+  formal checks.** Modifying the Helios scheduler, admission, speculation,
+  cancellation, cache ownership, completion validation, readiness, or rank
+  coordination without running—and updating when behavior, transitions, or
+  supported bounds change—the applicable TLA+ models, Rust conformance
+  fixtures, Kani harnesses, and scheduling simulator is a blocking design
+  failure, regardless of whether CPU unit tests pass.
+- **Keep formal bounds aligned with runtime capabilities.** When a change adds
+  protocol states or extends supported runtime geometries beyond an existing
+  model's or harness's bounds (for example, wider speculative verification
+  widths or additional lifecycle transitions), update the model, conformance
+  fixture, or Kani harness to cover the added domain rather than leaving it
+  unverified.
+- **Disclosure does not excuse skipping runnable CPU checks.** All three layers
+  run without a GPU or model checkpoint. Leaving an applicable crate test,
+  simulator sweep, TLA+ conformance run, or Kani proof unrun blocks commit and
+  PR acceptance; noting it as a limitation does not make the omission
+  acceptable.
+- **Multi-GPU collective execution is mandatory for TP dispatch and transport
+  changes.** Replacing or reordering cross-rank launch, commit, cancellation,
+  or drain paths in `helios/src/execution/{threaded,parallel,roce}*` requires
+  an explicit before/after cross-rank happens-before analysis and live
+  multi-GPU execution of real collective graphs (for example, serving a
+  multi-GPU exported core through `flare run`), not only independent per-rank
+  synthetic graphs. Disclosing busy or unavailable GPUs does not waive this
+  requirement for changes to TP execution paths.
+- Pure documentation and formatting edits require inspection and applicable
+  existing checks; they do not require simulator, formal, or GPU runs.
+
 ## Review and acknowledgment
 
 1. Inspect `git diff --cached`. Apply every relevant principle, fix violations,
